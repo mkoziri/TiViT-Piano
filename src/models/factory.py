@@ -1,0 +1,28 @@
+from typing import Any, Mapping
+from .tivit_piano import TiViTPiano
+
+def _get(d: Mapping[str, Any], key: str, default):
+    v = d.get(key, default)
+    return v if v is not None else default
+
+def build_model(cfg: Mapping[str, Any]):
+    if "model" not in cfg or "transformer" not in cfg["model"]:
+        raise ValueError("Config must have model.transformer section")
+
+    mcfg = cfg["model"]
+    tcfg = mcfg["transformer"]
+
+    return TiViTPiano(
+        tiles=_get(mcfg, "tiles", 3),
+        input_channels=_get(mcfg, "input_channels", 3),
+        patch_size=_get(tcfg, "input_patch_size", 16),
+        tube_size=_get(tcfg, "tube_size", 2),
+        d_model=_get(tcfg, "d_model", 768),
+        nhead=_get(tcfg, "num_heads", 8),
+        depth_temporal=_get(tcfg, "depth_temporal", 2),
+        depth_spatial=_get(tcfg, "depth_spatial", 2),
+        mlp_ratio=_get(tcfg, "mlp_ratio", 4.0),
+        dropout=_get(tcfg, "dropout", 0.1),
+        head_mode=cfg["model"].get("head_mode", "clip"),
+    )
+

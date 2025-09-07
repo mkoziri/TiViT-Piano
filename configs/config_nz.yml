@@ -1,0 +1,88 @@
+experiment:
+  name: "TiViT-Piano_OMAPS_cpu_mid"
+  seed: 42
+  output_dir: "outputs"
+
+dataset:
+  name: "OMAPS"
+  root_dir: "~/datasets/OMAPS"           # adjust if needed
+  annotations_root: "~/datasets/OMAPS"   # adjust if needed
+  label_format: "txt"
+  max_clips: 1                        # null -> full dataset
+  split_train: "train"
+  split_val: "train"                      # you currently use test for val
+  split_test: "test"
+  frames: 96
+  stride: 1
+  resize: [128, 128]                     # down from 160×160 for CPU
+  tiles: 3
+  channels: 3
+  batch_size: 1                          # no GPU; keep stable
+  num_workers: 0                         # avoid RAM churn on 8 GB
+  shuffle: false                         # was true. changed for debugging reasons
+  require_labels: true
+
+  frame_targets:
+    enable: true
+    tolerance: 0.20
+    dilate_active_frames: 5              # helps offsets on sparse labels
+    fill_mode: "overlap"
+    hand_from_pitch: true
+    clef_thresholds: [60, 64]
+    note_min: 0
+    note_max: 127
+    cache_labels: true                   # build once, reuse on CPU
+    cache_dir: ".cache/labels"
+    targets_sparse: false
+
+model:
+  name: "TiViT-Piano"
+  head_mode: "frame"
+  tiles: 3
+  input_channels: 3
+  transformer:
+    type: "ViViT"
+    input_patch_size: 16
+    tube_size: 2
+    d_model: 192                         # down from 256
+    num_heads: 3                         # 192/3=64 per head (valid)
+    depth_temporal: 1
+    depth_spatial: 1
+    mlp_ratio: 3.0
+    dropout: 0.0                         #was 0.1 changed for debugging
+
+training:
+  epochs: 30
+  learning_rate: 3e-4
+  weight_decay: 0.00                     #was 0.01 changed for debugging
+  grad_clip: 1.0
+  eval_freq: 1
+  debug_dummy_labels: false
+  log_interval: 25
+
+  loss_weights:
+    pitch: 1.0
+    onset: 5.0
+    offset: 5.0
+    hand: 0.2
+    clef: 0.2
+    focal_gamma: 1.5
+    focal_alpha: 0.15
+    onoff_prior_mean: 0.01
+    onoff_prior_weight: 0.00
+
+  metrics:
+    prob_threshold: 0.20
+
+  reset_head_bias: false
+
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  tensorboard: false
+  save_every: 1
+
+inference:
+  output_dir: "inference_results"
+  predict_on_train: false
+

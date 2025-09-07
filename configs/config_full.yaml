@@ -1,0 +1,66 @@
+# configs/config_full.yaml
+# ViViT-Base-ish configuration for TiViT-Piano
+# Heavier than the CPU/debug config. Use when you have the horsepower.
+
+experiment:
+  name: "TiViT-Piano_full"
+  seed: 42
+  output_dir: "outputs"
+
+dataset:
+  name: "OMAPS"
+  root_dir: "~/datasets/OMAPS"     # adjust if needed
+  annotations_root: "~/datasets/OMAPS"   # txt files live alongside videos
+  label_format: "txt"                     # not midi
+  split: "train"                   # use "test" for evaluation-only runs
+  frames: 32                       # increase to 64 if your machine can handle it
+  stride: 2
+  resize: [224, 224]
+  tiles: 3
+  channels: 3
+  normalize: true                  # scale to [0,1]
+  batch_size: 4                    # raise if you have the memory; lower on CPU
+  num_workers: 4
+  shuffle: true
+
+model:
+  name: "TiViT-Piano"
+  tiles: 3
+  input_channels: 3
+  transformer:
+    type: "ViViT"
+    input_patch_size: 16           # spatial patch size (p)
+    tube_size: 2                   # temporal tube length (t)
+    d_model: 768                   # ViT-Base width
+    num_heads: 8                   # ViT-Base heads
+    depth_temporal: 6              # temporal blocks per stage
+    depth_spatial: 6               # spatial (across tiles) blocks per stage
+    mlp_ratio: 4.0
+    dropout: 0.1
+
+training:
+  epochs: 50
+  learning_rate: 3e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  eval_freq: 1                     # run eval every X epochs (once eval is wired)
+  debug_dummy_labels: true         # set false once real labels are available
+  log_interval: 20                 # iterations
+  save_every: 1                    # epochs
+
+  loss_weights:
+    pitch: 1.0
+    onset: 0.5
+    offset: 0.5
+    hand: 0.2
+    clef: 0.2
+
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  tensorboard: true
+
+inference:
+  output_dir: "inference_results"
+  predict_on_train: false
+

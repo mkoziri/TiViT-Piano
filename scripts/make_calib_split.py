@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import argparse, json, math, os, random
+from pathlib import Path
+from statistics import median
+
+def load_train_meta(meta_path: Path):
+    if not meta_path.exists():
+        raise SystemExit(f"Missing metadata file: {meta_path}. Run Step 0 first.")
+    data = json.loads(meta_path.read_text(encoding="utf-8"))
+    pieces = data.get("pieces", [])
+    if not pieces:
+        raise SystemExit(f"No pieces found in {meta_path}.")
+    # Keep only items that actually have labels; stems are taken from JSON
+    out = []
+    for p in pieces:
+        stem = p["stem"]
+        txt  = Path(p["txt"])
+        rec = {
+            "stem": stem,
+            "txt": txt,
+            "notes_per_sec": float(p["notes_per_sec"]),
+        }
+        # mp4 may exist (has_video true) — if present, we’ll also symlink it
+        if "mp4" in p:
+            rec["mp4"] = Path(p["mp4"])
+        out.append(rec)
+    return out
+
+def quantile_cuts(values, n_bins):
+    vs = sorted(values)
+    cuts = []
+    for k in range(1, n_bins):
+        idx = max(0, min(len(vs)-1, int(round(k*(len(vs)-1)/n_bins))))
+        cuts.append(vs[idx])
+    return cuts
+
+def assign_bin(v, cuts):
+    for i, c in enumerate(cuts):
+        if v <= c:
+            return i
+    return len(cuts)
+
+def write_stem_list(path: Path, items):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in sorted(items, key=lambda x: x["stem"]):
+            f.write(r["stem"] + "\n")
+
+def main():
+    ap = argparse.ArgumentParser(description="Build a ~10% speed-matched calibration split from TRAIN only.")
+    ap.add_argument("--meta-train", type=Path, default=Path("metadata/omaps_train.json"),
+                    help="Path to Step 0 output for the TRAIN split")
+    ap.add_argument("--calib-frac", type=float, default=0.10, help="Fraction of TRAIN to sample (per speed bin)")
+    ap.add_argument("--bins", type=int, default=5, help="Number of quantile bins for notes/sec")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out-dir", type=Path, default=Path("splits"))
+    ap.add_argument("--symlink-out", type=Path, help="Optional directory to symlink the calib subset (videos+labels)")
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+
+    pieces = load_train_meta(args.meta_train)
+    speeds = [p["notes_per_sec"] for p in pieces]
+    cuts = quantile_cuts(speeds, args.bins)
+
+    # bucketize
+    buckets = [[] for _ in range(args.bins)]
+    for r in pieces:
+        buckets[assign_bin(r["notes_per_sec"], cuts)].append(r)
+
+    # sample
+    calib, train_minus = [], []
+    for b in buckets:
+        if not b:
+            continue
+        k = max(1, int(round(len(b) * args.calib_frac)))
+        random.shuffle(b)
+        calib.extend(b[:k])
+        train_minus.extend(b[k:])
+
+    # write lists (stems)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    write_stem_list(args.out_dir / "calib_list.txt", calib)
+    write_stem_list(args.out_dir / "train_minus_calib_list.txt", train_minus)
+
+    # optional symlink mini-dataset
+    if args.symlink_out:
+        args.symlink_out.mkdir(parents=True, exist_ok=True)
+        for r in calib:
+            stem = r["stem"]
+            # label
+            dst_txt = args.symlink_out / f"{stem}.txt"
+            if dst_txt.exists(): dst_txt.unlink()
+            os.symlink(r["txt"], dst_txt)
+            # video (if available)
+            if "mp4" in r:
+                src_v = r["mp4"]
+                vdst = args.symlink_out / f"{stem}{src_v.suffix}"
+                if vdst.exists(): vdst.unlink()
+                os.symlink(src_v, vdst)
+
+    # report
+    def bucket_desc(i):
+        lo = -math.inf if i == 0 else cuts[i-1]
+        hi = math.inf if i == len(cuts) else cuts[i]
+        return f"({lo:.3f}, {hi:.3f}]"
+
+    print(f"[OK] TRAIN pieces considered: {len(pieces)}")
+    print(f"[OK] Calib size: {len(calib)}  (~{args.calib_frac*100:.1f}% of TRAIN)")
+    for i, b in enumerate(buckets):
+        n_total = len(b)
+        n_calib = sum(1 for r in calib if assign_bin(r["notes_per_sec"], cuts) == i)
+        print(f"  bin{i} {bucket_desc(i)}: total={n_total:3d}  calib={n_calib:3d}")
+
+    print(f"[OK] Wrote: {args.out_dir/'calib_list.txt'} and {args.out_dir/'train_minus_calib_list.txt'}")
+    if args.symlink_out:
+        print(f"[OK] Symlinked calib subset at: {args.symlink_out}")
+
+if __name__ == "__main__":
+    main()
+
