@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Datasets
+datasets/
+data/cache/
+data/processed/
+data/omaps
+.cache/
+
+# Training outputs
+checkpoints/
+checkpoints_archive
+logs/
+out/
+notebooks/
+reports/
+sweep_logs/
+temp/
+calibration_results.txt
+calibration_summary.*
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
