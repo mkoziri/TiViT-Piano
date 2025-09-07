@@ -1,0 +1,293 @@
+{
+  "root": "/home/almar/datasets/OMAPS",
+  "split": "test",
+  "n": 26,
+  "pieces": [
+    {
+      "stem": "001",
+      "txt": "/home/almar/datasets/OMAPS/test/001.txt",
+      "duration_sec": 97.257083,
+      "n_notes": 561,
+      "notes_per_sec": 5.7682174161032576,
+      "pitch_min": 36,
+      "pitch_max": 103,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/001.mp4"
+    },
+    {
+      "stem": "002",
+      "txt": "/home/almar/datasets/OMAPS/test/002.txt",
+      "duration_sec": 124.31275,
+      "n_notes": 489,
+      "notes_per_sec": 3.93362708169516,
+      "pitch_min": 36,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/002.mp4"
+    },
+    {
+      "stem": "003",
+      "txt": "/home/almar/datasets/OMAPS/test/003.txt",
+      "duration_sec": 138.489,
+      "n_notes": 570,
+      "notes_per_sec": 4.115850356345991,
+      "pitch_min": 31,
+      "pitch_max": 95,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/003.mp4"
+    },
+    {
+      "stem": "004",
+      "txt": "/home/almar/datasets/OMAPS/test/004.txt",
+      "duration_sec": 148.859247,
+      "n_notes": 947,
+      "notes_per_sec": 6.361714297802406,
+      "pitch_min": 31,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/004.mp4"
+    },
+    {
+      "stem": "005",
+      "txt": "/home/almar/datasets/OMAPS/test/005.txt",
+      "duration_sec": 98.287687,
+      "n_notes": 645,
+      "notes_per_sec": 6.562368285256321,
+      "pitch_min": 36,
+      "pitch_max": 89,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/005.mp4"
+    },
+    {
+      "stem": "006",
+      "txt": "/home/almar/datasets/OMAPS/test/006.txt",
+      "duration_sec": 103.532077,
+      "n_notes": 586,
+      "notes_per_sec": 5.6600815610025865,
+      "pitch_min": 36,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/006.mp4"
+    },
+    {
+      "stem": "007",
+      "txt": "/home/almar/datasets/OMAPS/test/007.txt",
+      "duration_sec": 120.480617,
+      "n_notes": 573,
+      "notes_per_sec": 4.755951739523379,
+      "pitch_min": 32,
+      "pitch_max": 99,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/007.mp4"
+    },
+    {
+      "stem": "008",
+      "txt": "/home/almar/datasets/OMAPS/test/008.txt",
+      "duration_sec": 125.014,
+      "n_notes": 893,
+      "notes_per_sec": 7.1431999616043,
+      "pitch_min": 34,
+      "pitch_max": 103,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/008.mp4"
+    },
+    {
+      "stem": "009",
+      "txt": "/home/almar/datasets/OMAPS/test/009.txt",
+      "duration_sec": 120.579575,
+      "n_notes": 535,
+      "notes_per_sec": 4.436904011313691,
+      "pitch_min": 36,
+      "pitch_max": 93,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/009.mp4"
+    },
+    {
+      "stem": "010",
+      "txt": "/home/almar/datasets/OMAPS/test/010.txt",
+      "duration_sec": 137.768012,
+      "n_notes": 1034,
+      "notes_per_sec": 7.505370695194469,
+      "pitch_min": 31,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/010.mp4"
+    },
+    {
+      "stem": "011",
+      "txt": "/home/almar/datasets/OMAPS/test/011.txt",
+      "duration_sec": 135.496,
+      "n_notes": 599,
+      "notes_per_sec": 4.420794709806931,
+      "pitch_min": 24,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/011.mp4"
+    },
+    {
+      "stem": "012",
+      "txt": "/home/almar/datasets/OMAPS/test/012.txt",
+      "duration_sec": 130.393483,
+      "n_notes": 556,
+      "notes_per_sec": 4.264016783722235,
+      "pitch_min": 43,
+      "pitch_max": 99,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/012.mp4"
+    },
+    {
+      "stem": "013",
+      "txt": "/home/almar/datasets/OMAPS/test/013.txt",
+      "duration_sec": 107.122738,
+      "n_notes": 510,
+      "notes_per_sec": 4.760893994326396,
+      "pitch_min": 36,
+      "pitch_max": 93,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/013.mp4"
+    },
+    {
+      "stem": "014",
+      "txt": "/home/almar/datasets/OMAPS/test/014.txt",
+      "duration_sec": 99.140012,
+      "n_notes": 502,
+      "notes_per_sec": 5.063545887002717,
+      "pitch_min": 21,
+      "pitch_max": 101,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/014.mp4"
+    },
+    {
+      "stem": "015",
+      "txt": "/home/almar/datasets/OMAPS/test/015.txt",
+      "duration_sec": 130.340917,
+      "n_notes": 1124,
+      "notes_per_sec": 8.623539145424303,
+      "pitch_min": 29,
+      "pitch_max": 94,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/015.mp4"
+    },
+    {
+      "stem": "016",
+      "txt": "/home/almar/datasets/OMAPS/test/016.txt",
+      "duration_sec": 54.231547,
+      "n_notes": 528,
+      "notes_per_sec": 9.736030580134475,
+      "pitch_min": 45,
+      "pitch_max": 84,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/016.mp4"
+    },
+    {
+      "stem": "017",
+      "txt": "/home/almar/datasets/OMAPS/test/017.txt",
+      "duration_sec": 156.814833,
+      "n_notes": 797,
+      "notes_per_sec": 5.082427374711422,
+      "pitch_min": 24,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/017.mp4"
+    },
+    {
+      "stem": "018",
+      "txt": "/home/almar/datasets/OMAPS/test/018.txt",
+      "duration_sec": 101.79665,
+      "n_notes": 948,
+      "notes_per_sec": 9.312683668863366,
+      "pitch_min": 32,
+      "pitch_max": 101,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/018.mp4"
+    },
+    {
+      "stem": "019",
+      "txt": "/home/almar/datasets/OMAPS/test/019.txt",
+      "duration_sec": 116.808883,
+      "n_notes": 1138,
+      "notes_per_sec": 9.742409744642451,
+      "pitch_min": 24,
+      "pitch_max": 101,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/019.mp4"
+    },
+    {
+      "stem": "020",
+      "txt": "/home/almar/datasets/OMAPS/test/020.txt",
+      "duration_sec": 105.810706,
+      "n_notes": 423,
+      "notes_per_sec": 3.997705109348765,
+      "pitch_min": 33,
+      "pitch_max": 89,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/020.mp4"
+    },
+    {
+      "stem": "021",
+      "txt": "/home/almar/datasets/OMAPS/test/021.txt",
+      "duration_sec": 118.618017,
+      "n_notes": 894,
+      "notes_per_sec": 7.536797719354894,
+      "pitch_min": 41,
+      "pitch_max": 90,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/021.mp4"
+    },
+    {
+      "stem": "022",
+      "txt": "/home/almar/datasets/OMAPS/test/022.txt",
+      "duration_sec": 109.798616,
+      "n_notes": 569,
+      "notes_per_sec": 5.182214682924601,
+      "pitch_min": 40,
+      "pitch_max": 88,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/022.mp4"
+    },
+    {
+      "stem": "023",
+      "txt": "/home/almar/datasets/OMAPS/test/023.txt",
+      "duration_sec": 193.264626,
+      "n_notes": 1652,
+      "notes_per_sec": 8.54786535017536,
+      "pitch_min": 30,
+      "pitch_max": 99,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/023.mp4"
+    },
+    {
+      "stem": "024",
+      "txt": "/home/almar/datasets/OMAPS/test/024.txt",
+      "duration_sec": 156.8371,
+      "n_notes": 1205,
+      "notes_per_sec": 7.683131095895041,
+      "pitch_min": 38,
+      "pitch_max": 100,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/024.mp4"
+    },
+    {
+      "stem": "025",
+      "txt": "/home/almar/datasets/OMAPS/test/025.txt",
+      "duration_sec": 81.559762,
+      "n_notes": 497,
+      "notes_per_sec": 6.093691151281192,
+      "pitch_min": 51,
+      "pitch_max": 108,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/025.mp4"
+    },
+    {
+      "stem": "026",
+      "txt": "/home/almar/datasets/OMAPS/test/026.txt",
+      "duration_sec": 116.374337,
+      "n_notes": 360,
+      "notes_per_sec": 3.0934655292601154,
+      "pitch_min": 24,
+      "pitch_max": 98,
+      "has_video": true,
+      "mp4": "/home/almar/datasets/OMAPS/test/026.mp4"
+    }
+  ]
+}
