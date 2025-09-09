@@ -655,8 +655,8 @@ def main():
     #                  weight_decay=float(cfg["training"]["weight_decay"]))
     
     # --- build optimizer with higher LR for onset/offset heads ---
-    base_lr = cfg["training"]["learning_rate"]
-    wd      = cfg["training"].get("weight_decay", 0.0)
+    base_lr = float(cfg["training"]["learning_rate"])
+    wd      = float(cfg["training"].get("weight_decay", 0.0))
 
     head_params, base_params = [], []
     for name, p in model.named_parameters():
