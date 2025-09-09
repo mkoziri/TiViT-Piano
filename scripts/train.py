@@ -649,9 +649,41 @@ def main():
     
     # Model & optimizer
     model = build_model(cfg)
-    optimizer = AdamW(model.parameters(),
-                      lr=float(cfg["training"]["learning_rate"]),
-                      weight_decay=float(cfg["training"]["weight_decay"]))
+    #MK 9-9 changed the commented, but not feel sure
+    #optimizer = AdamW(model.parameters(),
+    #                  lr=float(cfg["training"]["learning_rate"]),
+    #                  weight_decay=float(cfg["training"]["weight_decay"]))
+    
+    # --- build optimizer with higher LR for onset/offset heads ---
+    base_lr = cfg["training"]["learning_rate"]
+    wd      = cfg["training"].get("weight_decay", 0.0)
+
+    head_params, base_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        lname = name.lower()
+        # put your exact substrings for the heads here; adjust if your module names differ
+        if "onset" in lname or "offset" in lname:
+            head_params.append(p)
+        else:
+            base_params.append(p)
+
+    assert len(head_params) > 0, "No onset/offset params found — check the module names."
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": base_params, "lr": base_lr,         "weight_decay": wd},
+            {"params": head_params, "lr": base_lr * 5.0,   "weight_decay": wd},
+        ]
+    )
+    
+    #MK Just for checking. If this works, it should be removed
+    num_head = sum(p.numel() for p in head_params)
+    num_base = sum(p.numel() for p in base_params)
+    print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
+    #END MK
+    #END MK
 
     # Train
     epochs = int(cfg["training"]["epochs"])

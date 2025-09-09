@@ -52,8 +52,8 @@ model:
 
 training:
   epochs: 5
-  learning_rate: 5e-4 
-  weight_decay: 0.00
+  learning_rate: 3e-4 
+  weight_decay: 0.01
   grad_clip: 1.0
   eval_freq: 1
   debug_dummy_labels: false
@@ -65,8 +65,8 @@ training:
     onoff_loss: "bce_pos"          # or "focal"
     
     #if "bce_pos":
-    onoff_pos_weight_mode: "fixed"  # "adaptive" or "fixed"
-    onoff_pos_weight: 16.0              # used only when mode == "fixed"
+    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
+    onoff_pos_weight: 0.0              # used only when mode == "fixed"
     onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
@@ -78,8 +78,8 @@ training:
     onoff_prior_weight: 0.00
     
     # per-task weights
-    onset: 8.0
-    offset: 8.0
+    onset: 5.0
+    offset: 5.0
     pitch: 1.0
     hand: 0.2
     clef: 0.2
