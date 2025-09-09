@@ -719,10 +719,17 @@ def main():
             else:
                 tgt = fabricate_dummy_targets(B)
 
-            #out = model(x)
-            #loss, parts = compute_loss(out, tgt, crit, w)
             out = model(x)
 
+            #DEB
+            if it % 20 == 0:
+            with torch.no_grad():
+                on = out["onset_logits"]             # expect (B, T') or (B, T', 1)
+                if on.dim() == 3 and on.size(-1) == 1: on = on.squeeze(-1)
+                std_per_sample = on.std(dim=1).mean().item()   # average temporal std over batch
+            pbar.write(f"[diag] onset temporal std (mean over batch) = {std_per_sample:.4f}")
+
+            #END DEB
             # --- Route to frame loss iff model is in frame mode AND batch has frame targets ---
             use_frame = (
                 getattr(model, "head_mode", "clip") == "frame"
