@@ -698,13 +698,18 @@ def main():
 
     # Try to resume from checkpoint
     resume_path = ckpt_dir / "tivit_best.pt"
+    want_resume = bool(cfg.get("training", {}).get("resume", False))
     if resume_path.exists():
         print(f"[resume] Loading from {resume_path}")
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
-        optimizer.load_state_dict(ckpt["optimizer"])
         best_val = ckpt.get("best_val", math.inf)
-        start_epoch = ckpt.get("epoch", 0) + 1
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as e:
+            print(f"[resume] optimizer groups mismatch; skipping optimizer state. ({e})")
+            # scheduler will be re-created fresh below
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
     else:
         # Fresh init → apply onset/offset bias if requested
         if cfg.get("training", {}).get("reset_head_bias", True):
