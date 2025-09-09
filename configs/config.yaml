@@ -61,15 +61,28 @@ training:
 
   reset_head_bias: true  
   loss_weights:
-    pitch: 1.0     
-    onset: 5.0     # force the network to learn this. 
-    offset: 5.0    # and this. 
-    hand: 0.2      
-    clef: 0.2      
-    focal_gamma: 1.5     
-    focal_alpha: 0.15
+    #choose the on/off loss family
+    onoff_loss: "bce_pos"          # or "focal"
+    
+    #if "bce_pos":
+    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
+    onoff_pos_weight: 0.0              # used only when mode == "fixed"
+    onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
+    
+    # focal params (used only when onoff_loss == "focal")
+    focal_gamma: 2.0
+    focal_alpha: 0.25
+    
+    # light prior (keep 0.00 while fixing heads; re-enable later if you want)
     onoff_prior_mean: 0.12
-    onoff_prior_weight: 0.0  
+    onoff_prior_weight: 0.00
+    
+    # per-task weights
+    onset: 5.0
+    offset: 5.0
+    pitch: 1.0
+    hand: 0.2
+    clef: 0.2
 
   metrics:
     prob_threshold: 0.20

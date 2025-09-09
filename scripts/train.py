@@ -162,124 +162,189 @@ def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
     }
     return total, parts
     
-def compute_loss_frame(out: dict, batch: dict, weights: dict):
+def compute_loss_frame(outputs: dict, batch: dict, weights: dict):
     """
-    Frame-level objective with time alignment + robust class imbalance handling.
-      - Align labels from T to T' (model time) via max-pooling for rolls, nearest for classes.
-      - pitch:  BCEWithLogits with gentle per-pitch pos_weight (sqrt, clamped)
-      - onset:  Focal BCE on ANY-note per frame (no pos_weight)
-      - offset: Focal BCE on ANY-note per frame (no pos_weight)
-      - hand, clef: CrossEntropy per frame
+    Frame-mode loss:
+      - Onset/Offset: focal OR BCE-with-logits(+pos_weight) selected via YAML
+      - Pitch: BCE-with-logits(+pos_weight) on frame x pitch
+      - Hand/Clef: BCE or CE depending on tensor shape
+
+    Expected (typical) shapes:
+      outputs["onset_logits"]   : (B, T, 1) or (B, T)
+      outputs["offset_logits"]  : (B, T, 1) or (B, T)
+      outputs["pitch_logits"]   : (B, T, 128)  [optional]
+      outputs["hand_logits"]    : (B, T, C)    C=1(binary) or 2 (softmax)
+      outputs["clef_logits"]    : (B, T, C)    C=1(binary) or 2 (softmax)
+
+      batch["onset_roll"]       : (B, T) or (B, T, 128)  -> ANY-over-pitch is used
+      batch["offset_roll"]      : (B, T) or (B, T, 128)
+      batch["pitch_roll"]       : (B, T, 128)            [optional]
+      batch["hand_frame"]       : (B, T) or (B, T, 2)
+      batch["clef_frame"]       : (B, T) or (B, T, 2)
+
+    Returns:
+      total_loss (scalar tensor), parts (dict of floats)
     """
-    
-    device = out["onset_logits"].device
+    device = next(v for v in outputs.values() if torch.is_tensor(v)).device
+    parts = {}
+    total = torch.zeros((), device=device)
 
-    # logits
-    pitch_logit  = out["pitch_logits"]          # (B,T',128)
-    onset_logit  = out["onset_logits"]          # (B,T')
-    offset_logit = out["offset_logits"]         # (B,T')
-    hand_logit   = out["hand_logits"]           # (B,T',2)
-    clef_logit   = out["clef_logits"]           # (B,T',3)
+    # ---- helpers ----
+    def _to_2d(logits):
+        # squeeze last dim if singleton: (B, T, 1) -> (B, T)
+        return logits.squeeze(-1) if logits.dim() == 3 and logits.size(-1) == 1 else logits
 
-    B, T_logits = onset_logit.shape
+    def _any_over_pitch(t):
+        # Accept (B,T) or (B,T,128) -> (B,T)
+        if t.dim() == 3:
+            return t.amax(dim=-1)
+        return t
 
-    # targets at original T
-    pitch_roll   = batch["pitch_roll"].float()   # (B,T,128)
-    onset_roll   = batch["onset_roll"].float()   # (B,T,128)
-    offset_roll  = batch["offset_roll"].float()  # (B,T,128)
-    hand_frame   = batch["hand_frame"].long()    # (B,T)
-    clef_frame   = batch["clef_frame"].long()    # (B,T)
+    def _bce_logits(logits, targets, pos_weight=None, reduction="mean"):
+        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction=reduction)
 
-    T_targets = pitch_roll.shape[1]
+    # Optional small negative-class smoothing (from YAML)
+    neg_smooth = float(weights.get("onoff_neg_smooth", 0.0))
 
-    # --- time alignment: T -> T' for rolls (max), T -> T' for classes (nearest) ---
-    if T_targets != T_logits:
-        def _pool_bt128(x_bt128, Tprime):
-            x = x_bt128.permute(0, 2, 1)            # (B,128,T)
-            x = F.adaptive_max_pool1d(x, Tprime)    # (B,128,T')
-            return x.permute(0, 2, 1).contiguous()  # (B,T',128)
+    # =========================
+    #  Onset / Offset (frame)
+    # =========================
+    on_logits  = _to_2d(outputs["onset_logits"]).to(device)     # (B,T)
+    off_logits = _to_2d(outputs["offset_logits"]).to(device)    # (B,T)
 
-        def _interp_bt(x_bt, Tprime):
-            x = x_bt.float().unsqueeze(1)                     # (B,1,T)
-            x = F.interpolate(x, size=Tprime, mode="nearest") # (B,1,T')
-            return x.squeeze(1).long()                        # (B,T')
+    onset_roll  = _any_over_pitch(batch["onset_roll"]).to(device).float()   # (B,T)
+    offset_roll = _any_over_pitch(batch["offset_roll"]).to(device).float()  # (B,T)
 
-        pitch_roll  = _pool_bt128(pitch_roll,  T_logits)
-        onset_roll  = _pool_bt128(onset_roll,  T_logits)
-        offset_roll = _pool_bt128(offset_roll, T_logits)
-        hand_frame  = _interp_bt(hand_frame,   T_logits)
-        clef_frame  = _interp_bt(clef_frame,   T_logits)
+    if neg_smooth > 0.0:
+        onset_t  = onset_roll  * (1.0 - neg_smooth) + neg_smooth * (1.0 - onset_roll)
+        offset_t = offset_roll * (1.0 - neg_smooth) + neg_smooth * (1.0 - offset_roll)
+    else:
+        onset_t, offset_t = onset_roll, offset_roll
 
-    # ANY-note flags per frame at T'
-    onset_any  = (onset_roll  > 0).any(dim=-1).float()   # (B,T')
-    offset_any = (offset_roll > 0).any(dim=-1).float()   # (B,T')
+    on_w  = float(weights.get("onset",  1.0))
+    off_w = float(weights.get("offset", 1.0))
 
-    # --- losses ---
-    # pitch: gentle per-pitch pos_weight (sqrt + clamp)
-    eps = 1e-6
-    pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)  # (128,)
-    pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
-    bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
-    #CAL
-    pos_rate_on  = onset_any.mean().clamp_min(eps)     # scalar
-    pos_rate_off = offset_any.mean().clamp_min(eps)    # scalar
+    onoff_loss_mode = str(weights.get("onoff_loss", "focal")).lower()  # "focal" or "bce_pos"
 
-    # pos_weight = (1-p)/p ; clamp to keep numerics tame
-    pos_w_on  = ((1.0 - pos_rate_on)  / (pos_rate_on  + eps)).clamp(1.0, 50.0).detach()
-    pos_w_off = ((1.0 - pos_rate_off) / (pos_rate_off + eps)).clamp(1.0, 50.0).detach()
+    if onoff_loss_mode == "bce_pos":
+        # ---- BCE with pos_weight (adaptive or fixed) ----
+        pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()  # "adaptive" | "fixed"
+        if pw_mode == "fixed":
+            pw_val = float(weights.get("onoff_pos_weight", 0.0))
+            if pw_val > 0.0:
+                pos_w_on  = torch.tensor([pw_val], device=device)
+                pos_w_off = torch.tensor([pw_val], device=device)
+            else:
+                pw_mode = "adaptive"
+        if pw_mode == "adaptive":
+            eps = 1e-6
+            p_on  = onset_t.mean().clamp_min(eps)
+            p_off = offset_t.mean().clamp_min(eps)
+            pos_w_on  = ((1.0 - p_on)  / (p_on  + eps)).clamp(1.0, 100.0).detach()
+            pos_w_off = ((1.0 - p_off) / (p_off + eps)).clamp(1.0, 100.0).detach()
 
-    bce_on  = nn.BCEWithLogitsLoss(pos_weight=pos_w_on)
-    bce_off = nn.BCEWithLogitsLoss(pos_weight=pos_w_off)
-    #END CAL
+        loss_on  = _bce_logits(on_logits,  onset_t,  pos_weight=pos_w_on)
+        loss_off = _bce_logits(off_logits, offset_t, pos_weight=pos_w_off)
 
-    # onset/offset: focal BCE (no pos_weight) to prevent "always-on"
-    #focal_on  = FocalBCE(gamma=3.0, alpha=0.05)
-    #focal_off = FocalBCE(gamma=3.0, alpha=0.05)
-    fl = dict(gamma=float(weights.get("focal_gamma", 2.0)),
-          alpha=float(weights.get("focal_alpha", 0.15)))
-    focal_on  = FocalBCE(**fl)
-    focal_off = FocalBCE(**fl)
+    else:
+        # ---- Focal BCE ----
+        gamma = float(weights.get("focal_gamma", 2.0))
+        alpha = float(weights.get("focal_alpha", 0.15))
 
+        # basic focal-BCE on logits
+        bce_on  = F.binary_cross_entropy_with_logits(on_logits,  onset_t,  reduction="none")
+        bce_off = F.binary_cross_entropy_with_logits(off_logits, offset_t, reduction="none")
+        p_on    = torch.sigmoid(on_logits)
+        p_off   = torch.sigmoid(off_logits)
+        w_on    = (alpha * (1.0 - p_on).pow(gamma)).detach()
+        w_off   = (alpha * (1.0 - p_off).pow(gamma)).detach()
+        loss_on  = (w_on  * bce_on ).mean()
+        loss_off = (w_off * bce_off).mean()
 
-    # hand/clef per-frame CE
-    ce = nn.CrossEntropyLoss()
+    loss_on  = loss_on  * on_w
+    loss_off = loss_off * off_w
+    total = total + loss_on + loss_off
+    parts["loss_onset"]  = float(loss_on.detach().cpu())
+    parts["loss_offset"] = float(loss_off.detach().cpu())
 
-    loss_pitch  = bce_pitch(pitch_logit, pitch_roll) * weights["pitch"]
-    #loss_onset  = focal_on(onset_logit, onset_any)   * weights["onset"]  #these were turned off for CALibration
-    #loss_offset = focal_off(offset_logit, offset_any)* weights["offset"] #these were turned off for CALibration
-    #CAL
-    neg_smooth = 0.02
-    onset_any_sm  = onset_any  * (1.0 - neg_smooth) + neg_smooth * (1.0 - onset_any)
-    offset_any_sm = offset_any * (1.0 - neg_smooth) + neg_smooth * (1.0 - offset_any)
+    # (optional) activation prior on the mean sigmoid — keep weight=0.0 while fixing heads
+    prior_w = float(weights.get("onoff_prior_weight", 0.0))
+    if prior_w > 0.0:
+        prior_target = float(weights.get("onoff_prior_mean", 0.12))
+        p_on_mean  = torch.sigmoid(on_logits).mean()
+        p_off_mean = torch.sigmoid(off_logits).mean()
+        reg_onoff = prior_w * (p_on_mean - prior_target).abs() + prior_w * (p_off_mean - prior_target).abs()
+        total = total + reg_onoff
+        parts["reg_onoff"] = float(reg_onoff.detach().cpu())
 
-    loss_onset  = bce_on(onset_logit,  onset_any_sm)  * weights["onset"]
-    loss_offset = bce_off(offset_logit, offset_any_sm) * weights["offset"]
-    #END CAL
+    # =========================
+    #  Pitch 
+    # =========================
+    if "pitch_logits" in outputs and "pitch_roll" in batch and weights.get("pitch", 0.0) > 0.0:
+        pitch_logits = outputs["pitch_logits"].to(device)           # (B,T,128)
+        pitch_roll   = batch["pitch_roll"].to(device).float()       # (B,T,128)
 
-    # CE expects (N,C) vs (N,)
-    loss_hand = ce(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * weights["hand"]
-    loss_clef = ce(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * weights["clef"]
+        # adaptive pos_weight per-batch for pitch (rare positives)
+        eps = 1e-6
+        pos_rate = pitch_roll.mean().clamp_min(eps)
+        pos_w_pitch = ((1.0 - pos_rate) / (pos_rate + eps)).clamp(1.0, 100.0).detach()
 
-    total = loss_pitch + loss_onset + loss_offset + loss_hand + loss_clef
-    parts = {
-        "total": total.item(),
-        "pitch": loss_pitch.item(),
-        "onset": loss_onset.item(),
-        "offset": loss_offset.item(),
-        "hand":  loss_hand.item(),
-        "clef":  loss_clef.item(),
-    }
-    
-     # --- activation prior regularizer: keep mean sigmoid around a small target ---
-    prior_target = float(weights.get("onoff_prior_mean", 0.02))   # ~2% frames positive
-    prior_weight = float(weights.get("onoff_prior_weight", 0.10)) # small penalty weight
-    p_on  = torch.sigmoid(onset_logit).mean()
-    p_off = torch.sigmoid(offset_logit).mean()
-    reg_onoff = prior_weight * (p_on - prior_target).abs() + prior_weight * (p_off - prior_target).abs()
-    total = total + reg_onoff
-    parts["total"] = total.item()
-    parts["reg_onoff"] = reg_onoff.item()
-    
+        loss_pitch = _bce_logits(pitch_logits, pitch_roll, pos_weight=pos_w_pitch)
+        loss_pitch = loss_pitch * float(weights.get("pitch", 1.0))
+        total += loss_pitch
+        parts["loss_pitch"] = float(loss_pitch.detach().cpu())
+
+    # =========================
+    #  Hand 
+    # =========================
+    if "hand_logits" in outputs and "hand_frame" in batch and weights.get("hand", 0.0) > 0.0:
+        hand_logits = outputs["hand_logits"].to(device)     # (B,T,C)
+        hand_target = batch["hand_frame"].to(device)
+        hand_w = float(weights.get("hand", 1.0))
+
+        if hand_logits.size(-1) == 1:
+            # binary BCE
+            hand_t = hand_target.float()
+            if hand_t.dim() == 3 and hand_t.size(-1) == 2:  # if one-hot provided
+                hand_t = hand_t[..., 1]                     # use "right" channel as positive
+            loss_hand = _bce_logits(hand_logits.squeeze(-1), hand_t)
+        else:
+            # multi-class CE with class dimension last
+            if hand_target.dim() == 3 and hand_target.size(-1) == hand_logits.size(-1):
+                hand_t = hand_target.argmax(dim=-1).long()
+            else:
+                hand_t = hand_target.long()
+            loss_hand = F.cross_entropy(hand_logits.movedim(-1, 1), hand_t)  # (B,T,C)->(B,C,T)
+
+        loss_hand = loss_hand * hand_w
+        total += loss_hand
+        parts["loss_hand"] = float(loss_hand.detach().cpu())
+
+    # =========================
+    #  Clef 
+    # =========================
+    if "clef_logits" in outputs and "clef_frame" in batch and weights.get("clef", 0.0) > 0.0:
+        clef_logits = outputs["clef_logits"].to(device)     # (B,T,C)
+        clef_target = batch["clef_frame"].to(device)
+        clef_w = float(weights.get("clef", 1.0))
+
+        if clef_logits.size(-1) == 1:
+            clef_t = clef_target.float()
+            if clef_t.dim() == 3 and clef_t.size(-1) == 2:
+                clef_t = clef_t[..., 1]
+            loss_clef = _bce_logits(clef_logits.squeeze(-1), clef_t)
+        else:
+            if clef_target.dim() == 3 and clef_target.size(-1) == clef_logits.size(-1):
+                clef_t = clef_target.argmax(dim=-1).long()
+            else:
+                clef_t = clef_target.long()
+            loss_clef = F.cross_entropy(clef_logits.movedim(-1, 1), clef_t)
+
+        loss_clef = loss_clef * clef_w
+        total += loss_clef
+        parts["loss_clef"] = float(loss_clef.detach().cpu())
+
+    parts["total"] = float(total.detach().cpu())
     return total, parts
 
 
@@ -656,7 +721,8 @@ def main():
     else:
         # Fresh init → apply onset/offset bias if requested
         if cfg.get("training", {}).get("reset_head_bias", True):
-            _set_onoff_head_bias(model, prior=0.01)
+            prior_cfg = float(cfg.get("training",{}).get("loss_weights",{}).get("onoff_prior_mean", 0.02))
+            _set_onoff_head_bias(model, prior=prior_cfg)
         best_val = math.inf
         start_epoch = 1
         
