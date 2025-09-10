@@ -26,8 +26,9 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
 
 def ensure_dirs(cfg: dict):
-    ckpt = Path(cfg["logging"]["checkpoint_dir"]).expanduser()
-    logd = Path(cfg["logging"]["log_dir"]).expanduser()
+    log_cfg = cfg.get("logging", {})
+    ckpt = Path(log_cfg.get("checkpoint_dir", "./checkpoints")).expanduser()
+    logd = Path(log_cfg.get("log_dir", "./logs")).expanduser()
     ckpt.mkdir(parents=True, exist_ok=True)
     logd.mkdir(parents=True, exist_ok=True)
     return ckpt, logd
@@ -626,15 +627,15 @@ def evaluate_one_epoch(model, loader, cfg):
 def main():
     set_seed(42)
     cfg = load_config("configs/config.yaml")
-    ckpt_dir, _ = ensure_dirs(cfg)
+    ckpt_dir, log_root = ensure_dirs(cfg)
 
     # Build experiment-specific log dir
     exp_name = cfg.get("experiment", {}).get("name", "default")
-    log_root = Path(cfg["logging"]["log_dir"])
     log_dir = log_root / exp_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    use_tb = bool(cfg["logging"].get("tensorboard", False))
+    log_cfg = cfg.get("logging", {})
+    use_tb = bool(log_cfg.get("tensorboard", False))
     writer = SummaryWriter(log_dir) if use_tb else None
     
     # Data
@@ -702,7 +703,6 @@ def main():
     # Train
     epochs = int(cfg["training"]["epochs"])
     save_every = int(cfg["training"].get("save_every", 1))
-    ckpt_dir = Path(cfg["logging"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     best_val = math.inf
