@@ -26,7 +26,24 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
-    ap.add_argument("--thresholds", default="0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90")
+    # Allow a wider default grid so that a reasonable F1 peak can be found
+    ap.add_argument(
+        "--thresholds",
+        default="0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95,1.00",
+    )
+    # Optional temperature and bias parameters for logit calibration
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Scale logits by this temperature before sigmoid; >1 softens predictions",
+    )
+    ap.add_argument(
+        "--bias",
+        type=float,
+        default=0.0,
+        help="Additive bias applied to logits before sigmoid",
+    )
     args = ap.parse_args()
 
     cfg = load_config("configs/config.yaml")
@@ -61,9 +78,10 @@ def main():
             # prefer *_logits if present; fallback to old naming
             onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
             offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
-
-            onset_prob = torch.sigmoid(onset_logits)
-            offset_prob = torch.sigmoid(offset_logits)
+            
+            # Apply temperature scaling and bias for calibration
+            onset_prob = torch.sigmoid(onset_logits / args.temperature + args.bias)
+            offset_prob = torch.sigmoid(offset_logits / args.temperature + args.bias)
 
             onset_probs.append(onset_prob.detach().cpu())
             offset_probs.append(offset_prob.detach().cpu())
@@ -80,19 +98,27 @@ def main():
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
 
-    onset_true_any = (onset_tgts > 0).any(dim=-1).float()
-    offset_true_any = (offset_tgts > 0).any(dim=-1).float()
+    # Use all key/time positions rather than collapsing with ``any``.
+    # Collapsing across the note dimension causes the predicted rate to be
+    # either 0 or 1 for a clip, which in turn makes F1-threshold sweeps
+    # uninformative.  Instead we compute metrics over the full pianoroll so
+    # that the positive rate varies smoothly with the threshold.
+    onset_true_bin = (onset_tgts > 0).float()
+    offset_true_bin = (offset_tgts > 0).float()
     
     thrs = [float(t.strip()) for t in args.thresholds.split(",") if t.strip()]
     print("Threshold\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
     for t in thrs:
-        onset_pred_any = (onset_probs >= t).any(dim=-1).float()
-        offset_pred_any = (offset_probs >= t).any(dim=-1).float()
+        # Threshold probabilities at the given level and evaluate at the
+        # pianoroll level (B, T, 88).  This yields more nuanced predicted
+        # positive rates and F1 scores, which are useful for calibration.
+        onset_pred_bin = (onset_probs >= t).float()
+        offset_pred_bin = (offset_probs >= t).float()
 
-        f1_on = _binary_f1(onset_pred_any.reshape(-1), onset_true_any.reshape(-1))
-        f1_off = _binary_f1(offset_pred_any.reshape(-1), offset_true_any.reshape(-1))
-        onset_pred_rate = onset_pred_any.mean().item()
-        onset_pos_rate = onset_true_any.mean().item()
+        f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
+        f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
+        onset_pred_rate = onset_pred_bin.mean().item()
+        onset_pos_rate = onset_true_bin.mean().item()
 
         f1_on = 0.0 if f1_on is None else f1_on
         f1_off = 0.0 if f1_off is None else f1_off
