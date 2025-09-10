@@ -348,10 +348,15 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
     use_amp = bool(cfg["training"].get("amp", False))
     scaler = GradScaler(enabled=use_amp)
 
+    accum_steps = int(cfg.get("train", {}).get("accumulate_steps", 1))
+    grad_clip = float(cfg["optim"].get("grad_clip", 1.0))
+
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
     n = 0
 
-    for batch in train_loader:
+    optimizer.zero_grad(set_to_none=True)
+
+    for it, batch in enumerate(train_loader):
         x = batch["video"]
 
         # Clip-level targets (fallback path)
@@ -367,8 +372,6 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
             }
         else:
             tgt = fabricate_dummy_targets(x.shape[0])
-
-        optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
             out = model(x)
@@ -388,14 +391,14 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
                 loss, parts = compute_loss(out, tgt, crit, w)
 
         # Backprop / step
-        scaler.scale(loss).backward()
-        if cfg["training"].get("grad_clip", None):
+        scaler.scale(loss / accum_steps).backward()
+        if (it + 1) % accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["grad_clip"])
-        # >>> print onset/offset grad norms here <<<
-        _print_head_grad_norms(model, step_tag=f"e{epoch}_it{it}")
-        scaler.step(optimizer)
-        scaler.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            _print_head_grad_norms(model, step_tag=f"e{epoch}_it{it}")
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         # Accumulate loss parts
         for k in sums:
@@ -413,6 +416,13 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
                 sums["train_offset_pred_rate"] = 0.0
             sums["train_onset_pred_rate"]  += onset_pred.mean().item()
             sums["train_offset_pred_rate"] += offset_pred.mean().item()
+
+    if (n % accum_steps) != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
     # Average over batches
     avg = {k: (sums[k] / max(1, n)) for k in sums}
@@ -685,6 +695,10 @@ def main():
     #END MK
     #END MK
 
+    accum_steps = int(cfg.get("train", {}).get("accumulate_steps", 1))
+    grad_clip = float(cfg["optim"].get("grad_clip", 1.0))
+    freeze_backbone_epochs = int(cfg.get("train", {}).get("freeze_backbone_epochs", 0))
+    
     # Train
     epochs = int(cfg["training"]["epochs"])
     save_every = int(cfg["training"].get("save_every", 1))
@@ -730,6 +744,16 @@ def main():
         count = 0
         avg_events_recent = None  # for TB data stat
 
+        if freeze_backbone_epochs and epoch <= freeze_backbone_epochs:
+            if epoch == 1:
+                print(f"[freeze] backbone frozen for {freeze_backbone_epochs} epoch(s)")
+            for p in base_params:
+                p.requires_grad = False
+        elif freeze_backbone_epochs and epoch == freeze_backbone_epochs + 1:
+            print("[freeze] backbone unfrozen")
+            for p in base_params:
+                p.requires_grad = True
+                
         #CAL
         # after you build train_loader / just before the for-it loop
         _first_batch = next(iter(train_loader))
@@ -737,6 +761,8 @@ def main():
         print(f"[DEBUG] frame-mode keys present: {_have_frame_keys}")
         del _first_batch
         #END CAL
+        
+        optimizer.zero_grad(set_to_none=True)
         
         for it, batch in pbar:
             x = batch["video"]
@@ -781,14 +807,12 @@ def main():
                     out = _time_pool_out_to_clip(out)
                 loss, parts = compute_loss(out, tgt, crit, w)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            gc = float(cfg["training"].get("grad_clip", 0.0))
-            if gc and gc > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gc)
-             # CAL >>> diagnostics here <<<
-            _print_head_grad_norms(model, step_tag=f"e{epoch}_it{it}")
-            optimizer.step()
+            (loss / accum_steps).backward()
+            if (it + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                _print_head_grad_norms(model, step_tag=f"e{epoch}_it{it}")
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             for k in running.keys():
                 running[k] += parts[k]
@@ -807,6 +831,11 @@ def main():
                 elif torch.is_tensor(batch["labels"]) and "labels_mask" in batch:
                     avg_events_recent = batch["labels_mask"].sum(dim=1).float().mean().item()
 
+        if (count % accum_steps) != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        
         # epoch metrics
         train_metrics = {k: running[k] / max(1, count) for k in running}
         dt = perf_counter() - t0
