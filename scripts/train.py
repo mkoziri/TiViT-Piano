@@ -217,6 +217,18 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
         clef_frame  = _interp_labels_BT(clef_frame, T_logits)
     # (this matches the alignment already used elsewhere in your code). :contentReference[oaicite:2]{index=2}
 
+    # --- ensure pitch dimension matches model head ---
+    P_tgt = pitch_roll.shape[-1]
+    if P_tgt != P:
+        if P_tgt == 128 and P == 88:
+            # map MIDI 0-127 targets to the 88-key piano range (21-108)
+            start = 21
+            pitch_roll  = pitch_roll[..., start:start + P]
+            onset_roll  = onset_roll[..., start:start + P]
+            offset_roll = offset_roll[..., start:start + P]
+        else:
+            raise ValueError(f"Target pitch dim {P_tgt} does not match model dim {P}")
+
     # --- optional negative-class smoothing for on/off targets ---
     neg_smooth = float(weights.get("onoff_neg_smooth", 0.0))
     if neg_smooth > 0.0:
