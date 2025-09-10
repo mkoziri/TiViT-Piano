@@ -723,7 +723,7 @@ def main():
         best_val = math.inf
         start_epoch = 1
         
-        def _freeze_backbone_keep_heads(model):
+    def _freeze_backbone_keep_heads(model):
         for _, p in model.named_parameters():
             p.requires_grad = False
         for name in ("head", "heads", "cls_head", "cls_heads"):
