@@ -117,16 +117,16 @@ class TiViTPiano(nn.Module):
 
     Outputs (dict):
       clip mode:
-        - pitch_logits:  (B, 128)
-        - onset_logits:  (B,)
-        - offset_logits: (B,)
+        - pitch_logits:  (B, 88)
+        - onset_logits:  (B, 88)
+        - offset_logits: (B, 88)
         - hand_logits:   (B, 2)
         - clef_logits:   (B, 3)
 
       frame mode:
-        - pitch_logits:  (B, T', 128)
-        - onset_logits:  (B, T')
-        - offset_logits: (B, T')
+        - pitch_logits:  (B, T', 88)
+        - onset_logits:  (B, T', 88)
+        - offset_logits: (B, T', 88)
         - hand_logits:   (B, T', 2)
         - clef_logits:   (B, T', 3)
     """
@@ -142,7 +142,7 @@ class TiViTPiano(nn.Module):
         depth_spatial=2,
         mlp_ratio=4.0,
         dropout=0.1,
-        pitch_classes=128,
+        pitch_classes=88,
         clef_classes=3,
         head_mode: str = "clip",   # "clip" or "frame"
     ):
@@ -165,8 +165,8 @@ class TiViTPiano(nn.Module):
 
         # Heads (LayerNorm -> Linear). These work with (B, D) and (B, T, D).
         self.head_pitch  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, pitch_classes))
-        self.head_onset  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
-        self.head_offset = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
+        self.head_onset  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 88))
+        self.head_offset = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 88))
         self.head_hand   = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 2))
         self.head_clef   = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, clef_classes))
 
@@ -279,11 +279,11 @@ class TiViTPiano(nn.Module):
             g_t = enc_5d.mean(dim=(1, 3))  # mean over tiles (m) and spatial (s)
 
             # Heads accept (B,T,D) thanks to LayerNorm -> Linear on last dim
-            pitch_logits  = self.head_pitch(g_t)              # (B, T', 128)
-            onset_logits  = self.head_onset(g_t).squeeze(-1)  # (B, T')
-            offset_logits = self.head_offset(g_t).squeeze(-1) # (B, T')
-            hand_logits   = self.head_hand(g_t)               # (B, T', 2)
-            clef_logits   = self.head_clef(g_t)               # (B, T', 3)
+            pitch_logits  = self.head_pitch(g_t)              # (B, T', 88)
+            onset_logits  = self.head_onset(g_t)             # (B, T', 88)
+            offset_logits = self.head_offset(g_t)            # (B, T', 88)
+            hand_logits   = self.head_hand(g_t)              # (B, T', 2)
+            clef_logits   = self.head_clef(g_t)              # (B, T', 3)
 
             return {
                 "pitch_logits":  pitch_logits,
@@ -296,9 +296,9 @@ class TiViTPiano(nn.Module):
         # ----- Clip mode: global mean-pool over all tokens -----
         g = enc.mean(dim=1)  # (B, D)
         out = {
-            "pitch_logits":  self.head_pitch(g),                 # (B, 128)
-            "onset_logits":  self.head_onset(g).squeeze(-1),     # (B,)
-            "offset_logits": self.head_offset(g).squeeze(-1),    # (B,)
+            "pitch_logits":  self.head_pitch(g),                 # (B, 88)
+            "onset_logits":  self.head_onset(g),                 # (B, 88)
+            "offset_logits": self.head_offset(g),                # (B, 88)
             "hand_logits":   self.head_hand(g),                  # (B, 2)
             "clef_logits":   self.head_clef(g),                  # (B, 3)
         }

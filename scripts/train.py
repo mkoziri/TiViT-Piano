@@ -34,17 +34,14 @@ def ensure_dirs(cfg: dict):
     return ckpt, logd
 
 def make_criterions():
-    # Rough pos_weight from your val rates: onset ~2% -> ~50; offset ~1% -> ~100
-    pos_w_on  = torch.tensor([50.0])    #later make them configurable through config
-    pos_w_off = torch.tensor([100.0])
-    # heads:
-    # - pitch_logits: (B, 128)  -> CrossEntropy
-    # - onset_logits: (B,)      -> BCEWithLogits
-    # - offset_logits: (B,)     -> BCEWithLogits
-    # - hand_logits:  (B, 2)    -> CrossEntropy
-    # - clef_logits:  (B, 3)    -> CrossEntropy
+    #heads
+    # - pitch_logits: (B, P)   -> BCEWithLogits
+    # - onset_logits: (B, P)   -> BCEWithLogits
+    # - offset_logits: (B, P)  -> BCEWithLogits
+    # - hand_logits:  (B, 2)   -> CrossEntropy
+    # - clef_logits:  (B, 3)   -> CrossEntropy
     return {
-        "pitch": nn.CrossEntropyLoss(),
+        "pitch": nn.BCEWithLogitsLoss(),
         "onset": nn.BCEWithLogitsLoss(),
         "offset": nn.BCEWithLogitsLoss(),
         "hand": nn.CrossEntropyLoss(),
@@ -71,12 +68,12 @@ def _print_head_grad_norms(model, step_tag=""):
     else:
         print(f"[GRAD{(':'+step_tag) if step_tag else ''}] no onset/offset grads found")
 
-def _pool_roll_BT128(x_bt128, Tprime):
-    # (B,T,128) -> (B,T',128) with "any positive in window" preserved via max
+def _pool_roll_BT(x_btP, Tprime):
+    # (B,T,P) -> (B,T',P) with "any positive in window" preserved via max
     # used for pitch/onset/offset rolls when aligning T -> T'
-    x = x_bt128.permute(0, 2, 1)           # (B,128,T)
-    x = F.adaptive_max_pool1d(x, Tprime)   # (B,128,T')
-    return x.permute(0, 2, 1).contiguous() # (B,T',128)
+    x = x_btP.permute(0, 2, 1)            # (B,P,T)
+    x = F.adaptive_max_pool1d(x, Tprime)  # (B,P,T')
+    return x.permute(0, 2, 1).contiguous() # (B,T',P)
 
 def _interp_labels_BT(x_bt, Tprime):
     # (B,T) -> (B,T') for integer class labels (nearest)
@@ -109,11 +106,11 @@ def _time_pool_out_to_clip(out: dict) -> dict:
     """
     pooled = dict(out)  # shallow copy
     if out["pitch_logits"].dim() == 3:
-        pooled["pitch_logits"]  = out["pitch_logits"].mean(dim=1)      # (B,128)
-    if out["onset_logits"].dim() == 2:
-        pooled["onset_logits"]  = out["onset_logits"].mean(dim=1)      # (B,)
-    if out["offset_logits"].dim() == 2:
-        pooled["offset_logits"] = out["offset_logits"].mean(dim=1)     # (B,)
+        pooled["pitch_logits"]  = out["pitch_logits"].mean(dim=1)      # (B,P)
+    if out["onset_logits"].dim() == 3:
+        pooled["onset_logits"]  = out["onset_logits"].mean(dim=1)      # (B,P)
+    if out["offset_logits"].dim() == 3:
+        pooled["offset_logits"] = out["offset_logits"].mean(dim=1)     # (B,P)
     if out["hand_logits"].dim() == 3:
         pooled["hand_logits"]   = out["hand_logits"].mean(dim=1)       # (B,2)
     if out["clef_logits"].dim() == 3:
@@ -156,7 +153,7 @@ def _set_onoff_head_bias(model, prior=0.12): #CAL prior was 0.01 END CAL
 
 def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
     # Guard: if logits are time-distributed but we're in clip-loss, pool over time
-    if out["pitch_logits"].dim() == 3:  # (B,T,128)
+    if out["pitch_logits"].dim() == 3:  # (B,T,P)
         out = _time_pool_out_to_clip(out)
         
     loss_pitch  = crit["pitch"](out["pitch_logits"],  tgt["pitch"])   * weights["pitch"]
@@ -195,44 +192,40 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
     device = out["onset_logits"].device
 
     # --- logits (at T') ---
-    pitch_logit  = out["pitch_logits"]     # (B,T',128)
-    onset_logit  = out["onset_logits"]     # (B,T')
-    offset_logit = out["offset_logits"]    # (B,T')
-    hand_logit   = out["hand_logits"]      # (B,T',C_hand=2)
-    clef_logit   = out["clef_logits"]      # (B,T',C_clef=3)
+    pitch_logit  = out["pitch_logits"]     # (B,T',P)
+    onset_logit  = out["onset_logits"]    # (B,T',P)
+    offset_logit = out["offset_logits"]   # (B,T',P)
+    hand_logit   = out["hand_logits"]     # (B,T',C_hand=2)
+    clef_logit   = out["clef_logits"]     # (B,T',C_clef=3)
 
-    B, T_logits = onset_logit.shape
+    B, T_logits, P = pitch_logit.shape
 
     # --- targets (at original T) ---
-    pitch_roll   = batch["pitch_roll"].float()   # (B,T,128)
-    onset_roll   = batch["onset_roll"].float()   # (B,T,128)
-    offset_roll  = batch["offset_roll"].float()  # (B,T,128)
+    pitch_roll   = batch["pitch_roll"].float()   # (B,T,P)
+    onset_roll   = batch["onset_roll"].float()   # (B,T,P)
+    offset_roll  = batch["offset_roll"].float()  # (B,T,P)
     hand_frame   = batch["hand_frame"].long()    # (B,T)
     clef_frame   = batch["clef_frame"].long()    # (B,T)
     T_targets = pitch_roll.shape[1]
 
     # --- time alignment: T -> T' (keep your repo behavior) ---
     if T_targets != T_logits:
-        pitch_roll  = _pool_roll_BT128(pitch_roll,  T_logits)
-        onset_roll  = _pool_roll_BT128(onset_roll,  T_logits)
-        offset_roll = _pool_roll_BT128(offset_roll, T_logits)
+        pitch_roll  = _pool_roll_BT(pitch_roll,  T_logits)
+        onset_roll  = _pool_roll_BT(onset_roll,  T_logits)
+        offset_roll = _pool_roll_BT(offset_roll, T_logits)
         hand_frame  = _interp_labels_BT(hand_frame, T_logits)
         clef_frame  = _interp_labels_BT(clef_frame, T_logits)
     # (this matches the alignment already used elsewhere in your code). :contentReference[oaicite:2]{index=2}
 
-    # --- derive ANY-note flags per frame (T') ---
-    onset_any  = (onset_roll  > 0).any(dim=-1).float()   # (B,T')
-    offset_any = (offset_roll > 0).any(dim=-1).float()   # (B,T')
-
     # --- optional negative-class smoothing for on/off targets ---
     neg_smooth = float(weights.get("onoff_neg_smooth", 0.0))
     if neg_smooth > 0.0:
-        onset_any  = onset_any  * (1.0 - neg_smooth) + neg_smooth * (1.0 - onset_any)
-        offset_any = offset_any * (1.0 - neg_smooth) + neg_smooth * (1.0 - offset_any)
+        onset_roll  = onset_roll  * (1.0 - neg_smooth) + neg_smooth * (1.0 - onset_roll)
+        offset_roll = offset_roll * (1.0 - neg_smooth) + neg_smooth * (1.0 - offset_roll)
 
     # --- pitch loss: gentle per-pitch pos_weight (sqrt + clamp) ---
     eps = 1e-6
-    pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)  # (128,)
+    pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)  # (P,)
     pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
     bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
     loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
@@ -249,22 +242,22 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
             else:
                 pw_mode = "adaptive"
         if pw_mode == "adaptive":
-            p_on  = onset_any.mean().clamp_min(eps)
-            p_off = offset_any.mean().clamp_min(eps)
+            p_on  = onset_roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
+            p_off = offset_roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
             pos_w_on  = ((1.0 - p_on)  / (p_on  + eps)).clamp(1.0, 100.0).detach()
             pos_w_off = ((1.0 - p_off) / (p_off + eps)).clamp(1.0, 100.0).detach()
 
         bce_on  = nn.BCEWithLogitsLoss(pos_weight=pos_w_on)
         bce_off = nn.BCEWithLogitsLoss(pos_weight=pos_w_off)
-        loss_onset  = bce_on(onset_logit,  onset_any)
-        loss_offset = bce_off(offset_logit, offset_any)
+        loss_onset  = bce_on(onset_logit,  onset_roll)
+        loss_offset = bce_off(offset_logit, offset_roll)
 
     else:
         # focal BCE on logits (your original path)
         gamma = float(weights.get("focal_gamma", 2.0))
         alpha = float(weights.get("focal_alpha", 0.15))
-        bce_on  = F.binary_cross_entropy_with_logits(onset_logit,  onset_any,  reduction="none")
-        bce_off = F.binary_cross_entropy_with_logits(offset_logit, offset_any, reduction="none")
+        bce_on  = F.binary_cross_entropy_with_logits(onset_logit,  onset_roll,  reduction="none")
+        bce_off = F.binary_cross_entropy_with_logits(offset_logit, offset_roll, reduction="none")
         p_on    = torch.sigmoid(onset_logit)
         p_off   = torch.sigmoid(offset_logit)
         w_on    = (alpha * (1.0 - p_on).pow(gamma)).detach()
@@ -307,12 +300,13 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
 def fabricate_dummy_targets(batch_size: int):
     # Simple random targets to exercise the loop
     device = "cpu"
+    P = 88
     tgt = {
-        "pitch": torch.randint(0, 128, (batch_size,), device=device),  # class ids
-        "onset": torch.rand(batch_size, device=device),                # [0,1]
-        "offset": torch.rand(batch_size, device=device),               # [0,1]
-        "hand": torch.randint(0, 2, (batch_size,), device=device),     # class ids
-        "clef": torch.randint(0, 3, (batch_size,), device=device),     # class ids
+        "pitch": torch.randint(0, 2, (batch_size, P), device=device, dtype=torch.float32),
+        "onset": torch.randint(0, 2, (batch_size, P), device=device, dtype=torch.float32),
+        "offset": torch.randint(0, 2, (batch_size, P), device=device, dtype=torch.float32),
+        "hand": torch.randint(0, 2, (batch_size,), device=device),
+        "clef": torch.randint(0, 3, (batch_size,), device=device),
     }
     return tgt
     
@@ -482,7 +476,7 @@ def evaluate_one_epoch(model, loader, cfg):
             use_dummy = bool(cfg["training"].get("debug_dummy_labels", False))
             if have_all and not use_dummy:
                 tgt = {k: batch[k] for k in want}
-                tgt["pitch"]  = tgt["pitch"].long()
+                tgt["pitch"]  = tgt["pitch"].float()
                 tgt["hand"]   = tgt["hand"].long()
                 tgt["clef"]   = tgt["clef"].long()
                 tgt["onset"]  = tgt["onset"].float()
@@ -517,10 +511,10 @@ def evaluate_one_epoch(model, loader, cfg):
             # --- metrics ---
             if use_frame:
                 # --- align frame targets to logits time (T -> T_logits) ---
-                B, T_logits = out["onset_logits"].shape
+                B, T_logits, P = out["onset_logits"].shape
 
-                onset_roll  = batch["onset_roll"].float()   # (B, T, 128)
-                offset_roll = batch["offset_roll"].float()  # (B, T, 128)
+                onset_roll  = batch["onset_roll"].float()   # (B, T, P)
+                offset_roll = batch["offset_roll"].float()  # (B, T, P)
                 hand_frame  = batch["hand_frame"].long()    # (B, T)
                 clef_frame  = batch["clef_frame"].long()    # (B, T)
 
@@ -528,20 +522,19 @@ def evaluate_one_epoch(model, loader, cfg):
 
                 #if T_targets != T_logits:
                 if onset_roll.shape[1] != T_logits:
-                    def _pool_bool_BT128(x_bt128, Tprime):
-                        # (B,T,128) -> (B,T',128), preserving "any positive in window"
-                        x = x_bt128.permute(0, 2, 1)             # (B,128,T)
-                        x = F.adaptive_max_pool1d(x, Tprime)     # (B,128,T')
-                        return x.permute(0, 2, 1).contiguous()   # (B,T',128)
+                    def _pool_bool_BT(x_btP, Tprime):
+                        # (B,T,P) -> (B,T',P), preserving "any positive in window"
+                        x = x_btP.permute(0, 2, 1)
+                        x = F.adaptive_max_pool1d(x, Tprime)
+                        return x.permute(0, 2, 1).contiguous()
 
                     def _interp_labels_BT(x_bt, Tprime):
-                        # nearest for class indices: (B,T) -> (B,T')
-                        x = x_bt.float().unsqueeze(1)            # (B,1,T)
+                        x = x_bt.float().unsqueeze(1)
                         x = F.interpolate(x, size=Tprime, mode="nearest")
-                        return x.squeeze(1).long()               # (B,T')
+                        return x.squeeze(1).long()               
 
-                    onset_roll  = _pool_bool_BT128(onset_roll,  T_logits)
-                    offset_roll = _pool_bool_BT128(offset_roll, T_logits)
+                    onset_roll  = _pool_bool_BT(onset_roll,  T_logits)
+                    offset_roll = _pool_bool_BT(offset_roll, T_logits)
                     hand_frame  = _interp_labels_BT(hand_frame, T_logits)
                     clef_frame  = _interp_labels_BT(clef_frame, T_logits)
                     #onset_roll  = _pool_bt128(onset_roll,  T_logits)
@@ -555,12 +548,12 @@ def evaluate_one_epoch(model, loader, cfg):
 
                 # --- binarize predictions ---
                 thr = float(cfg.get("training", {}).get("metrics", {}).get("prob_threshold", 0.5))
-                onset_pred  = (torch.sigmoid(out["onset_logits"])  >= thr).float()  # (B, T_logits)
-                offset_pred = (torch.sigmoid(out["offset_logits"]) >= thr).float()  # (B, T_logits)
+                onset_pred_any  = (torch.sigmoid(out["onset_logits"])  >= thr).any(dim=-1).float()  # (B, T_logits)
+                offset_pred_any = (torch.sigmoid(out["offset_logits"]) >= thr).any(dim=-1).float()  # (B, T_logits)
 
                 # --- masked F1 and positive-rate diagnostics ---
-                f1_on  = _binary_f1(onset_pred.reshape(-1),  onset_any.reshape(-1))
-                f1_off = _binary_f1(offset_pred.reshape(-1), offset_any.reshape(-1))
+                f1_on  = _binary_f1(onset_pred_any.reshape(-1),  onset_any.reshape(-1))
+                f1_off = _binary_f1(offset_pred_any.reshape(-1), offset_any.reshape(-1))
                 if f1_on is not None:
                     metric_counts["onset_f1"] += f1_on
                     metric_counts["n_on"] += 1
@@ -570,12 +563,14 @@ def evaluate_one_epoch(model, loader, cfg):
 
                 metric_counts["onset_pos_rate"]  += onset_any.mean().item()
                 metric_counts["offset_pos_rate"] += offset_any.mean().item()
-                metric_counts["onset_pred_rate"]  += onset_pred.mean().item()
-                metric_counts["offset_pred_rate"] += offset_pred.mean().item()
+                metric_counts["onset_pred_rate"]  += onset_pred_any.mean().item()
+                metric_counts["offset_pred_rate"] += offset_pred_any.mean().item()
 
                 # --- per-frame hand/clef accuracy ---
-                hand_pred = out["hand_logits"].argmax(dim=-1)   # (B, T_logits)
-                clef_pred = out["clef_logits"].argmax(dim=-1)   # (B, T_logits)
+                hand_prob = F.softmax(out["hand_logits"], dim=-1)
+                clef_prob = F.softmax(out["clef_logits"], dim=-1)
+                hand_pred = hand_prob.argmax(dim=-1)
+                clef_pred = clef_prob.argmax(dim=-1)
                 Bx, Tx = hand_pred.shape
                 metric_counts["hand_acc"] += (hand_pred.reshape(Bx*Tx) == hand_frame.reshape(Bx*Tx)).float().mean().item()
                 metric_counts["clef_acc"] += (clef_pred.reshape(Bx*Tx) == clef_frame.reshape(Bx*Tx)).float().mean().item()
@@ -585,16 +580,22 @@ def evaluate_one_epoch(model, loader, cfg):
 
             else:
                 # ---- clip-level metrics (existing path) ----
-                pitch_pred = out["pitch_logits"].argmax(dim=-1)   # (B,)
-                metric_counts["pitch_acc"] += _acc_from_logits(out["pitch_logits"], tgt["pitch"])
-                metric_counts["hand_acc"]  += _acc_from_logits(out["hand_logits"],  tgt["hand"])
-                metric_counts["clef_acc"]  += _acc_from_logits(out["clef_logits"],  tgt["clef"])
+                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr).float()
+                pitch_gt   = (tgt["pitch"] >= 0.5).float()
+                f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
+                if f1_pitch is not None:
+                    metric_counts["pitch_acc"] += f1_pitch
 
-                onset_pred_c  = (torch.sigmoid(out["onset_logits"])  >= thr).float()
-                offset_pred_c = (torch.sigmoid(out["offset_logits"]) >= thr).float()
+                hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
+                clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
+                metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
+                metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
 
-                onset_gt_bin  = (tgt["onset"]  >= 0.5).float()
-                offset_gt_bin = (tgt["offset"] >= 0.5).float()
+                onset_pred_c  = (torch.sigmoid(out["onset_logits"])  >= thr).any(dim=-1).float()
+                offset_pred_c = (torch.sigmoid(out["offset_logits"]) >= thr).any(dim=-1).float()
+
+                onset_gt_bin  = (tgt["onset"]  >= 0.5).float().any(dim=-1)
+                offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
 
                 onset_f1  = _binary_f1(onset_pred_c,  onset_gt_bin)
                 offset_f1 = _binary_f1(offset_pred_c, offset_gt_bin)
@@ -627,6 +628,7 @@ def evaluate_one_epoch(model, loader, cfg):
 def main():
     set_seed(42)
     cfg = load_config("configs/config.yaml")
+    freeze_epochs = int(cfg.get("train", {}).get("freeze_backbone_epochs", 0))
     ckpt_dir, log_root = ensure_dirs(cfg)
 
     # Build experiment-specific log dir
@@ -660,41 +662,30 @@ def main():
     
     # Model & optimizer
     model = build_model(cfg)
-    #MK 9-9 changed the commented, but not feel sure
-    #optimizer = AdamW(model.parameters(),
-    #                  lr=float(cfg["training"]["learning_rate"]),
-    #                  weight_decay=float(cfg["training"]["weight_decay"]))
     
-    # --- build optimizer with higher LR for onset/offset heads ---
-    base_lr = float(cfg["training"]["learning_rate"])
-    wd      = float(cfg["training"].get("weight_decay", 0.0))
+    def build_optimizer(model, optim_cfg):
+        base_lr = float(optim_cfg["learning_rate"])
+        wd = float(optim_cfg.get("weight_decay", 0.0))
+        head_params, base_params = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            lname = name.lower()
+            if "onset" in lname or "offset" in lname:
+                head_params.append(p)
+            else:
+                base_params.append(p)
+        assert len(head_params) > 0, "No onset/offset params found — check the module names."
+        opt = torch.optim.AdamW([
+            {"params": base_params, "lr": base_lr, "weight_decay": wd},
+            {"params": head_params, "lr": base_lr * 5.0, "weight_decay": wd},
+        ])
+        num_head = sum(p.numel() for p in head_params)
+        num_base = sum(p.numel() for p in base_params)
+        print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
+        return opt
 
-    head_params, base_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        lname = name.lower()
-        # put your exact substrings for the heads here; adjust if your module names differ
-        if "onset" in lname or "offset" in lname:
-            head_params.append(p)
-        else:
-            base_params.append(p)
-
-    assert len(head_params) > 0, "No onset/offset params found — check the module names."
-
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": base_params, "lr": base_lr,         "weight_decay": wd},
-            {"params": head_params, "lr": base_lr * 5.0,   "weight_decay": wd},
-        ]
-    )
-    
-    #MK Just for checking. If this works, it should be removed
-    num_head = sum(p.numel() for p in head_params)
-    num_base = sum(p.numel() for p in base_params)
-    print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
-    #END MK
-    #END MK
+    optimizer = build_optimizer(model, cfg["training"])
 
     accum_steps = int(cfg.get("train", {}).get("accumulate_steps", 1))
     grad_clip = float(cfg["optim"].get("grad_clip", 1.0))
@@ -732,7 +723,30 @@ def main():
         best_val = math.inf
         start_epoch = 1
         
-    for epoch in range(start_epoch, epochs + 1):    
+        def _freeze_backbone_keep_heads(model):
+        for _, p in model.named_parameters():
+            p.requires_grad = False
+        for name in ("head", "heads", "cls_head", "cls_heads"):
+            if hasattr(model, name):
+                for p in getattr(model, name).parameters():
+                    p.requires_grad = True
+
+    def _unfreeze_backbone(model):
+        for _, p in model.named_parameters():
+            p.requires_grad = True
+
+    if freeze_epochs > 0 and start_epoch <= freeze_epochs:
+        _freeze_backbone_keep_heads(model)
+        optimizer = build_optimizer(model, cfg["training"])
+        n_trainable = sum(p.requires_grad for p in model.parameters())
+        print(f"[warmup] trainable params: {n_trainable}")
+
+    for epoch in range(start_epoch, epochs + 1):
+        if freeze_epochs and epoch == freeze_epochs:
+            _unfreeze_backbone(model)
+            optimizer = build_optimizer(model, cfg["training"])
+            n_trainable = sum(p.requires_grad for p in model.parameters())
+            print(f"[warmup] trainable params: {n_trainable}")    
         t0 = perf_counter()
         # --- train one epoch ---
         model.train()
@@ -744,16 +758,6 @@ def main():
         count = 0
         avg_events_recent = None  # for TB data stat
 
-        if freeze_backbone_epochs and epoch <= freeze_backbone_epochs:
-            if epoch == 1:
-                print(f"[freeze] backbone frozen for {freeze_backbone_epochs} epoch(s)")
-            for p in base_params:
-                p.requires_grad = False
-        elif freeze_backbone_epochs and epoch == freeze_backbone_epochs + 1:
-            print("[freeze] backbone unfrozen")
-            for p in base_params:
-                p.requires_grad = True
-                
         #CAL
         # after you build train_loader / just before the for-it loop
         _first_batch = next(iter(train_loader))
@@ -774,7 +778,7 @@ def main():
             use_dummy_flag = bool(cfg["training"].get("debug_dummy_labels", False))
             if have_all and not use_dummy_flag:
                 tgt = {k: batch[k] for k in want}
-                tgt["pitch"]  = tgt["pitch"].long()
+                tgt["pitch"]  = tgt["pitch"].float()
                 tgt["hand"]   = tgt["hand"].long()
                 tgt["clef"]   = tgt["clef"].long()
                 tgt["onset"]  = tgt["onset"].float()

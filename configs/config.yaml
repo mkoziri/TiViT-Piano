@@ -96,7 +96,7 @@ optim:
 
 train:
   accumulate_steps: 1
-  freeze_backbone_epochs: 0
+  freeze_backbone_epochs: 3
 
 logging:
   log_dir: "logs"

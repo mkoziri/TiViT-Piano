@@ -270,7 +270,7 @@ def _load_clip_with_random_start(path: Path,
 
 def _build_frame_targets(labels: torch.Tensor,
                          T: int, stride: int, fps: float,
-                         note_min: int = 0, note_max: int = 127,
+                         note_min: int = 21, note_max: int = 108,
                          tol: float = 0.025,
                          fill_mode: str = "overlap",
                          hand_from_pitch: bool = True,
@@ -280,14 +280,14 @@ def _build_frame_targets(labels: torch.Tensor,
     """
     Build per-frame targets aligned to sampled frames.
     Returns dict with:
-      - pitch_roll:  (T, 128) float in {0,1}
-      - onset_roll:  (T, 128) float in {0,1}
-      - offset_roll: (T, 128) float in {0,1}
+      - pitch_roll:  (T, P) float in {0,1}
+      - onset_roll:  (T, P) float in {0,1}
+      - offset_roll: (T, P) float in {0,1}
       - hand_frame:  (T,) long in {0,1}     (0=left,1=right)
       - clef_frame:  (T,) long in {0,1,2}  (0=bass,1=treble,2=ambig)
     """
     T = int(T)
-    P = 128
+    P = int(note_max - note_min + 1)
     pitch_roll  = torch.zeros((T, P), dtype=torch.float32)
     onset_roll  = torch.zeros((T, P), dtype=torch.float32)
     offset_roll = torch.zeros((T, P), dtype=torch.float32)
@@ -310,11 +310,11 @@ def _build_frame_targets(labels: torch.Tensor,
 
     on = labels[:, 0]
     off = labels[:, 1]
-    pit = labels[:, 2].to(torch.int64).clamp(0, P - 1)
+    pit = labels[:, 2].to(torch.int64)
 
-    # optional pitch range clamp
+    # optional pitch range clamp  and shift to 0-index
     mask_pitch = (pit >= int(note_min)) & (pit <= int(note_max))
-    on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch]
+    on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch] - int(note_min)
 
     for k in range(T):
         s, e = float(t_starts[k]), float(t_ends[k])
@@ -355,7 +355,7 @@ def _build_frame_targets(labels: torch.Tensor,
     if hand_from_pitch:
         active = (pitch_roll > 0)
         # average pitch per frame (fallback to 60 if none active)
-        pitch_ids = torch.arange(P, dtype=torch.float32)
+        pitch_ids = torch.arange(P, dtype=torch.float32) + float(note_min)
         sums = (pitch_roll * pitch_ids[None, :]).sum(dim=1)
         counts = active.sum(dim=1).clamp(min=1)
         avg_pitch = torch.where(active.any(dim=1), sums / counts, torch.full((T,), 60.0))
@@ -506,28 +506,35 @@ class OMAPSDataset(Dataset):
             sel_onsets  = onset[mask]
             sel_offsets = offset[mask]
 
+            P = 88
+            note_min_clip = 21
+            pitch_vec  = torch.zeros(P, dtype=torch.float32)
+            onset_vec  = torch.zeros(P, dtype=torch.float32)
+            offset_vec = torch.zeros(P, dtype=torch.float32)
             if sel_pitches.numel() == 0:
-                # no events in window
                 pitch_class = 60
                 onset_flag, offset_flag = 0.0, 0.0
-                hand = 0
-                clef = 2
             else:
-                # most frequent pitch as simple single-class target
-                # (torch mode)
                 uniq, counts = sel_pitches.unique(return_counts=True)
                 pitch_class = int(uniq[counts.argmax()].item())
                 onset_flag  = 1.0 if ((sel_onsets >= t0) & (sel_onsets < t1)).any().item() else 0.0
                 offset_flag = 1.0 if ((sel_offsets >  t0) & (sel_offsets <= t1)).any().item() else 0.0
-                hand = 0 if pitch_class < 60 else 1
-                clef = 0 if pitch_class < 60 else (1 if pitch_class > 64 else 2)
 
+            idx = int(pitch_class - note_min_clip)
+            if 0 <= idx < P:
+                pitch_vec[idx] = 1.0
+                if onset_flag:  onset_vec[idx] = 1.0
+                if offset_flag: offset_vec[idx] = 1.0
+
+            hand = 0 if pitch_class < 60 else 1
+            clef = 0 if pitch_class < 60 else (1 if pitch_class > 64 else 2)
+            
             clip_targets = {
-                "pitch":  torch.tensor(pitch_class, dtype=torch.long),
-                "onset":  torch.tensor(onset_flag,  dtype=torch.float32),
-                "offset": torch.tensor(offset_flag, dtype=torch.float32),
-                "hand":   torch.tensor(hand,        dtype=torch.long),
-                "clef":   torch.tensor(clef,        dtype=torch.long),
+                "pitch":  pitch_vec,
+                "onset":  onset_vec,
+                "offset": offset_vec,
+                "hand":   torch.tensor(hand, dtype=torch.long),
+                "clef":   torch.tensor(clef, dtype=torch.long),
             }
 
         # --- build sample dict ---
@@ -548,8 +555,8 @@ class OMAPSDataset(Dataset):
             ft = _build_frame_targets(
                 labels=labels_tensor,
                 T=T, stride=self.stride, fps=fps,
-                note_min=int(ft_cfg.get("note_min", 0)),
-                note_max=int(ft_cfg.get("note_max", 127)),
+                note_min=int(ft_cfg.get("note_min", 21)),
+                note_max=int(ft_cfg.get("note_max", 108)),
                 tol=float(ft_cfg.get("tolerance", 0.025)),
                 fill_mode=str(ft_cfg.get("fill_mode", "overlap")),
                 hand_from_pitch=bool(ft_cfg.get("hand_from_pitch", True)),
