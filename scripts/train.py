@@ -675,14 +675,22 @@ def main():
                 head_params.append(p)
             else:
                 base_params.append(p)
-        assert len(head_params) > 0, "No onset/offset params found — check the module names."
-        opt = torch.optim.AdamW([
-            {"params": base_params, "lr": base_lr, "weight_decay": wd},
-            {"params": head_params, "lr": base_lr * 5.0, "weight_decay": wd},
-        ])
-        num_head = sum(p.numel() for p in head_params)
-        num_base = sum(p.numel() for p in base_params)
-        print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
+        
+        if head_params:
+            opt = torch.optim.AdamW([
+                {"params": base_params, "lr": base_lr, "weight_decay": wd},
+                {"params": head_params, "lr": base_lr * 5.0, "weight_decay": wd},
+            ])
+            num_head = sum(p.numel() for p in head_params)
+            num_base = sum(p.numel() for p in base_params)
+            print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
+        else:
+            # Fallback: treat all parameters as base params if no onset/offset heads exist
+            opt = torch.optim.AdamW([
+                {"params": base_params, "lr": base_lr, "weight_decay": wd},
+            ])
+            num_base = sum(p.numel() for p in base_params)
+            print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: 0 @ lr=n/a")
         return opt
 
     optimizer = build_optimizer(model, cfg["training"])
@@ -726,9 +734,15 @@ def main():
     def _freeze_backbone_keep_heads(model):
         for _, p in model.named_parameters():
             p.requires_grad = False
-        for name in ("head", "heads", "cls_head", "cls_heads"):
-            if hasattr(model, name):
-                for p in getattr(model, name).parameters():
+        # Unfreeze any modules that look like heads. This covers
+        # architectures that expose multiple head_* attributes (e.g.
+        # head_pitch, head_onset, head_offset, ...), as well as single
+        # "head" or "heads" containers.  We look through immediate
+        # children and re-enable gradients for those whose name
+        # contains "head".
+        for name, module in model.named_children():
+            if "head" in name.lower():
+                for p in module.parameters():
                     p.requires_grad = True
 
     def _unfreeze_backbone(model):
