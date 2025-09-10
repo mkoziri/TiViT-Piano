@@ -42,7 +42,32 @@ def main():
     # Allow a wider default grid so that a reasonable F1 peak can be found
     ap.add_argument(
         "--thresholds",
-        default="0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95,1.00",
+        type=float,
+        nargs="+",
+        default=[
+            0.00,
+            0.05,
+            0.10,
+            0.15,
+            0.20,
+            0.25,
+            0.30,
+            0.35,
+            0.40,
+            0.45,
+            0.50,
+            0.55,
+            0.60,
+            0.65,
+            0.70,
+            0.75,
+            0.80,
+            0.85,
+            0.90,
+            0.95,
+            1.00,
+        ],
+        help="List of threshold values to evaluate (space-separated)",
     )
     # Optional temperature and bias parameters for logit calibration
     ap.add_argument(
@@ -133,7 +158,7 @@ def main():
     onset_true_bin = (onset_tgts > 0).float()
     offset_true_bin = (offset_tgts > 0).float()
     
-    thrs = [float(t.strip()) for t in args.thresholds.split(",") if t.strip()]
+    thrs = list(args.thresholds)
     print("Threshold\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
     for t in thrs:
         # Threshold probabilities at the given level and evaluate at the
