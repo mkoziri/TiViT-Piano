@@ -144,7 +144,30 @@ def main():
     # run model once to collect probabilities and targets
     onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
-@@ -111,47 +172,47 @@ def main():
+    with torch.no_grad():
+        for batch in val_loader:
+            x = batch["video"]
+            out = model(x)
+
+            # prefer *_logits if present; fallback to old naming
+            onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
+            offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+
+            # Apply temperature scaling and bias for calibration
+            onset_prob = torch.sigmoid(onset_logits / args.temperature + args.bias)
+            offset_prob = torch.sigmoid(offset_logits / args.temperature + args.bias)
+
+            onset_probs.append(onset_prob.detach().cpu())
+            offset_probs.append(offset_prob.detach().cpu())
+
+            onset_tgts.append(batch["onset_roll"].float().cpu())
+            offset_tgts.append(batch["offset_roll"].float().cpu())
+
+    onset_probs = torch.cat(onset_probs, dim=0)
+    offset_probs = torch.cat(offset_probs, dim=0)
+    onset_tgts = torch.cat(onset_tgts, dim=0)
+    offset_tgts = torch.cat(offset_tgts, dim=0)
+
     T_logits, P_logits = onset_probs.shape[1], onset_probs.shape[2]
     if onset_tgts.shape[1] != T_logits:
         onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
@@ -191,5 +214,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
