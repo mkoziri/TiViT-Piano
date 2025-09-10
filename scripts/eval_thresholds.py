@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import sys, torch
+import torch.nn.functional as F
 from pathlib import Path
+
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
@@ -21,6 +23,17 @@ def _binary_f1(pred, target, eps=1e-8):
     precision = tp / (tp + fp + eps)
     recall = tp / (tp + fn + eps)
     return 2 * precision * recall / (precision + recall + eps)
+   
+   
+def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
+    """Downsample a (B,T,P) pianoroll along time using max pooling.
+
+    This mirrors the alignment logic used during training so that frame-level
+    targets match the model's temporal resolution ``Tprime``.
+    """
+    x = x_btP.permute(0, 2, 1)  # (B,P,T)
+    x = F.adaptive_max_pool1d(x, Tprime)  # (B,P,T')
+    return x.permute(0, 2, 1).contiguous()  # (B,T',P)
     
 def main():
     import argparse
@@ -94,6 +107,20 @@ def main():
     onset_tgts = torch.cat(onset_tgts, dim=0)
     offset_tgts = torch.cat(offset_tgts, dim=0)
 
+    # Align targets with model output resolution (time and pitch dims)
+    T_logits, P_logits = onset_probs.shape[1], onset_probs.shape[2]
+    if onset_tgts.shape[1] != T_logits:
+        onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
+        offset_tgts = _pool_roll_BT(offset_tgts, T_logits)
+    if onset_tgts.shape[2] != P_logits:
+        if onset_tgts.shape[2] == 128 and P_logits == 88:
+            start = 21  # map MIDI 0-127 to piano range 21-108
+            onset_tgts = onset_tgts[..., start : start + P_logits]
+            offset_tgts = offset_tgts[..., start : start + P_logits]
+        else:
+            raise ValueError(
+                f"Target pitch dim {onset_tgts.shape[2]} does not match model {P_logits}"
+            )
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
