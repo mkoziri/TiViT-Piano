@@ -11,6 +11,57 @@ from data import make_dataloader
 from models import build_model
 
 
+# Default grid of thresholds.  We parse this argument manually so that callers
+# can provide values in a comma-separated form (e.g., ``-3,-2.5,-2``) without
+# needing to escape leading minus signs.  Argparse would otherwise interpret
+# such tokens as new options.
+DEFAULT_THRESHOLDS = [
+    0.00,
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.25,
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+    0.55,
+    0.60,
+    0.65,
+    0.70,
+    0.75,
+    0.80,
+    0.85,
+    0.90,
+    0.95,
+    1.00,
+]
+
+
+def _parse_thresholds(argv):
+    """Extract ``--thresholds`` from ``argv`` allowing comma/space separation."""
+    for i, arg in enumerate(list(argv)):
+        if arg.startswith("--thresholds"):
+            if arg == "--thresholds":
+                j = i + 1
+                vals = []
+                while j < len(argv) and not argv[j].startswith("--"):
+                    vals.append(argv[j])
+                    j += 1
+                if not vals:
+                    raise ValueError("--thresholds expects at least one value")
+                del argv[i:j]
+                arg_str = " ".join(vals)
+            else:  # handle --thresholds=... form
+                arg_str = arg.split("=", 1)[1]
+                del argv[i]
+            arg_str = arg_str.replace(",", " ")
+            return [float(v) for v in arg_str.split() if v]
+    return DEFAULT_THRESHOLDS.copy()
+
+
 def _binary_f1(pred, target, eps=1e-8):
     """Binary F1 score for tensors in {0,1}.
 
@@ -37,37 +88,21 @@ def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
     
 def main():
     import argparse
+
+    argv = sys.argv[1:]
+    try:
+        thresholds = _parse_thresholds(argv)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
-    # Allow a wider default grid so that a reasonable F1 peak can be found
     ap.add_argument(
         "--thresholds",
-        type=float,
-        nargs="+",
-        default=[
-            0.00,
-            0.05,
-            0.10,
-            0.15,
-            0.20,
-            0.25,
-            0.30,
-            0.35,
-            0.40,
-            0.45,
-            0.50,
-            0.55,
-            0.60,
-            0.65,
-            0.70,
-            0.75,
-            0.80,
-            0.85,
-            0.90,
-            0.95,
-            1.00,
-        ],
-        help="List of threshold values to evaluate (space-separated)",
+        metavar="T",
+        nargs="*",
+        help="Threshold values (comma or space-separated)",
     )
     # Optional temperature and bias parameters for logit calibration
     ap.add_argument(
@@ -82,7 +117,8 @@ def main():
         default=0.0,
         help="Additive bias applied to logits before sigmoid",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    args.thresholds = thresholds
 
     cfg = load_config("configs/config.yaml")
     # lock the SAME positive window you trained on
@@ -108,31 +144,7 @@ def main():
     # run model once to collect probabilities and targets
     onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
-    with torch.no_grad():
-        for batch in val_loader:
-            x = batch["video"]
-            out = model(x)
-
-            # prefer *_logits if present; fallback to old naming
-            onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
-            offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
-            
-            # Apply temperature scaling and bias for calibration
-            onset_prob = torch.sigmoid(onset_logits / args.temperature + args.bias)
-            offset_prob = torch.sigmoid(offset_logits / args.temperature + args.bias)
-
-            onset_probs.append(onset_prob.detach().cpu())
-            offset_probs.append(offset_prob.detach().cpu())
-
-            onset_tgts.append(batch["onset_roll"].float().cpu())
-            offset_tgts.append(batch["offset_roll"].float().cpu())
-
-    onset_probs = torch.cat(onset_probs, dim=0)
-    offset_probs = torch.cat(offset_probs, dim=0)
-    onset_tgts = torch.cat(onset_tgts, dim=0)
-    offset_tgts = torch.cat(offset_tgts, dim=0)
-
-    # Align targets with model output resolution (time and pitch dims)
+@@ -111,47 +172,47 @@ def main():
     T_logits, P_logits = onset_probs.shape[1], onset_probs.shape[2]
     if onset_tgts.shape[1] != T_logits:
         onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
@@ -179,4 +191,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
