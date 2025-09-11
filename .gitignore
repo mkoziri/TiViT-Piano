@@ -37,3 +37,5 @@ src/data/omaps_dataset_nw.py
 
 # OS
 .DS_Store
+configs/config_base.yaml
+configs/config_base.yaml
