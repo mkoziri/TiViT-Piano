@@ -1,1 +1,0 @@
-/home/almar/datasets/OMAPS/train/033.txt
