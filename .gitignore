@@ -29,7 +29,7 @@ configs/config_old.yaml
 configs/config_nz.yml
 scripts/train_w0.py
 scripts/train_w1.py
-data/omaps_dataset_nw.py
+src/data/omaps_dataset_nw.py
 
 # IDEs
 .vscode/
