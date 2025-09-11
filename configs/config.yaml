@@ -5,12 +5,16 @@ experiment:
 
 dataset:
   name: "OMAPS"
-  root_dir: "./data_calib"
-  annotations_root: "./data_calib"
+  root_dir: "~/datasets/OMAPS"           # adjust if needed
+  annotations_root: "~/datasets/OMAPS"   # adjust if needed
   label_format: "txt"
   label_targets: ["pitch", "onset", "offset", "hand", "clef"]
   max_clips: null
-  split: "train"
+  # NEW: manifest files that select which IDs belong to each logical role
+  manifest:
+    train: "splits/train_minus_calib_list.txt"
+    val:   "splits/calib_list.txt"
+    test:  null                         # test uses the whole test/ folder
   split_train: "train"
   split_val: "train"
   split_test: "test"
