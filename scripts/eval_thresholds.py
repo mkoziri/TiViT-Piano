@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, torch
+import sys, json, torch
 import torch.nn.functional as F
 from pathlib import Path
 
@@ -11,10 +11,9 @@ from data import make_dataloader
 from models import build_model
 
 
-# Default grid of thresholds.  We parse this argument manually so that callers
-# can provide values in a comma-separated form (e.g., ``-3,-2.5,-2``) without
-# needing to escape leading minus signs.  Argparse would otherwise interpret
-# such tokens as new options.
+# Default probability grid used when sweeping thresholds without an explicit
+# list.  We parse lists manually so callers can provide comma-separated values
+# without escaping leading minus signs.
 DEFAULT_THRESHOLDS = [
     0.00,
     0.05,
@@ -40,26 +39,27 @@ DEFAULT_THRESHOLDS = [
 ]
 
 
-def _parse_thresholds(argv):
-    """Extract ``--thresholds`` from ``argv`` allowing comma/space separation."""
+def _parse_list(argv, name):
+    """Extract ``--<name>`` from ``argv`` allowing comma/space separation."""
+    flag = f"--{name}"
     for i, arg in enumerate(list(argv)):
-        if arg.startswith("--thresholds"):
-            if arg == "--thresholds":
+        if arg.startswith(flag):
+            if arg == flag:
                 j = i + 1
                 vals = []
                 while j < len(argv) and not argv[j].startswith("--"):
                     vals.append(argv[j])
                     j += 1
                 if not vals:
-                    raise ValueError("--thresholds expects at least one value")
+                    raise ValueError(f"{flag} expects at least one value")
                 del argv[i:j]
                 arg_str = " ".join(vals)
-            else:  # handle --thresholds=... form
+            else:  # handle --flag=... form
                 arg_str = arg.split("=", 1)[1]
                 del argv[i]
             arg_str = arg_str.replace(",", " ")
             return [float(v) for v in arg_str.split() if v]
-    return DEFAULT_THRESHOLDS.copy()
+    return None
 
 
 def _binary_f1(pred, target, eps=1e-8):
@@ -91,19 +91,22 @@ def main():
 
     argv = sys.argv[1:]
     try:
-        thresholds = _parse_thresholds(argv)
+        logit_thrs = _parse_list(argv, "thresholds")
+        prob_thrs = _parse_list(argv, "prob_thresholds")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
+    ap.add_argument("--thresholds", metavar="T", nargs="*", help="Logit threshold values")
     ap.add_argument(
-        "--thresholds",
-        metavar="T",
+        "--prob_thresholds",
+        metavar="P",
         nargs="*",
-        help="Threshold values (comma or space-separated)",
+        help="Probability threshold values",
     )
+    ap.add_argument("--calibration", help="JSON file with calibrated thresholds")
     # Optional temperature and bias parameters for logit calibration
     ap.add_argument(
         "--temperature",
@@ -118,7 +121,13 @@ def main():
         help="Additive bias applied to logits before sigmoid",
     )
     args = ap.parse_args(argv)
-    args.thresholds = thresholds
+    args.thresholds = logit_thrs
+    args.prob_thresholds = prob_thrs
+
+    # Unless a calibration file is provided, default to sweeping over
+    # probability thresholds when none were specified explicitly.
+    if not args.calibration and args.thresholds is None and args.prob_thresholds is None:
+        args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
     cfg = load_config("configs/config.yaml")
     # lock the SAME positive window you trained on
@@ -141,7 +150,8 @@ def main():
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
     model.eval()
 
-    # run model once to collect probabilities and targets
+    # run model once to collect logits/probabilities and targets
+    onset_logits_list, offset_logits_list = [], []
     onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
     with torch.no_grad():
@@ -154,15 +164,21 @@ def main():
             offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
 
             # Apply temperature scaling and bias for calibration
-            onset_prob = torch.sigmoid(onset_logits / args.temperature + args.bias)
-            offset_prob = torch.sigmoid(offset_logits / args.temperature + args.bias)
+            onset_logits = onset_logits / args.temperature + args.bias
+            offset_logits = offset_logits / args.temperature + args.bias
+            onset_prob = torch.sigmoid(onset_logits)
+            offset_prob = torch.sigmoid(offset_logits)
 
+            onset_logits_list.append(onset_logits.detach().cpu())
+            offset_logits_list.append(offset_logits.detach().cpu())
             onset_probs.append(onset_prob.detach().cpu())
             offset_probs.append(offset_prob.detach().cpu())
 
             onset_tgts.append(batch["onset_roll"].float().cpu())
             offset_tgts.append(batch["offset_roll"].float().cpu())
 
+    onset_logits = torch.cat(onset_logits_list, dim=0)
+    offset_logits = torch.cat(offset_logits_list, dim=0)
     onset_probs = torch.cat(onset_probs, dim=0)
     offset_probs = torch.cat(offset_probs, dim=0)
     onset_tgts = torch.cat(onset_tgts, dim=0)
@@ -193,14 +209,13 @@ def main():
     onset_true_bin = (onset_tgts > 0).float()
     offset_true_bin = (offset_tgts > 0).float()
     
-    thrs = list(args.thresholds)
-    print("Threshold\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
-    for t in thrs:
-        # Threshold probabilities at the given level and evaluate at the
-        # pianoroll level (B, T, 88).  This yields more nuanced predicted
-        # positive rates and F1 scores, which are useful for calibration.
-        onset_pred_bin = (onset_probs >= t).float()
-        offset_pred_bin = (offset_probs >= t).float()
+    def _eval_pair(on_thr, off_thr, use_logits):
+        if use_logits:
+            onset_pred_bin = (onset_logits >= on_thr).float()
+            offset_pred_bin = (offset_logits >= off_thr).float()
+        else:
+            onset_pred_bin = (onset_probs >= on_thr).float()
+            offset_pred_bin = (offset_probs >= off_thr).float()
 
         f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
         f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
@@ -210,7 +225,40 @@ def main():
         f1_on = 0.0 if f1_on is None else f1_on
         f1_off = 0.0 if f1_off is None else f1_off
 
-        print(f"{t:.2f}\t{f1_on:0.3f}\t{f1_off:0.3f}\t{onset_pred_rate:0.3f}\t{onset_pos_rate:0.3f}\t0.000")
+        print(f"{on_thr:.2f}\t{off_thr:.2f}\t{f1_on:0.3f}\t{f1_off:0.3f}\t{onset_pred_rate:0.3f}\t{onset_pos_rate:0.3f}\t0.000")
+
+    printed_header = False
+
+    def _header():
+        nonlocal printed_header
+        if not printed_header:
+            print("onset_thr\toffset_thr\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
+            printed_header = True
+
+    # Evaluate at calibrated thresholds if provided.
+    if args.calibration:
+        with open(args.calibration) as f:
+            calib = json.load(f)
+        on_cal = calib.get("onset", {})
+        off_cal = calib.get("offset", {})
+        if "best_logit" in on_cal and "best_logit" in off_cal:
+            _header()
+            _eval_pair(on_cal["best_logit"], off_cal["best_logit"], use_logits=True)
+        elif "best_prob" in on_cal and "best_prob" in off_cal:
+            _header()
+            _eval_pair(on_cal["best_prob"], off_cal["best_prob"], use_logits=False)
+        else:
+            print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
+
+    # Sweep over provided threshold grids.
+    if args.thresholds:
+        _header()
+        for t in args.thresholds:
+            _eval_pair(t, t, use_logits=True)
+    if args.prob_thresholds:
+        _header()
+        for t in args.prob_thresholds:
+            _eval_pair(t, t, use_logits=False)
 
 if __name__ == "__main__":
     main()
