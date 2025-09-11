@@ -6,7 +6,7 @@ from pathlib import Path
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
-from utils import load_config
+from utils import load_config, align_pitch_dim
 from data import make_dataloader
 from models import build_model
 
@@ -120,6 +120,10 @@ def main():
         default=0.0,
         help="Additive bias applied to logits before sigmoid",
     )
+    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument("--max-clips", type=int)
+    ap.add_argument("--frames", type=int)
+    ap.add_argument("--stride", type=int)
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
@@ -130,19 +134,20 @@ def main():
         args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
     cfg = load_config("configs/config.yaml")
-    # lock the SAME positive window you trained on
-    cfg["dataset"]["split_val"] = "train"
-    cfg["dataset"]["split_train"] = "train"
-    cfg["dataset"]["max_clips"] = 1
-    cfg["dataset"]["frames"] = 96
-    cfg["dataset"]["stride"] = 1
-    cfg["dataset"]["shuffle"] = False
-    # keep frames=96 etc as you used in Stage-A
+    if args.max_clips is not None:
+        cfg["dataset"]["max_clips"] = args.max_clips
+    if args.frames is not None:
+        cfg["dataset"]["frames"] = args.frames
+    if args.stride is not None:
+        cfg["dataset"]["stride"] = args.stride
+    split = args.split or cfg["dataset"].get("split_val", "val")
 
-    # build val loader
-    val_loader = make_dataloader(cfg, split="val")
-    if isinstance(val_loader, dict): val_loader = val_loader.get("val", next(iter(val_loader.values())))
-    if isinstance(val_loader, (list, tuple)): val_loader = val_loader[0]
+    # build loader
+    val_loader = make_dataloader(cfg, split=split)
+    if isinstance(val_loader, dict):
+        val_loader = val_loader.get(split, next(iter(val_loader.values())))
+    if isinstance(val_loader, (list, tuple)):
+        val_loader = val_loader[0]
 
     # load model + ckpt
     model = build_model(cfg)
@@ -188,15 +193,9 @@ def main():
     if onset_tgts.shape[1] != T_logits:
         onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
         offset_tgts = _pool_roll_BT(offset_tgts, T_logits)
-    if onset_tgts.shape[2] != P_logits:
-        if onset_tgts.shape[2] == 128 and P_logits == 88:
-            start = 21  # map MIDI 0-127 to piano range 21-108
-            onset_tgts = onset_tgts[..., start : start + P_logits]
-            offset_tgts = offset_tgts[..., start : start + P_logits]
-        else:
-            raise ValueError(
-                f"Target pitch dim {onset_tgts.shape[2]} does not match model {P_logits}"
-            )
+    onset_tgts = align_pitch_dim(onset_probs, onset_tgts, "onset")
+    offset_tgts = align_pitch_dim(offset_probs, offset_tgts, "offset")
+    
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")

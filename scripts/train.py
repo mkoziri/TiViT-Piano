@@ -4,6 +4,7 @@ from data import make_dataloader
 from models import build_model
 
 import os
+import argparse
 from pathlib import Path
 from time import perf_counter
 
@@ -638,8 +639,24 @@ def evaluate_one_epoch(model, loader, cfg):
     return {**losses, **metrics}
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/config.yaml")
+    ap.add_argument("--train-split", choices=["train", "val", "test"], help="Dataset split for training")
+    ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
+    ap.add_argument("--max-clips", type=int)
+    ap.add_argument("--frames", type=int)
+    ap.add_argument("--stride", type=int)
+    args = ap.parse_args()
+
     set_seed(42)
-    cfg = load_config("configs/config.yaml")
+    cfg = load_config(args.config)
+    if args.max_clips is not None:
+        cfg["dataset"]["max_clips"] = args.max_clips
+    if args.frames is not None:
+        cfg["dataset"]["frames"] = args.frames
+    if args.stride is not None:
+        cfg["dataset"]["stride"] = args.stride
+        
     freeze_epochs = int(cfg.get("train", {}).get("freeze_backbone_epochs", 0))
     ckpt_dir, log_root = ensure_dirs(cfg)
 
@@ -653,10 +670,8 @@ def main():
     writer = SummaryWriter(log_dir) if use_tb else None
     
     # Data
-    #split = cfg["dataset"].get("split", "test")
-    #loader = make_dataloader(cfg, split=split)
-    train_split = cfg["dataset"].get("split_train", "train")
-    val_split   = cfg["dataset"].get("split_val", "val")
+    train_split = args.train_split or cfg["dataset"].get("split_train", "train")
+    val_split   = args.val_split or cfg["dataset"].get("split_val", "val")
     train_loader = make_dataloader(cfg, split=train_split)
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.

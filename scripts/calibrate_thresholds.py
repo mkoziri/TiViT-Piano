@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-from utils import load_config
+from utils import load_config, align_pitch_dim
 from data import make_dataloader
 from models import build_model
 
@@ -96,13 +96,8 @@ def _collect(model, loader):
     if onset_tgts.shape[1] != T_logits:
         onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
         offset_tgts = _pool_roll_BT(offset_tgts, T_logits)
-    if onset_tgts.shape[2] != P_logits:
-        if onset_tgts.shape[2] == 128 and P_logits == 88:
-            start = 21
-            onset_tgts = onset_tgts[..., start:start + P_logits]
-            offset_tgts = offset_tgts[..., start:start + P_logits]
-        else:
-            raise ValueError("Target pitch dim does not match model output")
+    onset_tgts = align_pitch_dim(onset_logits, onset_tgts, "onset")
+    offset_tgts = align_pitch_dim(offset_logits, offset_tgts, "offset")
 
     onset_tgts = (onset_tgts > 0).float()
     offset_tgts = (offset_tgts > 0).float()
@@ -157,13 +152,23 @@ def _compute_metrics(logits: torch.Tensor, probs: torch.Tensor, targets: torch.T
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
-    ap.add_argument("--split", default="val", help="Dataset split to evaluate")
+    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument("--max-clips", type=int)
+    ap.add_argument("--frames", type=int)
+    ap.add_argument("--stride", type=int)
     args = ap.parse_args()
 
     cfg = load_config("configs/config.yaml")
-    loader = make_dataloader(cfg, split=args.split)
+    if args.max_clips is not None:
+        cfg["dataset"]["max_clips"] = args.max_clips
+    if args.frames is not None:
+        cfg["dataset"]["frames"] = args.frames
+    if args.stride is not None:
+        cfg["dataset"]["stride"] = args.stride
+    split = args.split or cfg["dataset"].get("split_val", "val")
+    loader = make_dataloader(cfg, split=split)
     if isinstance(loader, dict):
-        loader = loader.get(args.split) or next(iter(loader.values()))
+        loader = loader.get(split) or next(iter(loader.values()))
     if isinstance(loader, (list, tuple)):
         loader = loader[0]
 

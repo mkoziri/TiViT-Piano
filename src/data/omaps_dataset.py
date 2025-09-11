@@ -48,6 +48,19 @@ def _list_videos(root: Path, split: str) -> List[Path]:
     vids.sort()
     return vids
 
+def _read_manifest(path: str) -> set:
+    """Read manifest file listing filename stems; '#' comments allowed."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Manifest not found: {path}")
+    ids = set()
+    with open(p, "r") as f:
+        for line in f:
+            line = line.split('#', 1)[0].strip()
+            if line:
+                ids.add(line)
+    return ids
+
 def _load_clip_decord(path: Path, frames: int, stride: int,
                       resize_hw: Tuple[int, int], channels: int) -> torch.Tensor:
     """
@@ -399,7 +412,8 @@ class OMAPSDataset(Dataset):
                  resize: Tuple[int, int] = (224, 224),
                  tiles: int = 3,
                  channels: int = 3,
-                 normalize: bool = True):
+                 normalize: bool = True,
+                 manifest: Optional[str] = None):
         super().__init__()
         self.root = _expand_root(root_dir)
         self.split = split
@@ -411,6 +425,9 @@ class OMAPSDataset(Dataset):
         self.normalize = bool(normalize)
         
         self.videos = _list_videos(self.root, split)
+        if manifest:
+            ids = _read_manifest(manifest)
+            self.videos = [v for v in self.videos if v.stem in ids]
         #for overfit/debug runs: dataset will load only max_clips number of videos.
         max_clips = getattr(self, "max_clips", None)
         if max_clips is None:
@@ -577,7 +594,9 @@ class OMAPSDataset(Dataset):
 
 def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     dcfg = cfg["dataset"]
-
+    manifest_cfg = dcfg.get("manifest", {}) or {}
+    manifest_path = manifest_cfg.get(split)
+    
     dataset = OMAPSDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
@@ -587,6 +606,7 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         tiles=int(dcfg.get("tiles", 3)),
         channels=int(dcfg.get("channels", 3)),
         normalize=bool(dcfg.get("normalize", True)),
+        manifest=manifest_path,
     )
     # attach annotation config if present
     dataset.annotations_root = dcfg.get("annotations_root")

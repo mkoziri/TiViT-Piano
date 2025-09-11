@@ -12,8 +12,8 @@ dataset:
   max_clips: null
   # NEW: manifest files that select which IDs belong to each logical role
   manifest:
-    train: "splits/train_minus_calib_list.txt"
-    val:   "splits/calib_list.txt"
+    train: splits/train_minus_calib_list.txt
+    val:   splits/calib_list.txt
     test:  null                         # test uses the whole test/ folder
   split_train: "train"
   split_val: "train"
