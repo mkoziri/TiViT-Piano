@@ -569,8 +569,13 @@ class OMAPSDataset(Dataset):
         # --- NOW attach frame-level targets (optional) ---
         ft_cfg = getattr(self, "frame_targets_cfg", None)
         if ft_cfg and bool(ft_cfg.get("enable", False)):
+            labels_ft = None
+            if labels_tensor is not None:
+                labels_ft = labels_tensor.clone()
+                # Shift label times so frame 0 corresponds to the clip start.
+                labels_ft[:, 0:2] -= t0
             ft = _build_frame_targets(
-                labels=labels_tensor,
+                labels=labels_ft,
                 T=T, stride=self.stride, fps=fps,
                 note_min=int(ft_cfg.get("note_min", 21)),
                 note_max=int(ft_cfg.get("note_max", 108)),

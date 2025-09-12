@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--stride", type=int)
+    ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
@@ -194,6 +195,15 @@ def main():
             onset_tgts.append(batch["onset_roll"].float().cpu())
             offset_tgts.append(batch["offset_roll"].float().cpu())
 
+            if args.debug and len(onset_logits_list) == 1:
+                print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
+                print(
+                    "[DEBUG] onset_roll nonzero=",
+                    int(batch["onset_roll"].sum().item()),
+                    "offset_roll nonzero=",
+                    int(batch["offset_roll"].sum().item()),
+                )
+                
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
     onset_probs = torch.cat(onset_probs, dim=0)
@@ -208,6 +218,22 @@ def main():
     onset_tgts = align_pitch_dim(onset_probs, onset_tgts, "onset")
     offset_tgts = align_pitch_dim(offset_probs, offset_tgts, "offset")
     
+    if args.debug:
+        print(
+            "[DEBUG] aligned shapes logits=",
+            onset_logits.shape,
+            "targets=",
+            onset_tgts.shape,
+        )
+        print(
+            "[DEBUG] targets nonzero onset=",
+            int(onset_tgts.sum().item()),
+            "offset=",
+            int(offset_tgts.sum().item()),
+        )
+        diff = (torch.sigmoid(onset_logits) - onset_probs).abs().max().item()
+        print(f"[DEBUG] sigmoid max abs diff={diff:.3e}")
+        
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
