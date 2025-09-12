@@ -107,6 +107,12 @@ def main():
         help="Probability threshold values",
     )
     ap.add_argument("--calibration", help="JSON file with calibrated thresholds")
+    ap.add_argument("--head", choices=["onset", "offset"], help="Sweep thresholds for only one head")
+    # Explicit thresholds for the non-swept head when no calibration is provided
+    ap.add_argument("--fixed_offset_prob", type=float)
+    ap.add_argument("--fixed_offset_logit", type=float)
+    ap.add_argument("--fixed_onset_prob", type=float)
+    ap.add_argument("--fixed_onset_logit", type=float)
     # Optional temperature and bias parameters for logit calibration
     ap.add_argument(
         "--temperature",
@@ -128,10 +134,16 @@ def main():
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
 
-    # Unless a calibration file is provided, default to sweeping over
-    # probability thresholds when none were specified explicitly.
-    if not args.calibration and args.thresholds is None and args.prob_thresholds is None:
-        args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+    if args.thresholds is not None and args.prob_thresholds is not None:
+        print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
+        return
+
+    # Unless a calibration file is provided and no head is specified, default to
+    # sweeping over probability thresholds when none were specified explicitly.
+    if args.thresholds is None and args.prob_thresholds is None:
+        if args.head is not None or not args.calibration:
+            args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+
 
     cfg = load_config("configs/config.yaml")
     if args.max_clips is not None:
@@ -234,30 +246,83 @@ def main():
             print("onset_thr\toffset_thr\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
             printed_header = True
 
-    # Evaluate at calibrated thresholds if provided.
-    if args.calibration:
-        with open(args.calibration) as f:
-            calib = json.load(f)
-        on_cal = calib.get("onset", {})
-        off_cal = calib.get("offset", {})
-        if "best_logit" in on_cal and "best_logit" in off_cal:
-            _header()
-            _eval_pair(on_cal["best_logit"], off_cal["best_logit"], use_logits=True)
-        elif "best_prob" in on_cal and "best_prob" in off_cal:
-            _header()
-            _eval_pair(on_cal["best_prob"], off_cal["best_prob"], use_logits=False)
-        else:
-            print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
+    if args.head is None:
+        # Evaluate at calibrated thresholds if provided.
+        if args.calibration:
+            with open(args.calibration) as f:
+                calib = json.load(f)
+            on_cal = calib.get("onset", {})
+            off_cal = calib.get("offset", {})
+            if "best_logit" in on_cal and "best_logit" in off_cal:
+                _header()
+                _eval_pair(on_cal["best_logit"], off_cal["best_logit"], use_logits=True)
+            elif "best_prob" in on_cal and "best_prob" in off_cal:
+                _header()
+                _eval_pair(on_cal["best_prob"], off_cal["best_prob"], use_logits=False)
+            else:
+                print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
 
-    # Sweep over provided threshold grids.
-    if args.thresholds:
+        # Sweep over provided threshold grids.
+        if args.thresholds:
+            _header()
+            for t in args.thresholds:
+                _eval_pair(t, t, use_logits=True)
+        if args.prob_thresholds:
+            _header()
+            for t in args.prob_thresholds:
+                _eval_pair(t, t, use_logits=False)
+    else:
+        sweep_vals = args.prob_thresholds
+            use_logits = False
+            mode = "prob"
+
+        other_head = "offset" if args.head == "onset" else "onset"
+        fixed_thr = None
+        source = None
+
+        if args.calibration:
+            with open(args.calibration) as f:
+                calib = json.load(f)
+            other_cal = calib.get(other_head, {})
+            if use_logits:
+                if "best_logit" in other_cal:
+                    fixed_thr = other_cal["best_logit"]
+                elif "best_prob" in other_cal:
+                    fixed_thr = torch.logit(torch.tensor(other_cal["best_prob"])).item()
+            else:
+                if "best_prob" in other_cal:
+                    fixed_thr = other_cal["best_prob"]
+                elif "best_logit" in other_cal:
+                    fixed_thr = torch.sigmoid(torch.tensor(other_cal["best_logit"])).item()
+            if fixed_thr is None:
+                print("Calibration file missing threshold for", other_head, file=sys.stderr)
+                return
+            source = "calibration"
+        else:
+            if args.head == "onset":
+                fixed_thr = args.fixed_offset_logit if use_logits else args.fixed_offset_prob
+                flag_name = "--fixed_offset_logit" if use_logits else "--fixed_offset_prob"
+            else:
+                fixed_thr = args.fixed_onset_logit if use_logits else args.fixed_onset_prob
+                flag_name = "--fixed_onset_logit" if use_logits else "--fixed_onset_prob"
+            if fixed_thr is None:
+                print(
+                    f"error: specify {flag_name} or --calibration to fix {other_head} threshold",
+                    file=sys.stderr,
+                )
+                return
+            source = "flag"
+
+        print(
+            f"Per-head sweep: head={args.head}, mode={mode}, fixed_{other_head}={fixed_thr:.3f} (source={source})"
+        )
         _header()
-        for t in args.thresholds:
-            _eval_pair(t, t, use_logits=True)
-    if args.prob_thresholds:
-        _header()
-        for t in args.prob_thresholds:
-            _eval_pair(t, t, use_logits=False)
+        for t in sweep_vals:
+            if args.head == "onset":
+                on_thr, off_thr = t, fixed_thr
+            else:
+                on_thr, off_thr = fixed_thr, t
+            _eval_pair(on_thr, off_thr, use_logits)
 
 if __name__ == "__main__":
     main()
