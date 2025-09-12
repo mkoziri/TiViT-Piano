@@ -272,7 +272,13 @@ def main():
             for t in args.prob_thresholds:
                 _eval_pair(t, t, use_logits=False)
     else:
-        sweep_vals = args.prob_thresholds
+        # Per-head sweep
+        if args.thresholds is not None:
+            sweep_vals = args.thresholds
+            use_logits = True
+            mode = "logit"
+        else:
+            sweep_vals = args.prob_thresholds
             use_logits = False
             mode = "prob"
 
