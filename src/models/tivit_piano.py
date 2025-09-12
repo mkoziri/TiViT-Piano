@@ -40,21 +40,25 @@ class TransformerBlock(nn.Module):
 
 class FactorizedSpaceTimeEncoder(nn.Module):
     """
-    Factorized attention like ViViT Model-3/2:
+    Factorized attention like ViViT Model-3/2 with an extra global stage:
     - Temporal encoding within each (tile, spatial_position)
     - Spatial (across tiles) encoding for each (time, spatial_position)
+    - Cross-tile aggregation via learnable global tokens
     Shapes:
       Input tokens come per-tile from TubeletEmbed:
         per tile: X_tile -> (B, Ntokens, D) with Ntokens = T' * H' * W'
       We also need to know the factorization counts: T', S = H'*W'
     """
     def __init__(self, d_model=768, nhead=8, mlp_ratio=4.0, dropout=0.1,
-                 depth_temporal=2, depth_spatial=2,
+                 depth_temporal=2, depth_spatial=2, depth_global=1,
+                 global_tokens=2,
                  tiles=3, t_tokens=None, s_tokens=None):
         super().__init__()
         self.tiles = tiles
         self.depth_temporal = depth_temporal
-        self.depth_spatial  = depth_spatial
+        self.depth_spatial = depth_spatial
+        self.depth_global = depth_global
+        self.global_tokens = global_tokens
         self.t_tokens = t_tokens   # number of temporal tokens after tubeleting
         self.s_tokens = s_tokens   # number of spatial tokens (H'*W')
 
@@ -67,6 +71,16 @@ class FactorizedSpaceTimeEncoder(nn.Module):
             for _ in range(depth_spatial)
         ])
 
+    # Global aggregation blocks and context tokens
+        self.global_blocks = nn.ModuleList([
+            TransformerBlock(d_model, nhead, mlp_ratio, dropout)
+            for _ in range(depth_global)
+        ]) if depth_global > 0 else None
+        if global_tokens > 0:
+            self.global_ctx = nn.Parameter(torch.randn(global_tokens, d_model))
+        else:
+            self.register_parameter('global_ctx', None)
+            
     def forward(self, x_tiles, t_tokens, s_tokens):
         """
         x_tiles: list length=tiles, each (B, Ntokens, D) where Ntokens = t_tokens * s_tokens
@@ -96,8 +110,14 @@ class FactorizedSpaceTimeEncoder(nn.Module):
         # back to (B, n, m, d) then (B, m, n, d)
         x = rearrange(x_s, '(b n) m d -> b m n d', b=B)
 
-        # flatten tiles+tokens -> (B, m*n, D)
-        x = rearrange(x, 'b m n d -> b (m n) d')
+        # ---- Cross-tile aggregation with global context tokens ----
+        x = rearrange(x, 'b m n d -> b (m n) d')  # (B, tiles*Ntokens, D)
+        if self.depth_global > 0 and self.global_ctx is not None:
+            g = self.global_ctx.unsqueeze(0).expand(B, -1, -1)  # (B, G, D)
+            x = torch.cat([g, x], dim=1)  # prepend global tokens
+            for blk in self.global_blocks:
+                x = blk(x)
+            x = x[:, self.global_tokens:, :]  # drop globals
         return x
 
 # -------- TiViT-Piano: tiling wrapper + ViViT backbone + multi-task head ----------
@@ -109,7 +129,7 @@ class TiViTPiano(nn.Module):
 
     Pipeline:
       - For each tile: TubeletEmbed (shared weights) -> tokens of dim D
-      - Factorized space-time encoder (temporal then spatial-across-tiles)
+      - Factorized space-time-cross encoder (temporal -> spatial -> global cross-tile)
       - Heads:
           * head_mode="clip": global mean-pool over all tokens -> one prediction per clip
           * head_mode="frame": average over tiles & spatial -> per-time features (B, T', D),
@@ -140,6 +160,8 @@ class TiViTPiano(nn.Module):
         nhead=8,
         depth_temporal=2,
         depth_spatial=2,
+        depth_global=1,
+        global_tokens=2,
         mlp_ratio=4.0,
         dropout=0.1,
         pitch_classes=88,
@@ -161,6 +183,8 @@ class TiViTPiano(nn.Module):
                                 mlp_ratio=mlp_ratio, dropout=dropout,
                                 depth_temporal=depth_temporal,
                                 depth_spatial=depth_spatial,
+                                depth_global=depth_global,
+                                global_tokens=global_tokens,
                                 tiles=tiles)
 
         # Heads (LayerNorm -> Linear). These work with (B, D) and (B, T, D).

@@ -121,16 +121,17 @@ def _load_clip_cv2(path: Path, frames: int, stride: int,
     x = x.permute(0, 3, 1, 2)  # T,C,H,W
     return x
 
-def _tile_horiz(x: torch.Tensor, tiles: int) -> torch.Tensor:
+def _tile_vertical(x: torch.Tensor, tiles: int) -> torch.Tensor:
     """
-    x: T,C,H,W -> returns T,tiles,C,H,Wt (crop right edge if not divisible)
+    Split width into vertical tiles: T,C,H,W -> T,tiles,C,H,Wt
+    (crop right edge if not divisible)
     """
     T, C, H, W = x.shape
     w_each = W // tiles
     W2 = w_each * tiles
     if W2 != W:
         x = x[..., :W2]
-    parts = [x[..., i*w_each:(i+1)*w_each] for i in range(tiles)]
+    parts = [x[..., i * w_each:(i + 1) * w_each] for i in range(tiles)]
     return torch.stack(parts, dim=1)  # T,tiles,C,H,Wt
     
 def _labels_from_txt(txt_path: Path, t0: float, t1: float):
@@ -463,7 +464,7 @@ class OMAPSDataset(Dataset):
             channels=self.channels,
             training=is_train,
         )
-        clip = _tile_horiz(clip, self.tiles)  # T,tiles,C,H,Wt
+        clip = _tile_vertical(clip, self.tiles)  # T,tiles,C,H,Wt
 
         # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames

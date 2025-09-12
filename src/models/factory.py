@@ -21,6 +21,8 @@ def build_model(cfg: Mapping[str, Any]):
         nhead=_get(tcfg, "num_heads", 8),
         depth_temporal=_get(tcfg, "depth_temporal", 2),
         depth_spatial=_get(tcfg, "depth_spatial", 2),
+        depth_global=_get(tcfg, "depth_global", 1),
+        global_tokens=_get(tcfg, "global_tokens", 2),
         mlp_ratio=_get(tcfg, "mlp_ratio", 4.0),
         dropout=_get(tcfg, "dropout", 0.1),
         head_mode=cfg["model"].get("head_mode", "clip"),

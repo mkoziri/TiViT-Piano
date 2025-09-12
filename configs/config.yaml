@@ -54,6 +54,8 @@ model:
     num_heads: 3
     depth_temporal: 1
     depth_spatial: 1
+    depth_global: 1
+    global_tokens: 2
     mlp_ratio: 3.0
     dropout: 0.10
 
