@@ -22,12 +22,22 @@ from models import build_model
 
 
 def _align(a: torch.Tensor, b: torch.Tensor, delta: int):
-    """Align two 1-D tensors according to shift ``delta``."""
+     """Align two 1-D tensors according to shift ``delta``.
+
+    ``a`` and ``b`` may have different lengths.  After applying the shift, this
+    function crops both tensors to the minimum common length so that they can be
+    compared element-wise.
+    """
     if delta > 0:
-        return a[delta:], b[:-delta]
-    if delta < 0:
-        return a[:delta], b[-delta:]
-    return a, b
+        a = a[delta:]
+        b = b[:-delta]
+    elif delta < 0:
+        a = a[:delta]
+        b = b[-delta:]
+
+    n = min(a.shape[0], b.shape[0])
+    return a[:n], b[:n]
+
 
 
 def main():
