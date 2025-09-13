@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from utils.time_grid import frame_to_sec, sec_to_frame
+
 # Try decord first (fast), else fallback to OpenCV
 HAVE_DECORD = False
 try:
@@ -233,10 +235,12 @@ def _load_clip_with_random_start(path: Path,
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
-        start_sec = start_idx / decode_fps
+        start_sec = frame_to_sec(start_idx, 1.0 / decode_fps)
 
-        times = [start_sec + k * hop_seconds for k in range(frames)]
-        idxs = [min(int(round(t * native_fps)), total - 1) for t in times]
+        times = [frame_to_sec(start_idx + k * stride, 1.0 / decode_fps)
+                 for k in range(frames)]
+        idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=total - 1)
+                for t in times]
         batch = vr.get_batch(idxs)  # T,H,W,C (uint8)
         x = batch.to(torch.float32) / 255.0  # T,H,W,C
 
@@ -267,10 +271,12 @@ def _load_clip_with_random_start(path: Path,
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
-        start_sec = start_idx / decode_fps
+        start_sec = frame_to_sec(start_idx, 1.0 / decode_fps)
 
-        times = [start_sec + k * hop_seconds for k in range(frames)]
-        frame_idxs = [min(int(round(t * native_fps)), total - 1) for t in times]
+        times = [frame_to_sec(start_idx + k * stride, 1.0 / decode_fps)
+                 for k in range(frames)]
+        frame_idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=total - 1)
+                      for t in times]
 
         imgs = []
         for idx in frame_idxs:
@@ -305,35 +311,24 @@ def _build_frame_targets(labels: torch.Tensor,
                          clef_thresholds=(60, 64),
                          dilate_active_frames: int = 0,
                          targets_sparse: bool = False):
-    """
-    Build per-frame targets aligned to sampled frames.
-    Returns dict with:
-      - pitch_roll:  (T, P) float in {0,1}
-      - onset_roll:  (T, P) float in {0,1}
-      - offset_roll: (T, P) float in {0,1}
-      - hand_frame:  (T,) long in {0,1}     (0=left,1=right)
-      - clef_frame:  (T,) long in {0,1,2}  (0=bass,1=treble,2=ambig)
-    """
+   """Build per-frame targets aligned to sampled frames."""
+    hop_seconds = stride / max(1.0, float(fps))
+    
     T = int(T)
     P = int(note_max - note_min + 1)
-    pitch_roll  = torch.zeros((T, P), dtype=torch.float32)
-    onset_roll  = torch.zeros((T, P), dtype=torch.float32)
+    pitch_roll = torch.zeros((T, P), dtype=torch.float32)
+    onset_roll = torch.zeros((T, P), dtype=torch.float32)
     offset_roll = torch.zeros((T, P), dtype=torch.float32)
-
-    # frame boundaries in seconds: frame k spans [t_k, t_{k+1})
-    frame_step = stride / max(1.0, float(fps))
-    t_starts = torch.arange(T, dtype=torch.float32) * frame_step
-    t_ends   = t_starts + frame_step
 
     if labels is None or labels.numel() == 0:
         hand_frame = torch.zeros((T,), dtype=torch.long)
         clef_frame = torch.full((T,), 2, dtype=torch.long)  # ambiguous
         return {
-            "pitch_roll":  pitch_roll,
-            "onset_roll":  onset_roll,
+            "pitch_roll": pitch_roll,
+            "onset_roll": onset_roll,
             "offset_roll": offset_roll,
-            "hand_frame":  hand_frame,
-            "clef_frame":  clef_frame,
+            "hand_frame": hand_frame,
+            "clef_frame": clef_frame,
         }
 
     on = labels[:, 0]
@@ -344,30 +339,21 @@ def _build_frame_targets(labels: torch.Tensor,
     mask_pitch = (pit >= int(note_min)) & (pit <= int(note_max))
     on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch] - int(note_min)
 
-    for k in range(T):
-        s, e = float(t_starts[k]), float(t_ends[k])
+    on_frames = sec_to_frame(on, hop_seconds)
+    off_frames = sec_to_frame(off, hop_seconds)
+    on_frames = on_frames.clamp(0, T - 1)
+    off_frames = off_frames.clamp(0, T)
 
-        if fill_mode == "overlap":
-            sel = (on < e) & (off > s)  # any overlap with the frame window
-        else:
-            # center-based with tolerance
-            mid = 0.5 * (s + e)
-            sel = (on - tol <= mid) & (off + tol >= mid)
-
-        if sel.any():
-            p_sel = pit[sel]
-            pitch_roll[k, p_sel] = 1.0
-
-            # onsets within window (±tol)
-            onset_sel = (on[sel] >= (s - tol)) & (on[sel] < (e + tol))
-            if onset_sel.any():
-                onset_roll[k, p_sel[onset_sel]] = 1.0
-
-            # offsets within window (±tol)
-            offset_sel = (off[sel] > (s - tol)) & (off[sel] <= (e + tol))
-            if offset_sel.any():
-                offset_roll[k, p_sel[offset_sel]] = 1.0
-
+    for s, e, p in zip(on_frames, off_frames, pit):
+        s = int(s)
+        e = int(e)
+        if e <= s:
+            e = min(s + 1, T)
+        pitch_roll[s:e, p] = 1.0
+        onset_roll[s, p] = 1.0
+        off_idx = min(e, T - 1)
+        offset_roll[off_idx, p] = 1.0
+        
     # optional temporal dilation by N frames
     if dilate_active_frames and dilate_active_frames > 0:
         import torch.nn.functional as F
@@ -486,8 +472,8 @@ class OMAPSDataset(Dataset):
         # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames
         fps = self.decode_fps
-        t0 = float(start_idx) / float(fps)
-        t1 = float(start_idx + ((T - 1) * self.stride + 1)) / float(fps)
+        t0 = frame_to_sec(start_idx, 1.0 / fps)
+        t1 = frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps)
 
         sample = {"video": clip, "path": str(path)}  # <- create up-front
         labels_tensor = None                          # <- define up-front
