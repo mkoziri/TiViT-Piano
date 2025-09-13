@@ -155,7 +155,6 @@ def main():
     ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
-    ap.add_argument("--stride", type=int)
     args = ap.parse_args()
 
     cfg = load_config("configs/config.yaml")
@@ -163,8 +162,6 @@ def main():
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
         cfg["dataset"]["frames"] = args.frames
-    if args.stride is not None:
-        cfg["dataset"]["stride"] = args.stride
     split = args.split or cfg["dataset"].get("split_val", "val")
     loader = make_dataloader(cfg, split=split)
     if isinstance(loader, dict):

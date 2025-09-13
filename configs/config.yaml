@@ -19,7 +19,9 @@ dataset:
   split_val: "train"
   split_test: "test"
   frames: 96
-  stride: 1
+  # Time-grid parameters
+  decode_fps: 30.0
+  hop_seconds: 0.03333333333333333  # 1 / decode_fps
   resize: [128, 128]
   tiles: 3
   channels: 3

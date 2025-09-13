@@ -653,7 +653,6 @@ def main():
     ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
-    ap.add_argument("--stride", type=int)
     ap.add_argument("--debug", action="store_true", help="Enable verbose logging")
     ap.add_argument("--smoke", action="store_true", help="Run a quick synthetic pass")
     args = ap.parse_args()
@@ -665,8 +664,6 @@ def main():
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
         cfg["dataset"]["frames"] = args.frames
-    if args.stride is not None:
-        cfg["dataset"]["stride"] = args.stride
         
     if args.smoke:
         logger.info("Running smoke test")

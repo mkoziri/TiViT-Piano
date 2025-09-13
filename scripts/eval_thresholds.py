@@ -129,7 +129,6 @@ def main():
     ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
-    ap.add_argument("--stride", type=int)
     ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
@@ -151,8 +150,6 @@ def main():
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
         cfg["dataset"]["frames"] = args.frames
-    if args.stride is not None:
-        cfg["dataset"]["stride"] = args.stride
     split = args.split or cfg["dataset"].get("split_val", "val")
 
     # build loader

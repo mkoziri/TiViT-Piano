@@ -206,7 +206,7 @@ def _load_clip_with_random_start(path: Path,
                                  training: bool):
     """
     Load a clip using a randomized start (training=True) or start=0 (else).
-    Returns: clip (T,C,H,W) float32 in [0,1], start_idx (int), fps (float)
+    Returns: clip (T,C,H,W) float32 in [0,1], start_idx (int)
     """
     # --- decord fast path ---
     if HAVE_DECORD:
@@ -236,16 +236,13 @@ def _load_clip_with_random_start(path: Path,
         if (H, W) != tuple(resize_hw):
             x = F.interpolate(x, size=resize_hw, mode="area")
 
-        fps = float(getattr(vr, "get_avg_fps", lambda: 30.0)())
-        return x, start_idx, (fps if fps > 0 else 30.0)
+        return x, start_idx
 
     # --- OpenCV fallback (keeps your behavior) ---
     else:
         import cv2, numpy as np, torch
         cap = cv2.VideoCapture(str(path))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        fps = float(fps) if fps > 0 else 30.0
 
         max_start = max(0, total - ((frames - 1) * stride + 1))
         if training and max_start > 0:
@@ -280,7 +277,7 @@ def _load_clip_with_random_start(path: Path,
         if channels == 1:
             x = (0.299 * x[..., 0] + 0.587 * x[..., 1] + 0.114 * x[..., 2]).unsqueeze(-1)
         x = x.permute(0, 3, 1, 2)  # T,C,H,W
-        return x, start_idx, fps
+        return x, start_idx
 
 def _build_frame_targets(labels: torch.Tensor,
                          T: int, stride: int, fps: float,
@@ -414,7 +411,8 @@ class OMAPSDataset(Dataset):
                  tiles: int = 3,
                  channels: int = 3,
                  normalize: bool = True,
-                 manifest: Optional[str] = None):
+                 manifest: Optional[str] = None,
+                 decode_fps: float = 30.0):
         super().__init__()
         self.root = _expand_root(root_dir)
         self.split = split
@@ -424,6 +422,7 @@ class OMAPSDataset(Dataset):
         self.tiles = int(tiles)
         self.channels = int(channels)
         self.normalize = bool(normalize)
+        self.decode_fps = float(decode_fps)
         
         self.videos = _list_videos(self.root, split)
         if manifest:
@@ -456,7 +455,7 @@ class OMAPSDataset(Dataset):
         #changed so it should always start from frame 0 when training.
         # --- load video clip with randomized start for train, deterministic for val/test ---
         is_train = (self.split == "train")
-        clip, start_idx, fps = _load_clip_with_random_start(
+        clip, start_idx = _load_clip_with_random_start(
             path=path,
             frames=self.frames,
             stride=self.stride,
@@ -468,8 +467,7 @@ class OMAPSDataset(Dataset):
 
         # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames
-        #t0 = 0.0
-        #t1 = ((T - 1) * self.stride + 1) / fps
+        fps = self.decode_fps
         t0 = float(start_idx) / float(fps)
         t1 = float(start_idx + ((T - 1) * self.stride + 1)) / float(fps)
 
@@ -603,16 +601,21 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     manifest_cfg = dcfg.get("manifest", {}) or {}
     manifest_path = manifest_cfg.get(split)
     
+    decode_fps = float(dcfg.get("decode_fps", 30.0))
+    hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
+    stride = int(round(hop_seconds * decode_fps))
+
     dataset = OMAPSDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
         frames=int(dcfg.get("frames", 32)),
-        stride=int(dcfg.get("stride", 2)),
+        stride=stride,
         resize=tuple(dcfg.get("resize", [224, 224])),
         tiles=int(dcfg.get("tiles", 3)),
         channels=int(dcfg.get("channels", 3)),
         normalize=bool(dcfg.get("normalize", True)),
         manifest=manifest_path,
+        decode_fps=decode_fps,
     )
     # attach annotation config if present
     dataset.annotations_root = dcfg.get("annotations_root")
