@@ -5,49 +5,80 @@ import ast
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[2]
-DOC_PATH = ROOT / 'docs' / 'FILE_INDEX.md'
+def _find_root(start: Path) -> Path:
+    """Walk up from *start* until a repository marker is found."""
+    for parent in [start] + list(start.parents):
+        if (parent / "pyproject.toml").exists() or (parent / ".git").exists():
+            return parent
+    raise FileNotFoundError("Could not locate project root")
+
+
+ROOT = _find_root(Path(__file__).resolve())
+DOC_PATH = ROOT / "docs" / "FILE_INDEX.md"
+SCRIPT_REL = Path(__file__).resolve().relative_to(ROOT)
 
 
 def parse_cli(tree: ast.AST) -> list[dict[str, Any]]:
-    args = []
+    """Extract argparse ``add_argument`` calls from a module."""
+
+    args: list[dict[str, Any]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'add_argument':
-            entry: dict[str, Any] = {'flags': []}
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            entry: dict[str, Any] = {"flags": []}
             for a in node.args:
                 if isinstance(a, ast.Constant) and isinstance(a.value, str):
-                    entry['flags'].append(a.value)
+                    entry["flags"].append(a.value)
             for kw in node.keywords:
-                if kw.arg == 'help' and isinstance(kw.value, ast.Constant):
-                    entry['help'] = kw.value.value
-                elif kw.arg == 'default' and isinstance(kw.value, ast.Constant):
-                    entry['default'] = kw.value.value
-                elif kw.arg == 'type':
+                if kw.arg == "help" and isinstance(kw.value, ast.Constant):
+                    entry["help"] = kw.value.value
+                elif kw.arg == "default" and isinstance(kw.value, ast.Constant):
+                    entry["default"] = kw.value.value
+                elif kw.arg == "type":
                     if isinstance(kw.value, ast.Name):
-                        entry['type'] = kw.value.id
+                        entry["type"] = kw.value.id
                     elif isinstance(kw.value, ast.Attribute):
-                        entry['type'] = kw.value.attr
-                elif kw.arg == 'action' and isinstance(kw.value, ast.Constant):
-                    entry['type'] = kw.value.value
+                        entry["type"] = kw.value.attr
+                elif kw.arg == "action" and isinstance(kw.value, ast.Constant):
+                    entry["type"] = kw.value.value
+                elif kw.arg == "dest" and isinstance(kw.value, ast.Constant):
+                    entry["dest"] = kw.value.value
+            if "dest" not in entry and entry["flags"]:
+                flag = entry["flags"][0].lstrip("-").replace("-", "_")
+                entry["dest"] = flag
             args.append(entry)
     return args
 
 
 def list_defs(tree: ast.AST) -> list[str]:
-    items = []
+    """List top-level functions and classes with docstring summaries."""
+
+    items: list[str] = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
-            items.append(f"- `{node.name}()`")
+            doc = ast.get_docstring(node) or ""
+            summary = f" — {doc.splitlines()[0]}" if doc else ""
+            items.append(f"- `{node.name}()`{summary}")
         if isinstance(node, ast.ClassDef):
-            items.append(f"- class `{node.name}`")
+            doc = ast.get_docstring(node) or ""
+            summary = f" — {doc.splitlines()[0]}" if doc else ""
+            items.append(f"- class `{node.name}`{summary}")
     return items
 
 
 def summarize_file(path: Path) -> str:
-    text = path.read_text()
+    text = (ROOT / path).read_text()
     tree = ast.parse(text)
-    doc = ast.get_docstring(tree) or ''
-    lines = [f"### {path.as_posix()}", f"**Purpose:** {doc.splitlines()[0] if doc else 'N/A'}", ""]
+    doc = ast.get_docstring(tree) or ""
+    rel = path.relative_to(ROOT)
+    lines = [
+        f"### {rel.as_posix()}",
+        f"**Purpose:** {doc.splitlines()[0] if doc else 'N/A'}",
+        "",
+    ]
     defs = list_defs(tree)
     if defs:
         lines.append("**Key Functions/Classes**")
@@ -56,32 +87,45 @@ def summarize_file(path: Path) -> str:
     cli = parse_cli(tree)
     if cli:
         lines.append("**CLI**")
-        lines.append("| Flags | Type | Default | Help |")
-        lines.append("|---|---|---|---|")
+        lines.append("| Flag(s) | Dest | Type | Default | Help |")
+        lines.append("|---|---|---|---|---|")
         for c in cli:
-            flags = ", ".join(c.get('flags', []))
-            lines.append(f"| `{flags}` | {c.get('type','')} | {c.get('default','')} | {c.get('help','')} |")
+            flags = ", ".join(c.get("flags", []))
+            lines.append(
+                f"| `{flags}` | {c.get('dest','')} | {c.get('type','')} | {c.get('default','')} | {c.get('help','')} |"
+            )
         lines.append("")
     return "\n".join(lines)
 
 
 def main() -> None:
-    files = []
-    files.extend(sorted((ROOT / 'src').rglob('*.py')))
-    files.extend(sorted((ROOT / 'scripts').rglob('*.py')))
-    yaml_files = sorted((ROOT / 'configs').rglob('*.yaml'))
-    lines = ["# File Index", "", "Generated by `scripts/dev/gen_file_index.py`.", ""]
+    files: list[Path] = []
+    files.extend(sorted((ROOT / "src").rglob("*.py")))
+    files.extend(sorted((ROOT / "scripts").rglob("*.py")))
+    yaml_files = sorted((ROOT / "configs").rglob("*.yaml"))
+    lines = [
+        "# File Index",
+        "",
+        f"Generated by `{SCRIPT_REL.as_posix()}`.",
+        "",
+    ]
     for path in files:
-        if 'dev' in path.parts:
+        if "dev" in path.parts:
             continue
-        lines.append(summarize_file(path.relative_to(ROOT)))
+        rel = path.relative_to(ROOT)
+        lines.append(summarize_file(path))
     for yml in yaml_files:
         rel = yml.relative_to(ROOT)
         text = yml.read_text().splitlines()
-        keys = [line.split(':')[0] for line in text if ':' in line and not line.startswith(' ')]
+        keys = [
+            line.split(":")[0]
+            for line in text
+            if ":" in line and not line.startswith(" ")
+        ]
         lines.append(f"### {rel.as_posix()}\nTop-level keys: {', '.join(keys)}\n")
     DOC_PATH.write_text("\n".join(lines))
 
 
 if __name__ == '__main__':
     main()
+
