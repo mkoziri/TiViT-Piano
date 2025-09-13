@@ -203,26 +203,40 @@ def _load_clip_with_random_start(path: Path,
                                  stride: int,
                                  resize_hw: Tuple[int, int],
                                  channels: int,
-                                 training: bool):
+                                 training: bool,
+                                 decode_fps: float):
     """
     Load a clip using a randomized start (training=True) or start=0 (else).
-    Returns: clip (T,C,H,W) float32 in [0,1], start_idx (int)
+    Decoding is performed on a fixed "decode_fps" grid so that all clips
+    align temporally, regardless of their native fps.  The returned
+    ``start_idx`` is expressed in units of ``decode_fps``.
+
+    Returns:
+        clip (T,C,H,W) float32 in [0,1], start_idx (int)
     """
+    
+    hop_seconds = float(stride) / float(decode_fps)
+    
     # --- decord fast path ---
     if HAVE_DECORD:
         import decord, torch
         import torch.nn.functional as F
         vr = decord.VideoReader(str(path))
+        native_fps = float(vr.get_avg_fps())
         total = len(vr)
-        # how many frames we need to span: ((frames-1)*stride)+1
-        max_start = max(0, total - ((frames - 1) * stride + 1))
-        if training and max_start > 0:
+        duration = total / native_fps if native_fps > 0 else 0.0
+
+        clip_span = (frames - 1) * hop_seconds
+        max_start_sec = max(0.0, duration - clip_span)
+        if training and max_start_sec > 0:
             import random
-            start_idx = random.randint(0, max_start)
+            start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
+        start_sec = start_idx / decode_fps
 
-        idxs = [min(start_idx + i * stride, total - 1) for i in range(frames)]
+        times = [start_sec + k * hop_seconds for k in range(frames)]
+        idxs = [min(int(round(t * native_fps)), total - 1) for t in times]
         batch = vr.get_batch(idxs)  # T,H,W,C (uint8)
         x = batch.to(torch.float32) / 255.0  # T,H,W,C
 
@@ -243,27 +257,30 @@ def _load_clip_with_random_start(path: Path,
         import cv2, numpy as np, torch
         cap = cv2.VideoCapture(str(path))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        native_fps = float(cap.get(cv2.CAP_PROP_FPS)) or decode_fps
+        duration = total / native_fps if native_fps > 0 else 0.0
 
-        max_start = max(0, total - ((frames - 1) * stride + 1))
-        if training and max_start > 0:
+        clip_span = (frames - 1) * hop_seconds
+        max_start_sec = max(0.0, duration - clip_span)
+        if training and max_start_sec > 0:
             import random
-            start_idx = random.randint(0, max_start)
+            start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
+        start_sec = start_idx / decode_fps
 
-        want = {start_idx + i * stride for i in range(frames)}
-        imgs, i = [], 0
-        while True:
+        times = [start_sec + k * hop_seconds for k in range(frames)]
+        frame_idxs = [min(int(round(t * native_fps)), total - 1) for t in times]
+
+        imgs = []
+        for idx in frame_idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if not ok:
                 break
-            if i in want:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (resize_hw[1], resize_hw[0]), interpolation=CV2_INTER)
-                imgs.append(frame)
-                if len(imgs) == frames:
-                    break
-            i += 1
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (resize_hw[1], resize_hw[0]), interpolation=CV2_INTER)
+            imgs.append(frame)
         cap.release()
 
         if len(imgs) == 0:
@@ -462,6 +479,7 @@ class OMAPSDataset(Dataset):
             resize_hw=self.resize,
             channels=self.channels,
             training=is_train,
+            decode_fps=self.decode_fps,
         )
         clip = _tile_vertical(clip, self.tiles)  # T,tiles,C,H,Wt
 
