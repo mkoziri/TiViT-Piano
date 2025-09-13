@@ -162,6 +162,8 @@ def main():
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
         cfg["dataset"]["frames"] = args.frames
+    decode_fps = float(cfg["dataset"].get("decode_fps", 1.0))
+    hop_seconds = float(cfg["dataset"].get("hop_seconds", 1.0 / decode_fps))
     split = args.split or cfg["dataset"].get("split_val", "val")
     loader = make_dataloader(cfg, split=split)
     if isinstance(loader, dict):

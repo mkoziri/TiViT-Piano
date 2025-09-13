@@ -311,7 +311,7 @@ def _build_frame_targets(labels: torch.Tensor,
                          clef_thresholds=(60, 64),
                          dilate_active_frames: int = 0,
                          targets_sparse: bool = False):
-   """Build per-frame targets aligned to sampled frames."""
+    """Build per-frame targets aligned to sampled frames."""
     hop_seconds = stride / max(1.0, float(fps))
     
     T = int(T)

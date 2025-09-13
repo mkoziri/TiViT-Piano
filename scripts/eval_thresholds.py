@@ -7,6 +7,7 @@ repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
 from utils import load_config, align_pitch_dim
+from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 
@@ -76,6 +77,38 @@ def _binary_f1(pred, target, eps=1e-8):
     return 2 * precision * recall / (precision + recall + eps)
    
    
+def _event_f1(pred, target, hop_seconds: float, tol_sec: float, eps=1e-8):
+    """Event-level F1 score with time tolerance."""
+    pred_pos = pred.nonzero(as_tuple=False)
+    true_pos = target.nonzero(as_tuple=False)
+    if pred_pos.numel() == 0 and true_pos.numel() == 0:
+        return None
+
+    pred_times = frame_to_sec(pred_pos[:, 0], hop_seconds)
+    true_times = frame_to_sec(true_pos[:, 0], hop_seconds)
+    pred_pitch = pred_pos[:, 1]
+    true_pitch = true_pos[:, 1]
+
+    used = torch.zeros(true_pos.shape[0], dtype=torch.bool)
+    tp = 0
+    for i in range(pred_pos.shape[0]):
+        p = pred_pitch[i]
+        t = pred_times[i]
+        mask = (true_pitch == p) & (~used)
+        if mask.any():
+            cand_idx = torch.where(mask)[0]
+            diffs = torch.abs(true_times[cand_idx] - t)
+            min_diff, j = torch.min(diffs, dim=0)
+            if min_diff.item() <= tol_sec:
+                tp += 1
+                used[cand_idx[j]] = True
+    fp = pred_pos.shape[0] - tp
+    fn = true_pos.shape[0] - tp
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    return 2 * precision * recall / (precision + recall + eps)
+
+
 def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
     """Downsample a (B,T,P) pianoroll along time using max pooling.
 
@@ -150,6 +183,11 @@ def main():
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
         cfg["dataset"]["frames"] = args.frames
+    decode_fps = float(cfg["dataset"].get("decode_fps", 1.0))
+    hop_seconds = float(cfg["dataset"].get("hop_seconds", 1.0 / decode_fps))
+    event_tolerance = float(
+        cfg["dataset"].get("frame_targets", {}).get("tolerance", hop_seconds)
+    )
     split = args.split or cfg["dataset"].get("split_val", "val")
 
     # build loader
@@ -253,20 +291,24 @@ def main():
 
         f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
         f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
+        ev_f1_on = _event_f1(onset_pred_bin, onset_true_bin, hop_seconds, event_tolerance)
+        ev_f1_off = _event_f1(offset_pred_bin, offset_true_bin, hop_seconds, event_tolerance)
         onset_pred_rate = onset_pred_bin.mean().item()
         onset_pos_rate = onset_true_bin.mean().item()
 
         f1_on = 0.0 if f1_on is None else f1_on
         f1_off = 0.0 if f1_off is None else f1_off
+        ev_f1_on = 0.0 if ev_f1_on is None else ev_f1_on
+        ev_f1_off = 0.0 if ev_f1_off is None else ev_f1_off
 
-        print(f"{on_thr:.2f}\t{off_thr:.2f}\t{f1_on:0.3f}\t{f1_off:0.3f}\t{onset_pred_rate:0.3f}\t{onset_pos_rate:0.3f}\t0.000")
+        print(f"{on_thr:.2f}\t{off_thr:.2f}\t{f1_on:0.3f}\t{f1_off:0.3f}\t{onset_pred_rate:0.3f}\t{onset_pos_rate:0.3f}\t{ev_f1_on:0.3f}\t{ev_f1_off:0.3f}")
 
     printed_header = False
 
     def _header():
         nonlocal printed_header
         if not printed_header:
-            print("onset_thr\toffset_thr\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\ttotal")
+            print("onset_thr\toffset_thr\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\tonset_event_f1\toffset_event_f1")
             printed_header = True
 
     if args.head is None:
