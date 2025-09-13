@@ -1,7 +1,9 @@
 # scripts/train.py
-from utils import load_config
+from utils import load_config, setup_logging, get_logger
 from data import make_dataloader
 from models import build_model
+
+logger = get_logger(__name__)
 
 import os
 import argparse
@@ -64,10 +66,16 @@ def _print_head_grad_norms(model, step_tag=""):
             head_norms[name] = n
     if head_norms:
         top = sorted(head_norms.items(), key=lambda kv: kv[1], reverse=True)[:6]
-        print(f"[GRAD{(':'+step_tag) if step_tag else ''}] onset/offset param norms (top): " +
-              ", ".join(f"{k}={v:.4e}" for k,v in top))
+        logger.debug(
+            "[GRAD%s] onset/offset param norms (top): %s",
+            f":{step_tag}" if step_tag else "",
+            ", ".join(f"{k}={v:.4e}" for k, v in top),
+        )
     else:
-        print(f"[GRAD{(':'+step_tag) if step_tag else ''}] no onset/offset grads found")
+        logger.debug(
+            "[GRAD%s] no onset/offset grads found",
+            f":{step_tag}" if step_tag else "",
+        )
 
 def _pool_roll_BT(x_btP, Tprime):
     # (B,T,P) -> (B,T',P) with "any positive in window" preserved via max
@@ -646,8 +654,11 @@ def main():
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--stride", type=int)
+    ap.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    ap.add_argument("--smoke", action="store_true", help="Run a quick synthetic pass")
     args = ap.parse_args()
 
+    setup_logging(args.debug)
     set_seed(42)
     cfg = load_config(args.config)
     if args.max_clips is not None:
@@ -656,6 +667,14 @@ def main():
         cfg["dataset"]["frames"] = args.frames
     if args.stride is not None:
         cfg["dataset"]["stride"] = args.stride
+        
+    if args.smoke:
+        logger.info("Running smoke test")
+        model = build_model(cfg)
+        x = torch.randn(1, 4, 3, 224, 224)
+        out = model(x)
+        logger.info("Smoke forward keys: %s", list(out.keys()))
+        return
         
     freeze_epochs = int(cfg.get("train", {}).get("freeze_backbone_epochs", 0))
     ckpt_dir, log_root = ensure_dirs(cfg)
@@ -710,14 +729,24 @@ def main():
             ])
             num_head = sum(p.numel() for p in head_params)
             num_base = sum(p.numel() for p in base_params)
-            print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: {num_head:,} @ lr={base_lr*5.0}")
+            logger.info(
+                "[OPT] base params: %s @ lr=%s | head params: %s @ lr=%s",
+                f"{num_base:,}",
+                base_lr,
+                f"{num_head:,}",
+                base_lr * 5.0,
+            )
         else:
             # Fallback: treat all parameters as base params if no onset/offset heads exist
             opt = torch.optim.AdamW([
                 {"params": base_params, "lr": base_lr, "weight_decay": wd},
             ])
             num_base = sum(p.numel() for p in base_params)
-            print(f"[OPT] base params: {num_base:,} @ lr={base_lr} | head params: 0 @ lr=n/a")
+            logger.info(
+                "[OPT] base params: %s @ lr=%s | head params: 0 @ lr=n/a",
+                f"{num_base:,}",
+                base_lr,
+            )
         return opt
 
     optimizer = build_optimizer(model, cfg["training"])
@@ -741,6 +770,7 @@ def main():
     want_resume = bool(cfg.get("training", {}).get("resume", False))
     if resume_path.exists():
         print(f"[resume] Loading from {resume_path}")
+        logger.info("[resume] Loading from %s", resume_path)
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
         best_val = ckpt.get("best_val", math.inf)
@@ -748,6 +778,7 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception as e:
             print(f"[resume] optimizer groups mismatch; skipping optimizer state. ({e})")
+            logger.warning("[resume] optimizer groups mismatch; skipping optimizer state. (%s)", e)
             # scheduler will be re-created fresh below
         start_epoch = int(ckpt.get("epoch", 0)) + 1
     else:
@@ -781,6 +812,7 @@ def main():
         optimizer = build_optimizer(model, cfg["training"])
         n_trainable = sum(p.requires_grad for p in model.parameters())
         print(f"[warmup] trainable params: {n_trainable}")
+        logger.info("[warmup] trainable params: %s", n_trainable)
 
     for epoch in range(start_epoch, epochs + 1):
         if freeze_epochs and epoch == freeze_epochs:
@@ -804,6 +836,7 @@ def main():
         _first_batch = next(iter(train_loader))
         _have_frame_keys = all(k in _first_batch for k in ("pitch_roll","onset_roll","offset_roll","hand_frame","clef_frame"))
         print(f"[DEBUG] frame-mode keys present: {_have_frame_keys}")
+        logger.debug("frame-mode keys present: %s", _have_frame_keys)
         del _first_batch
         #END CAL
         
@@ -898,6 +931,7 @@ def main():
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
             val_metrics = evaluate_one_epoch(model, val_loader, cfg)
             print("Val:", " ".join([f"{k}={v:.3f}" for k, v in val_metrics.items()]))
+            logger.info("Val: %s", " ".join(f"{k}={v:.3f}" for k, v in val_metrics.items()))
             if writer is not None:
                 for k, v in val_metrics.items():
                     writer.add_scalar(f"val/{k}", v, epoch)
@@ -906,6 +940,7 @@ def main():
                 best_val = val_total
                 save_checkpoint(best_path, model, optimizer, epoch, cfg, best_val)
                 print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
+                logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
 
         # --- always save LAST ---
         save_checkpoint(last_path, model, optimizer, epoch, cfg, best_val)
