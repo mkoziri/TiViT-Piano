@@ -153,7 +153,22 @@ class KeyPriorConfig:
 
 
 class KeyAwarePrior:
-    """Estimate musical keys and apply pitch-class priors to logits."""
+    """Estimate musical keys and apply pitch-class priors to logits.
+
+    The typical workflow is:
+
+    1. Call :meth:`estimate_key_posteriors` with ``(T, P)`` logits to obtain a
+       per-frame distribution over the 24 candidate keys and the associated key
+       labels.
+    2. Pass the resulting posterior to :meth:`pc_prior_from_keys` to convert it
+       into a ``(T, 12)`` pitch-class prior with rows that sum to one.
+    3. Supply the original logits and the pitch-class prior to
+       :meth:`rescore_logits_with_pc_prior` to obtain soft-rescored logits that
+       remain finite.
+
+    Each method accepts and returns NumPy arrays so the utilities integrate into
+    both offline scripts and JIT-free research workflows.
+    """
 
     def __init__(self, config: KeyPriorConfig | None = None) -> None:
         """Initialize the prior estimator.

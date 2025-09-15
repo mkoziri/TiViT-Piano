@@ -21,13 +21,14 @@ Rescore onset & offset logits with a 3-second key window::
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
-from theory.key_prior import KeyAwarePrior, KeyPriorConfig
+from tivit.theory import KeyAwarePrior, KeyPriorConfig
 
 
 LOGIT_HEADS: Tuple[str, ...] = ("onset", "pitch", "offset")
@@ -166,6 +167,91 @@ def save_npz(
     np.savez_compressed(path, **np_arrays)
 
 
+def maybe_save_key_track(
+    path: Path | None,
+    fps: float,
+    posteriors: np.ndarray,
+    key_names: List[str],
+) -> None:
+    """Optionally write a CSV summary of the key posterior."""
+
+    if path is None:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    num_frames = posteriors.shape[0]
+    times = (
+        np.arange(num_frames, dtype=np.float64) / fps if num_frames else np.empty(0)
+    )
+
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["t_sec", "top1_key", "top1_prob", "top2_key", "top2_prob"])
+        if num_frames == 0:
+            return
+
+        sorted_indices = np.argsort(posteriors, axis=1)[:, ::-1]
+        sorted_probs = np.take_along_axis(posteriors, sorted_indices, axis=1)
+
+        for frame, time in enumerate(times):
+            top1_idx = int(sorted_indices[frame, 0])
+            if sorted_indices.shape[1] >= 2:
+                top2_idx = int(sorted_indices[frame, 1])
+                top2_prob = float(sorted_probs[frame, 1])
+            else:
+                top2_idx = top1_idx
+                top2_prob = float(sorted_probs[frame, 0])
+
+            writer.writerow(
+                [
+                    float(time),
+                    key_names[top1_idx],
+                    float(sorted_probs[frame, 0]),
+                    key_names[top2_idx],
+                    top2_prob,
+                ]
+            )
+
+    print(f"[theory_decode] wrote key posterior track -> {path}")
+
+
+def maybe_plot_key_posteriors(
+    enabled: bool, fps: float, posteriors: np.ndarray, key_names: List[str]
+) -> None:
+    """Display a heatmap of the key posterior when requested."""
+
+    if not enabled:
+        return
+
+    if posteriors.size == 0:
+        print("[theory_decode] skipping plot: no frames available.")
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("matplotlib is required for --plot") from exc
+
+    num_frames = posteriors.shape[0]
+    duration = num_frames / fps if fps > 0 else float(num_frames)
+    extent = (0.0, duration, -0.5, len(key_names) - 0.5)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    im = ax.imshow(
+        posteriors.T,
+        aspect="auto",
+        origin="lower",
+        extent=extent,
+    )
+    ax.set_xlabel("Time (s)" if fps > 0 else "Frame")
+    ax.set_ylabel("Key")
+    ax.set_yticks(np.arange(len(key_names)))
+    ax.set_yticklabels(key_names)
+    fig.colorbar(im, ax=ax, label="Posterior")
+    fig.tight_layout()
+    plt.show()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Apply a key-aware pitch-class prior to saved logits."
@@ -195,6 +281,17 @@ def main() -> None:
         type=str,
         default=None,
         help="Reference head to estimate the key posterior (onset, pitch, or offset).",
+    )
+     parser.add_argument(
+        "--save_key_track",
+        type=Path,
+        default=None,
+        help="Optional CSV path to save per-frame key posterior summaries.",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Display a matplotlib heatmap of the key posterior over time.",
     )
     args = parser.parse_args()
 
@@ -237,7 +334,9 @@ def main() -> None:
     ref_logits = arrays[ref_head]
     P_keys, key_names = prior.estimate_key_posteriors(ref_logits)
     Pc_t = prior.pc_prior_from_keys(P_keys, key_names)
-
+    maybe_save_key_track(args.save_key_track, fps, P_keys, key_names)
+    maybe_plot_key_posteriors(args.plot, fps, P_keys, key_names)
+    
     applied_heads: List[str] = []
     for head in apply_heads:
         if head not in arrays:
