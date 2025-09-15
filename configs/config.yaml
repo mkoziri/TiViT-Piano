@@ -1,6 +1,6 @@
 experiment:
-  name: "TiViT-Piano_OMAPS_calib_v5_onsets_only"
-  seed: 42
+  name: "TiViT-Piano_OMAPS_v1"
+  seed: 1332 #It was 42
   output_dir: "outputs"
 
 dataset:
@@ -26,7 +26,7 @@ dataset:
   tiles: 3
   channels: 3
   normalize: true
-  batch_size: 1
+  batch_size: 2
   num_workers: 4
   shuffle: true
   require_labels: true
@@ -90,14 +90,14 @@ training:
     onoff_prior_weight: 0.00
     
     # per-task weights
-    onset: 5.0
-    offset: 5.0
+    onset: 8.0
+    offset: 8.0
     pitch: 1.0
     hand: 0.2
     clef: 0.2
 
   metrics:
-    prob_threshold: 0.50 #It was 0.20
+    prob_threshold: 0.20 #It was 0.20
 
 optim:
   grad_clip: 1.0
