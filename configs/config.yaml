@@ -27,13 +27,13 @@ dataset:
   channels: 3
   normalize: true
   batch_size: 1
-  num_workers: 0
+  num_workers: 4
   shuffle: true
   require_labels: true
   frame_targets:
     enable: true
-    tolerance: 0.10  
-    dilate_active_frames: 3  
+    tolerance: 0.00  #It was 0.10
+    dilate_active_frames: 0  #It was 3  
     fill_mode: "overlap"
     hand_from_pitch: true
     clef_thresholds: [60, 64]
@@ -41,7 +41,7 @@ dataset:
     note_max: 127
     cache_labels: true
     cache_dir: ".cache/labels"
-    targets_sparse: false
+    targets_sparse: true #It was false
 
 model:
   name: "TiViT-Piano"
@@ -62,7 +62,7 @@ model:
     dropout: 0.10
 
 training:
-  epochs: 5
+  epochs: 30
   learning_rate: 3e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -97,19 +97,19 @@ training:
     clef: 0.2
 
   metrics:
-    prob_threshold: 0.20
+    prob_threshold: 0.50 #It was 0.20
 
 optim:
   grad_clip: 1.0
 
 train:
-  accumulate_steps: 1
+  accumulate_steps: 4  #It was 1
   freeze_backbone_epochs: 3
 
 logging:
   log_dir: "logs"
   checkpoint_dir: "checkpoints"
-  tensorboard: false
+  tensorboard: true
 
 inference:
   output_dir: "inference_results"
