@@ -12,5 +12,5 @@ This repository contains experiments around a piano transcription model.
 
 To regenerate:
 ```bash
-python scripts/doc/gen_repo_tree.py
-python scripts/doc/gen_file_index.py
+python scripts/dev/gen_repo_tree.py
+python scripts/dev/gen_file_index.py
