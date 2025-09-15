@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys, json, torch
+import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
 
@@ -38,6 +39,31 @@ DEFAULT_THRESHOLDS = [
     0.95,
     1.00,
 ]
+
+
+def _prepare_logits_for_dump(tensor: torch.Tensor) -> np.ndarray:
+    """Flatten a tensor to (T,P) and return a contiguous float64 numpy array."""
+
+    if tensor is None:
+        raise ValueError("Expected tensor, got None")
+    if tensor.ndim < 2:
+        raise ValueError(f"Logits tensor must have at least 2 dims, got {tensor.ndim}")
+
+    tensor = tensor.contiguous()
+    last_dim = tensor.shape[-1]
+    tensor = tensor.reshape(-1, last_dim).contiguous()
+
+    if tensor.ndim != 2:
+        raise ValueError(f"Logits tensor reshape result must be 2D, got {tensor.ndim}D")
+    if not tensor.is_contiguous():
+        raise ValueError("Expected contiguous tensor after reshape")
+
+    array = np.ascontiguousarray(tensor.numpy(), dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError(f"NumPy logits array must be 2D, got {array.ndim}D")
+    if not array.flags["C_CONTIGUOUS"]:
+        raise ValueError("Expected contiguous NumPy array for logits dump")
+    return array
 
 
 def _parse_list(argv, name):
@@ -163,6 +189,11 @@ def main():
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
+    ap.add_argument(
+        "--dump_logits",
+        default="",
+        help="Optional path to save per-frame logits as a compressed NPZ",
+    )
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
@@ -205,6 +236,7 @@ def main():
 
     # run model once to collect logits/probabilities and targets
     onset_logits_list, offset_logits_list = [], []
+    pitch_logits_list = []
     onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
     with torch.no_grad():
@@ -215,7 +247,8 @@ def main():
             # prefer *_logits if present; fallback to old naming
             onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
             offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
-
+            pitch_logits = out.get("pitch_logits")
+            
             # Apply temperature scaling and bias for calibration
             onset_logits = onset_logits / args.temperature + args.bias
             offset_logits = offset_logits / args.temperature + args.bias
@@ -227,6 +260,11 @@ def main():
             onset_probs.append(onset_prob.detach().cpu())
             offset_probs.append(offset_prob.detach().cpu())
 
+            if pitch_logits is not None:
+                if pitch_logits.dim() == 2:
+                    pitch_logits = pitch_logits.unsqueeze(1)
+                pitch_logits_list.append(pitch_logits.detach().cpu())
+                
             onset_tgts.append(batch["onset_roll"].float().cpu())
             offset_tgts.append(batch["offset_roll"].float().cpu())
 
@@ -241,6 +279,7 @@ def main():
                 
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
+    pitch_logits = torch.cat(pitch_logits_list, dim=0) if pitch_logits_list else None
     onset_probs = torch.cat(onset_probs, dim=0)
     offset_probs = torch.cat(offset_probs, dim=0)
     onset_tgts = torch.cat(onset_tgts, dim=0)
@@ -268,6 +307,41 @@ def main():
         )
         diff = (torch.sigmoid(onset_logits) - onset_probs).abs().max().item()
         print(f"[DEBUG] sigmoid max abs diff={diff:.3e}")
+    
+    dump_path = Path(args.dump_logits).expanduser() if args.dump_logits else None
+    if dump_path is not None:
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+        dump_arrays = {}
+        onset_np = _prepare_logits_for_dump(onset_logits)
+        offset_np = _prepare_logits_for_dump(offset_logits)
+        dump_arrays["onset_logits"] = onset_np
+        dump_arrays["offset_logits"] = offset_np
+
+        if pitch_logits is not None:
+            dump_arrays["pitch_logits"] = _prepare_logits_for_dump(pitch_logits)
+
+        pitch_bins = next((arr.shape[1] for arr in dump_arrays.values() if arr is not None), None)
+        frame_cfg = cfg.get("dataset", {}).get("frame_targets", {}) or {}
+        midi_low = int(frame_cfg.get("note_min", 21))
+        midi_high_cfg = frame_cfg.get("note_max")
+        midi_high = int(midi_high_cfg) if midi_high_cfg is not None else midi_low
+        if pitch_bins is not None:
+            if midi_high - midi_low + 1 != pitch_bins:
+                midi_low = 21
+                midi_high = midi_low + pitch_bins - 1
+            else:
+                midi_high = midi_low + pitch_bins - 1
+
+        meta = {
+            "fps": decode_fps,
+            "midi_low": midi_low,
+            "midi_high": midi_high,
+        }
+        dump_arrays["meta"] = json.dumps(meta, sort_keys=True)
+
+        np.savez_compressed(dump_path, **dump_arrays)
+        print(f"[eval] dumped logits -> {dump_path}")
         
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
