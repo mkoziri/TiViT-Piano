@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Inspect dataloader outputs for debugging by printing label tensors,
+    metadata, and summary statistics for a single batch.
+
+Key Functions/Classes:
+    - pick_train_loader(): Normalizes different return types from
+      ``make_dataloader`` to a training loader instance.
+    - describe_tensor(): Logs tensor shapes and positive rates for frame-level
+      targets.
+    - main(): Loads configuration, fetches one batch from the training split,
+      and dumps relevant diagnostics.
+
+CLI:
+    Execute ``python scripts/dump_labels.py``.  The script has no arguments and
+    prints results directly to stdout.
+"""
+
 import sys
 from pathlib import Path
 

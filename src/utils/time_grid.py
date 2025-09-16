@@ -1,5 +1,16 @@
-"""Utility functions for converting between seconds and frame indices on a
-uniform time grid."""
+"""Purpose:
+    Convert between seconds and frame indices on a uniform time grid using
+    tensor-friendly helper functions.
+
+Key Functions/Classes:
+    - sec_to_frame(): Map seconds to frame indices with optional bounds.
+    - frame_to_sec(): Convert frame indices back to seconds while supporting
+      tensor inputs.
+
+CLI:
+    None.  Import these helpers wherever timing conversions are needed.
+"""
+
 from __future__ import annotations
 
 from typing import Optional, Union

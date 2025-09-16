@@ -1,4 +1,17 @@
-"""Generate docs/REPO_TREE.md showing repository structure."""
+"""Purpose:
+    Produce a Markdown tree view of the repository while respecting
+    ``.gitignore`` and project-specific ignore patterns.
+
+Key Functions/Classes:
+    - build_tree(): Recursively enumerate directory entries while applying the
+      ignore rules.
+    - load_gitignore(): Reads ``.gitignore`` patterns to augment the ignore
+      set.
+
+CLI:
+    Execute ``python scripts/dev/gen_repo_tree.py``.  The script has no CLI
+    options and writes ``docs/REPO_TREE.md``.
+"""
 
 from __future__ import annotations
 

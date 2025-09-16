@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Quick diagnostic of the time grid for a single clip.
+"""Purpose:
+    Diagnose the dataset time grid by examining the relationship between frame
+    indices, seconds, and raw label timestamps for a single clip.
 
-For the first clip from the configured dataset (test split), print:
-  * First 10 time-grid values ``t_k`` (seconds)
-  * A few raw label onset times and the frame ``k`` they map to
-  * A small table showing ``k``, ``t_k`` and whether any pitch onset occurs
+Key Functions/Classes:
+    - main(): Loads configuration, fetches one batch from the test split, and
+      prints time-grid samples along with label mappings.
+
+CLI:
+    Execute ``python scripts/probe_timegrid.py``.  The script has no arguments
+    and prints diagnostic information to stdout.
 """
+
 import sys
 from pathlib import Path
 

@@ -1,4 +1,17 @@
-"""Generate docs/FILE_INDEX.md with per-file summaries."""
+"""Purpose:
+    Generate ``docs/FILE_INDEX.md`` summarizing module purposes, top-level
+    definitions, and CLI arguments across the repository.
+
+Key Functions/Classes:
+    - summarize_file(): Builds the Markdown section describing a single source
+      file, including key functions/classes and CLI tables.
+    - parse_cli(): Extracts ``argparse`` definitions from an abstract syntax
+      tree to document command-line interfaces automatically.
+
+CLI:
+    Run ``python scripts/dev/gen_file_index.py`` to refresh the Markdown index.
+    The script takes no arguments and writes output in-place.
+"""
 
 from __future__ import annotations
 

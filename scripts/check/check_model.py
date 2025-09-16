@@ -1,3 +1,16 @@
+"""Purpose:
+    Quick smoke test that instantiates the TiViT-Piano model and verifies the
+    output tensor shapes produced by a dummy forward pass.
+
+Key Functions/Classes:
+    - main(): Loads ``configs/config.yaml``, builds the configured model, and
+      prints the shapes of each prediction head given random input data.
+
+CLI:
+    Run ``python scripts/check_model.py`` without arguments.  The script prints
+    batch shapes to stdout and exits.
+"""
+
 from utils import load_config
 from models import build_model
 import torch

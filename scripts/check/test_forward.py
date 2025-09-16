@@ -1,3 +1,16 @@
+"""Purpose:
+    Validate a full dataloader-to-model pipeline by running a forward pass on a
+    real batch and printing timing plus output tensor statistics.
+
+Key Functions/Classes:
+    - main(): Loads the configuration, builds the dataloader and model, executes
+      a forward pass, and reports shapes and value ranges.
+
+CLI:
+    Execute ``python scripts/test_forward.py``.  The script requires no
+    arguments and is useful for sanity checks.
+"""
+
 from utils import load_config
 from models import build_model
 from data import make_dataloader

@@ -1,3 +1,16 @@
+"""Purpose:
+    Provide a thin factory that instantiates :class:`TiViTPiano` from nested
+    configuration dictionaries used across training and evaluation scripts.
+
+Key Functions/Classes:
+    - build_model(): Reads transformer/head parameters from ``cfg`` and returns
+      a configured TiViT-Piano instance.
+
+CLI:
+    Not applicable; this module is imported by scripts such as
+    :mod:`scripts.train` and :mod:`scripts.eval_thresholds`.
+"""
+
 from typing import Any, Mapping
 from .tivit_piano import TiViTPiano
 

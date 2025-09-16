@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Lag sweep between model predictions and ground truth events.
+"""Purpose:
+    Diagnose temporal alignment between model predictions and ground-truth
+    onset/offset labels by sweeping integer frame shifts and evaluating
+    correlation and F1 scores.
 
-This script loads a single clip, runs the trained model on a chosen head
-(onset/offset), aggregates predictions and ground truth over pitch, and then
-sweeps integer frame shifts to evaluate temporal alignment via correlation and
-F1.  It is intended as a diagnostic utility and performs a number of safety
-checks so that silent failures are caught early.
+Key Functions/Classes:
+    - _align(): Crops tensors after applying a temporal shift so correlations
+      can be computed on equal-length sequences.
+    - _load_window(): Fetches a temporal window from disk using the dataset's
+      decoding parameters and tiling scheme.
+    - main(): CLI entry point that loads configuration, runs the model on a
+      selected clip, and sweeps lag offsets.
+
+CLI:
+    Run ``python scripts/lag_sweep.py --split val --clip <name> --seconds 5 --ckpt``
+    to analyze a specific window.  Optional flags include ``--head`` to choose
+    onset or offset logits and ``--max_shift`` for the sweep range.
 """
 
 from __future__ import annotations

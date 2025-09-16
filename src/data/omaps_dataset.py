@@ -1,4 +1,20 @@
-# This is a working version. It is clip-supervision version (before going to frame-level supervision
+"""Purpose:
+    Implement the OMAPS dataset loader used by TiViT-Piano, including video
+    decoding, label parsing, and frame-level target generation.
+
+Key Functions/Classes:
+    - OMAPSDataset: PyTorch dataset that yields tiled video clips, timing
+      metadata, and structured label targets.
+    - make_dataloader(): Factory that builds dataloaders with appropriate
+      collate functions for clip or frame objectives.
+    - Helper utilities such as ``_load_clip_decord`` and ``_build_frame_targets``
+      perform decoding, tiling, and pianoroll construction.
+
+CLI:
+    Not a standalone CLI.  The dataset is consumed by scripts like
+    :mod:`scripts.train`, :mod:`scripts.eval_thresholds`, and diagnostic tools.
+"""
+
 import os
 import glob
 from pathlib import Path

@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Remove derived artifacts such as checkpoints, logs, caches, and ``__pycache__``
+    directories while protecting source code and dataset assets.
+
+Key Functions/Classes:
+    - list_targets(): Builds deletion plans based on presets or explicit toggles
+      while respecting dataset exclusions and configuration overrides.
+    - delete_groups(): Applies the removal plan with dry-run support and safety
+      checks.
+    - main(): Parses CLI arguments (e.g., ``--preset`` or ``--keep-best``) and
+      coordinates cleanup operations.
+
+CLI:
+    Run ``python scripts/clean_tivit.py --project-root <path>`` with presets
+    like ``pre-run`` or ``logs``.  Combine ``--dry-run`` and ``--yes`` to
+    preview or confirm deletions.
+"""
 # scripts/clean_tivit.py
 #
 # TiViT cleaner that mirrors the exact repo layout described in your tivit_structure.txt.

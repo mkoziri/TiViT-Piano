@@ -1,3 +1,16 @@
+"""Purpose:
+    Inspect raw and aggregated label structures produced by the configured
+    dataloader for sanity checking during development.
+
+Key Functions/Classes:
+    - main(): Loads the configured split, prints key tensors, and shows sample
+      label rows and clip-level targets.
+
+CLI:
+    Run ``python scripts/test_labels.py`` without arguments to print label
+    diagnostics for the current dataset configuration.
+"""
+
 from utils import load_config
 from data import make_dataloader
 

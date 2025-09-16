@@ -1,3 +1,21 @@
+"""Purpose:
+    Define the TiViT-Piano neural network architecture including tubelet
+    embedding, factorized space-time attention, and multi-task prediction
+    heads.
+
+Key Functions/Classes:
+    - TubeletEmbed: Performs 3D convolutional patchification over temporal
+      windows to produce token sequences per tile.
+    - FactorizedSpaceTimeEncoder: Applies temporal, spatial, and global
+      transformer blocks in a ViViT-style factorization.
+    - TiViTPiano: Wraps embedding, encoder, and head modules to produce clip or
+      frame-level predictions for pitch, onset, offset, hand, and clef tasks.
+
+CLI:
+    Not a CLI module; instantiate :class:`TiViTPiano` via configuration
+    factories for training or evaluation scripts.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

@@ -1,4 +1,21 @@
-# scripts/train.py
+"""Purpose:
+    Train TiViT-Piano models by loading configuration, preparing dataloaders,
+    running the optimization loop, and logging metrics/checkpoints.
+
+Key Functions/Classes:
+    - compute_loss() / compute_loss_frame(): Implement clip- and frame-level
+      loss calculations with focal/BCE options and auxiliary regularizers.
+    - train(): Orchestrates the optimization loop (defined later in the file)
+      including gradient scaling, logging, and checkpointing helpers.
+    - main(): Parses CLI arguments, initializes logging, and kicks off training
+      using the selected configuration.
+
+CLI:
+    Run ``python scripts/train.py --config configs/config.yaml`` with optional
+    overrides such as ``--epochs`` or dataset adjustments defined within the
+    configuration file.
+"""
+
 from utils import load_config, setup_logging, get_logger
 from data import make_dataloader
 from models import build_model

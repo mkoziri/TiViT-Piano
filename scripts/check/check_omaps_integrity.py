@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Validate the on-disk OMAPS dataset by checking video/label pairs, reporting
+    anomalies, and collecting metadata summaries.
+
+Key Functions/Classes:
+    - scan_split(): Scans a split directory to match MP4 and TXT files, reading
+      note annotations and computing statistics.
+    - read_labels(): Parses sidecar label files and ensures timings and MIDI
+      values are valid.
+    - main(): Handles CLI arguments, writes JSON/TSV reports, and prints
+      high-level dataset diagnostics.
+
+CLI:
+    Execute ``python scripts/check_omaps_integrity.py --root ~/datasets/OMAPS``
+    with optional ``--probe-media`` to query ``ffprobe`` details and
+    ``--meta-dir``/``--report-dir`` to control output locations.
+"""
+
 import argparse, json, os, re, shutil
 from pathlib import Path
 from statistics import median

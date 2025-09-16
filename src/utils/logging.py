@@ -1,3 +1,14 @@
+"""Purpose:
+    Provide consistent logging helpers for TiViT-Piano scripts and libraries.
+
+Key Functions/Classes:
+    - setup_logging(): Configure the root logger with an optional debug level.
+    - get_logger(): Convenience wrapper returning namespaced loggers.
+
+CLI:
+    None.  Import these helpers from ``src.utils.logging``.
+"""
+
 import logging
 from typing import Optional
 

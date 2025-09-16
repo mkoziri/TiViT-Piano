@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-# scripts/parse_sweep.py
+"""Purpose:
+    Summarize sweep or calibration experiment logs by parsing TSV-like rows,
+    sorting metrics, and writing CSV/Markdown reports.
+
+Key Functions/Classes:
+    - parse_val_line(): Converts ``key=value`` fragments into numeric entries
+      when possible.
+    - to_num_or_none(): Utility that casts tokens to numbers while tolerating
+      sentinel strings.
+    - main(): Provides the CLI flow for reading the results file, filtering by
+      return code, sorting, and writing outputs.
+
+CLI:
+    Invoke ``python scripts/parse_sweep.py --results sweep_results.txt`` with
+    optional ``--sort_by`` or ``--filter_retcode`` flags to control the summary
+    outputs ``--out_csv`` and ``--out_md``.
+"""
+
 import argparse, csv, math, re, sys
 from pathlib import Path
 

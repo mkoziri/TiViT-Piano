@@ -1,4 +1,16 @@
-# src/data/collate.py
+"""Purpose:
+    Provide custom collation utilities for batching frame-wise piano datasets
+    with dense or sparse target encodings.
+
+Key Functions/Classes:
+    - collate_framewise(): Stacks video tensors, frame times, and label
+      dictionaries into a batch compatible with TiViT-Piano models.
+
+CLI:
+    None.  These helpers are used by dataloaders within the training and
+    evaluation scripts.
+"""
+
 from typing import List, Dict, Any
 import torch
 

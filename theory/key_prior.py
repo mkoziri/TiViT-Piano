@@ -1,8 +1,18 @@
-"""Pitch-class key prior utilities.
+"""Purpose:
+    Implement pitch-class key priors that estimate musical keys and rescore
+    model logits with theory-aware adjustments.
 
-This module provides NumPy implementations for building Krumhansl--Schmuckler
-key profiles and for applying a time-varying, key-aware prior to frame-level
-pitch logits.
+Key Functions/Classes:
+    - build_key_profiles(): Constructs normalized Krumhansl--Schmuckler key
+      templates for all major and minor keys.
+    - KeyAwarePrior: Estimates frame-level key posteriors and derives
+      pitch-class priors that rescore onset/pitch logits.
+    - KeyPriorConfig: Dataclass collecting hyper-parameters for the prior
+      estimator, including windowing and MIDI ranges.
+
+CLI:
+    None.  Import these utilities when post-processing logits or running unit
+    tests such as ``scripts/test_key_prior.py``.
 """
 
 from __future__ import annotations

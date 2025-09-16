@@ -1,4 +1,14 @@
-"""Pitch utility helpers."""
+"""Purpose:
+    Provide functions for aligning pitch dimensions between model outputs and
+    dataset targets while logging helpful diagnostics.
+
+Key Functions/Classes:
+    - align_pitch_dim(): Slices or validates pitch dimensions so predictions and
+      labels match, with logging describing the applied mapping.
+
+CLI:
+    None.  Import this helper within training and evaluation code.
+"""
 
 import torch
 from typing import Optional

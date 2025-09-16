@@ -1,4 +1,19 @@
-"""Tests for key-aware prior utilities."""
+"""Purpose:
+    Provide unit-style tests that exercise the key-aware prior to ensure key
+    estimation and rescoring behave as expected.
+
+Key Functions/Classes:
+    - _build_c_major_sequence(): Constructs deterministic logits representing a
+      C-major progression for repeatable testing.
+    - test_estimate_key_posteriors_prefers_c_major(): Asserts that the prior
+      favors the correct key when evaluated on the synthetic sequence.
+    - test_rescore_logits_boosts_in_key_classes(): Checks that rescoring
+      increases in-key pitch classes relative to out-of-key ones.
+
+CLI:
+    Designed for ``pytest``.  Run ``pytest scripts/test_key_prior.py`` or the
+    full suite to execute these tests.
+"""
 
 from __future__ import annotations
 

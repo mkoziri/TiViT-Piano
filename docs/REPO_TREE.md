@@ -13,27 +13,32 @@ tivit/
 │  ├─ omaps_test.json
 │  └─ omaps_train.json
 ├─ scripts
+│  ├─ calib
+│  │  ├─ calibrate.py
+│  │  ├─ calibrate_thresholds.py
+│  │  ├─ dump_labels.py
+│  │  ├─ eval_thresholds.py
+│  │  ├─ inspect_ckpt.py
+│  │  ├─ lag_sweep.py
+│  │  ├─ make_calib_split.py
+│  │  ├─ parse_sweep.py
+│  │  └─ sweep.py
+│  ├─ check
+│  │  ├─ check_model.py
+│  │  ├─ check_omaps_integrity.py
+│  │  ├─ diagnose_onset_offsets.py
+│  │  ├─ test_conf.py
+│  │  ├─ test_forward.py
+│  │  ├─ test_key_prior.py
+│  │  ├─ test_labels.py
+│  │  ├─ test_loader.py
+│  │  └─ test_synthetic_forward.py
 │  ├─ dev
 │  │  ├─ gen_file_index.py
 │  │  └─ gen_repo_tree.py
-│  ├─ calibrate.py
-│  ├─ calibrate_thresholds.py
-│  ├─ check_model.py
-│  ├─ check_omaps_integrity.py
 │  ├─ clean_tivit.py
-│  ├─ diagnose_onset_offsets.py
-│  ├─ dump_labels.py
-│  ├─ eval_thresholds.py
-│  ├─ inspect_ckpt.py
-│  ├─ lag_sweep.py
-│  ├─ make_calib_split.py
-│  ├─ parse_sweep.py
 │  ├─ probe_timegrid.py
-│  ├─ sweep.py
-│  ├─ test_forward.py
-│  ├─ test_labels.py
-│  ├─ test_loader.py
-│  ├─ test_synthetic_forward.py
+│  ├─ theory_decode.py
 │  └─ train.py
 ├─ splits
 │  ├─ calib_list.txt

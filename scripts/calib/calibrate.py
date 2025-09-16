@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Coordinate multi-phase calibration sweeps by editing ``configs/config.yaml``
+    and invoking :mod:`scripts.sweep` with curated parameter grids.
+
+Key Functions/Classes:
+    - set_yaml(): Helper that updates nested YAML keys in the configuration
+      file.
+    - run_sweep(): Launches :mod:`scripts.sweep` with PYTHONPATH configured for
+      the repository.
+    - main(): Parses CLI arguments and orchestrates the staged calibration
+      phases.
+
+CLI:
+    Run ``python scripts/calibrate.py`` with options such as ``--epochs`` for
+    per-run training length, ``--max_clips`` for dataset truncation, and
+    ``--skip_bias_toggle`` to omit the final comparison sweep.
+"""
+
 import argparse, subprocess, sys, os, time
 from pathlib import Path
 

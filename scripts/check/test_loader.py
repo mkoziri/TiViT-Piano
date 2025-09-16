@@ -1,3 +1,16 @@
+"""Purpose:
+    Iterate over the configured dataloader to print batch shapes and sample
+    paths, ensuring dataset settings are correct.
+
+Key Functions/Classes:
+    - main(): Loads ``configs/config.yaml``, constructs a dataloader for the
+      selected split, and prints details for the first two batches.
+
+CLI:
+    Execute ``python scripts/test_loader.py``.  The script accepts no arguments
+    and logs dataset metadata to stdout.
+"""
+
 from utils import load_config
 from data import make_dataloader
 

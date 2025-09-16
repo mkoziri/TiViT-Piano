@@ -1,21 +1,24 @@
-"""CLI for applying a music-theory-informed key prior to saved logits.
+"""Purpose:
+    Apply a music-theory-informed key prior to logits stored in NPZ archives and
+    persist the adjusted predictions together with updated metadata.
 
-This tool loads frame-level logits stored in an NPZ file, estimates a
-time-varying musical key posterior from a reference prediction head, converts
-that posterior into a pitch-class prior, and rescales selected heads' logits
-accordingly. The adjusted logits are then written back to disk in a new NPZ
-file with updated metadata describing the applied prior.
+Key Functions/Classes:
+    - load_npz_logits(): Loads logits arrays and metadata while validating the
+      expected heads and shapes.
+    - maybe_save_key_track(): Optionally writes a CSV summarizing the key
+      posterior over time for inspection.
+    - main(): Parses CLI arguments, builds the prior configuration, applies the
+      prior to requested heads, and saves the results.
 
-Example
--------
-Rescore onset & offset logits with a 3-second key window::
+CLI:
+    Example invocation::
 
-    python scripts/theory_decode.py \
-      --in_npz out/val_logits.npz \
-      --out_npz out/val_logits_keyaware.npz \
-      --apply_to onset,offset \
-      --window_sec 3.0 --beta 4.0 --rho_uniform 0.8 --lambda_key 0.5 \
-      --fps 30 --midi_low 21 --midi_high 108
+        python scripts/theory_decode.py \
+          --in_npz out/val_logits.npz \
+          --out_npz out/val_logits_keyaware.npz \
+          --apply_to onset,offset \
+          --window_sec 3.0 --beta 4.0 --rho_uniform 0.8 --lambda_key 0.5 \
+          --fps 30 --midi_low 21 --midi_high 108
 """
 
 from __future__ import annotations
@@ -282,7 +285,7 @@ def main() -> None:
         default=None,
         help="Reference head to estimate the key posterior (onset, pitch, or offset).",
     )
-     parser.add_argument(
+    parser.add_argument(
         "--save_key_track",
         type=Path,
         default=None,

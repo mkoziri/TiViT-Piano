@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Analyze onset and offset head behavior across a few batches by logging
+    probability statistics, exporting CSV/plots, and optionally loading
+    checkpoints on CPU or GPU.
+
+Key Functions/Classes:
+    - pick_input_tensor(): Finds the video tensor within heterogeneous batch
+      structures produced by custom collates.
+    - find_logits(): Extracts onset/offset logits from potentially nested model
+      outputs.
+    - summarize(): Computes descriptive statistics used for console and CSV
+      reporting.
+
+CLI:
+    Example usage::
+
+        python scripts/diagnose_onset_offsets.py --config configs/config.yaml \
+            --ckpt checkpoints/tivit_best.pt --split val --batches 5
+
+    Additional options include ``--device`` for CPU/GPU selection.
+"""
+
 import argparse, os, sys, csv
 from pathlib import Path
 

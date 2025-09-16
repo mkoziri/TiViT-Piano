@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
-# scripts/sweep.py
+"""Purpose:
+    Automate hyperparameter sweeps by editing ``configs/config.yaml``, invoking
+    the training script, and logging results for later analysis.
+
+Key Functions/Classes:
+    - run_train(): Executes :mod:`scripts.train` while capturing the final
+      ``Val:`` line and process return code.
+    - parse_list(): Parses comma-separated CLI arguments into typed value
+      lists used to expand the sweep grid.
+    - main(): Coordinates configuration editing, experiment naming, and
+      logging of sweep outcomes.
+
+CLI:
+    Run ``python scripts/sweep.py --gamma 1.5,2.0 --alpha 0.05,0.1`` with
+    additional options such as ``--threshold`` or ``--tag``.  Paths like
+    ``--repo`` and ``--base_config`` can be overridden for custom layouts.
+"""
+
 import argparse
 import hashlib
 import itertools

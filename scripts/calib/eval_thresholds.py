@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Purpose:
+    Sweep onset/offset thresholds and evaluate frame- and event-level metrics,
+    optionally dumping logits for further analysis.
+
+Key Functions/Classes:
+    - _parse_list(): Custom parser that supports comma- or space-separated CLI
+      threshold lists.
+    - _event_f1(): Computes event-level F1 scores using tolerance-aware
+      matching on the time grid.
+    - main(): Parses CLI options, loads a checkpoint, iterates over the
+      dataloader, and prints metric summaries for each threshold.
+
+CLI:
+    Run ``python scripts/eval_thresholds.py --ckpt <path>`` with optional
+    ``--thresholds``/``--prob_thresholds`` lists, ``--split`` to choose a
+    dataset split, and ``--dump_logits`` to save logits to NPZ.
+"""
+
 import sys, json, torch
 import numpy as np
 import torch.nn.functional as F
