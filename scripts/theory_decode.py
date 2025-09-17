@@ -27,11 +27,22 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING, cast
 
 import numpy as np
 
-from tivit.theory import KeyAwarePrior, KeyPriorConfig
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from theory.key_prior import KeyAwarePrior, KeyPriorConfig
+else:
+    try:
+        from tivit.theory import KeyAwarePrior, KeyPriorConfig
+    except ModuleNotFoundError:  # pragma: no cover - environment guard
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        if str(repo_root) not in sys.path:
+            sys.path.append(str(repo_root))
+        from tivit.theory import KeyAwarePrior, KeyPriorConfig
 
 
 LOGIT_HEADS: Tuple[str, ...] = ("onset", "pitch", "offset")
@@ -75,20 +86,20 @@ def load_npz_logits(path: Path) -> Tuple[Dict[str, np.ndarray], Dict[str, object
 
         meta_dict: Dict[str, object]
         if "meta" in data:
-            raw_meta = data["meta"]
-            if np.isscalar(raw_meta):
-                meta_str = str(raw_meta.item())
+            meta_array = np.asarray(data["meta"]).ravel()
+            if meta_array.size == 0:
+                meta_str = ""
+            elif meta_array.ndim == 0 or meta_array.size == 1:
+                meta_str = str(meta_array.item())
             else:
-                meta_array = np.asarray(raw_meta).ravel()
-                if meta_array.size != 1:
-                    raise ValueError("meta array must contain a single JSON string.")
-                meta_str = str(meta_array[0])
+                raise ValueError("meta array must contain a single JSON string.")
             try:
-                meta_dict = json.loads(meta_str) if meta_str else {}
+                meta_obj = json.loads(meta_str) if meta_str else {}
             except json.JSONDecodeError as exc:
                 raise ValueError("Failed to decode meta JSON from NPZ.") from exc
-            if not isinstance(meta_dict, dict):
+            if not isinstance(meta_obj, dict):
                 raise ValueError("Decoded meta JSON must be an object.")
+            meta_dict = cast(Dict[str, object], meta_obj)
         else:
             meta_dict = {}
 
@@ -164,10 +175,12 @@ def save_npz(
 ) -> None:
     """Write logits arrays and metadata to an NPZ file."""
 
-    np_arrays = {f"{head}{NPZ_SUFFIX}": value for head, value in arrays.items()}
+    np_arrays: Dict[str, np.ndarray] = {
+        f"{head}{NPZ_SUFFIX}": value for head, value in arrays.items()
+    }
     meta_json = json.dumps(meta)
     np_arrays["meta"] = np.asarray(meta_json)
-    np.savez_compressed(path, **np_arrays)
+    np.savez_compressed(str(path), **cast(Dict[str, Any], np_arrays))
 
 
 def maybe_save_key_track(
@@ -302,21 +315,26 @@ def main() -> None:
     _, num_pitches = validate_logits_shapes(arrays)
 
     # Resolve configuration parameters using CLI overrides first, then metadata, then defaults.
-    meta_fps = meta.get("fps") if isinstance(meta.get("fps"), (int, float)) else None
-    meta_midi_low = meta.get("midi_low") if isinstance(meta.get("midi_low"), int) else None
-    meta_midi_high = meta.get("midi_high") if isinstance(meta.get("midi_high"), int) else None
+    fps_override = args.fps
+    if fps_override is not None:
+        fps = float(fps_override)
+    else:
+        meta_fps_obj = meta.get("fps")
+        fps = float(meta_fps_obj) if isinstance(meta_fps_obj, (int, float)) else 30.0
 
-    fps = float(args.fps if args.fps is not None else (meta_fps if meta_fps is not None else 30.0))
-    midi_low = int(
-        args.midi_low
-        if args.midi_low is not None
-        else (meta_midi_low if meta_midi_low is not None else 21)
-    )
-    midi_high = int(
-        args.midi_high
-        if args.midi_high is not None
-        else (meta_midi_high if meta_midi_high is not None else 108)
-    )
+    midi_low_override = args.midi_low
+    if midi_low_override is not None:
+        midi_low = int(midi_low_override)
+    else:
+        meta_midi_low = meta.get("midi_low")
+        midi_low = int(meta_midi_low) if isinstance(meta_midi_low, int) else 21
+
+    midi_high_override = args.midi_high
+    if midi_high_override is not None:
+        midi_high = int(midi_high_override)
+    else:
+        meta_midi_high = meta.get("midi_high")
+        midi_high = int(meta_midi_high) if isinstance(meta_midi_high, int) else 108
 
     expected_pitches = midi_high - midi_low + 1
     if expected_pitches <= 0:

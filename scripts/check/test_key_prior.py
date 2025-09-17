@@ -18,10 +18,23 @@ CLI:
 from __future__ import annotations
 
 import numpy as np
+from typing import TYPE_CHECKING
 
-from tivit.theory import KeyAwarePrior, KeyPriorConfig
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from theory.key_prior import KeyAwarePrior, KeyPriorConfig
+else:
+    try:
+        from tivit.theory import KeyAwarePrior, KeyPriorConfig
+    except ModuleNotFoundError:  # pragma: no cover - environment guard
+        import sys
+        from pathlib import Path
 
-
+        repo_root = Path(__file__).resolve().parents[2]
+        if str(repo_root) not in sys.path:
+            sys.path.append(str(repo_root))
+        from tivit.theory import KeyAwarePrior, KeyPriorConfig
+        
+        
 def _build_c_major_sequence() -> tuple[KeyAwarePrior, np.ndarray, np.ndarray, np.ndarray]:
     """Construct a deterministic C-major logit sequence."""
 
@@ -74,5 +87,4 @@ def test_rescore_logits_boosts_in_key_classes() -> None:
 
     assert in_key_delta > 0.0
     assert in_key_delta > out_key_delta
-theory/__init__.py
 
