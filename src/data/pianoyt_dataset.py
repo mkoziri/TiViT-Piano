@@ -46,9 +46,13 @@ def _expand_root(root_dir: Optional[str]) -> Path:
     """Resolve the PianoYT root directory with environment fallbacks."""
 
     if root_dir:
-        p = Path(root_dir).expanduser()
-        if p.exists():
-            return p
+        expanded = Path(os.path.expandvars(str(root_dir))).expanduser()
+        candidates = [expanded]
+        if expanded.name.lower() != "pianoyt":
+            candidates.append(expanded / "PianoYT")
+        for cand in candidates:
+            if cand.exists():
+                return cand
     env = os.environ.get("TIVIT_DATA_DIR") or os.environ.get("DATASETS_HOME")
     if env:
         cand = Path(env).expanduser() / "PianoYT"
@@ -63,15 +67,48 @@ def _expand_root(root_dir: Optional[str]) -> Path:
 
 def _read_split_ids(root: Path, split: str) -> List[str]:
     split_file = root / "splits" / f"{split}.txt"
-    if not split_file.exists():
-        raise FileNotFoundError(f"Split list missing: {split_file}")
-    ids: List[str] = []
-    with split_file.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if line:
-                ids.append(line)
-    return ids
+    if split_file.exists():
+        ids: List[str] = []
+        with split_file.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    ids.append(line)
+        return ids
+
+    split_dir = root / split
+    if not split_dir.exists():
+        raise FileNotFoundError(
+            f"Split list missing: {split_file} and directory missing: {split_dir}"
+        )
+
+    def _extract_id(name: str, prefix: str) -> Optional[str]:
+        if not name.startswith(prefix):
+            return None
+        remainder = name[len(prefix) :]
+        if ".0" not in remainder:
+            return None
+        return remainder.split(".0", 1)[0]
+
+    ids_set = set()
+    for video_path in split_dir.glob("video_*.0*"):
+        vid = _extract_id(video_path.name, "video_")
+        if vid:
+            ids_set.add(vid)
+    for midi_path in split_dir.glob("audio_*.0.midi"):
+        vid = _extract_id(midi_path.name, "audio_")
+        if vid:
+            ids_set.add(vid)
+
+    if not ids_set:
+        raise FileNotFoundError(
+            f"Split list missing: {split_file} and no media found in {split_dir}"
+        )
+
+    LOGGER.info(
+        "[PianoYT] Using inferred ID list for split '%s' from directory %s", split, split_dir
+    )
+    return sorted(ids_set)
 
 
 def _clean_cell(value: Optional[str]) -> str:
