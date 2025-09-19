@@ -14,6 +14,9 @@ CLI:
 
 import argparse
 
+import sys
+from pathlib import Path
+
 from utils import load_config
 from data import make_dataloader
 

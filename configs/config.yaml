@@ -16,8 +16,10 @@ dataset:
   pipeline_v2: false
   # NEW: manifest files that select which IDs belong to each logical role
   manifest:
-    train: splits/train_minus_calib_list.txt
-    val:   splits/calib_list.txt
+    #train: splits/train_minus_calib_list.txt  #For OMAPS
+    #val:   splits/calib_list.txt  #For OMAPS
+    train: data/PianoYT/splits/train_minus_val.txt  #For OMAPS
+    val:   data/PianoYT/splits/splits/val.txt  #For OMAPS
     test:  null                         # test uses the whole test/ folder
   split: "train"
   split_train: "train"

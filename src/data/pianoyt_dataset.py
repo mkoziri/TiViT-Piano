@@ -54,6 +54,10 @@ def _expand_root(root_dir: Optional[str]) -> Path:
         cand = Path(env).expanduser() / "PianoYT"
         if cand.exists():
             return cand
+    project_root = Path(__file__).resolve().parents[2]
+    repo_data = project_root / "data" / "PianoYT"
+    if repo_data.exists():
+        return repo_data
     return Path("~/datasets/PianoYT").expanduser()
 
 
@@ -324,7 +328,15 @@ class PianoYTDataset(Dataset):
         ids = _read_split_ids(self.root, split)
         if manifest:
             allow = _read_manifest(manifest)
-            ids = [vid for vid in ids if vid in allow]
+            filtered = [vid for vid in ids if vid in allow]
+            if filtered:
+                ids = filtered
+            else:
+                LOGGER.warning(
+                    "[PianoYT] Manifest %s removed all ids from split %s; ignoring manifest.",
+                    manifest,
+                    split,
+                )
 
         self.metadata = _load_metadata(self.root)
         self.samples: List[Dict[str, Optional[Path]]] = []
