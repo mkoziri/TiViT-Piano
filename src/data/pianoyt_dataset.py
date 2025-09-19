@@ -70,25 +70,126 @@ def _read_split_ids(root: Path, split: str) -> List[str]:
     return ids
 
 
+def _clean_cell(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return value.strip().lstrip("\ufeff").rstrip("\ufeff")
+
+
+def _normalise_header(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    cleaned = _clean_cell(name)
+    if not cleaned:
+        return ""
+    key = "".join(ch for ch in cleaned.lower() if ch.isalnum())
+    alias_map = {
+        "videoid": "videoID",
+        "miny": "min_y",
+        "maxy": "max_y",
+        "minx": "min_x",
+        "maxx": "max_x",
+        "crop": "crop",
+    }
+    return alias_map.get(key, cleaned)
+
+
 def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
     meta_path = root / "metadata" / "pianoyt.csv"
     table: Dict[str, Tuple[int, int, int, int]] = {}
     if not meta_path.exists():
         return table
     with meta_path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            vid = row.get("videoID")
-            if not vid:
-                continue
-            try:
-                min_y = int(float(row.get("min_y", 0)))
-                max_y = int(float(row.get("max_y", 0)))
-                min_x = int(float(row.get("min_x", 0)))
-                max_x = int(float(row.get("max_x", 0)))
-            except (TypeError, ValueError):
-                continue
-            table[vid] = (min_y, max_y, min_x, max_x)
+        sample = handle.read(4096)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(handle, dialect)
+
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            return table
+
+        if first_row is None:
+            return table
+
+        first_row = [_clean_cell(cell) for cell in first_row]
+        normalised = [_normalise_header(cell) for cell in first_row]
+        header_fields = {name for name in normalised if name}
+        known_header = {"videoID", "min_y", "max_y", "min_x", "max_x", "crop"}
+        has_header = bool(header_fields & known_header)
+
+        if has_header:
+            column_map: Dict[str, int] = {}
+            for idx, name in enumerate(normalised):
+                if name and name not in column_map:
+                    column_map[name] = idx
+
+            video_idx = column_map.get("videoID")
+            if video_idx is None:
+                return table
+
+            crop_keys = ("min_y", "max_y", "min_x", "max_x")
+            has_explicit_crop = all(key in column_map for key in crop_keys)
+            has_compound_crop = "crop" in column_map
+
+            def parse_with_header(raw_row: List[str]) -> None:
+                row = [_clean_cell(cell) for cell in raw_row]
+                if video_idx >= len(row):
+                    return
+                vid = row[video_idx]
+                if not vid:
+                    return
+                try:
+                    if has_explicit_crop:
+                        values = []
+                        for key in crop_keys:
+                            idx = column_map[key]
+                            if idx >= len(row):
+                                raise ValueError
+                            values.append(int(float(row[idx])))
+                    elif has_compound_crop:
+                        idx = column_map["crop"]
+                        if idx >= len(row):
+                            return
+                        raw_crop = row[idx].strip().strip("()[]\"'")
+                        if not raw_crop:
+                            return
+                        parts = [part.strip() for part in raw_crop.replace(";", ",").split(",") if part.strip()]
+                        if len(parts) != 4:
+                            return
+                        values = [int(float(part)) for part in parts]
+                    else:
+                        return
+                except (TypeError, ValueError):
+                    return
+                table[vid] = (values[0], values[1], values[2], values[3])
+
+            for raw_row in reader:
+                parse_with_header(raw_row)
+        else:
+            def parse_headerless_row(raw_row: List[str]) -> None:
+                row = [_clean_cell(cell) for cell in raw_row]
+                if len(row) < 7:
+                    return
+                vid = row[0]
+                if not vid:
+                    return
+                try:
+                    min_y = int(float(row[3]))
+                    max_y = int(float(row[4]))
+                    min_x = int(float(row[5]))
+                    max_x = int(float(row[6]))
+                except (TypeError, ValueError):
+                    return
+                table[vid] = (min_y, max_y, min_x, max_x)
+
+            parse_headerless_row(first_row)
+            for raw_row in reader:
+                parse_headerless_row(raw_row)
     return table
 
 

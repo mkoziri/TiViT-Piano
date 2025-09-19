@@ -37,6 +37,31 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 VIDEO_EXT_PREFERENCE: Sequence[str] = (".mp4", ".mkv", ".webm")
 MIDI_EXT = ".midi"
 
+
+def _clean_cell(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return value.strip().lstrip("\ufeff").rstrip("\ufeff")
+
+
+def _normalise_header(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    cleaned = _clean_cell(name)
+    if not cleaned:
+        return ""
+    key = "".join(ch for ch in cleaned.lower() if ch.isalnum())
+    alias_map = {
+        "videoid": "videoID",
+        "miny": "min_y",
+        "maxy": "max_y",
+        "minx": "min_x",
+        "maxx": "max_x",
+        "crop": "crop",
+    }
+    return alias_map.get(key, cleaned)
+
+
 # Populated via ``load_crop_metadata`` prior to scanning splits.
 PIANOYT_CROPS: Dict[str, Sequence[int]] = {}
 EXCLUDED_IDS: Set[str] = set()
@@ -170,33 +195,28 @@ def load_crop_metadata(root: Path) -> Dict[str, Sequence[int]]:
         return {}
 
     with csv_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            raise SystemExit("metadata/pianoyt.csv has no header row")
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(f, dialect)
 
-        def _normalise_header(name: Optional[str]) -> str:
-            if not name:
-                return ""
-            cleaned = name.strip().lstrip("\ufeff").rstrip("\ufeff")
-            if not cleaned:
-                return ""
-            key = "".join(ch for ch in cleaned.lower() if ch.isalnum())
-            alias_map = {
-                "videoid": "videoID",
-                "miny": "min_y",
-                "maxy": "max_y",
-                "minx": "min_x",
-                "maxx": "max_x",
-                "crop": "crop",
-            }
-            return alias_map.get(key, cleaned)
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            raise SystemExit("metadata/pianoyt.csv is empty")
 
-        normalised_fieldnames = [_normalise_header(name) for name in reader.fieldnames]
-        
-        reader.fieldnames = normalised_fieldnames
-        fields = set(normalised_fieldnames)
-        
-        required = {"videoID", "min_y", "max_y", "min_x", "max_x"}
+        if first_row is None:
+            raise SystemExit("metadata/pianoyt.csv is empty")
+
+        first_row = [_clean_cell(cell) for cell in first_row]
+        normalised = [_normalise_header(cell) for cell in first_row]
+        header_fields = {name for name in normalised if name}
+        known_header = {"videoID", "min_y", "max_y", "min_x", "max_x", "crop"}
+        has_header = bool(header_fields & known_header)
+
         crops: Dict[str, Sequence[int]] = {}
         
         def parse_crop_sequence(values: Sequence[str], video_id: str) -> Sequence[int]:
@@ -207,38 +227,109 @@ def load_crop_metadata(root: Path) -> Dict[str, Sequence[int]]:
                     f"Invalid crop values for videoID={video_id}: {values} ({exc})"
                 ) from exc
 
-        if required.issubset(fields):
-            for row in reader:
-                video_id = (row.get("videoID") or "").strip()
-                if not video_id:
-                    raise SystemExit("metadata/pianoyt.csv row missing videoID")
-                crops[video_id] = parse_crop_sequence(
-                    [row["min_y"], row["max_y"], row["min_x"], row["max_x"]],
-                    video_id,
+        if has_header:
+            column_map: Dict[str, int] = {}
+            for idx, name in enumerate(normalised):
+                if name and name not in column_map:
+                    column_map[name] = idx
+
+            fields = set(column_map)
+            required = {"videoID", "min_y", "max_y", "min_x", "max_x"}
+            alt_required = {"videoID", "crop"}
+
+            video_idx = column_map.get("videoID")
+            if video_idx is None:
+                raise SystemExit("metadata/pianoyt.csv missing column: videoID")
+
+            if required.issubset(fields):
+                for line_no, raw_row in enumerate(reader, start=2):
+                    if not raw_row or not any(cell.strip() for cell in raw_row):
+                        continue
+                    row = [_clean_cell(cell) for cell in raw_row]
+                    if video_idx >= len(row):
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing videoID (line {line_no})"
+                        )
+                    video_id = row[video_idx]
+                    if not video_id:
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing videoID (line {line_no})"
+                        )
+                    values = []
+                    for key in ("min_y", "max_y", "min_x", "max_x"):
+                        idx = column_map[key]
+                        if idx >= len(row):
+                            raise SystemExit(
+                                f"metadata/pianoyt.csv row missing {key} for videoID={video_id}"
+                            )
+                        values.append(row[idx])
+                    crops[video_id] = parse_crop_sequence(values, video_id)
+                return crops
+
+            if alt_required.issubset(fields):
+                crop_idx = column_map["crop"]
+                for line_no, raw_row in enumerate(reader, start=2):
+                    if not raw_row or not any(cell.strip() for cell in raw_row):
+                        continue
+                    row = [_clean_cell(cell) for cell in raw_row]
+                    if video_idx >= len(row):
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing videoID (line {line_no})"
+                        )
+                    video_id = row[video_idx]
+                    if not video_id:
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing videoID (line {line_no})"
+                        )
+                    if crop_idx >= len(row):
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing crop for videoID={video_id}"
+                        )
+                    raw_crop = row[crop_idx]
+                    if not raw_crop:
+                        raise SystemExit(
+                            f"metadata/pianoyt.csv row missing crop for videoID={video_id}"
+                        )
+                    stripped = raw_crop.strip().strip("()[]\"' ")
+                    parts = [
+                        part.strip()
+                        for part in stripped.replace(";", ",").split(",")
+                        if part.strip()
+                    ]
+                    if len(parts) != 4:
+                        raise SystemExit(
+                            "metadata/pianoyt.csv crop should contain four values "
+                            f"for videoID={video_id}: got {raw_crop!r}"
+                        )
+                    crops[video_id] = parse_crop_sequence(parts, video_id)
+                return crops
+
+            missing = (
+                alt_required - fields if alt_required.issubset(fields) else required - fields
+            )
+            raise SystemExit(f"metadata/pianoyt.csv missing columns: {sorted(missing)}")
+
+        def parse_headerless_row(raw_row: List[str], line_no: int) -> None:
+            row = [_clean_cell(cell) for cell in raw_row]
+            if not row or not any(row):
+                return
+            if len(row) < 7:
+                raise SystemExit(
+                    "metadata/pianoyt.csv headerless layout requires 7 columns "
+                    "(videoID,url,split,min_y,max_y,min_x,max_x) "
+                    f"(line {line_no})"
                 )
-            return crops
+            video_id = row[0]
+            if not video_id:
+                raise SystemExit(
+                    f"metadata/pianoyt.csv row missing videoID (line {line_no})"
+                )
+            crops[video_id] = parse_crop_sequence(row[3:7], video_id)
 
-        alt_required = {"videoID", "crop"}
-        missing = alt_required - fields if alt_required.issubset(fields) else required - fields
-        if alt_required.issubset(fields):
-            for row in reader:
-                video_id = (row.get("videoID") or "").strip()
-                if not video_id:
-                    raise SystemExit("metadata/pianoyt.csv row missing videoID")
-                raw_crop = (row.get("crop") or "").strip()
-                if not raw_crop:
-                    raise SystemExit(f"metadata/pianoyt.csv row missing crop for videoID={video_id}")
-                stripped = raw_crop.strip().strip("()[]\"' ")
-                parts = [part.strip() for part in stripped.replace(";", ",").split(",") if part.strip()]
-                if len(parts) != 4:
-                    raise SystemExit(
-                        "metadata/pianoyt.csv crop should contain four values "
-                        f"for videoID={video_id}: got {raw_crop!r}"
-                    )
-                crops[video_id] = parse_crop_sequence(parts, video_id)
-            return crops
-
-        raise SystemExit(f"metadata/pianoyt.csv missing columns: {sorted(missing)}")
+        parse_headerless_row(first_row, 1)
+        for line_no, raw_row in enumerate(reader, start=2):
+            parse_headerless_row(raw_row, line_no)
+        return crops
 
 
 def load_excluded_ids(root: Path) -> Set[str]:
