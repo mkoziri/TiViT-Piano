@@ -174,8 +174,25 @@ def load_crop_metadata(root: Path) -> Dict[str, Sequence[int]]:
         if reader.fieldnames is None:
             raise SystemExit("metadata/pianoyt.csv has no header row")
 
-        # Normalise field names in-place so that trailing spaces do not break lookups.
-        normalised_fieldnames = [name.strip() if name else "" for name in reader.fieldnames]
+        def _normalise_header(name: Optional[str]) -> str:
+            if not name:
+                return ""
+            cleaned = name.strip().lstrip("\ufeff").rstrip("\ufeff")
+            if not cleaned:
+                return ""
+            key = "".join(ch for ch in cleaned.lower() if ch.isalnum())
+            alias_map = {
+                "videoid": "videoID",
+                "miny": "min_y",
+                "maxy": "max_y",
+                "minx": "min_x",
+                "maxx": "max_x",
+                "crop": "crop",
+            }
+            return alias_map.get(key, cleaned)
+
+        normalised_fieldnames = [_normalise_header(name) for name in reader.fieldnames]
+        
         reader.fieldnames = normalised_fieldnames
         fields = set(normalised_fieldnames)
         
