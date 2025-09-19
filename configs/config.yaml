@@ -13,6 +13,7 @@ dataset:
   label_format: "txt"
   label_targets: ["pitch", "onset", "offset", "hand", "clef"]
   max_clips: null
+  pipeline_v2: false
   # NEW: manifest files that select which IDs belong to each logical role
   manifest:
     train: splits/train_minus_calib_list.txt
@@ -31,6 +32,14 @@ dataset:
   channels: 3
   normalize: true
   apply_crop: true
+  canonical_hw: [145, 800]
+  registration:
+    source: "metadata"
+    interp: "bilinear"
+    global_aug:
+      enabled: false
+      resize_jitter: [150, 805]
+      random_crop_hw: [145, 800]
   crop_rescale: "auto"
   include_low_res: false
   batch_size: 2
@@ -67,6 +76,10 @@ model:
     global_tokens: 2
     mlp_ratio: 3.0
     dropout: 0.10
+
+tiling:
+  tokens_split: "auto"
+  overlap_tokens: 0
 
 training:
   epochs: 30

@@ -16,6 +16,8 @@ from typing import Any, Dict
 
 def make_dataloader(cfg: Dict[str, Any], split: str, drop_last: bool = False):
     dataset_cfg = cfg.get("dataset", {})
+    if "pipeline_v2" not in dataset_cfg:
+        dataset_cfg["pipeline_v2"] = False
     name = str(dataset_cfg.get("name", "OMAPS")).lower()
 
     if name == "omaps":
@@ -28,4 +30,11 @@ def make_dataloader(cfg: Dict[str, Any], split: str, drop_last: bool = False):
     return dataset_mod.make_dataloader(cfg, split, drop_last)
 
 
-__all__ = ["make_dataloader"]
+def is_pipeline_v2_enabled(cfg: Dict[str, Any]) -> bool:
+    dataset_cfg = cfg.get("dataset", {})
+    if "pipeline_v2" not in dataset_cfg:
+        dataset_cfg["pipeline_v2"] = False
+    return bool(dataset_cfg["pipeline_v2"])
+
+
+__all__ = ["make_dataloader", "is_pipeline_v2_enabled"]

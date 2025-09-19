@@ -15,7 +15,7 @@ CLI:
 import argparse
 
 from utils import load_config
-from tivit.data.datasets.loader import make_dataloader
+from data import make_dataloader
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect dataset loader output.")

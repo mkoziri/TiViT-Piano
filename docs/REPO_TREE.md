@@ -11,7 +11,10 @@ tivit/
 ├─ metadata
 │  ├─ omaps_all.json
 │  ├─ omaps_test.json
-│  └─ omaps_train.json
+│  ├─ omaps_train.json
+│  ├─ pianoyt_all.json
+│  ├─ pianoyt_test.json
+│  └─ pianoyt_train.json
 ├─ scripts
 │  ├─ calib
 │  │  ├─ calibrate.py
@@ -26,6 +29,7 @@ tivit/
 │  ├─ check
 │  │  ├─ check_model.py
 │  │  ├─ check_omaps_integrity.py
+│  │  ├─ check_pianoyt_integrity.py
 │  │  ├─ diagnose_onset_offsets.py
 │  │  ├─ test_conf.py
 │  │  ├─ test_forward.py
@@ -47,7 +51,9 @@ tivit/
 │  ├─ data
 │  │  ├─ __init__.py
 │  │  ├─ collate.py
-│  │  └─ omaps_dataset.py
+│  │  ├─ loader.py
+│  │  ├─ omaps_dataset.py
+│  │  └─ pianoyt_dataset.py
 │  ├─ models
 │  │  ├─ __init__.py
 │  │  ├─ factory.py
