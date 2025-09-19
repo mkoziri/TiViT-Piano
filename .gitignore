@@ -8,6 +8,7 @@ datasets/
 data/cache/
 data/processed/
 data/omaps
+data/PianoYT
 data_calib/
 .cache/
 .ruff_cache/
