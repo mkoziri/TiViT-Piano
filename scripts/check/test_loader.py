@@ -4,22 +4,47 @@
 
 Key Functions/Classes:
     - main(): Loads ``configs/config.yaml``, constructs a dataloader for the
-      selected split, and prints details for the first two batches.
+      selected split, and prints details for the first two batches (or the
+      requested number of batches).
 
 CLI:
-    Execute ``python scripts/test_loader.py``.  The script accepts no arguments
-    and logs dataset metadata to stdout.
+    Execute ``python scripts/test_loader.py``. Optional arguments can override
+    the configuration path, dataset split, and the number of batches to print.
 """
 
+import argparse
+
 from utils import load_config
-from data import make_dataloader
+from tivit.data.datasets.loader import make_dataloader
 
 def main():
-    cfg = load_config("configs/config.yaml")
-    split = cfg["dataset"].get("split", "test")
+    parser = argparse.ArgumentParser(description="Inspect dataset loader output.")
+    parser.add_argument(
+        "--config",
+        default="configs/config.yaml",
+        help="Path to the configuration file.",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split to load. Overrides the split from the config if provided.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=2,
+        dest="max_batches",
+        help="Number of batches to iterate over before stopping.",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    split = args.split if args.split is not None else cfg["dataset"].get("split", "test")
     loader = make_dataloader(cfg, split=split)
+    dataset_name = cfg["dataset"].get("name", "unknown")
 
     print(f"Dataset split: {split}")
+    print(f"Dataset name: {dataset_name}")
     for i, batch in enumerate(loader):
         x = batch["video"]           # B, T, tiles, C, H, W
         paths = batch["path"]
@@ -27,7 +52,7 @@ def main():
         print(f"[{i}] batch: {B} clips | shape={x.shape}")
         print(" sample:", paths[0])
         print(f"  B={B}, T={T}, tiles={M}, C={C}, H={H}, W={W}")
-        if i == 1:
+        if i + 1 >= args.max_batches:
             break
 
 if __name__ == "__main__":

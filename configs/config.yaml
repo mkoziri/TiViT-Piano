@@ -4,9 +4,12 @@ experiment:
   output_dir: "outputs"
 
 dataset:
-  name: "OMAPS"
-  root_dir: "~/datasets/OMAPS"           # adjust if needed
-  annotations_root: "~/datasets/OMAPS"   # adjust if needed
+  #name: "OMAPS"
+  #root_dir: "~/datasets/OMAPS"           # adjust if needed
+  #annotations_root: "~/datasets/OMAPS"   # adjust if needed
+  name: "PianoYT"
+  root_dir: "~/datasets/PianoYT"           # adjust if needed
+  annotations_root: "~/datasets/PianoYT"   # adjust if needed
   label_format: "txt"
   label_targets: ["pitch", "onset", "offset", "hand", "clef"]
   max_clips: null
