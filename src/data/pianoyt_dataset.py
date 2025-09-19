@@ -624,7 +624,19 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     def _collate(batch):
         vids = [b["video"] for b in batch]
         paths = [b["path"] for b in batch]
-        x = torch.stack(vids, dim=0)
+        if not vids:
+            raise RuntimeError("Empty batch supplied to PianoYT collate function")
+
+        dims = vids[0].dim()
+        if any(v.dim() != dims for v in vids):
+            raise RuntimeError("Inconsistent tensor ranks in PianoYT batch")
+
+        max_shape = tuple(max(v.shape[d] for v in vids) for d in range(dims))
+        x = vids[0].new_zeros((len(vids),) + max_shape)
+        for idx, vid in enumerate(vids):
+            slices = tuple(slice(0, size) for size in vid.shape)
+            x[(idx,) + slices] = vid
+
         out = {"video": x, "path": paths}
         extra_keys = set().union(*[set(d.keys()) for d in batch]) - {"video", "path"}
         for k in extra_keys:
