@@ -64,6 +64,7 @@ def main():
     # Force same conditions as the overfit check:
     cfg["dataset"]["split_train"] = "train"
     cfg["dataset"]["split_val"]   = "train"
+    cfg["dataset"]["split"]       = "train"
     cfg["dataset"]["max_clips"]   = 1
     cfg["dataset"]["shuffle"]     = False
 

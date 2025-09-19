@@ -15,6 +15,7 @@ dataset:
     train: splits/train_minus_calib_list.txt
     val:   splits/calib_list.txt
     test:  null                         # test uses the whole test/ folder
+  split: "train"
   split_train: "train"
   split_val: "train"
   split_test: "test"
@@ -26,6 +27,9 @@ dataset:
   tiles: 3
   channels: 3
   normalize: true
+  apply_crop: true
+  crop_rescale: "auto"
+  include_low_res: false
   batch_size: 2
   num_workers: 4
   shuffle: true

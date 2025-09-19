@@ -703,8 +703,8 @@ def main():
     writer = SummaryWriter(log_dir) if use_tb else None
     
     # Data
-    train_split = args.train_split or cfg["dataset"].get("split_train", "train")
-    val_split   = args.val_split or cfg["dataset"].get("split_val", "val")
+    train_split = args.train_split or cfg["dataset"].get("split_train") or cfg["dataset"].get("split") or "train"
+    val_split = args.val_split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
     train_loader = make_dataloader(cfg, split=train_split)
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.
@@ -715,10 +715,10 @@ def main():
             val_loader = make_dataloader(cfg, split=val_split)
         except Exception:
             try:
-                val_loader = make_dataloader(cfg, split=cfg["dataset"].get("split_test","test"))
+                test_split = cfg["dataset"].get("split_test") or cfg["dataset"].get("split") or "test"
+                val_loader = make_dataloader(cfg, split=test_split)
             except Exception:
                 val_loader = None
-
     
     # Model & optimizer
     model = build_model(cfg)

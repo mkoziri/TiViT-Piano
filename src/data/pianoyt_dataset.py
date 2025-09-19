@@ -1,0 +1,498 @@
+"""Purpose:
+    Implement the PianoYT dataset loader with the same runtime surface as the
+    existing :mod:`omaps_dataset` module.  The loader mirrors the clip sampling
+    behaviour, target construction, and collate contract used by TiViT-Piano so
+    that training scripts can switch datasets only through configuration.
+
+Key Functions/Classes:
+    - PianoYTDataset: PyTorch ``Dataset`` yielding tiled clips and optional
+      MIDI-derived labels/targets.
+    - make_dataloader(): Factory matching :func:`omaps_dataset.make_dataloader`
+      which wires runtime configuration, per-clip targets, and collate logic.
+    - _read_midi_events(): Utility that converts a MIDI file into the ``(N,3)``
+      event tensor used by downstream code (onset, offset, pitch).
+
+CLI:
+    Not a standalone CLI.  Use the loader via :mod:`scripts.train` or diagnostic
+    scripts that already depend on :func:`data.make_dataloader`.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+from utils.time_grid import frame_to_sec, sec_to_frame
+
+from .omaps_dataset import (  # reuse established helpers for identical behaviour
+    _build_frame_targets,
+    _load_clip_with_random_start,
+    _read_manifest,
+    _tile_vertical,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+_VIDEO_EXTS: Sequence[str] = (".mp4", ".mkv", ".webm")
+
+
+def _expand_root(root_dir: Optional[str]) -> Path:
+    """Resolve the PianoYT root directory with environment fallbacks."""
+
+    if root_dir:
+        p = Path(root_dir).expanduser()
+        if p.exists():
+            return p
+    env = os.environ.get("TIVIT_DATA_DIR") or os.environ.get("DATASETS_HOME")
+    if env:
+        cand = Path(env).expanduser() / "PianoYT"
+        if cand.exists():
+            return cand
+    return Path("~/datasets/PianoYT").expanduser()
+
+
+def _read_split_ids(root: Path, split: str) -> List[str]:
+    split_file = root / "splits" / f"{split}.txt"
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split list missing: {split_file}")
+    ids: List[str] = []
+    with split_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                ids.append(line)
+    return ids
+
+
+def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
+    meta_path = root / "metadata" / "pianoyt.csv"
+    table: Dict[str, Tuple[int, int, int, int]] = {}
+    if not meta_path.exists():
+        return table
+    with meta_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            vid = row.get("videoID")
+            if not vid:
+                continue
+            try:
+                min_y = int(float(row.get("min_y", 0)))
+                max_y = int(float(row.get("max_y", 0)))
+                min_x = int(float(row.get("min_x", 0)))
+                max_x = int(float(row.get("max_x", 0)))
+            except (TypeError, ValueError):
+                continue
+            table[vid] = (min_y, max_y, min_x, max_x)
+    return table
+
+
+def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optional[Path], Optional[Path]]:
+    """Find the video and MIDI paths for ``video_id`` within ``split``."""
+
+    search_dirs: List[Path] = []
+    split_dir = root / split
+    if split_dir.exists():
+        search_dirs.append(split_dir)
+    if split == "val" and not split_dir.exists():
+        train_dir = root / "train"
+        if train_dir.exists():
+            search_dirs.append(train_dir)
+    if not search_dirs:
+        search_dirs.append(split_dir)
+
+    for base in search_dirs:
+        midi = base / f"audio_{video_id}.0.midi"
+        video = None
+        for ext in _VIDEO_EXTS:
+            cand = base / f"video_{video_id}.0{ext}"
+            if cand.exists():
+                video = cand
+                break
+        if video is not None or midi.exists():
+            return video, midi if midi.exists() else None
+    return None, None
+
+
+def _read_excluded(root: Path, path: Optional[str]) -> set:
+    file_path = Path(path).expanduser() if path else root / "splits" / "excluded_low.txt"
+    if not file_path.exists():
+        return set()
+    ids = set()
+    with file_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                ids.add(line)
+    return ids
+
+
+def _read_midi_events(midi_path: Path) -> torch.FloatTensor:
+    """Return ``(N,3)`` tensor [onset_sec, offset_sec, pitch] parsed from MIDI."""
+
+    if not midi_path or not midi_path.exists():
+        return torch.zeros((0, 3), dtype=torch.float32)
+
+    events: List[Tuple[float, float, float]] = []
+
+    try:
+        import pretty_midi  # type: ignore
+    except Exception:  # pragma: no cover - handled by fallback
+        pretty_midi = None
+
+    if pretty_midi is not None:
+        try:
+            pm = pretty_midi.PrettyMIDI(str(midi_path))
+        except Exception:
+            pm = None
+        if pm is not None:
+            for inst in pm.instruments:
+                for note in inst.notes:
+                    events.append((float(note.start), float(note.end), float(note.pitch)))
+
+    if not events:
+        try:
+            import mido
+            from mido import MidiFile, merge_tracks
+            from mido.midifiles.midifiles import tick2second
+        except Exception as exc:  # pragma: no cover - import guard
+            if pretty_midi is None:
+                raise RuntimeError(
+                    "Neither pretty_midi nor mido is available for MIDI parsing."
+                ) from exc
+        else:
+            mid = MidiFile(str(midi_path))
+            tempo = 500000  # default microseconds per beat
+            ticks_per_beat = mid.ticks_per_beat or 480
+            current_sec = 0.0
+            active: Dict[int, List[float]] = {}
+            for msg in merge_tracks(mid.tracks):
+                delta = msg.time
+                current_sec += tick2second(delta, ticks_per_beat, tempo)
+                if msg.type == "set_tempo":
+                    tempo = msg.tempo
+                elif msg.type == "note_on" and msg.velocity > 0:
+                    active.setdefault(msg.note, []).append(current_sec)
+                elif msg.type in {"note_off", "note_on"}:
+                    if msg.type == "note_on" and msg.velocity > 0:
+                        continue
+                    pitches = active.get(msg.note)
+                    if pitches:
+                        start = pitches.pop()
+                        events.append((float(start), float(current_sec), float(msg.note)))
+
+    if not events:
+        return torch.zeros((0, 3), dtype=torch.float32)
+
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+    return torch.tensor(events, dtype=torch.float32)
+
+
+class PianoYTDataset(Dataset):
+    """Dataset that mirrors :class:`OMAPSDataset` but reads PianoYT assets."""
+
+    def __init__(
+        self,
+        root_dir: Optional[str],
+        split: str = "test",
+        frames: int = 32,
+        stride: int = 2,
+        resize: Tuple[int, int] = (224, 224),
+        tiles: int = 3,
+        channels: int = 3,
+        normalize: bool = True,
+        manifest: Optional[str] = None,
+        decode_fps: float = 30.0,
+    ):
+        super().__init__()
+        self.root = _expand_root(root_dir)
+        self.split = split
+        self.frames = int(frames)
+        self.stride = int(stride)
+        self.resize = tuple(resize)
+        self.tiles = int(tiles)
+        self.channels = int(channels)
+        self.normalize = bool(normalize)
+        self.decode_fps = float(decode_fps)
+
+        ids = _read_split_ids(self.root, split)
+        if manifest:
+            allow = _read_manifest(manifest)
+            ids = [vid for vid in ids if vid in allow]
+
+        self.metadata = _load_metadata(self.root)
+        self.samples: List[Dict[str, Optional[Path]]] = []
+        for vid in ids:
+            video_path, midi_path = _resolve_media_paths(self.root, split, vid)
+            if video_path is None:
+                continue
+            self.samples.append({"id": vid, "video": video_path, "midi": midi_path})
+
+        self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+        self._crop_warned: set = set()
+        self.apply_crop = True
+        self.crop_rescale = "auto"
+        self.include_low_res = True
+        self.excluded_ids: set = set()
+
+        if len(self.samples) == 0:
+            raise FileNotFoundError(
+                f"No PianoYT media found under {self.root} for split '{split}'."
+            )
+
+    def configure(self, *, include_low_res: bool, excluded_ids: set, apply_crop: bool, crop_rescale: str):
+        self.include_low_res = include_low_res
+        self.apply_crop = apply_crop
+        self.crop_rescale = crop_rescale.lower()
+        self.excluded_ids = excluded_ids
+        if not include_low_res and excluded_ids:
+            self.samples = [s for s in self.samples if s["id"] not in excluded_ids]
+            self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+        if len(self.samples) == 0:
+            raise RuntimeError("All PianoYT samples were filtered out by configuration.")
+
+    def limit_max_clips(self, max_clips: Optional[int]):
+        if max_clips is None:
+            return
+        if max_clips < len(self.samples):
+            self.samples = self.samples[:max_clips]
+            self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _apply_crop(self, clip: torch.Tensor, video_id: str) -> torch.Tensor:
+        if not self.apply_crop:
+            return clip
+        crop = self.metadata.get(video_id)
+        if not crop:
+            return clip
+        min_y, max_y, min_x, max_x = crop
+        T, C, H, W = clip.shape
+        if (H != 1080 or W != 1920) and self.crop_rescale != "auto":
+            if video_id not in self._crop_warned:
+                LOGGER.warning(
+                    "[PianoYT] Skipping crop for %s (%dx%d vs 1080p baseline).",
+                    video_id,
+                    H,
+                    W,
+                )
+                self._crop_warned.add(video_id)
+            return clip
+        if H != 1080 or W != 1920:
+            scale_y = H / 1080.0
+            scale_x = W / 1920.0
+            min_y = int(round(min_y * scale_y))
+            max_y = int(round(max_y * scale_y))
+            min_x = int(round(min_x * scale_x))
+            max_x = int(round(max_x * scale_x))
+        min_y = max(0, min(min_y, H - 1))
+        max_y = max(min_y + 1, min(max_y, H))
+        min_x = max(0, min(min_x, W - 1))
+        max_x = max(min_x + 1, min(max_x, W))
+        return clip[..., min_y:max_y, min_x:max_x]
+
+    def __getitem__(self, idx: int):
+        record = self.samples[idx]
+        video_path = record.get("video")
+        midi_path = record.get("midi")
+        video_id = record.get("id", "")
+
+        if video_path is None:
+            raise FileNotFoundError(f"Missing video for PianoYT id={video_id}")
+
+        is_train = self.split == "train"
+        clip, start_idx = _load_clip_with_random_start(
+            path=video_path,
+            frames=self.frames,
+            stride=self.stride,
+            resize_hw=self.resize,
+            channels=self.channels,
+            training=is_train,
+            decode_fps=self.decode_fps,
+        )
+
+        clip = self._apply_crop(clip, video_id)
+        clip = _tile_vertical(clip, self.tiles)
+
+        T = self.frames
+        fps = self.decode_fps
+        t0 = frame_to_sec(start_idx, 1.0 / fps)
+        t1 = frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps)
+
+        sample = {"video": clip, "path": str(video_path)}
+
+        labels_tensor = None
+        if midi_path is not None and midi_path.exists():
+            labels_tensor = _read_midi_events(midi_path)
+            sample["labels"] = labels_tensor
+        elif getattr(self, "require_labels", False):
+            raise FileNotFoundError(f"Missing MIDI annotations for {video_path}")
+
+        clip_targets = None
+        if labels_tensor is not None and labels_tensor.numel() > 0:
+            onset = labels_tensor[:, 0]
+            offset = labels_tensor[:, 1]
+            pitch = labels_tensor[:, 2].to(torch.int64)
+
+            mask = (onset < t1) & (offset > t0)
+            sel_pitches = pitch[mask]
+            sel_onsets = onset[mask]
+            sel_offsets = offset[mask]
+
+            P = 88
+            note_min_clip = 21
+            pitch_vec = torch.zeros(P, dtype=torch.float32)
+            onset_vec = torch.zeros(P, dtype=torch.float32)
+            offset_vec = torch.zeros(P, dtype=torch.float32)
+            if sel_pitches.numel() == 0:
+                pitch_class = 60
+                onset_flag = 0.0
+                offset_flag = 0.0
+            else:
+                uniq, counts = sel_pitches.unique(return_counts=True)
+                pitch_class = int(uniq[counts.argmax()].item())
+                onset_flag = 1.0 if ((sel_onsets >= t0) & (sel_onsets < t1)).any().item() else 0.0
+                offset_flag = 1.0 if ((sel_offsets > t0) & (sel_offsets <= t1)).any().item() else 0.0
+
+            idx_pitch = int(pitch_class - note_min_clip)
+            if 0 <= idx_pitch < P:
+                pitch_vec[idx_pitch] = 1.0
+                if onset_flag:
+                    onset_vec[idx_pitch] = 1.0
+                if offset_flag:
+                    offset_vec[idx_pitch] = 1.0
+
+            hand = 0 if pitch_class < 60 else 1
+            clef = 0 if pitch_class < 60 else (1 if pitch_class > 64 else 2)
+
+            clip_targets = {
+                "pitch": pitch_vec,
+                "onset": onset_vec,
+                "offset": offset_vec,
+                "hand": torch.tensor(hand, dtype=torch.long),
+                "clef": torch.tensor(clef, dtype=torch.long),
+            }
+
+        if clip_targets is not None:
+            sample.update(clip_targets)
+        elif getattr(self, "require_labels", False):
+            raise FileNotFoundError(f"No usable labels for {video_path}")
+
+        ft_cfg = getattr(self, "frame_targets_cfg", None)
+        if ft_cfg and bool(ft_cfg.get("enable", False)):
+            labels_ft = None
+            if labels_tensor is not None and labels_tensor.numel() > 0:
+                labels_ft = labels_tensor.clone()
+                labels_ft[:, 0:2] -= t0
+            ft = _build_frame_targets(
+                labels=labels_ft,
+                T=T,
+                stride=self.stride,
+                fps=fps,
+                note_min=int(ft_cfg.get("note_min", 21)),
+                note_max=int(ft_cfg.get("note_max", 108)),
+                tol=float(ft_cfg.get("tolerance", 0.025)),
+                fill_mode=str(ft_cfg.get("fill_mode", "overlap")),
+                hand_from_pitch=bool(ft_cfg.get("hand_from_pitch", True)),
+                clef_thresholds=tuple(ft_cfg.get("clef_thresholds", [60, 64])),
+                dilate_active_frames=int(ft_cfg.get("dilate_active_frames", 0)),
+                targets_sparse=bool(ft_cfg.get("targets_sparse", False)),
+            )
+            sample.update(
+                {
+                    "pitch_roll": ft["pitch_roll"],
+                    "onset_roll": ft["onset_roll"],
+                    "offset_roll": ft["offset_roll"],
+                    "hand_frame": ft["hand_frame"],
+                    "clef_frame": ft["clef_frame"],
+                }
+            )
+
+        return sample
+
+
+def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
+    dcfg = cfg["dataset"]
+    manifest_cfg = dcfg.get("manifest", {}) or {}
+    manifest_path = manifest_cfg.get(split)
+
+    decode_fps = float(dcfg.get("decode_fps", 30.0))
+    hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
+    stride = int(round(hop_seconds * decode_fps))
+
+    dataset = PianoYTDataset(
+        root_dir=dcfg.get("root_dir"),
+        split=split,
+        frames=int(dcfg.get("frames", 32)),
+        stride=stride,
+        resize=tuple(dcfg.get("resize", [224, 224])),
+        tiles=int(dcfg.get("tiles", 3)),
+        channels=int(dcfg.get("channels", 3)),
+        normalize=bool(dcfg.get("normalize", True)),
+        manifest=manifest_path,
+        decode_fps=decode_fps,
+    )
+
+    include_low = bool(dcfg.get("include_low_res", False))
+    excluded_ids = set()
+    if not include_low:
+        excluded_ids = _read_excluded(dataset.root, dcfg.get("excluded_list"))
+    dataset.configure(
+        include_low_res=include_low,
+        excluded_ids=excluded_ids,
+        apply_crop=bool(dcfg.get("apply_crop", True)),
+        crop_rescale=str(dcfg.get("crop_rescale", "auto")),
+    )
+
+    max_clips = dcfg.get("max_clips")
+    dataset.limit_max_clips(max_clips if isinstance(max_clips, int) else None)
+    dataset.max_clips = max_clips
+
+    dataset.annotations_root = dcfg.get("annotations_root")
+    dataset.label_format = dcfg.get("label_format", "midi")
+    dataset.label_targets = dcfg.get("label_targets", ["pitch", "onset", "offset", "hand", "clef"])
+    dataset.require_labels = bool(dcfg.get("require_labels", False))
+    dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
+
+    def _collate(batch):
+        vids = [b["video"] for b in batch]
+        paths = [b["path"] for b in batch]
+        x = torch.stack(vids, dim=0)
+        out = {"video": x, "path": paths}
+        extra_keys = set().union(*[set(d.keys()) for d in batch]) - {"video", "path"}
+        for k in extra_keys:
+            vals = [d[k] for d in batch if k in d]
+            if len(vals) != len(batch):
+                continue
+            if k == "labels":
+                out[k] = vals
+            else:
+                v0 = vals[0]
+                if torch.is_tensor(v0):
+                    try:
+                        out[k] = torch.stack(vals, dim=0)
+                    except Exception:
+                        out[k] = vals
+                else:
+                    out[k] = vals
+        return out
+
+    loader = DataLoader(
+        dataset,
+        batch_size=int(dcfg.get("batch_size", 2)),
+        shuffle=bool(dcfg.get("shuffle", True)) if split == "train" else False,
+        num_workers=int(dcfg.get("num_workers", 0)),
+        pin_memory=False,
+        drop_last=drop_last,
+        collate_fn=_collate,
+    )
+    return loader
+
+
+__all__ = ["PianoYTDataset", "make_dataloader"]

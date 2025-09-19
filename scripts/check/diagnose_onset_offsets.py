@@ -45,7 +45,7 @@ sys.path.insert(0, str(SRC))
 
 from utils.config import load_config                           # src/utils/config.py
 from models.factory import build_model                         # src/models/factory.py
-from data.omaps_dataset import make_dataloader                 # src/data/omaps_dataset.py
+from data.loader import make_dataloader                        # src/data/loader.py
 
 # --- Config + device ---
 cfg = load_config(args.config)

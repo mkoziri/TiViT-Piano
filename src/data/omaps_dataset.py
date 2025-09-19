@@ -638,12 +638,15 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         decode_fps=decode_fps,
     )
     # attach annotation config if present
+    max_clips = dcfg.get("max_clips")
+    if isinstance(max_clips, int) and len(dataset.videos) > max_clips:
+        dataset.videos = dataset.videos[:max_clips]
     dataset.annotations_root = dcfg.get("annotations_root")
     dataset.label_format = dcfg.get("label_format", "txt")
     dataset.label_targets = dcfg.get("label_targets", ["pitch","onset","offset","hand","clef"])
     dataset.require_labels = bool(dcfg.get("require_labels", False))
     dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
-    dataset.max_clips = cfg["dataset"].get("max_clips", None)
+    dataset.max_clips = max_clips
 
     # --- robust collate that preserves extra fields (labels, targets) ---
     def _collate(batch):

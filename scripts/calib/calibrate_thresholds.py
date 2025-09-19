@@ -182,7 +182,7 @@ def main():
         cfg["dataset"]["frames"] = args.frames
     decode_fps = float(cfg["dataset"].get("decode_fps", 1.0))
     hop_seconds = float(cfg["dataset"].get("hop_seconds", 1.0 / decode_fps))
-    split = args.split or cfg["dataset"].get("split_val", "val")
+    split = args.split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
     loader = make_dataloader(cfg, split=split)
     if isinstance(loader, dict):
         loader = loader.get(split) or next(iter(loader.values()))

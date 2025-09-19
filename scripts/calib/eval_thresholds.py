@@ -237,7 +237,7 @@ def main():
     event_tolerance = float(
         cfg["dataset"].get("frame_targets", {}).get("tolerance", hop_seconds)
     )
-    split = args.split or cfg["dataset"].get("split_val", "val")
+    split = args.split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
 
     # build loader
     val_loader = make_dataloader(cfg, split=split)
