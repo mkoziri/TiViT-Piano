@@ -23,7 +23,7 @@ import csv
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -39,6 +39,17 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
 
 LOGGER = logging.getLogger(__name__)
 
+
+def _safe_expanduser(path: Union[str, Path]) -> Path:
+    """Expand ``~`` safely even when ``Path.expanduser`` cannot."""
+
+    candidate = Path(path)
+    try:
+        return candidate.expanduser()
+    except RuntimeError:
+        LOGGER.debug("Failed to expand user in path '%s'; returning as-is.", candidate)
+        return candidate
+
 _VIDEO_EXTS: Sequence[str] = (".mp4", ".mkv", ".webm")
 
 
@@ -46,7 +57,7 @@ def _expand_root(root_dir: Optional[str]) -> Path:
     """Resolve the PianoYT root directory with environment fallbacks."""
 
     if root_dir:
-        expanded = Path(os.path.expandvars(str(root_dir))).expanduser()
+        expanded = _safe_expanduser(os.path.expandvars(str(root_dir)))
         candidates = [expanded]
         if expanded.name.lower() != "pianoyt":
             candidates.append(expanded / "PianoYT")
@@ -55,14 +66,14 @@ def _expand_root(root_dir: Optional[str]) -> Path:
                 return cand
     env = os.environ.get("TIVIT_DATA_DIR") or os.environ.get("DATASETS_HOME")
     if env:
-        cand = Path(env).expanduser() / "PianoYT"
+        cand = _safe_expanduser(env) / "PianoYT"
         if cand.exists():
             return cand
     project_root = Path(__file__).resolve().parents[2]
     repo_data = project_root / "data" / "PianoYT"
     if repo_data.exists():
         return repo_data
-    return Path("~/datasets/PianoYT").expanduser()
+    return _safe_expanduser("~/datasets/PianoYT")
 
 
 def _read_split_ids(root: Path, split: str) -> List[str]:
@@ -262,7 +273,7 @@ def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optiona
 
 
 def _read_excluded(root: Path, path: Optional[str]) -> set:
-    file_path = Path(path).expanduser() if path else root / "splits" / "excluded_low.txt"
+    file_path = _safe_expanduser(path) if path else root / "splits" / "excluded_low.txt"
     if not file_path.exists():
         return set()
     ids = set()
