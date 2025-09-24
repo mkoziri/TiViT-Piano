@@ -41,3 +41,4 @@ src/data/omaps_dataset_nw.py
 # OS
 .DS_Store
 
+/data/
