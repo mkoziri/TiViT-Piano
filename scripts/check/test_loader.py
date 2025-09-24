@@ -48,13 +48,29 @@ def main():
 
     print(f"Dataset split: {split}")
     print(f"Dataset name: {dataset_name}")
+    pipeline_v2 = bool(cfg.get("dataset", {}).get("pipeline_v2", False))
+    
     for i, batch in enumerate(loader):
-        x = batch["video"]           # B, T, tiles, C, H, W
+        x = batch["video"]
         paths = batch["path"]
-        B, T, M, C, H, W = x.shape
-        print(f"[{i}] batch: {B} clips | shape={x.shape}")
+        shape = tuple(x.shape)
+        print(f"[{i}] batch: {len(paths)} clips | shape={shape}")
         print(" sample:", paths[0])
-        print(f"  B={B}, T={T}, tiles={M}, C={C}, H={H}, W={W}")
+        if x.dim() == 6:
+            B, T, M, C, H, W = x.shape
+            print(f"  B={B}, T={T}, tiles={M}, C={C}, H={H}, W={W}")
+        elif x.dim() == 5:
+            B, T, C, H, W = x.shape
+            print(f"  B={B}, T={T}, C={C}, H={H}, W={W}")
+            if pipeline_v2:
+                tiles = cfg.get("dataset", {}).get("tiles")
+                if tiles is not None:
+                    print(f"  pipeline_v2: tiles will be split lazily (configured tiles={tiles})")
+                else:
+                    print("  pipeline_v2: tiles will be split lazily")
+        else:
+            print(f"  tensor rank={x.dim()} (unexpected for video batch)")
+            
         if i + 1 >= args.max_batches:
             break
 
