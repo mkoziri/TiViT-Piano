@@ -340,6 +340,353 @@ def load_excluded_ids(root: Path) -> Set[str]:
         return {line.strip() for line in f if line.strip() and not line.startswith("#")}
 
 
+def _apply_metadata_crop(
+    clip, video_id: str, *, crop_rescale: str = "auto"
+):  # type: ignore[no-untyped-def]
+    """Crop ``clip`` according to metadata gathered during integrity checks."""
+
+    crop = PIANOYT_CROPS.get(video_id)
+    if not crop:
+        return clip
+
+    min_y, max_y, min_x, max_x = crop
+    _, _, H, W = clip.shape
+    if (H != 1080 or W != 1920) and crop_rescale.lower() != "auto":
+        return clip
+
+    if H != 1080 or W != 1920:
+        scale_y = H / 1080.0
+        scale_x = W / 1920.0
+        min_y = int(round(min_y * scale_y))
+        max_y = int(round(max_y * scale_y))
+        min_x = int(round(min_x * scale_x))
+        max_x = int(round(max_x * scale_x))
+
+    min_y = max(0, min(int(min_y), H - 1))
+    max_y = max(min_y + 1, min(int(max_y), H))
+    min_x = max(0, min(int(min_x), W - 1))
+    max_x = max(min_x + 1, min(int(max_x), W))
+
+    return clip[..., min_y:max_y, min_x:max_x]
+
+
+def _save_stage_frame(base: Path, stage: str, tensor):  # type: ignore[no-untyped-def]
+    """Persist ``tensor``'s first frame to ``base/stage/frame0.png`` if possible."""
+
+    try:
+        from PIL import Image
+    except Exception:
+        print(f"[PIPE][WARN] pillow not available; skipping dump for stage '{stage}'")
+        return
+
+    stage_dir = base / stage
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    frame_path = stage_dir / "frame0.png"
+
+    if tensor.ndim == 4:
+        frame = tensor[0]
+    elif tensor.ndim == 3:
+        frame = tensor
+    else:
+        raise ValueError(f"Unexpected tensor rank {tensor.ndim} for stage '{stage}' dump")
+
+    frame = frame.detach().cpu().clamp(0.0, 1.0)
+    if frame.shape[0] == 1:
+        array = (frame.squeeze(0) * 255.0).round().byte().numpy()
+        mode = "L"
+    else:
+        array = (frame.permute(1, 2, 0) * 255.0).round().byte().numpy()
+        mode = "RGB"
+
+    Image.fromarray(array, mode=mode).save(frame_path)
+
+
+def verify_pipeline(
+    *,
+    root: Path,
+    config_path: Path,
+    splits: Dict[str, Sequence[Dict[str, object]]],
+    n_samples: int,
+    dump_dir: Optional[Path],
+    strict: bool,
+) -> List[str]:
+    """Run a light-weight pipeline verification using pipeline_v2 semantics."""
+
+    if n_samples <= 0:
+        return []
+
+    from utils import load_config
+
+    try:
+        cfg = load_config(config_path)
+    except FileNotFoundError as exc:
+        message = f"[PIPE][ERROR] config not found: {config_path}"
+        print(message)
+        return [message]
+    except Exception as exc:  # pragma: no cover - defensive logging
+        message = f"[PIPE][ERROR] failed to load config {config_path}: {exc}"
+        print(message)
+        return [message]
+
+    dataset_cfg = dict(cfg.get("dataset", {}) or {})
+    if not dataset_cfg:
+        message = "[PIPE][ERROR] dataset configuration missing from config file"
+        print(message)
+        return [message]
+
+    cfg_root = dataset_cfg.get("root_dir")
+    if cfg_root:
+        cfg_root_path = Path(os.path.expanduser(str(cfg_root))).resolve()
+        if cfg_root_path != root:
+            print(
+                f"[PIPE][INFO] overriding config root_dir {cfg_root_path} with CLI root {root}"
+            )
+    dataset_cfg["root_dir"] = str(root)
+
+    from data.omaps_dataset import (
+        _load_clip_with_random_start,
+        apply_global_augment,
+        apply_registration_crop,
+        resize_to_canonical,
+    )
+    from utils.tiling import tile_vertical_token_aligned
+    import torch
+
+    tiles = int(dataset_cfg.get("tiles", 1))
+    frames = int(dataset_cfg.get("frames", 32))
+    decode_fps = float(dataset_cfg.get("decode_fps", 30.0))
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 1.0 / decode_fps))
+    stride = int(round(hop_seconds * decode_fps))
+    channels = int(dataset_cfg.get("channels", 3))
+    apply_crop_flag = bool(dataset_cfg.get("apply_crop", True))
+    crop_rescale = str(dataset_cfg.get("crop_rescale", "auto"))
+    resize_hw_cfg = dataset_cfg.get("resize", [224, 224])
+    resize_hw = tuple(int(v) for v in resize_hw_cfg[:2]) if resize_hw_cfg else (224, 224)
+
+    reg_cfg = dict(dataset_cfg.get("registration", {}) or {})
+    registration_enabled = bool(reg_cfg.get("enabled", False))
+    registration_interp = str(reg_cfg.get("interp", "bilinear"))
+
+    canonical_cfg = dataset_cfg.get("canonical_hw", resize_hw)
+    if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
+        canonical_hw = (int(round(float(canonical_cfg[0]))), int(round(float(canonical_cfg[1]))))
+    else:
+        canonical_hw = tuple(resize_hw)
+
+    global_aug_cfg = dataset_cfg.get("global_aug")
+    if not isinstance(global_aug_cfg, dict):
+        candidate = reg_cfg.get("global_aug") if isinstance(reg_cfg, dict) else {}
+        global_aug_cfg = candidate if isinstance(candidate, dict) else {}
+    global_aug_enabled = bool(global_aug_cfg.get("enabled", False))
+
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    experiment_cfg = cfg.get("experiment", {}) if isinstance(cfg, dict) else {}
+    seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
+    data_seed = int(seed_val) if seed_val is not None else None
+
+    tiling_cfg = cfg.get("tiling", {}) if isinstance(cfg, dict) else {}
+    patch_w = tiling_cfg.get("patch_w")
+    if patch_w is None:
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        transformer_cfg = model_cfg.get("transformer", {}) if isinstance(model_cfg, dict) else {}
+        patch_w = transformer_cfg.get("input_patch_size")
+    if patch_w is None:
+        message = "[PIPE][ERROR] tiling.patch_w or model.transformer.input_patch_size required"
+        print(message)
+        return [message]
+    patch_w = int(patch_w)
+
+    tokens_split = tiling_cfg.get("tokens_split", "auto")
+    overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
+
+    dump_dir = dump_dir.resolve() if dump_dir else None
+
+    violations: List[str] = []
+
+    for split_name, pieces in splits.items():
+        if not pieces:
+            continue
+        taken = 0
+        for index, piece in enumerate(pieces):
+            if taken >= n_samples:
+                break
+            video_path_str = piece.get("video") if isinstance(piece, dict) else None
+            if not video_path_str:
+                continue
+            video_path = Path(video_path_str)
+            if not video_path.exists():
+                msg = f"[PIPE][WARN] split={split_name} id={piece.get('id')} missing video {video_path}"
+                print(msg)
+                violations.append(msg)
+                continue
+
+            try:
+                clip_native, start_idx = _load_clip_with_random_start(
+                    path=video_path,
+                    frames=frames,
+                    stride=stride,
+                    resize_hw=None,
+                    channels=channels,
+                    training=False,
+                    decode_fps=decode_fps,
+                    pipeline_v2=True,
+                )
+            except Exception as exc:
+                msg = f"[PIPE][ERROR] decode failed for split={split_name} id={piece.get('id')}: {exc}"
+                print(msg)
+                violations.append(msg)
+                continue
+
+            video_id = str(piece.get("id", video_path.stem))
+
+            native_hw = clip_native.shape[-2:]
+
+            clip_stage = clip_native
+            if registration_enabled:
+                try:
+                    clip_stage = apply_registration_crop(
+                        clip_stage, PIANOYT_CROPS.get(video_id), reg_cfg
+                    )
+                except Exception as exc:
+                    msg = (
+                        f"[PIPE][ERROR] registration crop failed split={split_name} id={video_id}: {exc}"
+                    )
+                    print(msg)
+                    violations.append(msg)
+                    continue
+
+            if apply_crop_flag:
+                clip_stage = _apply_metadata_crop(
+                    clip_stage, video_id, crop_rescale=crop_rescale
+                )
+
+            crop_hw = clip_stage.shape[-2:]
+
+            clip_resized = resize_to_canonical(
+                clip_stage, canonical_hw, registration_interp
+            )
+            canon_hw = clip_resized.shape[-2:]
+
+            if canonical_hw and len(canonical_hw) == 2:
+                expected_hw = (int(canonical_hw[0]), int(canonical_hw[1]))
+                if canon_hw != expected_hw:
+                    msg = (
+                        f"[PIPE][VIOLATION] split={split_name} id={video_id}: "
+                        f"resize produced {canon_hw} expected {expected_hw}"
+                    )
+                    print(msg)
+                    violations.append(msg)
+
+            aug_clip = clip_resized
+            if global_aug_enabled and split_name == "train":
+                try:
+                    aug_clip = apply_global_augment(
+                        clip_resized,
+                        global_aug_cfg,
+                        base_seed=data_seed,
+                        sample_index=index,
+                        start_idx=start_idx,
+                        interp=global_aug_cfg.get("interp", registration_interp),
+                        id_key=video_id,
+                    )
+                except Exception as exc:
+                    msg = (
+                        f"[PIPE][ERROR] global_aug failed split={split_name} id={video_id}: {exc}"
+                    )
+                    print(msg)
+                    violations.append(msg)
+                    continue
+
+                if data_seed is not None:
+                    aug_again = apply_global_augment(
+                        clip_resized,
+                        global_aug_cfg,
+                        base_seed=data_seed,
+                        sample_index=index,
+                        start_idx=start_idx,
+                        interp=global_aug_cfg.get("interp", registration_interp),
+                        id_key=video_id,
+                    )
+                    if not torch.allclose(aug_clip, aug_again):
+                        msg = (
+                            f"[PIPE][VIOLATION] split={split_name} id={video_id}: "
+                            "global_aug not deterministic for fixed seed"
+                        )
+                        print(msg)
+                        violations.append(msg)
+
+            aug_hw = aug_clip.shape[-2:]
+
+            try:
+                (
+                    tile_tensors,
+                    tokens_per_tile,
+                    widths_px,
+                    _,
+                    aligned_w,
+                    original_w,
+                ) = tile_vertical_token_aligned(
+                    aug_clip,
+                    tiles,
+                    patch_w=patch_w,
+                    tokens_split=tokens_split,
+                    overlap_tokens=overlap_tokens,
+                )
+            except Exception as exc:
+                msg = f"[PIPE][ERROR] tiling failed split={split_name} id={video_id}: {exc}"
+                print(msg)
+                violations.append(msg)
+                continue
+
+            tile_width_violations = [w for w in widths_px if w % patch_w != 0]
+            if tile_width_violations:
+                msg = (
+                    f"[PIPE][VIOLATION] split={split_name} id={video_id}: "
+                    f"tile widths {tile_width_violations} not multiples of patch_w={patch_w}"
+                )
+                print(msg)
+                violations.append(msg)
+
+            total_tokens = sum(tokens_per_tile)
+            if patch_w > 0:
+                expected_tokens = aligned_w // patch_w
+                if total_tokens != expected_tokens:
+                    msg = (
+                        f"[PIPE][VIOLATION] split={split_name} id={video_id}: "
+                        f"tokens sum {total_tokens} != aligned width {aligned_w}//patch_w"
+                    )
+                    print(msg)
+                    violations.append(msg)
+
+            native_str = f"{native_hw[0]}x{native_hw[1]}"
+            crop_str = f"{crop_hw[0]}x{crop_hw[1]}"
+            canon_str = f"{canon_hw[0]}x{canon_hw[1]}"
+            aug_str = f"{aug_hw[0]}x{aug_hw[1]}"
+            print(
+                "[PIPE] split={split_name} id="
+                f"{video_id} order=decode→crop→resize→aug→tile | hw: "
+                f"{native_str}→{crop_str}→{canon_str}→{aug_str} | "
+                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                f"aligned={aligned_w} orig={original_w}"
+            )
+
+            if dump_dir is not None:
+                sample_dir = dump_dir / split_name / video_id
+                _save_stage_frame(sample_dir, "decode", clip_native)
+                _save_stage_frame(sample_dir, "crop", clip_stage)
+                _save_stage_frame(sample_dir, "resize", clip_resized)
+                _save_stage_frame(sample_dir, "aug", aug_clip)
+                if tile_tensors:
+                    _save_stage_frame(sample_dir, "tile", tile_tensors[0])
+
+            taken += 1
+
+    if strict and violations:
+        raise SystemExit(1)
+
+    return violations
+    
+    
 def scan_split(split_name: str, root: Path, probe_media: bool, anomalies: List[str]) -> List[Dict[str, object]]:
     """Return list of piece dicts for a PianoYT split."""
 
@@ -492,6 +839,33 @@ def main() -> None:
         help="Use ffprobe to log FPS/resolution/audio rate if available",
     )
     ap.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/config.yaml"),
+        help="Configuration file used for pipeline verification",
+    )
+    ap.add_argument(
+        "--verify-pipeline",
+        action="store_true",
+        help="Decode→crop→resize→aug→tile sanity check using pipeline_v2",
+    )
+    ap.add_argument(
+        "--n-samples",
+        type=int,
+        default=1,
+        help="Number of samples per split for --verify-pipeline",
+    )
+    ap.add_argument(
+        "--dump-dir",
+        type=Path,
+        help="If set, dump first-frame visualisations of each pipeline stage",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero when --verify-pipeline detects violations",
+    )
+    ap.add_argument(
         "--meta-dir",
         type=Path,
         default=Path("metadata"),
@@ -565,6 +939,19 @@ def main() -> None:
     summarize("TEST", test_pieces)
     print(f"[OK] JSON → {meta_dir}/pianoyt_*.json")
     print(f"[OK] TSV  → {report_dir}/pianoyt_*.tsv")
+    
+    if args.verify_pipeline:
+        splits = {"train": train_pieces, "val": val_pieces or [], "test": test_pieces}
+        violations = verify_pipeline(
+            root=root,
+            config_path=args.config,
+            splits=splits,
+            n_samples=args.n_samples,
+            dump_dir=args.dump_dir,
+            strict=args.strict,
+        )
+        if violations and not args.strict:
+            print(f"[PIPE][WARN] {len(violations)} issues detected (strict mode disabled)")
 
 
 if __name__ == "__main__":
