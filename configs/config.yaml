@@ -80,6 +80,7 @@ model:
     dropout: 0.10
 
 tiling:
+  patch_w: 16
   tokens_split: "auto"
   overlap_tokens: 0
 

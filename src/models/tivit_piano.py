@@ -19,7 +19,11 @@ CLI:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from einops import rearrange
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from utils.tiling import tile_vertical_token_aligned
+
 
 # -------- Tubelet embedding (3D patchify) ----------
 class TubeletEmbed(nn.Module):
@@ -185,10 +189,26 @@ class TiViTPiano(nn.Module):
         pitch_classes=88,
         clef_classes=3,
         head_mode: str = "clip",   # "clip" or "frame"
+        pipeline_v2: bool = False,
+        tiling_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.tiles = tiles
         self.head_mode = head_mode  # runtime switch for clip vs frame heads
+        self.pipeline_v2 = bool(pipeline_v2)
+
+        tiling_cfg = dict(tiling_cfg or {})
+        tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
+        if isinstance(tokens_split_cfg, Sequence) and not isinstance(tokens_split_cfg, str):
+            self.tiling_tokens_split: Union[str, List[int]] = [int(v) for v in tokens_split_cfg]
+        else:
+            self.tiling_tokens_split = tokens_split_cfg
+        self.tiling_overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
+        self.tiling_patch_w = int(tiling_cfg.get("patch_w", patch_size))
+        self._tile_aligned_width: Optional[int] = None
+        self._tile_bounds: Optional[List[Tuple[int, int]]] = None
+        self._tile_token_counts: Optional[List[int]] = None
+        self._tile_widths_px: Optional[List[int]] = None
 
         # Tubelet / patch embed
         self.embed = TubeletEmbed(in_ch=input_channels, embed_dim=d_model,
@@ -226,20 +246,41 @@ class TiViTPiano(nn.Module):
                 t_tokens=t_tokens, s_tokens=s_tokens, **self.encoder_cfg
             )
 
-    @staticmethod
-    def _tile_split(x):
-        """
-        Split frame horizontally into 3 tiles if needed.
-        Input:  x (B, T, C, H, W)
-        Return: list of 3 tensors each (B, T, C, H, W/3)
-        """
+    def _tile_split(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Evenly split ``x`` (B,T,C,H,W) into ``self.tiles`` vertical tiles."""
+
         B, T, C, H, W = x.shape
-        w3 = W // 3
-        return [
-            x[..., 0:w3],
-            x[..., w3:2*w3],
-            x[..., 2*w3:3*w3],
-        ]
+        w_each = W // self.tiles
+        total = w_each * self.tiles
+        if total != W:
+            x = x[..., :total]
+        return [x[..., i * w_each:(i + 1) * w_each] for i in range(self.tiles)]
+
+    def _tile_split_token_aligned(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Split using token-aligned tiling for pipeline v2 clips."""
+
+        B, T, C, H, W = x.shape
+        cache_width = self._tile_aligned_width
+        bounds = self._tile_bounds
+        if cache_width is None or bounds is None or cache_width != W:
+            sample = x[0]
+            _, tokens_per_tile, widths_px, bounds, aligned_w, _ = tile_vertical_token_aligned(
+                sample,
+                self.tiles,
+                patch_w=self.tiling_patch_w,
+                tokens_split=self.tiling_tokens_split,
+                overlap_tokens=self.tiling_overlap_tokens,
+            )
+            cache_width = aligned_w
+            self._tile_aligned_width = cache_width
+            self._tile_bounds = bounds
+            self._tile_token_counts = tokens_per_tile
+            self._tile_widths_px = widths_px
+        if cache_width is None or bounds is None:
+            raise RuntimeError("Token-aligned tiling failed to compute bounds")
+        if W != cache_width:
+            x = x[..., :cache_width]
+        return [x[..., left:right] for (left, right) in bounds]
 
     def _infer_token_factors(self, t_cf: torch.Tensor) -> tuple[int, int]:
         """
@@ -291,7 +332,10 @@ class TiViTPiano(nn.Module):
             tiles = [x[:, :, i, :, :, :] for i in range(M)]
         else:
             B, T, C, H, W = x.shape
-            tiles = self._tile_split(x)
+            if self.pipeline_v2:
+                tiles = self._tile_split_token_aligned(x)
+            else:
+                tiles = self._tile_split(x)
 
         # Per-tile tubelet embedding (shared weights)
         tile_tokens = []

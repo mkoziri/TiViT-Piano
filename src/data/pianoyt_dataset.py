@@ -29,6 +29,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from utils.time_grid import frame_to_sec, sec_to_frame
+from utils.tiling import tile_vertical_token_aligned
 
 from .omaps_dataset import (  # reuse established helpers for identical behaviour
     _build_frame_targets,
@@ -404,6 +405,29 @@ class PianoYTDataset(Dataset):
         self.global_aug_cfg = dict(global_aug_cfg or {})
         self.global_aug_enabled = bool(self.global_aug_cfg.get("enabled", False))
 
+        tiling_cfg = {}
+        if isinstance(self.full_cfg, dict):
+            tiling_cfg = dict(self.full_cfg.get("tiling", {}) or {})
+        self.tiling_cfg = tiling_cfg
+        patch_w_cfg = tiling_cfg.get("patch_w")
+        if patch_w_cfg is None:
+            model_cfg = self.full_cfg.get("model", {}) if isinstance(self.full_cfg, dict) else {}
+            trans_cfg = model_cfg.get("transformer", {}) if isinstance(model_cfg, dict) else {}
+            patch_w_cfg = trans_cfg.get("input_patch_size")
+        self.tiling_patch_w = int(patch_w_cfg) if patch_w_cfg is not None else None
+        tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
+        if isinstance(tokens_split_cfg, Sequence) and not isinstance(tokens_split_cfg, str):
+            self.tiling_tokens_split = [int(v) for v in tokens_split_cfg]
+        else:
+            self.tiling_tokens_split = tokens_split_cfg
+        self.tiling_overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
+        self._tiling_log_once = False
+
+        if self.pipeline_v2 and self.tiling_patch_w is None:
+            raise ValueError(
+                "pipeline_v2 requires 'tiling.patch_w' or model transformer patch size"
+            )
+
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
         experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
         seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
@@ -556,10 +580,27 @@ class PianoYTDataset(Dataset):
                 )
         else:
             clip = self._apply_crop(clip, video_id)
-
-
         clip = self._apply_crop(clip, video_id)
-        clip = _tile_vertical(clip, self.tiles)
+         if self.pipeline_v2:
+            _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
+                clip,
+                self.tiles,
+                patch_w=self.tiling_patch_w,
+                tokens_split=self.tiling_tokens_split,
+                overlap_tokens=self.tiling_overlap_tokens,
+            )
+            if aligned_w != original_w:
+                clip = clip[..., :aligned_w]
+            if not self._tiling_log_once:
+                width_sum = sum(widths_px)
+                print(
+                    f"[pipeline_v2] tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                    f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                    flush=True,
+                )
+                self._tiling_log_once = True
+        else:
+            clip = _tile_vertical(clip, self.tiles)
 
         T = self.frames
         fps = self.decode_fps
