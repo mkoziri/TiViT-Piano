@@ -581,7 +581,7 @@ class PianoYTDataset(Dataset):
         else:
             clip = self._apply_crop(clip, video_id)
         clip = self._apply_crop(clip, video_id)
-         if self.pipeline_v2:
+        if self.pipeline_v2:
             _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
                 clip,
                 self.tiles,
