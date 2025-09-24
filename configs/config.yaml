@@ -13,7 +13,7 @@ dataset:
   label_format: "txt"
   label_targets: ["pitch", "onset", "offset", "hand", "clef"]
   max_clips: null
-  pipeline_v2: false
+  pipeline_v2: true
   # NEW: manifest files that select which IDs belong to each logical role
   manifest:
     #train: splits/train_minus_calib_list.txt  #For OMAPS
@@ -39,13 +39,13 @@ dataset:
     source: "metadata"
     interp: "bilinear"
     global_aug:
-      enabled: false
+      enabled: true
       resize_jitter: [150, 805]
       random_crop_hw: [145, 800]
   crop_rescale: "auto"
   include_low_res: false
   batch_size: 2
-  num_workers: 1  #Should be 4, changed for desktop's memory 
+  num_workers: 0  #Should be 4, changed for desktop's memory 
   shuffle: true
   require_labels: true
   frame_targets:

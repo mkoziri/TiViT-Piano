@@ -23,7 +23,7 @@ import csv
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -35,6 +35,9 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
     _load_clip_with_random_start,
     _read_manifest,
     _tile_vertical,
+    apply_global_augment,
+    apply_registration_crop,
+    resize_to_canonical,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -361,6 +364,10 @@ class PianoYTDataset(Dataset):
         normalize: bool = True,
         manifest: Optional[str] = None,
         decode_fps: float = 30.0,
+        *,
+        pipeline_v2: bool = False,
+        dataset_cfg: Optional[Dict[str, Any]] = None,
+        full_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.root = _expand_root(root_dir)
@@ -372,6 +379,35 @@ class PianoYTDataset(Dataset):
         self.channels = int(channels)
         self.normalize = bool(normalize)
         self.decode_fps = float(decode_fps)
+        self.pipeline_v2 = bool(pipeline_v2)
+        self.dataset_cfg = dict(dataset_cfg or {})
+        self.full_cfg = dict(full_cfg or {})
+
+        reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
+        self.registration_cfg = reg_cfg
+        self.registration_enabled = bool(reg_cfg.get("enabled", False))
+        self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
+
+        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
+        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
+            self.canonical_hw = (
+                int(round(float(canonical_cfg[0]))),
+                int(round(float(canonical_cfg[1]))),
+            )
+        else:
+            self.canonical_hw = tuple(self.resize)
+
+        global_aug_cfg = self.dataset_cfg.get("global_aug")
+        if not isinstance(global_aug_cfg, dict):
+            aug_candidate = reg_cfg.get("global_aug")
+            global_aug_cfg = aug_candidate if isinstance(aug_candidate, dict) else {}
+        self.global_aug_cfg = dict(global_aug_cfg or {})
+        self.global_aug_enabled = bool(self.global_aug_cfg.get("enabled", False))
+
+        data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
+        experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
+        seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
+        self.data_seed = int(seed_val) if seed_val is not None else None
 
         ids = _read_split_ids(self.root, split)
         if manifest:
@@ -472,11 +508,55 @@ class PianoYTDataset(Dataset):
             path=video_path,
             frames=self.frames,
             stride=self.stride,
-            resize_hw=self.resize,
+            resize_hw=None if self.pipeline_v2 else self.resize,
             channels=self.channels,
             training=is_train,
             decode_fps=self.decode_fps,
+            pipeline_v2=self.pipeline_v2,
         )
+        
+        if self.pipeline_v2:
+            native_h, native_w = clip.shape[-2:]
+            print(
+                f"[pipeline_v2] decode {video_path.name}: native {native_h}x{native_w}",
+                flush=True,
+            )
+            if self.registration_enabled:
+                before_h, before_w = clip.shape[-2:]
+                meta = self.metadata.get(video_id)
+                clip = apply_registration_crop(clip, meta, self.registration_cfg)
+                after_h, after_w = clip.shape[-2:]
+                print(
+                    f"[pipeline_v2] crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                    flush=True,
+                )
+            before_h, before_w = clip.shape[-2:]
+            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+            after_h, after_w = clip.shape[-2:]
+            target_h, target_w = self.canonical_hw
+            print(
+                f"[pipeline_v2] canonical {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+                flush=True,
+            )
+            if self.global_aug_enabled and self.split == "train":
+                before_h, before_w = clip.shape[-2:]
+                clip = apply_global_augment(
+                    clip,
+                    self.global_aug_cfg,
+                    base_seed=self.data_seed,
+                    sample_index=idx,
+                    start_idx=start_idx,
+                    interp=self.global_aug_cfg.get("interp", self.registration_interp),
+                    id_key=video_id,
+                )
+                after_h, after_w = clip.shape[-2:]
+                print(
+                    f"[pipeline_v2] global_aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                    flush=True,
+                )
+        else:
+            clip = self._apply_crop(clip, video_id)
+
 
         clip = self._apply_crop(clip, video_id)
         clip = _tile_vertical(clip, self.tiles)
@@ -586,6 +666,8 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     decode_fps = float(dcfg.get("decode_fps", 30.0))
     hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
     stride = int(round(hop_seconds * decode_fps))
+    
+    pipeline_v2 = bool(dcfg.get("pipeline_v2", False))
 
     dataset = PianoYTDataset(
         root_dir=dcfg.get("root_dir"),
@@ -598,6 +680,9 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         normalize=bool(dcfg.get("normalize", True)),
         manifest=manifest_path,
         decode_fps=decode_fps,
+        pipeline_v2=pipeline_v2,
+        dataset_cfg=dcfg,
+        full_cfg=cfg,
     )
 
     include_low = bool(dcfg.get("include_low_res", False))

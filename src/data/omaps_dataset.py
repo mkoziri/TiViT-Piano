@@ -17,8 +17,10 @@ CLI:
 
 import os
 import glob
+import math
+import zlib
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -219,10 +221,11 @@ def _read_txt_events(txt_path: Path):
 def _load_clip_with_random_start(path: Path,
                                  frames: int,
                                  stride: int,
-                                 resize_hw: Tuple[int, int],
+                                 resize_hw: Optional[Tuple[int, int]],
                                  channels: int,
                                  training: bool,
-                                 decode_fps: float):
+                                 decode_fps: float,
+                                 pipeline_v2: bool = False):
     """
     Load a clip using a randomized start (training=True) or start=0 (else).
     Decoding is performed on a fixed "decode_fps" grid so that all clips
@@ -234,6 +237,7 @@ def _load_clip_with_random_start(path: Path,
     """
     
     hop_seconds = float(stride) / float(decode_fps)
+    do_resize = bool(resize_hw) and not pipeline_v2
     
     # --- decord fast path ---
     if HAVE_DECORD:
@@ -266,9 +270,11 @@ def _load_clip_with_random_start(path: Path,
 
         # to (T,C,H,W) and resize like existing decord helper
         x = x.permute(0, 3, 1, 2)  # T,C,H,W
-        H, W = x.shape[-2:]
-        if (H, W) != tuple(resize_hw):
-            x = F.interpolate(x, size=resize_hw, mode="area")
+        if do_resize:
+            H, W = x.shape[-2:]
+            target_hw = tuple(resize_hw)  # type: ignore[arg-type]
+            if (H, W) != target_hw:
+                x = F.interpolate(x, size=target_hw, mode="area")
 
         return x, start_idx
 
@@ -301,7 +307,12 @@ def _load_clip_with_random_start(path: Path,
             if not ok:
                 break
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (resize_hw[1], resize_hw[0]), interpolation=CV2_INTER)
+            if do_resize:
+                frame = cv2.resize(
+                    frame,
+                    (resize_hw[1], resize_hw[0]),  # type: ignore[index]
+                    interpolation=CV2_INTER,
+                )
             imgs.append(frame)
         cap.release()
 
@@ -318,6 +329,193 @@ def _load_clip_with_random_start(path: Path,
         x = x.permute(0, 3, 1, 2)  # T,C,H,W
         return x, start_idx
 
+def _extract_crop_values(meta: Union[None, Sequence[float], torch.Tensor, Dict[str, Any]]) -> Optional[Tuple[float, float, float, float]]:
+    """Normalize metadata describing a crop box into ``(min_y, max_y, min_x, max_x)``."""
+
+    if meta is None:
+        return None
+
+    if isinstance(meta, torch.Tensor):
+        if meta.numel() < 4:
+            return None
+        vals = meta.flatten()[:4].tolist()
+    elif isinstance(meta, dict):
+        keys = [
+            ("min_y", "max_y", "min_x", "max_x"),
+            ("y0", "y1", "x0", "x1"),
+            ("top", "bottom", "left", "right"),
+        ]
+        vals = None
+        for candidate in keys:
+            if all(k in meta for k in candidate):
+                vals = [meta[k] for k in candidate]  # type: ignore[index]
+                break
+        if vals is None and "crop" in meta:
+            crop_val = meta["crop"]
+            if isinstance(crop_val, (list, tuple)) and len(crop_val) >= 4:
+                vals = list(crop_val[:4])
+        if vals is None:
+            return None
+    elif isinstance(meta, Sequence):
+        if len(meta) < 4:
+            return None
+        vals = list(meta[:4])
+    else:
+        return None
+
+    try:
+        return tuple(float(v) for v in vals[:4])  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_registration_crop(frames: torch.Tensor,
+                            meta: Union[None, Sequence[float], torch.Tensor, Dict[str, Any]],
+                            cfg: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+    """Crop ``frames`` (T,C,H,W) according to registration metadata."""
+
+    _ = cfg  # reserved for future configuration options
+
+    coords = _extract_crop_values(meta)
+    if coords is None:
+        return frames
+
+    min_y, max_y, min_x, max_x = coords
+    T, C, H, W = frames.shape
+
+    is_normalized = all(0.0 <= v <= 1.0 for v in (min_y, max_y, min_x, max_x))
+    if is_normalized:
+        min_y *= H
+        max_y *= H
+        min_x *= W
+        max_x *= W
+
+    y0 = int(math.floor(min_y))
+    y1 = int(math.ceil(max_y))
+    x0 = int(math.floor(min_x))
+    x1 = int(math.ceil(max_x))
+
+    y0 = max(0, min(y0, H - 1))
+    x0 = max(0, min(x0, W - 1))
+    y1 = max(y0 + 1, min(y1, H))
+    x1 = max(x0 + 1, min(x1, W))
+
+    return frames[..., y0:y1, x0:x1]
+
+
+def resize_to_canonical(frames: torch.Tensor,
+                        canonical_hw: Optional[Sequence[int]],
+                        interp: str = "bilinear") -> torch.Tensor:
+    """Resize clip ``frames`` (T,C,H,W) to canonical ``(H,W)`` if provided."""
+
+    if not canonical_hw or len(canonical_hw) < 2:
+        return frames
+
+    target_h = int(round(float(canonical_hw[0])))
+    target_w = int(round(float(canonical_hw[1])))
+    if target_h <= 0 or target_w <= 0:
+        return frames
+
+    h, w = frames.shape[-2:]
+    if (h, w) == (target_h, target_w):
+        return frames
+
+    mode = str(interp or "bilinear").lower()
+    alignable = {"linear", "bilinear", "bicubic", "trilinear"}
+    if mode in alignable:
+        return F.interpolate(frames, size=(target_h, target_w), mode=mode, align_corners=False)
+    return F.interpolate(frames, size=(target_h, target_w), mode=mode)
+
+
+def _apply_color_jitter(frames: torch.Tensor, cfg: Dict[str, Any], rng: np.random.Generator) -> torch.Tensor:
+    if not cfg:
+        return frames
+
+    brightness = float(cfg.get("brightness", 0.0))
+    if brightness > 0.0:
+        factor = float(rng.uniform(max(0.0, 1.0 - brightness), 1.0 + brightness))
+        frames = torch.clamp(frames * factor, 0.0, 1.0)
+
+    contrast = float(cfg.get("contrast", 0.0))
+    if contrast > 0.0:
+        mean = frames.mean(dim=(-1, -2), keepdim=True)
+        factor = float(rng.uniform(max(0.0, 1.0 - contrast), 1.0 + contrast))
+        frames = torch.clamp((frames - mean) * factor + mean, 0.0, 1.0)
+
+    saturation = float(cfg.get("saturation", 0.0))
+    if saturation > 0.0 and frames.shape[1] > 1:
+        gray = frames.mean(dim=1, keepdim=True)
+        factor = float(rng.uniform(max(0.0, 1.0 - saturation), 1.0 + saturation))
+        frames = torch.clamp((frames - gray) * factor + gray, 0.0, 1.0)
+
+    return frames
+
+
+def apply_global_augment(frames: torch.Tensor,
+                         aug_cfg: Optional[Dict[str, Any]],
+                         *,
+                         base_seed: Optional[int] = None,
+                         sample_index: Optional[int] = None,
+                         start_idx: Optional[int] = None,
+                         interp: str = "bilinear",
+                         id_key: Optional[Union[str, int]] = None) -> torch.Tensor:
+    """Apply clip-consistent global augmentations prior to tiling."""
+
+    if not aug_cfg or not bool(aug_cfg.get("enabled", False)):
+        return frames
+
+    seed_val = int(base_seed) if base_seed is not None else 0
+    if sample_index is not None:
+        seed_val = (seed_val + int(sample_index) * 1000003) % (2 ** 32)
+    if start_idx is not None:
+        seed_val = (seed_val + int(start_idx) * 9173) % (2 ** 32)
+    if id_key is not None:
+        key_hash = zlib.crc32(str(id_key).encode("utf-8")) & 0xFFFFFFFF
+        seed_val = (seed_val + key_hash) % (2 ** 32)
+
+    rng = np.random.default_rng(seed_val)
+    mode = str(aug_cfg.get("interp", interp or "bilinear")).lower()
+    alignable = {"linear", "bilinear", "bicubic", "trilinear"}
+
+    def _resize_if_needed(tensor: torch.Tensor, size_hw: Sequence[float]) -> torch.Tensor:
+        target_h = int(round(float(size_hw[0])))
+        target_w = int(round(float(size_hw[1])))
+        if target_h <= 0 or target_w <= 0:
+            return tensor
+        if tensor.shape[-2:] == (target_h, target_w):
+            return tensor
+        if mode in alignable:
+            return F.interpolate(tensor, size=(target_h, target_w), mode=mode, align_corners=False)
+        return F.interpolate(tensor, size=(target_h, target_w), mode=mode)
+
+    resize_hw = aug_cfg.get("resize_jitter")
+    if isinstance(resize_hw, Sequence) and len(resize_hw) >= 2:
+        frames = _resize_if_needed(frames, resize_hw)
+
+    crop_hw = aug_cfg.get("random_crop_hw")
+    if isinstance(crop_hw, Sequence) and len(crop_hw) >= 2:
+        crop_h = int(round(float(crop_hw[0])))
+        crop_w = int(round(float(crop_hw[1])))
+        crop_h = max(1, min(frames.shape[-2], crop_h))
+        crop_w = max(1, min(frames.shape[-1], crop_w))
+        max_y = frames.shape[-2] - crop_h
+        max_x = frames.shape[-1] - crop_w
+        y0 = int(rng.integers(0, max_y + 1)) if max_y > 0 else 0
+        x0 = int(rng.integers(0, max_x + 1)) if max_x > 0 else 0
+        frames = frames[..., y0:y0 + crop_h, x0:x0 + crop_w]
+
+    if bool(aug_cfg.get("hflip", False)):
+        prob = float(aug_cfg.get("hflip_prob", 0.5))
+        if float(rng.random()) < prob:
+            frames = torch.flip(frames, dims=[-1])
+
+    color_cfg = aug_cfg.get("color_jitter")
+    if isinstance(color_cfg, dict):
+        frames = _apply_color_jitter(frames, color_cfg, rng)
+
+    return frames
+  
+  
 def _build_frame_targets(labels: torch.Tensor,
                          T: int, stride: int, fps: float,
                          note_min: int = 21, note_max: int = 108,
@@ -431,7 +629,11 @@ class OMAPSDataset(Dataset):
                  channels: int = 3,
                  normalize: bool = True,
                  manifest: Optional[str] = None,
-                 decode_fps: float = 30.0):
+                 decode_fps: float = 30.0,
+                 *,
+                 pipeline_v2: bool = False,
+                 dataset_cfg: Optional[Dict[str, Any]] = None,
+                 full_cfg: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.root = _expand_root(root_dir)
         self.split = split
@@ -442,6 +644,31 @@ class OMAPSDataset(Dataset):
         self.channels = int(channels)
         self.normalize = bool(normalize)
         self.decode_fps = float(decode_fps)
+        self.pipeline_v2 = bool(pipeline_v2)
+        self.dataset_cfg = dict(dataset_cfg or {})
+        self.full_cfg = dict(full_cfg or {})
+
+        reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
+        self.registration_cfg = reg_cfg
+        self.registration_enabled = bool(reg_cfg.get("enabled", False))
+        self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
+
+        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
+        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
+            self.canonical_hw = (int(round(float(canonical_cfg[0]))), int(round(float(canonical_cfg[1]))))
+        else:
+            self.canonical_hw = tuple(self.resize)
+
+        global_aug_cfg = self.dataset_cfg.get("global_aug")
+        if not isinstance(global_aug_cfg, dict):
+            global_aug_cfg = reg_cfg.get("global_aug") if isinstance(reg_cfg.get("global_aug"), dict) else {}
+        self.global_aug_cfg = dict(global_aug_cfg or {})
+        self.global_aug_enabled = bool(self.global_aug_cfg.get("enabled", False))
+
+        data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
+        experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
+        seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
+        self.data_seed = int(seed_val) if seed_val is not None else None
         
         self.videos = _list_videos(self.root, split)
         if manifest:
@@ -478,11 +705,52 @@ class OMAPSDataset(Dataset):
             path=path,
             frames=self.frames,
             stride=self.stride,
-            resize_hw=self.resize,
+            resize_hw=None if self.pipeline_v2 else self.resize,
             channels=self.channels,
             training=is_train,
             decode_fps=self.decode_fps,
+            pipeline_v2=self.pipeline_v2,
         )
+        if self.pipeline_v2:
+            native_h, native_w = clip.shape[-2:]
+            print(
+                f"[pipeline_v2] decode {path.name}: native {native_h}x{native_w}",
+                flush=True,
+            )
+            if self.registration_enabled:
+                before_h, before_w = clip.shape[-2:]
+                meta = self.registration_cfg.get("crop")
+                clip = apply_registration_crop(clip, meta, self.registration_cfg)
+                after_h, after_w = clip.shape[-2:]
+                print(
+                    f"[pipeline_v2] crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                    flush=True,
+                )
+            before_h, before_w = clip.shape[-2:]
+            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+            after_h, after_w = clip.shape[-2:]
+            target_h, target_w = self.canonical_hw
+            print(
+                f"[pipeline_v2] canonical {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+                flush=True,
+            )
+            if self.global_aug_enabled and self.split == "train":
+                before_h, before_w = clip.shape[-2:]
+                clip = apply_global_augment(
+                    clip,
+                    self.global_aug_cfg,
+                    base_seed=self.data_seed,
+                    sample_index=idx,
+                    start_idx=start_idx,
+                    interp=self.global_aug_cfg.get("interp", self.registration_interp),
+                    id_key=path.stem,
+                )
+                after_h, after_w = clip.shape[-2:]
+                print(
+                    f"[pipeline_v2] global_aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                    flush=True,
+                )
+                
         clip = _tile_vertical(clip, self.tiles)  # T,tiles,C,H,Wt
 
         # --- compute the clip's time window [t0, t1) in seconds ---
@@ -625,6 +893,8 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
     stride = int(round(hop_seconds * decode_fps))
 
+    pipeline_v2 = bool(dcfg.get("pipeline_v2", False))
+    
     dataset = OMAPSDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
@@ -636,6 +906,9 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         normalize=bool(dcfg.get("normalize", True)),
         manifest=manifest_path,
         decode_fps=decode_fps,
+        pipeline_v2=pipeline_v2,
+        dataset_cfg=dcfg,
+        full_cfg=cfg,
     )
     # attach annotation config if present
     max_clips = dcfg.get("max_clips")
