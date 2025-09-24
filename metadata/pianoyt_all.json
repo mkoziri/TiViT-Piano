@@ -1,7 +1,7 @@
 {
   "root": "/home/almar/dev/tivit/data/PianoYT",
   "split": "all",
-  "n": 218,
+  "n": 237,
   "pieces": [
     {
       "id": "100",
@@ -290,23 +290,6 @@
         1008,
         41,
         1875
-      ]
-    },
-    {
-      "id": "118",
-      "duration_sec": 184.51136363636363,
-      "n_notes": 2473,
-      "notes_per_sec": 13.40296852866909,
-      "pitch_min": 32,
-      "pitch_max": 92,
-      "has_video": true,
-      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_118.0.midi",
-      "video": "/home/almar/datasets/PianoYT/raw_videos/video_118.0.mp4",
-      "crop": [
-        672,
-        994,
-        39,
-        1872
       ]
     },
     {
@@ -3367,6 +3350,346 @@
         1083,
         3,
         1916
+      ]
+    },
+    {
+      "id": "106",
+      "duration_sec": 101.27954545454546,
+      "n_notes": 244,
+      "notes_per_sec": 2.409173529609766,
+      "pitch_min": 33,
+      "pitch_max": 88,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_106.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_106.0.mp4",
+      "crop": [
+        675,
+        990,
+        47,
+        1869
+      ]
+    },
+    {
+      "id": "132",
+      "duration_sec": 368.575,
+      "n_notes": 2845,
+      "notes_per_sec": 7.718917452350269,
+      "pitch_min": 30,
+      "pitch_max": 97,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_132.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_132.0.mp4",
+      "crop": [
+        677,
+        993,
+        45,
+        1871
+      ]
+    },
+    {
+      "id": "136",
+      "duration_sec": 525.790909090909,
+      "n_notes": 2467,
+      "notes_per_sec": 4.691979182876014,
+      "pitch_min": 30,
+      "pitch_max": 97,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_136.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_136.0.mp4",
+      "crop": [
+        539,
+        850,
+        79,
+        1845
+      ]
+    },
+    {
+      "id": "145",
+      "duration_sec": 576.5431818181818,
+      "n_notes": 4464,
+      "notes_per_sec": 7.742698449615459,
+      "pitch_min": 29,
+      "pitch_max": 92,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_145.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_145.0.mp4",
+      "crop": [
+        587,
+        902,
+        102,
+        1832
+      ]
+    },
+    {
+      "id": "152",
+      "duration_sec": 205.24772727272727,
+      "n_notes": 1003,
+      "notes_per_sec": 4.886777619063437,
+      "pitch_min": 28,
+      "pitch_max": 88,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_152.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_152.0.mp4",
+      "crop": [
+        517,
+        824,
+        53,
+        1873
+      ]
+    },
+    {
+      "id": "198",
+      "duration_sec": 203.5522727272727,
+      "n_notes": 1601,
+      "notes_per_sec": 7.865301519600728,
+      "pitch_min": 27,
+      "pitch_max": 99,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_198.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_198.0.mp4",
+      "crop": [
+        531,
+        833,
+        57,
+        1853
+      ]
+    },
+    {
+      "id": "211",
+      "duration_sec": 201.5681818181818,
+      "n_notes": 1294,
+      "notes_per_sec": 6.419663998195964,
+      "pitch_min": 29,
+      "pitch_max": 94,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_211.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_211.0.mp4",
+      "crop": [
+        602,
+        915,
+        50,
+        1860
+      ]
+    },
+    {
+      "id": "218",
+      "duration_sec": 152.99090909090907,
+      "n_notes": 697,
+      "notes_per_sec": 4.555826252302573,
+      "pitch_min": 25,
+      "pitch_max": 104,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_218.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_218.0.mp4",
+      "crop": [
+        675,
+        990,
+        40,
+        1869
+      ]
+    },
+    {
+      "id": "220",
+      "duration_sec": 234.91136363636363,
+      "n_notes": 1371,
+      "notes_per_sec": 5.836243844390051,
+      "pitch_min": 37,
+      "pitch_max": 84,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_220.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_220.0.mp4",
+      "crop": [
+        673,
+        986,
+        41,
+        1874
+      ]
+    },
+    {
+      "id": "227",
+      "duration_sec": 228.06363636363636,
+      "n_notes": 1980,
+      "notes_per_sec": 8.681787379917886,
+      "pitch_min": 36,
+      "pitch_max": 84,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_227.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_227.0.mp4",
+      "crop": [
+        675,
+        988,
+        34,
+        1880
+      ]
+    },
+    {
+      "id": "238",
+      "duration_sec": 540.1272727272727,
+      "n_notes": 1959,
+      "notes_per_sec": 3.6269229474534623,
+      "pitch_min": 36,
+      "pitch_max": 84,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_238.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_238.0.mp4",
+      "crop": [
+        681,
+        987,
+        38,
+        1874
+      ]
+    },
+    {
+      "id": "254",
+      "duration_sec": 191.61590909090907,
+      "n_notes": 2386,
+      "notes_per_sec": 12.451993215594644,
+      "pitch_min": 31,
+      "pitch_max": 86,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_254.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_254.0.mp4",
+      "crop": [
+        679,
+        988,
+        56,
+        1860
+      ]
+    },
+    {
+      "id": "262",
+      "duration_sec": 202.5909090909091,
+      "n_notes": 1641,
+      "notes_per_sec": 8.100067309849674,
+      "pitch_min": 33,
+      "pitch_max": 86,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_262.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_262.0.mp4",
+      "crop": [
+        535,
+        851,
+        84,
+        1845
+      ]
+    },
+    {
+      "id": "269",
+      "duration_sec": 116.70454545454545,
+      "n_notes": 1345,
+      "notes_per_sec": 11.524829600778968,
+      "pitch_min": 36,
+      "pitch_max": 101,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_269.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_269.0.mp4",
+      "crop": [
+        515,
+        873,
+        48,
+        1877
+      ]
+    },
+    {
+      "id": "276",
+      "duration_sec": 95.425,
+      "n_notes": 371,
+      "notes_per_sec": 3.887870055017029,
+      "pitch_min": 36,
+      "pitch_max": 89,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_276.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_276.0.mp4",
+      "crop": [
+        535,
+        853,
+        60,
+        1870
+      ]
+    },
+    {
+      "id": "277",
+      "duration_sec": 99.13636363636363,
+      "n_notes": 253,
+      "notes_per_sec": 2.5520403484640077,
+      "pitch_min": 36,
+      "pitch_max": 99,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_277.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_277.0.mp4",
+      "crop": [
+        529,
+        856,
+        39,
+        1854
+      ]
+    },
+    {
+      "id": "402",
+      "duration_sec": 244.64090909090908,
+      "n_notes": 1810,
+      "notes_per_sec": 7.3985990598465285,
+      "pitch_min": 28,
+      "pitch_max": 75,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_402.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_402.0.mp4",
+      "crop": [
+        579,
+        993,
+        13,
+        1919
+      ]
+    },
+    {
+      "id": "406",
+      "duration_sec": 184.47954545454544,
+      "n_notes": 1239,
+      "notes_per_sec": 6.716191743356618,
+      "pitch_min": 27,
+      "pitch_max": 84,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_406.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_406.0.mp4",
+      "crop": [
+        585,
+        1000,
+        3,
+        1919
+      ]
+    },
+    {
+      "id": "410",
+      "duration_sec": 244.64090909090908,
+      "n_notes": 1810,
+      "notes_per_sec": 7.3985990598465285,
+      "pitch_min": 28,
+      "pitch_max": 75,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_410.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_410.0.mp4",
+      "crop": [
+        579,
+        993,
+        13,
+        1919
+      ]
+    },
+    {
+      "id": "428",
+      "duration_sec": 183.26363636363635,
+      "n_notes": 455,
+      "notes_per_sec": 2.482762041767945,
+      "pitch_min": 39,
+      "pitch_max": 102,
+      "has_video": true,
+      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_428.0.midi",
+      "video": "/home/almar/datasets/PianoYT/raw_videos/video_428.0.mp4",
+      "crop": [
+        361,
+        659,
+        0,
+        1279
       ]
     },
     {

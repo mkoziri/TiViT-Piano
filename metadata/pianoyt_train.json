@@ -1,7 +1,7 @@
 {
   "root": "/home/almar/dev/tivit/data/PianoYT",
   "split": "train",
-  "n": 198,
+  "n": 197,
   "pieces": [
     {
       "id": "100",
@@ -290,23 +290,6 @@
         1008,
         41,
         1875
-      ]
-    },
-    {
-      "id": "118",
-      "duration_sec": 184.51136363636363,
-      "n_notes": 2473,
-      "notes_per_sec": 13.40296852866909,
-      "pitch_min": 32,
-      "pitch_max": 92,
-      "has_video": true,
-      "midi": "/home/almar/datasets/PianoYT/pseudo_midis/audio_118.0.midi",
-      "video": "/home/almar/datasets/PianoYT/raw_videos/video_118.0.mp4",
-      "crop": [
-        672,
-        994,
-        39,
-        1872
       ]
     },
     {
