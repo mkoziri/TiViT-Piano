@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -297,7 +298,13 @@ def _read_midi_events(midi_path: Path) -> torch.FloatTensor:
     events: List[Tuple[float, float, float]] = []
 
     try:
-        import pretty_midi  # type: ignore
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"pkg_resources is deprecated as an API",
+                category=UserWarning,
+            )
+            import pretty_midi  # type: ignore
     except Exception:  # pragma: no cover - handled by fallback
         pretty_midi = None
 
@@ -522,29 +529,23 @@ class PianoYTDataset(Dataset):
         )
         
         native_h, native_w = clip.shape[-2:]
-        print(f"decode {video_path.name}: native {native_h}x{native_w}", flush=True)
+        #print(f"decode {video_path.name}: native {native_h}x{native_w}", flush=True)
 
         if self.registration_enabled and self.apply_crop:
             before_h, before_w = clip.shape[-2:]
             meta = self.metadata.get(video_id)
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
             after_h, after_w = clip.shape[-2:]
-            print(
-                f"registration crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                flush=True,
-            )
+            #print(f"registration crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
         elif not self.registration_enabled and not self._registration_off_logged:
-            print("registration=off → decode→resize→aug→tile", flush=True)
+            #print("registration=off → decode→resize→aug→tile", flush=True)
             self._registration_off_logged = True
 
         before_h, before_w = clip.shape[-2:]
         clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
         after_h, after_w = clip.shape[-2:]
         target_h, target_w = self.canonical_hw
-        print(
-            f"canonical resize {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
-            flush=True,
-        )
+        #print(f"canonical resize {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",flush=True,)
 
         if self.global_aug_enabled and is_train:
             before_h, before_w = clip.shape[-2:]
@@ -558,10 +559,7 @@ class PianoYTDataset(Dataset):
                 id_key=video_id,
             )
             after_h, after_w = clip.shape[-2:]
-            print(
-                f"global aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                flush=True,
-            )
+            #print(f"global aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
 
         _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
             clip,
@@ -574,11 +572,7 @@ class PianoYTDataset(Dataset):
             clip = clip[..., :aligned_w]
         if not self._tiling_log_once:
             width_sum = sum(widths_px)
-            print(
-                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                flush=True,
-            )
+            print(f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",flush=True,)
             self._tiling_log_once = True
 
         T = self.frames

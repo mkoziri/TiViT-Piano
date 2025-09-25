@@ -28,6 +28,7 @@ import csv
 import json
 import os
 import shutil
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from statistics import median
@@ -87,7 +88,13 @@ def read_midi(midi_path: Path) -> List[Tuple[float, float, int]]:
 
     # Preferred reader: pretty_midi (handles tempo maps & controllers).
     try:
-        import pretty_midi
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"pkg_resources is deprecated as an API",
+                category=UserWarning,
+            )
+            import pretty_midi
 
         pm = pretty_midi.PrettyMIDI(str(midi_path))
         rows = _validate((note.start, note.end, note.pitch)

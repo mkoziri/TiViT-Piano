@@ -706,28 +706,22 @@ class OMAPSDataset(Dataset):
             decode_fps=self.decode_fps,
         )
         native_h, native_w = clip.shape[-2:]
-        print(f"decode {path.name}: native {native_h}x{native_w}", flush=True)
+        #print(f"decode {path.name}: native {native_h}x{native_w}", flush=True)
         if self.registration_enabled and self.apply_crop:
             before_h, before_w = clip.shape[-2:]
             meta = self.registration_cfg.get("crop")
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
             after_h, after_w = clip.shape[-2:]
-            print(
-                f"registration crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                flush=True,
-            )
+            #print(f"registration crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
         elif not self.registration_enabled and not self._registration_off_logged:
-            print("registration=off → decode→resize→aug→tile", flush=True)
+            #print("registration=off → decode→resize→aug→tile", flush=True)
             self._registration_off_logged = True
 
         before_h, before_w = clip.shape[-2:]
         clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
         after_h, after_w = clip.shape[-2:]
         target_h, target_w = self.canonical_hw
-        print(
-            f"canonical resize {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
-            flush=True,
-        )
+        #print(f"canonical resize {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",flush=True,)
         if self.global_aug_enabled and self.split == "train":
             before_h, before_w = clip.shape[-2:]
             clip = apply_global_augment(
@@ -740,10 +734,7 @@ class OMAPSDataset(Dataset):
                 id_key=path.stem,
             )
             after_h, after_w = clip.shape[-2:]
-            print(
-                f"global aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                flush=True,
-            )
+            #print(f"global aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
 
         _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
             clip,
@@ -756,11 +747,7 @@ class OMAPSDataset(Dataset):
             clip = clip[..., :aligned_w]
         if not self._tiling_log_once:
             width_sum = sum(widths_px)
-            print(
-                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                flush=True,
-            )
+            print(f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",flush=True,)
             self._tiling_log_once = True
 
         # --- compute the clip's time window [t0, t1) in seconds ---
@@ -776,8 +763,6 @@ class OMAPSDataset(Dataset):
         ann_path = None
         try:
             ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
-            print(f"[DEBUG] video={path.name} -> ann_path={ann_path}", flush=True)  #just for debugging. this should be removed.
-            print(f"[DEBUG] video={path}  stem={path.stem}  dir={path.parent}  ann_path={ann_path}", flush=True)
         except NameError:
             from pathlib import Path
             ann_root = getattr(self, "annotations_root", None)
