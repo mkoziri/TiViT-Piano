@@ -39,7 +39,7 @@ dataset:
     source: "metadata"
     interp: "bilinear"
     global_aug:
-      enabled: true
+      enabled: false
       resize_jitter: [150, 805]
       random_crop_hw: [145, 800]
   crop_rescale: "auto"
