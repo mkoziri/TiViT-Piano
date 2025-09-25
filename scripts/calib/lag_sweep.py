@@ -36,11 +36,14 @@ from models import build_model  # noqa: E402
 from data.omaps_dataset import (  # noqa: E402
     OMAPSDataset,
     _load_clip_with_random_start,
-    _tile_vertical,
     _read_txt_events,
     _build_frame_targets,
+    apply_global_augment,
+    apply_registration_crop,
+    resize_to_canonical,
 )
-
+from utils.tiling import tile_vertical_token_aligned  # noqa: E402
+ 
 
 def _align(a: torch.Tensor, b: torch.Tensor, delta: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Align two 1-D tensors according to shift ``delta``.
@@ -83,17 +86,15 @@ def _find_clip(dataset: OMAPSDataset, key: str) -> Path:
 
 def _load_window(
     path: Path,
+    dataset: OMAPSDataset,
     decode_fps: float,
     hop_seconds: float,
     start_sec: float,
     seconds: float,
-    resize: Tuple[int, int],
-    tiles: int,
-    channels: int,
 ) -> torch.Tensor:
     """Load a window ``[start_sec, start_sec+seconds)`` from ``path``.
 
-    Returns ``T,tiles,C,H,W`` tensor on CPU with values in [0,1].
+    Returns a ``(T,C,H,W)`` tensor on CPU with values in [0, 1].
     """
 
     stride = int(round(hop_seconds * decode_fps))
@@ -104,13 +105,45 @@ def _load_window(
         path=path,
         frames=frames_total,
         stride=stride,
-        resize_hw=resize,
-        channels=channels,
+        channels=dataset.channels,
         training=False,
         decode_fps=decode_fps,
     )
 
-    clip_full = _tile_vertical(clip_full, tiles)  # T,tiles,C,H,Wt
+    if dataset.registration_enabled and dataset.apply_crop:
+        clip_full = apply_registration_crop(
+            clip_full,
+            dataset.registration_cfg.get("crop"),
+            dataset.registration_cfg,
+        )
+
+    clip_full = resize_to_canonical(
+        clip_full,
+        dataset.canonical_hw,
+        dataset.registration_interp,
+    )
+
+    if dataset.global_aug_enabled and dataset.split == "train":
+        clip_full = apply_global_augment(
+            clip_full,
+            dataset.global_aug_cfg,
+            base_seed=dataset.data_seed,
+            sample_index=0,
+            start_idx=0,
+            interp=dataset.global_aug_cfg.get("interp", dataset.registration_interp),
+            id_key=path.stem,
+        )
+
+    _, _, _, _, aligned_w, original_w = tile_vertical_token_aligned(
+        clip_full,
+        dataset.tiles,
+        patch_w=dataset.tiling_patch_w,
+        tokens_split=dataset.tiling_tokens_split,
+        overlap_tokens=dataset.tiling_overlap_tokens,
+    )
+    if aligned_w != original_w:
+        clip_full = clip_full[..., :aligned_w]
+
 
     start_frame = int(np.floor(start_sec / hop_seconds))
     clip = clip_full[start_frame : start_frame + frames_needed]
@@ -166,6 +199,7 @@ def main():  # noqa: C901 - command-line tool
         normalize=bool(dcfg.get("normalize", True)),
         decode_fps=decode_fps,
     )
+    dataset.apply_crop = bool(dcfg.get("apply_crop", True))
     dataset.annotations_root = dcfg.get("annotations_root")
     dataset.label_format = dcfg.get("label_format", "txt")
     dataset.label_targets = dcfg.get("label_targets", ["pitch", "onset", "offset", "hand", "clef"])
@@ -178,16 +212,14 @@ def main():  # noqa: C901 - command-line tool
     # load video window
     clip = _load_window(
         path=clip_path,
+        dataset=dataset,
         decode_fps=decode_fps,
         hop_seconds=hop_seconds,
         start_sec=args.start_sec,
         seconds=args.seconds,
-        resize=tuple(dcfg.get("resize", [224, 224])),
-        tiles=int(dcfg.get("tiles", 3)),
-        channels=int(dcfg.get("channels", 3)),
     )
     T = clip.shape[0]
-    x = clip.unsqueeze(0)  # B, T, tiles, C, H, W
+    x = clip.unsqueeze(0)  # B, T, C, H, W
 
     # load labels and build frame targets
     ann_path = None

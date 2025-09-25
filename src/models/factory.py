@@ -42,7 +42,6 @@ def build_model(cfg: Mapping[str, Any]):
         mlp_ratio=_get(tcfg, "mlp_ratio", 4.0),
         dropout=_get(tcfg, "dropout", 0.1),
         head_mode=cfg["model"].get("head_mode", "clip"),
-        pipeline_v2=bool(dataset_cfg.get("pipeline_v2", False)),
         tiling_cfg=tiling_cfg,
     )
 

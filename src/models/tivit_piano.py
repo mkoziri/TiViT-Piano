@@ -189,13 +189,11 @@ class TiViTPiano(nn.Module):
         pitch_classes=88,
         clef_classes=3,
         head_mode: str = "clip",   # "clip" or "frame"
-        pipeline_v2: bool = False,
         tiling_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.tiles = tiles
         self.head_mode = head_mode  # runtime switch for clip vs frame heads
-        self.pipeline_v2 = bool(pipeline_v2)
 
         tiling_cfg = dict(tiling_cfg or {})
         tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
@@ -246,18 +244,8 @@ class TiViTPiano(nn.Module):
                 t_tokens=t_tokens, s_tokens=s_tokens, **self.encoder_cfg
             )
 
-    def _tile_split(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Evenly split ``x`` (B,T,C,H,W) into ``self.tiles`` vertical tiles."""
-
-        B, T, C, H, W = x.shape
-        w_each = W // self.tiles
-        total = w_each * self.tiles
-        if total != W:
-            x = x[..., :total]
-        return [x[..., i * w_each:(i + 1) * w_each] for i in range(self.tiles)]
-
     def _tile_split_token_aligned(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Split using token-aligned tiling for pipeline v2 clips."""
+        """Split ``x`` using token-aligned tiling consistent with the data pipeline."""
 
         B, T, C, H, W = x.shape
         cache_width = self._tile_aligned_width
@@ -351,13 +339,12 @@ class TiViTPiano(nn.Module):
         if x.dim() == 6:
             B, T, M, C, H, W = x.shape
             tiles = [x[:, :, i, :, :, :] for i in range(M)]
-        else:
+        elif x.dim() == 5:
             B, T, C, H, W = x.shape
-            if self.pipeline_v2:
-                tiles = self._tile_split_token_aligned(x)
-            else:
-                tiles = self._tile_split(x)
-
+            tiles = self._tile_split_token_aligned(x)
+        else:
+            raise ValueError(f"Unexpected input rank {x.dim()} for TiViTPiano forward")
+            
         # Per-tile tubelet embedding (shared weights)
         tile_tokens = []
         t_tokens = s_tokens = None

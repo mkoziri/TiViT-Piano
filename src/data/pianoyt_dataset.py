@@ -35,7 +35,6 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
     _build_frame_targets,
     _load_clip_with_random_start,
     _read_manifest,
-    _tile_vertical,
     apply_global_augment,
     apply_registration_crop,
     resize_to_canonical,
@@ -366,7 +365,6 @@ class PianoYTDataset(Dataset):
         manifest: Optional[str] = None,
         decode_fps: float = 30.0,
         *,
-        pipeline_v2: bool = False,
         dataset_cfg: Optional[Dict[str, Any]] = None,
         full_cfg: Optional[Dict[str, Any]] = None,
     ):
@@ -380,7 +378,6 @@ class PianoYTDataset(Dataset):
         self.channels = int(channels)
         self.normalize = bool(normalize)
         self.decode_fps = float(decode_fps)
-        self.pipeline_v2 = bool(pipeline_v2)
         self.dataset_cfg = dict(dataset_cfg or {})
         self.full_cfg = dict(full_cfg or {})
 
@@ -422,12 +419,13 @@ class PianoYTDataset(Dataset):
             self.tiling_tokens_split = tokens_split_cfg
         self.tiling_overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
         self._tiling_log_once = False
+        self._registration_off_logged = False
 
-        if self.pipeline_v2 and self.tiling_patch_w is None:
+        if self.tiling_patch_w is None:
             raise ValueError(
-                "pipeline_v2 requires 'tiling.patch_w' or model transformer patch size"
+                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
             )
-
+            
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
         experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
         seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
@@ -473,7 +471,6 @@ class PianoYTDataset(Dataset):
         
         # Now compute videos based on the filtered sample list
         self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
-        self._crop_warned: set = set()
         self.apply_crop = True
         self.crop_rescale = "auto"
         self.include_low_res = True
@@ -505,37 +502,6 @@ class PianoYTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _apply_crop(self, clip: torch.Tensor, video_id: str) -> torch.Tensor:
-        if not self.apply_crop:
-            return clip
-        crop = self.metadata.get(video_id)
-        if not crop:
-            return clip
-        min_y, max_y, min_x, max_x = crop
-        T, C, H, W = clip.shape
-        if (H != 1080 or W != 1920) and self.crop_rescale != "auto":
-            if video_id not in self._crop_warned:
-                LOGGER.warning(
-                    "[PianoYT] Skipping crop for %s (%dx%d vs 1080p baseline).",
-                    video_id,
-                    H,
-                    W,
-                )
-                self._crop_warned.add(video_id)
-            return clip
-        if H != 1080 or W != 1920:
-            scale_y = H / 1080.0
-            scale_x = W / 1920.0
-            min_y = int(round(min_y * scale_y))
-            max_y = int(round(max_y * scale_y))
-            min_x = int(round(min_x * scale_x))
-            max_x = int(round(max_x * scale_x))
-        min_y = max(0, min(min_y, H - 1))
-        max_y = max(min_y + 1, min(max_y, H))
-        min_x = max(0, min(min_x, W - 1))
-        max_x = max(min_x + 1, min(max_x, W))
-        return clip[..., min_y:max_y, min_x:max_x]
-
     def __getitem__(self, idx: int):
         record = self.samples[idx]
         video_path = record.get("video")
@@ -550,75 +516,70 @@ class PianoYTDataset(Dataset):
             path=video_path,
             frames=self.frames,
             stride=self.stride,
-            resize_hw=None if self.pipeline_v2 else self.resize,
             channels=self.channels,
             training=is_train,
             decode_fps=self.decode_fps,
-            pipeline_v2=self.pipeline_v2,
         )
         
-        if self.pipeline_v2:
-            native_h, native_w = clip.shape[-2:]
-            print(
-                f"[pipeline_v2] decode {video_path.name}: native {native_h}x{native_w}",
-                flush=True,
-            )
-            if self.registration_enabled:
-                before_h, before_w = clip.shape[-2:]
-                meta = self.metadata.get(video_id)
-                clip = apply_registration_crop(clip, meta, self.registration_cfg)
-                after_h, after_w = clip.shape[-2:]
-                print(
-                    f"[pipeline_v2] crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                    flush=True,
-                )
+        native_h, native_w = clip.shape[-2:]
+        print(f"decode {video_path.name}: native {native_h}x{native_w}", flush=True)
+
+        if self.registration_enabled and self.apply_crop:
             before_h, before_w = clip.shape[-2:]
-            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+            meta = self.metadata.get(video_id)
+            clip = apply_registration_crop(clip, meta, self.registration_cfg)
             after_h, after_w = clip.shape[-2:]
-            target_h, target_w = self.canonical_hw
             print(
-                f"[pipeline_v2] canonical {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+                f"registration crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
                 flush=True,
             )
-            if self.global_aug_enabled and self.split == "train":
-                before_h, before_w = clip.shape[-2:]
-                clip = apply_global_augment(
-                    clip,
-                    self.global_aug_cfg,
-                    base_seed=self.data_seed,
-                    sample_index=idx,
-                    start_idx=start_idx,
-                    interp=self.global_aug_cfg.get("interp", self.registration_interp),
-                    id_key=video_id,
-                )
-                after_h, after_w = clip.shape[-2:]
-                print(
-                    f"[pipeline_v2] global_aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                    flush=True,
-                )
-        else:
-            clip = self._apply_crop(clip, video_id)
-        clip = self._apply_crop(clip, video_id)
-        if self.pipeline_v2:
-            _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
+        elif not self.registration_enabled and not self._registration_off_logged:
+            print("registration=off → decode→resize→aug→tile", flush=True)
+            self._registration_off_logged = True
+
+        before_h, before_w = clip.shape[-2:]
+        clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+        after_h, after_w = clip.shape[-2:]
+        target_h, target_w = self.canonical_hw
+        print(
+            f"canonical resize {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+            flush=True,
+        )
+
+        if self.global_aug_enabled and is_train:
+            before_h, before_w = clip.shape[-2:]
+            clip = apply_global_augment(
                 clip,
-                self.tiles,
-                patch_w=self.tiling_patch_w,
-                tokens_split=self.tiling_tokens_split,
-                overlap_tokens=self.tiling_overlap_tokens,
+                self.global_aug_cfg,
+                base_seed=self.data_seed,
+                sample_index=idx,
+                start_idx=start_idx,
+                interp=self.global_aug_cfg.get("interp", self.registration_interp),
+                id_key=video_id,
             )
-            if aligned_w != original_w:
-                clip = clip[..., :aligned_w]
-            if not self._tiling_log_once:
-                width_sum = sum(widths_px)
-                print(
-                    f"[pipeline_v2] tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                    f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                    flush=True,
-                )
-                self._tiling_log_once = True
-        else:
-            clip = _tile_vertical(clip, self.tiles)
+            after_h, after_w = clip.shape[-2:]
+            print(
+                f"global aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                flush=True,
+            )
+
+        _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
+            clip,
+            self.tiles,
+            patch_w=self.tiling_patch_w,
+            tokens_split=self.tiling_tokens_split,
+            overlap_tokens=self.tiling_overlap_tokens,
+        )
+        if aligned_w != original_w:
+            clip = clip[..., :aligned_w]
+        if not self._tiling_log_once:
+            width_sum = sum(widths_px)
+            print(
+                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                flush=True,
+            )
+            self._tiling_log_once = True
 
         T = self.frames
         fps = self.decode_fps
@@ -726,8 +687,6 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
     stride = int(round(hop_seconds * decode_fps))
     
-    pipeline_v2 = bool(dcfg.get("pipeline_v2", False))
-
     dataset = PianoYTDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
@@ -739,7 +698,6 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         normalize=bool(dcfg.get("normalize", True)),
         manifest=manifest_path,
         decode_fps=decode_fps,
-        pipeline_v2=pipeline_v2,
         dataset_cfg=dcfg,
         full_cfg=cfg,
     )

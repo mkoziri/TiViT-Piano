@@ -48,8 +48,6 @@ def main():
 
     print(f"Dataset split: {split}")
     print(f"Dataset name: {dataset_name}")
-    pipeline_v2 = bool(cfg.get("dataset", {}).get("pipeline_v2", False))
-    
     for i, batch in enumerate(loader):
         x = batch["video"]
         paths = batch["path"]
@@ -62,12 +60,11 @@ def main():
         elif x.dim() == 5:
             B, T, C, H, W = x.shape
             print(f"  B={B}, T={T}, C={C}, H={H}, W={W}")
-            if pipeline_v2:
-                tiles = cfg.get("dataset", {}).get("tiles")
-                if tiles is not None:
-                    print(f"  pipeline_v2: tiles will be split lazily (configured tiles={tiles})")
-                else:
-                    print("  pipeline_v2: tiles will be split lazily")
+            tiles = cfg.get("dataset", {}).get("tiles")
+            if tiles is not None:
+                print(f"  token-aligned tiling will be applied lazily (configured tiles={tiles})")
+            else:
+                print("  token-aligned tiling will be applied lazily")
         else:
             print(f"  tensor rank={x.dim()} (unexpected for video batch)")
             

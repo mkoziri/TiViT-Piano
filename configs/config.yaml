@@ -13,7 +13,6 @@ dataset:
   label_format: "txt"
   label_targets: ["pitch", "onset", "offset", "hand", "clef"]
   max_clips: null
-  pipeline_v2: true
   # NEW: manifest files that select which IDs belong to each logical role
   manifest:
     #train: splits/train_minus_calib_list.txt  #For OMAPS

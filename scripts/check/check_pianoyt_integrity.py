@@ -340,36 +340,6 @@ def load_excluded_ids(root: Path) -> Set[str]:
         return {line.strip() for line in f if line.strip() and not line.startswith("#")}
 
 
-def _apply_metadata_crop(
-    clip, video_id: str, *, crop_rescale: str = "auto"
-):  # type: ignore[no-untyped-def]
-    """Crop ``clip`` according to metadata gathered during integrity checks."""
-
-    crop = PIANOYT_CROPS.get(video_id)
-    if not crop:
-        return clip
-
-    min_y, max_y, min_x, max_x = crop
-    _, _, H, W = clip.shape
-    if (H != 1080 or W != 1920) and crop_rescale.lower() != "auto":
-        return clip
-
-    if H != 1080 or W != 1920:
-        scale_y = H / 1080.0
-        scale_x = W / 1920.0
-        min_y = int(round(min_y * scale_y))
-        max_y = int(round(max_y * scale_y))
-        min_x = int(round(min_x * scale_x))
-        max_x = int(round(max_x * scale_x))
-
-    min_y = max(0, min(int(min_y), H - 1))
-    max_y = max(min_y + 1, min(int(max_y), H))
-    min_x = max(0, min(int(min_x), W - 1))
-    max_x = max(min_x + 1, min(int(max_x), W))
-
-    return clip[..., min_y:max_y, min_x:max_x]
-
-
 def _save_stage_frame(base: Path, stage: str, tensor):  # type: ignore[no-untyped-def]
     """Persist ``tensor``'s first frame to ``base/stage/frame0.png`` if possible."""
 
@@ -400,7 +370,6 @@ def _save_stage_frame(base: Path, stage: str, tensor):  # type: ignore[no-untype
 
     Image.fromarray(array, mode=mode).save(frame_path)
 
-
 def verify_pipeline(
     *,
     root: Path,
@@ -410,7 +379,7 @@ def verify_pipeline(
     dump_dir: Optional[Path],
     strict: bool,
 ) -> List[str]:
-    """Run a light-weight pipeline verification using pipeline_v2 semantics."""
+    """Run a light-weight pipeline verification using the token-aligned pipeline."""
 
     if n_samples <= 0:
         return []
@@ -459,9 +428,6 @@ def verify_pipeline(
     stride = int(round(hop_seconds * decode_fps))
     channels = int(dataset_cfg.get("channels", 3))
     apply_crop_flag = bool(dataset_cfg.get("apply_crop", True))
-    crop_rescale = str(dataset_cfg.get("crop_rescale", "auto"))
-    resize_hw_cfg = dataset_cfg.get("resize", [224, 224])
-    resize_hw = tuple(int(v) for v in resize_hw_cfg[:2]) if resize_hw_cfg else (224, 224)
 
     reg_cfg = dict(dataset_cfg.get("registration", {}) or {})
     registration_enabled = bool(reg_cfg.get("enabled", False))
@@ -525,11 +491,9 @@ def verify_pipeline(
                     path=video_path,
                     frames=frames,
                     stride=stride,
-                    resize_hw=None,
                     channels=channels,
                     training=False,
                     decode_fps=decode_fps,
-                    pipeline_v2=True,
                 )
             except Exception as exc:
                 msg = f"[PIPE][ERROR] decode failed for split={split_name} id={piece.get('id')}: {exc}"
@@ -538,11 +502,12 @@ def verify_pipeline(
                 continue
 
             video_id = str(piece.get("id", video_path.stem))
-
-            native_hw = clip_native.shape[-2:]
+            stage_names = ["decode"]
+            stage_hws = [clip_native.shape[-2:]]
+            stage_tensors = [clip_native]
 
             clip_stage = clip_native
-            if registration_enabled:
+            if registration_enabled and apply_crop_flag:
                 try:
                     clip_stage = apply_registration_crop(
                         clip_stage, PIANOYT_CROPS.get(video_id), reg_cfg
@@ -555,17 +520,17 @@ def verify_pipeline(
                     violations.append(msg)
                     continue
 
-            if apply_crop_flag:
-                clip_stage = _apply_metadata_crop(
-                    clip_stage, video_id, crop_rescale=crop_rescale
-                )
-
-            crop_hw = clip_stage.shape[-2:]
+                stage_names.append("registration")
+                stage_hws.append(clip_stage.shape[-2:])
+                stage_tensors.append(clip_stage)
 
             clip_resized = resize_to_canonical(
                 clip_stage, canonical_hw, registration_interp
             )
             canon_hw = clip_resized.shape[-2:]
+            stage_names.append("resize")
+            stage_hws.append(canon_hw)
+            stage_tensors.append(clip_resized)
 
             if canonical_hw and len(canonical_hw) == 2:
                 expected_hw = (int(canonical_hw[0]), int(canonical_hw[1]))
@@ -614,12 +579,13 @@ def verify_pipeline(
                         )
                         print(msg)
                         violations.append(msg)
-
-            aug_hw = aug_clip.shape[-2:]
+            stage_names.append("aug")
+            stage_hws.append(aug_clip.shape[-2:])
+            stage_tensors.append(aug_clip)
 
             try:
                 (
-                    tile_tensors,
+                    _tile_slices,
                     tokens_per_tile,
                     widths_px,
                     _,
@@ -637,7 +603,10 @@ def verify_pipeline(
                 print(msg)
                 violations.append(msg)
                 continue
-
+            tile_clip = aug_clip if aligned_w == original_w else aug_clip[..., :aligned_w]
+            stage_names.append("tile")
+            stage_hws.append(tile_clip.shape[-2:])
+            stage_tensors.append(tile_clip)
             tile_width_violations = [w for w in widths_px if w % patch_w != 0]
             if tile_width_violations:
                 msg = (
@@ -658,26 +627,19 @@ def verify_pipeline(
                     print(msg)
                     violations.append(msg)
 
-            native_str = f"{native_hw[0]}x{native_hw[1]}"
-            crop_str = f"{crop_hw[0]}x{crop_hw[1]}"
-            canon_str = f"{canon_hw[0]}x{canon_hw[1]}"
-            aug_str = f"{aug_hw[0]}x{aug_hw[1]}"
+            hw_str = "→".join(f"{h}x{w}" for (h, w) in stage_hws)
+            order_str = "→".join(stage_names)
             print(
                 "[PIPE] split={split_name} id="
-                f"{video_id} order=decode→crop→resize→aug→tile | hw: "
-                f"{native_str}→{crop_str}→{canon_str}→{aug_str} | "
+                f"{video_id} order={order_str} | hw: {hw_str} | "
                 f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
                 f"aligned={aligned_w} orig={original_w}"
             )
 
             if dump_dir is not None:
                 sample_dir = dump_dir / split_name / video_id
-                _save_stage_frame(sample_dir, "decode", clip_native)
-                _save_stage_frame(sample_dir, "crop", clip_stage)
-                _save_stage_frame(sample_dir, "resize", clip_resized)
-                _save_stage_frame(sample_dir, "aug", aug_clip)
-                if tile_tensors:
-                    _save_stage_frame(sample_dir, "tile", tile_tensors[0])
+                for stage_name, tensor in zip(stage_names, stage_tensors):
+                    _save_stage_frame(sample_dir, stage_name, tensor)
 
             taken += 1
 
@@ -847,7 +809,7 @@ def main() -> None:
     ap.add_argument(
         "--verify-pipeline",
         action="store_true",
-        help="Decode→crop→resize→aug→tile sanity check using pipeline_v2",
+        help="Alias retained for compatibility; pipeline verification now runs by default",
     )
     ap.add_argument(
         "--n-samples",
@@ -940,19 +902,17 @@ def main() -> None:
     print(f"[OK] JSON → {meta_dir}/pianoyt_*.json")
     print(f"[OK] TSV  → {report_dir}/pianoyt_*.tsv")
     
-    if args.verify_pipeline:
-        splits = {"train": train_pieces, "val": val_pieces or [], "test": test_pieces}
-        violations = verify_pipeline(
-            root=root,
-            config_path=args.config,
-            splits=splits,
-            n_samples=args.n_samples,
-            dump_dir=args.dump_dir,
-            strict=args.strict,
-        )
-        if violations and not args.strict:
-            print(f"[PIPE][WARN] {len(violations)} issues detected (strict mode disabled)")
-
+    splits = {"train": train_pieces, "val": val_pieces or [], "test": test_pieces}
+    violations = verify_pipeline(
+        root=root,
+        config_path=args.config,
+        splits=splits,
+        n_samples=args.n_samples,
+        dump_dir=args.dump_dir,
+        strict=args.strict,
+    )
+    if violations and not args.strict:
+        print(f"[PIPE][WARN] {len(violations)} issues detected (strict mode disabled)")
 
 if __name__ == "__main__":
     main()

@@ -142,19 +142,6 @@ def _load_clip_cv2(path: Path, frames: int, stride: int,
     x = x.permute(0, 3, 1, 2)  # T,C,H,W
     return x
 
-def _tile_vertical(x: torch.Tensor, tiles: int) -> torch.Tensor:
-    """
-    Split width into vertical tiles: T,C,H,W -> T,tiles,C,H,Wt
-    (crop right edge if not divisible)
-    """
-    T, C, H, W = x.shape
-    w_each = W // tiles
-    W2 = w_each * tiles
-    if W2 != W:
-        x = x[..., :W2]
-    parts = [x[..., i * w_each:(i + 1) * w_each] for i in range(tiles)]
-    return torch.stack(parts, dim=1)  # T,tiles,C,H,Wt
-    
 def _labels_from_txt(txt_path: Path, t0: float, t1: float):
     """
     Parse a .txt sidecar file with lines: onset_sec  offset_sec  pitch
@@ -222,11 +209,9 @@ def _read_txt_events(txt_path: Path):
 def _load_clip_with_random_start(path: Path,
                                  frames: int,
                                  stride: int,
-                                 resize_hw: Optional[Tuple[int, int]],
                                  channels: int,
                                  training: bool,
-                                 decode_fps: float,
-                                 pipeline_v2: bool = False):
+                                 decode_fps: float):
     """
     Load a clip using a randomized start (training=True) or start=0 (else).
     Decoding is performed on a fixed "decode_fps" grid so that all clips
@@ -238,8 +223,6 @@ def _load_clip_with_random_start(path: Path,
     """
     
     hop_seconds = float(stride) / float(decode_fps)
-    do_resize = bool(resize_hw) and not pipeline_v2
-    
     # --- decord fast path ---
     if HAVE_DECORD:
         import decord, torch
@@ -271,11 +254,6 @@ def _load_clip_with_random_start(path: Path,
 
         # to (T,C,H,W) and resize like existing decord helper
         x = x.permute(0, 3, 1, 2)  # T,C,H,W
-        if do_resize:
-            H, W = x.shape[-2:]
-            target_hw = tuple(resize_hw)  # type: ignore[arg-type]
-            if (H, W) != target_hw:
-                x = F.interpolate(x, size=target_hw, mode="area")
 
         return x, start_idx
 
@@ -308,12 +286,6 @@ def _load_clip_with_random_start(path: Path,
             if not ok:
                 break
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if do_resize:
-                frame = cv2.resize(
-                    frame,
-                    (resize_hw[1], resize_hw[0]),  # type: ignore[index]
-                    interpolation=CV2_INTER,
-                )
             imgs.append(frame)
         cap.release()
 
@@ -632,7 +604,6 @@ class OMAPSDataset(Dataset):
                  manifest: Optional[str] = None,
                  decode_fps: float = 30.0,
                  *,
-                 pipeline_v2: bool = False,
                  dataset_cfg: Optional[Dict[str, Any]] = None,
                  full_cfg: Optional[Dict[str, Any]] = None):
         super().__init__()
@@ -645,7 +616,6 @@ class OMAPSDataset(Dataset):
         self.channels = int(channels)
         self.normalize = bool(normalize)
         self.decode_fps = float(decode_fps)
-        self.pipeline_v2 = bool(pipeline_v2)
         self.dataset_cfg = dict(dataset_cfg or {})
         self.full_cfg = dict(full_cfg or {})
 
@@ -683,10 +653,12 @@ class OMAPSDataset(Dataset):
             self.tiling_tokens_split = tokens_split_cfg
         self.tiling_overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
         self._tiling_log_once = False
+        self._registration_off_logged = False
+        self.apply_crop = True
 
-        if self.pipeline_v2 and self.tiling_patch_w is None:
+        if self.tiling_patch_w is None:
             raise ValueError(
-                "pipeline_v2 requires 'tiling.patch_w' or model transformer patch size"
+                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
             )
 
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
@@ -729,72 +701,67 @@ class OMAPSDataset(Dataset):
             path=path,
             frames=self.frames,
             stride=self.stride,
-            resize_hw=None if self.pipeline_v2 else self.resize,
             channels=self.channels,
             training=is_train,
             decode_fps=self.decode_fps,
-            pipeline_v2=self.pipeline_v2,
         )
-        if self.pipeline_v2:
-            native_h, native_w = clip.shape[-2:]
-            print(
-                f"[pipeline_v2] decode {path.name}: native {native_h}x{native_w}",
-                flush=True,
-            )
-            if self.registration_enabled:
-                before_h, before_w = clip.shape[-2:]
-                meta = self.registration_cfg.get("crop")
-                clip = apply_registration_crop(clip, meta, self.registration_cfg)
-                after_h, after_w = clip.shape[-2:]
-                print(
-                    f"[pipeline_v2] crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                    flush=True,
-                )
+        native_h, native_w = clip.shape[-2:]
+        print(f"decode {path.name}: native {native_h}x{native_w}", flush=True)
+        if self.registration_enabled and self.apply_crop:
             before_h, before_w = clip.shape[-2:]
-            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+            meta = self.registration_cfg.get("crop")
+            clip = apply_registration_crop(clip, meta, self.registration_cfg)
             after_h, after_w = clip.shape[-2:]
-            target_h, target_w = self.canonical_hw
             print(
-                f"[pipeline_v2] canonical {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+                f"registration crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
                 flush=True,
             )
-            if self.global_aug_enabled and self.split == "train":
-                before_h, before_w = clip.shape[-2:]
-                clip = apply_global_augment(
-                    clip,
-                    self.global_aug_cfg,
-                    base_seed=self.data_seed,
-                    sample_index=idx,
-                    start_idx=start_idx,
-                    interp=self.global_aug_cfg.get("interp", self.registration_interp),
-                    id_key=path.stem,
-                )
-                after_h, after_w = clip.shape[-2:]
-                print(
-                    f"[pipeline_v2] global_aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
-                    flush=True,
-                )
-                
-        if self.pipeline_v2:
-            _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
+        elif not self.registration_enabled and not self._registration_off_logged:
+            print("registration=off → decode→resize→aug→tile", flush=True)
+            self._registration_off_logged = True
+
+        before_h, before_w = clip.shape[-2:]
+        clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+        after_h, after_w = clip.shape[-2:]
+        target_h, target_w = self.canonical_hw
+        print(
+            f"canonical resize {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",
+            flush=True,
+        )
+        if self.global_aug_enabled and self.split == "train":
+            before_h, before_w = clip.shape[-2:]
+            clip = apply_global_augment(
                 clip,
-                self.tiles,
-                patch_w=self.tiling_patch_w,
-                tokens_split=self.tiling_tokens_split,
-                overlap_tokens=self.tiling_overlap_tokens,
+                self.global_aug_cfg,
+                base_seed=self.data_seed,
+                sample_index=idx,
+                start_idx=start_idx,
+                interp=self.global_aug_cfg.get("interp", self.registration_interp),
+                id_key=path.stem,
             )
-            if aligned_w != original_w:
-                clip = clip[..., :aligned_w]
-            if not self._tiling_log_once:
-                width_sum = sum(widths_px)
-                print(
-                    f"[pipeline_v2] tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                    f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                    flush=True,
-                )
-                self._tiling_log_once = True
-        else:
-            clip = _tile_vertical(clip, self.tiles)  # T,tiles,C,H,Wt
+            after_h, after_w = clip.shape[-2:]
+            print(
+                f"global aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",
+                flush=True,
+            )
+
+        _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
+            clip,
+            self.tiles,
+            patch_w=self.tiling_patch_w,
+            tokens_split=self.tiling_tokens_split,
+            overlap_tokens=self.tiling_overlap_tokens,
+        )
+        if aligned_w != original_w:
+            clip = clip[..., :aligned_w]
+        if not self._tiling_log_once:
+            width_sum = sum(widths_px)
+            print(
+                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                flush=True,
+            )
+            self._tiling_log_once = True
 
         # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames
@@ -936,8 +903,6 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
     hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
     stride = int(round(hop_seconds * decode_fps))
 
-    pipeline_v2 = bool(dcfg.get("pipeline_v2", False))
-    
     dataset = OMAPSDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
@@ -949,7 +914,6 @@ def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
         normalize=bool(dcfg.get("normalize", True)),
         manifest=manifest_path,
         decode_fps=decode_fps,
-        pipeline_v2=pipeline_v2,
         dataset_cfg=dcfg,
         full_cfg=cfg,
     )

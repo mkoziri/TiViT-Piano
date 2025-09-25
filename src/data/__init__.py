@@ -14,9 +14,9 @@ CLI:
     None.  These helpers are consumed by scripts such as :mod:`scripts.train`.
 """
 
-from .loader import make_dataloader, is_pipeline_v2_enabled
+from .loader import make_dataloader
 from .omaps_dataset import OMAPSDataset
 from .pianoyt_dataset import PianoYTDataset
 
-__all__ = ["make_dataloader", "is_pipeline_v2_enabled", "OMAPSDataset", "PianoYTDataset"]
+__all__ = ["make_dataloader", "OMAPSDataset", "PianoYTDataset"]
 
