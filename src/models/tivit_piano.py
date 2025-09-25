@@ -300,11 +300,7 @@ class TiViTPiano(nn.Module):
                         tile = F.pad(tile, (0, pad_px))
                     padded_tiles.append(tile)
                 tiles = padded_tiles
-                self._tile_token_counts = [max_tokens] * len(self._tile_token_counts)
-                if self._tile_widths_px is not None:
-                    target_width = max_tokens * patch_w
-                    self._tile_widths_px = [target_width] * len(self._tile_widths_px)
-
+                
         return tiles
 
     def _infer_token_factors(self, t_cf: torch.Tensor) -> tuple[int, int]:
