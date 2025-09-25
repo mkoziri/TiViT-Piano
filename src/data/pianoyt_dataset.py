@@ -454,6 +454,24 @@ class PianoYTDataset(Dataset):
                 continue
             self.samples.append({"id": vid, "video": video_path, "midi": midi_path})
 
+        # --- Robustness: drop unreadable/corrupt videos up-front ---
+        try:
+            import decord  # type: ignore
+        except Exception:  # decord missing/unavailable: skip probing
+            decord = None
+        if decord is not None:
+            kept = []
+            for s in self.samples:
+                v = s.get("video")
+                try:
+                    decord.VideoReader(str(v))
+                except Exception as e:
+                    LOGGER.warning("[PianoYT] Skipping unreadable video: %s (%s)", v, e)
+                    continue
+                kept.append(s)
+            self.samples = kept
+        
+        # Now compute videos based on the filtered sample list
         self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
         self._crop_warned: set = set()
         self.apply_crop = True
