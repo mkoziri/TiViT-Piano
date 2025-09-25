@@ -280,7 +280,32 @@ class TiViTPiano(nn.Module):
             raise RuntimeError("Token-aligned tiling failed to compute bounds")
         if W != cache_width:
             x = x[..., :cache_width]
-        return [x[..., left:right] for (left, right) in bounds]
+        tiles = [x[..., left:right] for (left, right) in bounds]
+
+        # Pipeline v2 clips can yield token counts that differ by at most one
+        # between tiles when the overall width is not perfectly divisible by the
+        # number of tiles. This causes issues later when we stack the token
+        # sequences, so we zero-pad narrower tiles to match the widest one. The
+        # padding size is computed in token units to keep alignment with the ViT
+        # patch grid.
+        if self._tile_token_counts:
+            max_tokens = max(self._tile_token_counts)
+            if any(tok != max_tokens for tok in self._tile_token_counts):
+                patch_w = self.tiling_patch_w
+                padded_tiles = []
+                for tile, tok in zip(tiles, self._tile_token_counts):
+                    extra_tokens = max_tokens - tok
+                    if extra_tokens > 0:
+                        pad_px = extra_tokens * patch_w
+                        tile = F.pad(tile, (0, pad_px))
+                    padded_tiles.append(tile)
+                tiles = padded_tiles
+                self._tile_token_counts = [max_tokens] * len(self._tile_token_counts)
+                if self._tile_widths_px is not None:
+                    target_width = max_tokens * patch_w
+                    self._tile_widths_px = [target_width] * len(self._tile_widths_px)
+
+        return tiles
 
     def _infer_token_factors(self, t_cf: torch.Tensor) -> tuple[int, int]:
         """
