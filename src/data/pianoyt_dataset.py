@@ -388,6 +388,17 @@ class PianoYTDataset(Dataset):
         self.dataset_cfg = dict(dataset_cfg or {})
         self.full_cfg = dict(full_cfg or {})
 
+        # Optional hooks configured after construction (mirrors OMAPSDataset).
+        # Provide defaults so static analyzers are aware of these attributes and
+        # so runtime code can safely assume their existence prior to external
+        # configuration.
+        self.annotations_root: Optional[str] = None
+        self.label_format: str = "midi"
+        self.label_targets: Sequence[str] = ("pitch", "onset", "offset", "hand", "clef")
+        self.require_labels: bool = False
+        self.frame_targets_cfg: Dict[str, Any] = {}
+        self.max_clips: Optional[int] = None
+
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
@@ -418,7 +429,11 @@ class PianoYTDataset(Dataset):
             model_cfg = self.full_cfg.get("model", {}) if isinstance(self.full_cfg, dict) else {}
             trans_cfg = model_cfg.get("transformer", {}) if isinstance(model_cfg, dict) else {}
             patch_w_cfg = trans_cfg.get("input_patch_size")
-        self.tiling_patch_w = int(patch_w_cfg) if patch_w_cfg is not None else None
+        if patch_w_cfg is None:
+            raise ValueError(
+                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
+            )
+        self.tiling_patch_w = int(patch_w_cfg)
         tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
         if isinstance(tokens_split_cfg, Sequence) and not isinstance(tokens_split_cfg, str):
             self.tiling_tokens_split = [int(v) for v in tokens_split_cfg]
@@ -428,11 +443,6 @@ class PianoYTDataset(Dataset):
         self._tiling_log_once = False
         self._registration_off_logged = False
 
-        if self.tiling_patch_w is None:
-            raise ValueError(
-                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
-            )
-            
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
         experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
         seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
@@ -585,7 +595,8 @@ class PianoYTDataset(Dataset):
         labels_tensor = None
         if midi_path is not None and midi_path.exists():
             labels_tensor = _read_midi_events(midi_path)
-            sample["labels"] = labels_tensor
+            if labels_tensor is not None and labels_tensor.numel() > 0:
+                sample["labels"] = labels_tensor
         elif getattr(self, "require_labels", False):
             raise FileNotFoundError(f"Missing MIDI annotations for {video_path}")
 

@@ -10,10 +10,14 @@ CLI:
 """
 
 from pathlib import Path
+from typing import Any, Mapping, Union
 import yaml
 
-def load_config(path="configs/config.yaml"):
+ConfigPath = Union[str, Path]
+
+
+def load_config(path: ConfigPath = "configs/config.yaml") -> Mapping[str, Any]:
     p = Path(path).expanduser()
-    with p.open("r") as f:
+    with p.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 

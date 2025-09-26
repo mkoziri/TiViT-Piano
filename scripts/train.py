@@ -268,22 +268,45 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
     bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
     loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
 
+    # --- Helper for adaptive pos_weight calculation ---
+    def _adaptive_pos_weight(roll, P, eps=1e-6):
+        """
+        Computes an adaptive positive class weight for BCE loss based on the mean positive rate
+        per pitch dimension in the provided roll tensor.
+
+        Args:
+            roll (Tensor): Target tensor of shape (..., P) containing binary labels.
+            P (int): Number of pitch classes (last dimension of roll).
+            eps (float, optional): Small value to avoid division by zero. Default is 1e-6.
+
+        Returns:
+            Tensor: Per-pitch positive class weights (shape: [P]) for use in BCEWithLogitsLoss.
+        """
+        p = roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
+        return ((1.0 - p) / (p + eps)).clamp(1.0, 100.0).detach()
+
     # --- onset/offset loss: "bce_pos" (adaptive/fixed) OR "focal" ---
     onoff_mode = str(weights.get("onoff_loss", "focal")).lower()  # "bce_pos" | "focal"
     if onoff_mode == "bce_pos":
         pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()  # "adaptive" | "fixed"
+        pos_w_on = None
+        pos_w_off = None
         if pw_mode == "fixed":
             pw_val = float(weights.get("onoff_pos_weight", 0.0))
             if pw_val > 0.0:
                 pos_w_on  = torch.tensor([pw_val], device=device)
                 pos_w_off = torch.tensor([pw_val], device=device)
             else:
-                pw_mode = "adaptive"
-        if pw_mode == "adaptive":
-            p_on  = onset_roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
-            p_off = offset_roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
-            pos_w_on  = ((1.0 - p_on)  / (p_on  + eps)).clamp(1.0, 100.0).detach()
-            pos_w_off = ((1.0 - p_off) / (p_off + eps)).clamp(1.0, 100.0).detach()
+                # fallback to adaptive if fixed value is not positive
+                pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
+                pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
+        elif pw_mode == "adaptive":
+            pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
+            pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
+        else:
+            # fallback to adaptive if unknown mode
+            pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
+            pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
 
         bce_on  = nn.BCEWithLogitsLoss(pos_weight=pos_w_on)
         bce_off = nn.BCEWithLogitsLoss(pos_weight=pos_w_off)

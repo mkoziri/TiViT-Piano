@@ -183,6 +183,50 @@ def _labels_from_txt(txt_path: Path, t0: float, t1: float):
         "clef": clef,
     }
 
+def _find_annotation_for_video(
+    video_path: Union[str, Path], annotations_root: Optional[Union[str, Path]] = None
+) -> Optional[Path]:
+    """Locate a sidecar annotation file for ``video_path``.
+
+    Parameters
+    ----------
+    video_path:
+        Path to the decoded video file.
+    annotations_root:
+        Optional root directory that mirrors the video structure but stores
+        annotations.  When provided, this root is searched before falling back
+        to the video's directory.
+
+    Returns
+    -------
+    pathlib.Path or None
+        The first existing annotation path using a set of known suffixes, or
+        ``None`` if nothing is found.
+    """
+
+    video_path = Path(video_path)
+    stem = video_path.stem
+
+    suffixes: Tuple[str, ...] = (".txt", ".json", ".csv", ".mid", ".midi")
+    candidates: List[Path] = []
+
+    if annotations_root:
+        ann_root = Path(annotations_root).expanduser()
+        candidates.extend(ann_root / f"{stem}{suffix}" for suffix in suffixes)
+
+    candidates.extend(video_path.with_suffix(suffix) for suffix in suffixes)
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
 def _read_txt_events(txt_path: Path):
     """
     Returns a torch.FloatTensor of shape (N, 3) with columns:
@@ -526,10 +570,14 @@ def _build_frame_targets(labels: torch.Tensor,
     mask_pitch = (pit >= int(note_min)) & (pit <= int(note_max))
     on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch] - int(note_min)
 
-    on_frames = sec_to_frame(on, hop_seconds)
-    off_frames = sec_to_frame(off, hop_seconds)
-    on_frames = on_frames.clamp(0, T - 1)
-    off_frames = off_frames.clamp(0, T)
+    # ``sec_to_frame`` preserves the input type.  When ``labels`` originate from
+    # numpy arrays they can surface here as Python scalars/lists which do not
+    # implement ``.clamp``.  Normalise to tensors before clamping so the code
+    # path works regardless of the upstream type.
+    on_frames = torch.as_tensor(sec_to_frame(on, hop_seconds), dtype=torch.int64)
+    off_frames = torch.as_tensor(sec_to_frame(off, hop_seconds), dtype=torch.int64)
+    on_frames = torch.clamp(on_frames, 0, T - 1)
+    off_frames = torch.clamp(off_frames, 0, T)
 
     for s, e, p in zip(on_frames, off_frames, pit):
         s = int(s)
@@ -619,6 +667,17 @@ class OMAPSDataset(Dataset):
         self.dataset_cfg = dict(dataset_cfg or {})
         self.full_cfg = dict(full_cfg or {})
 
+        # Optional attributes configured externally (e.g. by dataloader factories).
+        # Define sensible defaults here so static type checkers know these fields
+        # exist and so callers can rely on their presence even before
+        # configuration hooks run.
+        self.annotations_root: Optional[str] = None
+        self.label_format: str = "txt"
+        self.label_targets: Sequence[str] = ("pitch", "onset", "offset", "hand", "clef")
+        self.require_labels: bool = False
+        self.frame_targets_cfg: Dict[str, Any] = {}
+        self.max_clips: Optional[int] = None
+
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
@@ -645,7 +704,11 @@ class OMAPSDataset(Dataset):
             model_cfg = self.full_cfg.get("model", {}) if isinstance(self.full_cfg, dict) else {}
             trans_cfg = model_cfg.get("transformer", {}) if isinstance(model_cfg, dict) else {}
             patch_w_cfg = trans_cfg.get("input_patch_size")
-        self.tiling_patch_w = int(patch_w_cfg) if patch_w_cfg is not None else None
+        if patch_w_cfg is None:
+            raise ValueError(
+                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
+            )
+        self.tiling_patch_w = int(patch_w_cfg)
         tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
         if isinstance(tokens_split_cfg, Sequence) and not isinstance(tokens_split_cfg, str):
             self.tiling_tokens_split = [int(v) for v in tokens_split_cfg]
@@ -656,10 +719,6 @@ class OMAPSDataset(Dataset):
         self._registration_off_logged = False
         self.apply_crop = True
 
-        if self.tiling_patch_w is None:
-            raise ValueError(
-                "tiling.patch_w or model.transformer.input_patch_size required for token-aligned tiling"
-            )
 
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
         experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
@@ -760,27 +819,7 @@ class OMAPSDataset(Dataset):
         labels_tensor = None                          # <- define up-front
     
         # --- locate sidecar annotation file ---
-        ann_path = None
-        try:
-            ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
-        except NameError:
-            from pathlib import Path
-            ann_root = getattr(self, "annotations_root", None)
-            stem = path.stem
-            candidates = []
-            if ann_root:
-                candidates.append(Path(ann_root).expanduser() / f"{stem}.txt")
-            candidates.extend([
-                path.with_suffix(".txt"),
-                path.with_suffix(".mid"),
-                path.with_suffix(".midi"),
-                path.with_suffix(".json"),
-                path.with_suffix(".csv"),
-            ])
-            for c in candidates:
-                if Path(c).exists():
-                    ann_path = Path(c)
-                    break
+        ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
         if ann_path is not None and ann_path.suffix.lower() == ".txt":
             labels_tensor = _read_txt_events(ann_path)  # (N,3) or (0,3)
             if labels_tensor is not None:

@@ -100,6 +100,8 @@ def run_train(python_bin: str, train_script: Path, workdir: Path, env_extra: dic
         bufsize=1,
         universal_newlines=True,
     )
+    if proc.stdout is None:
+        raise RuntimeError("proc.stdout is unexpectedly None. Check subprocess.Popen arguments.")
     stdout_lines = []
     last_val = None
     for line in proc.stdout:

@@ -308,11 +308,23 @@ class TiViTPiano(nn.Module):
         W_in = int(t_cf.shape[4])
 
         # Conv3d (tubelet) parameters — assuming padding=0 (as in TubeletEmbed)
-        kt, kh, kw = self.embed.proj.kernel_size
-        st, sh, sw = self.embed.proj.stride
-        # If you ever change TubeletEmbed padding, adjust here accordingly:
-        pt, ph, pw = self.embed.proj.padding if hasattr(self.embed.proj, "padding") else (0, 0, 0)
+        kernel_t, kernel_h, kernel_w = self.embed.proj.kernel_size
+        kt, kh, kw = int(kernel_t), int(kernel_h), int(kernel_w)
 
+        stride_t, stride_h, stride_w = self.embed.proj.stride
+        st, sh, sw = int(stride_t), int(stride_h), int(stride_w)
+        # If you ever change TubeletEmbed padding, adjust here accordingly:
+        if hasattr(self.embed.proj, "padding"):
+            padding_attr = self.embed.proj.padding
+        else:
+            padding_attr = (0, 0, 0)
+
+        if isinstance(padding_attr, (list, tuple)):
+            pt_raw, ph_raw, pw_raw = padding_attr
+        else:
+            pt_raw = ph_raw = pw_raw = padding_attr
+
+        pt, ph, pw = int(pt_raw), int(ph_raw), int(pw_raw)
         # Standard conv output-size arithmetic (floor division)
         # T' = floor((T + 2*pt - kt)/st) + 1, etc.
         Tprime = (T_in + 2 * pt - kt) // st + 1

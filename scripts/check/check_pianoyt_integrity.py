@@ -436,6 +436,14 @@ def verify_pipeline(
     channels = int(dataset_cfg.get("channels", 3))
     apply_crop_flag = bool(dataset_cfg.get("apply_crop", True))
 
+    resize_cfg = dataset_cfg.get("resize")
+    if isinstance(resize_cfg, Sequence) and not isinstance(resize_cfg, (str, bytes)) and len(resize_cfg) >= 2:
+        resize_hw = (
+            int(round(float(resize_cfg[0]))),
+            int(round(float(resize_cfg[1]))),
+        )
+    else:
+        resize_hw = (224, 224)
     reg_cfg = dict(dataset_cfg.get("registration", {}) or {})
     registration_enabled = bool(reg_cfg.get("enabled", False))
     registration_interp = str(reg_cfg.get("interp", "bilinear"))
