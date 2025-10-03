@@ -190,14 +190,37 @@ def _set_onoff_head_bias(model, prior=0.12): #CAL prior was 0.01 END CAL
         _seed_bias(getattr(model, "head_onset", None))
         _seed_bias(getattr(model, "head_offset", None))
 
+def _dynamic_pos_weighted_bce(logits: torch.Tensor, targets: torch.Tensor, base_crit: nn.BCEWithLogitsLoss):
+    """Compute BCEWithLogits with adaptive pos_weight derived from current batch."""
+
+    eps = 1e-6
+    target_float = targets.float()
+    positive_rate = target_float.mean().clamp(min=eps, max=1.0 - eps)
+    pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
+
+    reduction = getattr(base_crit, "reduction", "mean")
+    weight = getattr(base_crit, "weight", None)
+    if weight is not None:
+        weight = weight.to(device=logits.device, dtype=logits.dtype)
+
+    pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        target_float,
+        weight=weight,
+        pos_weight=pos_weight,
+        reduction=reduction,
+    )
+
 def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
     # Guard: if logits are time-distributed but we're in clip-loss, pool over time
     if out["pitch_logits"].dim() == 3:  # (B,T,P)
         out = _time_pool_out_to_clip(out)
         
-    loss_pitch  = crit["pitch"](out["pitch_logits"],  tgt["pitch"])   * weights["pitch"]
-    loss_onset  = crit["onset"](out["onset_logits"],  tgt["onset"])   * weights["onset"]
-    loss_offset = crit["offset"](out["offset_logits"], tgt["offset"]) * weights["offset"]
+    loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], tgt["pitch"], crit["pitch"]) * weights["pitch"]
+    loss_onset = _dynamic_pos_weighted_bce(out["onset_logits"], tgt["onset"], crit["onset"]) * weights["onset"]
+    loss_offset = _dynamic_pos_weighted_bce(out["offset_logits"], tgt["offset"], crit["offset"]) * weights["offset"]
     loss_hand   = crit["hand"](out["hand_logits"],    tgt["hand"])    * weights["hand"]
     loss_clef   = crit["clef"](out["clef_logits"],    tgt["clef"])    * weights["clef"]
 
