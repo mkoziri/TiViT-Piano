@@ -382,8 +382,8 @@ class PianoYTDataset(Dataset):
         manifest: Optional[str] = None,
         decode_fps: float = 30.0,
         *,
-        dataset_cfg: Optional[Dict[str, Any]] = None,
-        full_cfg: Optional[Dict[str, Any]] = None,
+        dataset_cfg: Optional[Mapping[str, Any]] = None,
+        full_cfg: Optional[Mapping[str, Any]] = None,
     ):
         super().__init__()
         self.root = _expand_root(root_dir)

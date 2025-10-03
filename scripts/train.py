@@ -504,7 +504,7 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
     return avg
 
 
-def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: dict, best_val: float | None = None):
+def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: Mapping[str, Any], best_val: float | None = None):
     state = {
         "epoch": epoch,
         "model": model.state_dict(),
