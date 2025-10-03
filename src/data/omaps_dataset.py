@@ -19,6 +19,7 @@ import os
 import glob
 import math
 import zlib
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -30,6 +31,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
+
+LOGGER = logging.getLogger(__name__)
 
 # Try decord first (fast), else fallback to OpenCV
 HAVE_DECORD = False
@@ -294,7 +297,38 @@ def _load_clip_with_random_start(path: Path,
         max_native_idx = max(num_frames - 1 - safe_margin, 0)
         idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=max_native_idx)
                 for t in times]
-        batch = vr.get_batch(idxs)  # T,H,W,C (uint8)
+        try:
+            batch = vr.get_batch(idxs)  # T,H,W,C (uint8)
+        except decord.DECORDError as err:
+            LOGGER.warning(
+                "Decord failed for %s at idx %s; falling back to OpenCV decode (%s)",
+                path,
+                idxs[-1] if idxs else "<empty>",
+                err,
+            )
+            import cv2  # local import to avoid dependency when unused
+            import numpy as np
+
+            cap = cv2.VideoCapture(str(path))
+            imgs: List[np.ndarray] = []
+            try:
+                for native_idx in idxs:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(native_idx, 0)))
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    imgs.append(frame)
+            finally:
+                cap.release()
+
+            if len(imgs) == 0:
+                raise RuntimeError(f"Failed to decode frames from {path}") from err
+
+            while len(imgs) < frames:
+                imgs.append(imgs[-1])
+
+            batch = torch.from_numpy(np.stack(imgs, axis=0))
         x = batch.to(torch.float32) / 255.0  # T,H,W,C
         if x.shape[0] < frames:
             pad = x[-1:].repeat(frames - x.shape[0], 1, 1, 1)
