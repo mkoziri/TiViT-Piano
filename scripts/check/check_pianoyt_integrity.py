@@ -29,10 +29,11 @@ import json
 import os
 import shutil
 import warnings
+from os import PathLike
 from collections import defaultdict
 from pathlib import Path
 from statistics import median
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, SupportsFloat, Tuple, cast
 
 
 VIDEO_EXT_PREFERENCE: Sequence[str] = (".mp4", ".mkv", ".webm")
@@ -381,7 +382,7 @@ def verify_pipeline(
     *,
     root: Path,
     config_path: Path,
-    splits: Dict[str, Sequence[Dict[str, object]]],
+    splits: Mapping[str, Sequence[Dict[str, object]]],
     n_samples: int,
     dump_dir: Optional[Path],
     strict: bool,
@@ -492,7 +493,9 @@ def verify_pipeline(
             if taken >= n_samples:
                 break
             video_path_str = piece.get("video") if isinstance(piece, dict) else None
-            if not video_path_str:
+            if not isinstance(video_path_str, (str, PathLike)):
+                continue
+            if not str(video_path_str):
                 continue
             video_path = Path(video_path_str)
             if not video_path.exists():
@@ -780,7 +783,7 @@ def write_tsv(path: Path, pieces: Sequence[Dict[str, object]]) -> None:
     ]
     with path.open("w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
-        for rec in sorted(pieces, key=lambda x: x["id"]):
+        for rec in sorted(pieces, key=lambda x: str(x["id"])):
             row = [str(rec.get(col, "")) for col in cols]
             f.write("\t".join(row) + "\n")
 
@@ -789,8 +792,8 @@ def summarize(name: str, pieces: Sequence[Dict[str, object]]) -> None:
     if not pieces:
         print(f"[{name}] 0 pieces")
         return
-    speeds = [p["notes_per_sec"] for p in pieces]
-    durs = [p["duration_sec"] for p in pieces]
+    speeds = [float(cast(SupportsFloat, p["notes_per_sec"])) for p in pieces]
+    durs = [float(cast(SupportsFloat, p["duration_sec"])) for p in pieces]
     with_video = sum(1 for p in pieces if p.get("has_video"))
     print(
         f"[{name}] pieces={len(pieces)} "

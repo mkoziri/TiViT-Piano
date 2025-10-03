@@ -518,8 +518,8 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: dict, best_va
 def evaluate_one_epoch(model, loader, cfg):
     model.eval()
     crit = make_criterions()
-    #w = cfg["training"]["loss_weights"]   #This was recently proposed but preferred to keep the previous
-    w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"]
+    w = cfg["training"]["loss_weights"]   
+    #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
     thr = float(cfg.get("training", {}).get("metrics", {}).get("prob_threshold", 0.5))
 
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
@@ -874,7 +874,8 @@ def main():
         # --- train one epoch ---
         model.train()
         crit = make_criterions()
-        w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"]
+        w = cfg["training"]["loss_weights"]
+        #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
         log_interval = int(cfg["training"].get("log_interval", 20))
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}", ncols=100)
         running = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
