@@ -24,7 +24,7 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 try:
     from typing import TypedDict
 except ImportError:  # Python <3.8 fallback (not expected in TiViT)
@@ -694,7 +694,7 @@ class PianoYTDataset(Dataset):
         return sample
 
 
-def make_dataloader(cfg: dict, split: str, drop_last: bool = False):
+def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
     dcfg = cfg["dataset"]
     manifest_cfg = dcfg.get("manifest", {}) or {}
     manifest_path = manifest_cfg.get(split)
