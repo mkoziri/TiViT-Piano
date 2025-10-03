@@ -170,12 +170,16 @@ class FocalBCE(nn.Module):
             return loss.sum()
         return loss
 
-def _set_onoff_head_bias(model, prior=0.12): #CAL prior was 0.01 END CAL
-    """Calibrate onset/offset last-layer biases to a small prior P≈1% (negative logits)."""
+def _set_onoff_head_bias(model, prior: float = 0.02):
+    """Calibrate onset/offset last-layer biases using a Bernoulli prior mean."""
     import math
     from typing import Optional
     import torch
     import torch.nn as nn
+
+    prior = float(prior)
+    if not (0.0 < prior < 1.0):
+        raise ValueError(f"onset/offset bias prior must be in (0,1); got {prior}")
 
     def _seed_bias(module: Optional[nn.Module]) -> None:
         if not isinstance(module, nn.Sequential) or not module:
@@ -186,6 +190,7 @@ def _set_onoff_head_bias(model, prior=0.12): #CAL prior was 0.01 END CAL
             nn.init.constant_(bias, b0)
 
     b0 = math.log(prior / (1.0 - prior))
+    logger.info("[bias_seed] onset/offset bias prior=%.4f (logit=%.4f)", prior, b0)
     with torch.no_grad():
         _seed_bias(getattr(model, "head_onset", None))
         _seed_bias(getattr(model, "head_offset", None))
@@ -857,7 +862,9 @@ def main():
     else:
         # Fresh init → apply onset/offset bias if requested
         if cfg.get("training", {}).get("reset_head_bias", True):
-            prior_cfg = float(cfg.get("training",{}).get("loss_weights",{}).get("onoff_prior_mean", 0.02))
+            training_cfg = cfg.get("training", {})
+            bias_cfg = training_cfg.get("bias_seed", {})
+            prior_cfg = float(bias_cfg.get("onoff_prior_mean", 0.02))
             _set_onoff_head_bias(model, prior=prior_cfg)
         best_val = math.inf
         start_epoch = 1
