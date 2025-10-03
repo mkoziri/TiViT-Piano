@@ -14,7 +14,8 @@ tivit/
 │  ├─ omaps_train.json
 │  ├─ pianoyt_all.json
 │  ├─ pianoyt_test.json
-│  └─ pianoyt_train.json
+│  ├─ pianoyt_train.json
+│  └─ pianoyt_val.json
 ├─ scripts
 │  ├─ calib
 │  │  ├─ calibrate.py
@@ -63,6 +64,7 @@ tivit/
 │     ├─ config.py
 │     ├─ logging.py
 │     ├─ pitch.py
+│     ├─ tiling.py
 │     └─ time_grid.py
 ├─ theory
 │  ├─ __init__.py
