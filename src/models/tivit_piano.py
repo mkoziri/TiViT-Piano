@@ -142,6 +142,34 @@ class FactorizedSpaceTimeEncoder(nn.Module):
             x = x[:, self.global_tokens:, :]  # drop globals
         return x
 
+# -------- Shared multi-layer prediction head ----------
+class MultiLayerHead(nn.Module):
+    """Light-weight MLP head with normalization, hidden layers, and dropout."""
+
+    def __init__(
+        self,
+        d_model: int,
+        out_dim: int,
+        hidden_dims: Sequence[int] = (512,),
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        layers: List[nn.Module] = [nn.LayerNorm(d_model)]
+
+        in_dim = d_model
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+    
 # -------- TiViT-Piano: tiling wrapper + ViViT backbone + multi-task head ----------
 class TiViTPiano(nn.Module):
     """
@@ -223,12 +251,14 @@ class TiViTPiano(nn.Module):
                                 global_tokens=global_tokens,
                                 tiles=tiles)
 
-        # Heads (LayerNorm -> Linear). These work with (B, D) and (B, T, D).
-        self.head_pitch  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, pitch_classes))
-        self.head_onset  = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 88))
-        self.head_offset = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 88))
-        self.head_hand   = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 2))
-        self.head_clef   = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, clef_classes))
+        # Heads. These work with (B, D) and (B, T, D).
+        base_hidden = max(d_model // 2, 128)
+
+        self.head_pitch = MultiLayerHead(d_model, pitch_classes, hidden_dims=(base_hidden,), dropout=dropout)
+        self.head_onset = MultiLayerHead(d_model, 88, hidden_dims=(base_hidden, base_hidden), dropout=dropout)  
+        self.head_offset = MultiLayerHead(d_model, 88, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
+        self.head_hand = MultiLayerHead(d_model, 2, hidden_dims=(base_hidden//2,), dropout=dropout)
+        self.head_clef = MultiLayerHead(d_model, clef_classes, hidden_dims=(base_hidden//2,), dropout=dropout)
 
         # Cache Tubelet conv sizes for token shape inference
         self._tube_k   = self.embed.proj.kernel_size[0]

@@ -49,8 +49,8 @@ dataset:
   require_labels: true
   frame_targets:
     enable: true
-    tolerance: 0.00  #It was 0.10
-    dilate_active_frames: 0  #It was 3  
+    tolerance: 0.03  
+    dilate_active_frames: 1   
     fill_mode: "overlap"
     hand_from_pitch: true
     clef_thresholds: [60, 64]
@@ -85,7 +85,7 @@ tiling:
 
 training:
   epochs: 5
-  learning_rate: 3e-4
+  learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
   debug_dummy_labels: false
@@ -100,8 +100,8 @@ training:
     
     #if "bce_pos":
     onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
-    onoff_pos_weight: 0.0              # used only when mode == "fixed"
-    onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
+    onoff_pos_weight: 0.001              # used only when mode == "fixed"
+    onoff_neg_smooth: 0.1             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
     focal_gamma: 2.0
@@ -115,8 +115,8 @@ training:
     onset: 8.0
     offset: 8.0
     pitch: 1.0
-    hand: 0.2
-    clef: 0.2
+    hand: 0.3
+    clef: 0.3
 
   metrics:
     prob_threshold: 0.20 #It was 0.20

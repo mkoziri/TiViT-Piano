@@ -11,19 +11,23 @@ Key Functions/Classes:
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Mapping, MutableMapping
 
 _PIPELINE_WARNING_EMITTED = False
 _PIPELINE_KEY = "pipeline_" + "v2"
 
 
-def _consume_pipeline_flag(dataset_cfg: Dict[str, Any]) -> None:
+def _consume_pipeline_flag(dataset_cfg: Mapping[str, Any]) -> None:
     global _PIPELINE_WARNING_EMITTED
 
     if _PIPELINE_KEY not in dataset_cfg:
         return
 
-    value = dataset_cfg.pop(_PIPELINE_KEY)
+    if isinstance(dataset_cfg, MutableMapping):
+        value = dataset_cfg.pop(_PIPELINE_KEY)
+    else:
+        value = dataset_cfg.get(_PIPELINE_KEY)
+
     if value in (False, "false", "False", 0):
         raise ValueError("pipeline_v1 has been removed")
 
@@ -33,7 +37,7 @@ def _consume_pipeline_flag(dataset_cfg: Dict[str, Any]) -> None:
         _PIPELINE_WARNING_EMITTED = True
 
 
-def make_dataloader(cfg: Dict[str, Any], split: str, drop_last: bool = False):
+def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
     dataset_cfg = cfg.get("dataset", {})
     _consume_pipeline_flag(dataset_cfg)
     name = str(dataset_cfg.get("name", "OMAPS")).lower()
