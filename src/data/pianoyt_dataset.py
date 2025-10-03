@@ -450,7 +450,7 @@ class PianoYTDataset(Dataset):
         else:
             self.tiling_tokens_split = tokens_split_cfg
         self.tiling_overlap_tokens = int(tiling_cfg.get("overlap_tokens", 0))
-        self._tiling_log_once = False
+        self._tiling_log_once = True
         self._registration_off_logged = False
 
         data_cfg = self.full_cfg.get("data", {}) if isinstance(self.full_cfg, dict) else {}
