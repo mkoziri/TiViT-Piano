@@ -20,7 +20,7 @@ import glob
 import math
 import zlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -267,30 +267,38 @@ def _load_clip_with_random_start(path: Path,
     """
     
     hop_seconds = float(stride) / float(decode_fps)
+    required_span = (frames - 1) * stride + 1
+    safe_margin = max(8, 2 * stride)
     # --- decord fast path ---
     if HAVE_DECORD:
         import decord, torch
         import torch.nn.functional as F
         vr = decord.VideoReader(str(path))
         native_fps = float(vr.get_avg_fps())
-        total = len(vr)
-        duration = total / native_fps if native_fps > 0 else 0.0
+        num_frames = len(vr)
+        duration = num_frames / native_fps if native_fps > 0 else 0.0
 
         clip_span = (frames - 1) * hop_seconds
         max_start_sec = max(0.0, duration - clip_span)
+        max_start_idx = max(num_frames - safe_margin - required_span, 0)
         if training and max_start_sec > 0:
             import random
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
+        start_idx = min(start_idx, max_start_idx)
         start_sec = frame_to_sec(start_idx, 1.0 / decode_fps)
 
         times = [frame_to_sec(start_idx + k * stride, 1.0 / decode_fps)
                  for k in range(frames)]
-        idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=total - 1)
+        max_native_idx = max(num_frames - 1 - safe_margin, 0)
+        idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=max_native_idx)
                 for t in times]
         batch = vr.get_batch(idxs)  # T,H,W,C (uint8)
         x = batch.to(torch.float32) / 255.0  # T,H,W,C
+        if x.shape[0] < frames:
+            pad = x[-1:].repeat(frames - x.shape[0], 1, 1, 1)
+            x = torch.cat([x, pad], dim=0)
 
         # RGB->gray if requested
         if channels == 1 and x.shape[-1] == 3:
@@ -305,27 +313,30 @@ def _load_clip_with_random_start(path: Path,
     else:
         import cv2, numpy as np, torch
         cap = cv2.VideoCapture(str(path))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         native_fps = float(cap.get(cv2.CAP_PROP_FPS)) or decode_fps
-        duration = total / native_fps if native_fps > 0 else 0.0
+        duration = num_frames / native_fps if native_fps > 0 else 0.0
 
         clip_span = (frames - 1) * hop_seconds
         max_start_sec = max(0.0, duration - clip_span)
+        max_start_idx = max(num_frames - safe_margin - required_span, 0)
         if training and max_start_sec > 0:
             import random
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
             start_idx = 0
+        start_idx = min(start_idx, max_start_idx)
         start_sec = frame_to_sec(start_idx, 1.0 / decode_fps)
 
         times = [frame_to_sec(start_idx + k * stride, 1.0 / decode_fps)
                  for k in range(frames)]
-        frame_idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=total - 1)
+        max_native_idx = max(num_frames - 1 - safe_margin, 0)
+        frame_idxs = [sec_to_frame(t, 1.0 / native_fps, max_idx=max_native_idx)
                       for t in times]
 
         imgs = []
         for idx in frame_idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
             ok, frame = cap.read()
             if not ok:
                 break
@@ -533,7 +544,7 @@ def apply_global_augment(frames: torch.Tensor,
     return frames
   
   
-def _build_frame_targets(labels: torch.Tensor,
+def _build_frame_targets(labels: Optional[torch.Tensor],
                          T: int, stride: int, fps: float,
                          note_min: int = 21, note_max: int = 108,
                          tol: float = 0.025,
@@ -732,7 +743,7 @@ class OMAPSDataset(Dataset):
         #for overfit/debug runs: dataset will load only max_clips number of videos.
         max_clips = getattr(self, "max_clips", None)
         if max_clips is None:
-            max_clips = dcfg.get("max_clips", None) if "dcfg" in locals() else None
+            max_clips = self.dataset_cfg.get("max_clips", None)
         if max_clips is not None and len(self.videos) > max_clips:
             self.videos = self.videos[:max_clips]
         #End
@@ -895,6 +906,9 @@ class OMAPSDataset(Dataset):
                 labels_ft = labels_tensor.clone()
                 # Shift label times so frame 0 corresponds to the clip start.
                 labels_ft[:, 0:2] -= t0
+            else:
+                # Ensure labels_ft is always a Tensor (empty if no labels)
+                labels_ft = torch.zeros((0, 3), dtype=torch.float32)
             ft = _build_frame_targets(
                 labels=labels_ft,
                 T=T, stride=self.stride, fps=fps,

@@ -25,8 +25,13 @@ import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+try:
+    from typing import TypedDict
+except ImportError:  # Python <3.8 fallback (not expected in TiViT)
+    from typing_extensions import TypedDict  # pragma: no cover
 
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from utils.time_grid import frame_to_sec, sec_to_frame
@@ -42,6 +47,11 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
 )
 
 LOGGER = logging.getLogger(__name__)
+
+class SampleRecord(TypedDict):
+    id: str
+    video: Path
+    midi: Optional[Path]
 
 
 def _safe_expanduser(path: Union[str, Path]) -> Path:
@@ -289,7 +299,7 @@ def _read_excluded(root: Path, path: Optional[str]) -> set:
     return ids
 
 
-def _read_midi_events(midi_path: Path) -> torch.FloatTensor:
+def _read_midi_events(midi_path: Path) -> Tensor:
     """Return ``(N,3)`` tensor [onset_sec, offset_sec, pitch] parsed from MIDI."""
 
     if not midi_path or not midi_path.exists():
@@ -462,7 +472,7 @@ class PianoYTDataset(Dataset):
                 )
 
         self.metadata = _load_metadata(self.root)
-        self.samples: List[Dict[str, Optional[Path]]] = []
+        self.samples: List[SampleRecord] = []
         for vid in ids:
             video_path, midi_path = _resolve_media_paths(self.root, split, vid)
             if video_path is None:
@@ -487,7 +497,7 @@ class PianoYTDataset(Dataset):
             self.samples = kept
         
         # Now compute videos based on the filtered sample list
-        self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+        self.videos = [s["video"] for s in self.samples]
         self.apply_crop = True
         self.crop_rescale = "auto"
         self.include_low_res = True
@@ -505,7 +515,7 @@ class PianoYTDataset(Dataset):
         self.excluded_ids = excluded_ids
         if not include_low_res and excluded_ids:
             self.samples = [s for s in self.samples if s["id"] not in excluded_ids]
-            self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+            self.videos = [s["video"] for s in self.samples]
         if len(self.samples) == 0:
             raise RuntimeError("All PianoYT samples were filtered out by configuration.")
 
@@ -514,19 +524,16 @@ class PianoYTDataset(Dataset):
             return
         if max_clips < len(self.samples):
             self.samples = self.samples[:max_clips]
-            self.videos = [s["video"] for s in self.samples if s.get("video") is not None]
+            self.videos = [s["video"] for s in self.samples]
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         record = self.samples[idx]
-        video_path = record.get("video")
-        midi_path = record.get("midi")
-        video_id = record.get("id", "")
-
-        if video_path is None:
-            raise FileNotFoundError(f"Missing video for PianoYT id={video_id}")
+        video_path = record["video"]
+        midi_path = record["midi"]
+        video_id = record["id"]
 
         is_train = self.split == "train"
         clip, start_idx = _load_clip_with_random_start(
@@ -592,15 +599,15 @@ class PianoYTDataset(Dataset):
 
         sample = {"video": clip, "path": str(video_path)}
 
-        labels_tensor = None
+        labels_tensor: Optional[torch.Tensor] = None
         if midi_path is not None and midi_path.exists():
             labels_tensor = _read_midi_events(midi_path)
-            if labels_tensor is not None and labels_tensor.numel() > 0:
+            if labels_tensor.numel() > 0:
                 sample["labels"] = labels_tensor
         elif getattr(self, "require_labels", False):
             raise FileNotFoundError(f"Missing MIDI annotations for {video_path}")
 
-        clip_targets = None
+        clip_targets: Optional[Dict[str, torch.Tensor]] = None
         if labels_tensor is not None and labels_tensor.numel() > 0:
             onset = labels_tensor[:, 0]
             offset = labels_tensor[:, 1]
@@ -651,11 +658,15 @@ class PianoYTDataset(Dataset):
             raise FileNotFoundError(f"No usable labels for {video_path}")
 
         ft_cfg = getattr(self, "frame_targets_cfg", None)
-        if ft_cfg and bool(ft_cfg.get("enable", False)):
-            labels_ft = None
-            if labels_tensor is not None and labels_tensor.numel() > 0:
-                labels_ft = labels_tensor.clone()
-                labels_ft[:, 0:2] -= t0
+        if (
+            labels_tensor is not None
+            and labels_tensor.numel() > 0
+            and ft_cfg
+            and bool(ft_cfg.get("enable", False))
+        ):
+            labels_ft = labels_tensor.clone()
+            labels_ft[:, 0:2] -= t0
+
             ft = _build_frame_targets(
                 labels=labels_ft,
                 T=T,

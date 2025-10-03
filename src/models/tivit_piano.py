@@ -134,7 +134,7 @@ class FactorizedSpaceTimeEncoder(nn.Module):
 
         # ---- Cross-tile aggregation with global context tokens ----
         x = rearrange(x, 'b m n d -> b (m n) d')  # (B, tiles*Ntokens, D)
-        if self.depth_global > 0 and self.global_ctx is not None:
+        if self.depth_global > 0 and self.global_ctx is not None and self.global_blocks is not None:
             g = self.global_ctx.unsqueeze(0).expand(B, -1, -1)  # (B, G, D)
             x = torch.cat([g, x], dim=1)  # prepend global tokens
             for blk in self.global_blocks:
@@ -241,7 +241,17 @@ class TiViTPiano(nn.Module):
     def _init_encoder_if_needed(self, t_tokens, s_tokens):
         if self.encoder is None:
             self.encoder = FactorizedSpaceTimeEncoder(
-                t_tokens=t_tokens, s_tokens=s_tokens, **self.encoder_cfg
+                t_tokens=int(t_tokens), 
+                s_tokens=int(s_tokens), 
+                d_model=int(self.encoder_cfg["d_model"]),
+                nhead=int(self.encoder_cfg["nhead"]),
+                mlp_ratio=self.encoder_cfg["mlp_ratio"],
+                dropout=self.encoder_cfg["dropout"],
+                depth_temporal=int(self.encoder_cfg["depth_temporal"]),
+                depth_spatial=int(self.encoder_cfg["depth_spatial"]),
+                depth_global=int(self.encoder_cfg["depth_global"]),
+                global_tokens=int(self.encoder_cfg["global_tokens"]),
+                tiles=int(self.encoder_cfg["tiles"])
             )
 
     def _tile_split_token_aligned(self, x: torch.Tensor) -> List[torch.Tensor]:
@@ -368,11 +378,13 @@ class TiViTPiano(nn.Module):
                 t_tokens, s_tokens = self._infer_token_factors(t_cf)
             tile_tokens.append(tok)
 
-        # Init encoder if needed and apply dropout to tokens
+        # Ensure encoder is initialized before use
         self._init_encoder_if_needed(t_tokens=t_tokens, s_tokens=s_tokens)
         tile_tokens = [self.pos_drop(tok) for tok in tile_tokens]
 
         # Factorized encoding across time then tiles
+        if self.encoder is None:
+            raise RuntimeError("Encoder was not initialized properly.")
         enc = self.encoder(tile_tokens, t_tokens=t_tokens, s_tokens=s_tokens)  # (B, tiles*Ntok, D)
 
         # Recover 5D token grid: (B, tiles, T', S', D)

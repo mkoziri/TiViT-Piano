@@ -16,14 +16,11 @@ CLI:
     configuration file.
 """
 
-from utils import load_config, setup_logging, get_logger
-from data import make_dataloader
-from models import build_model
+from typing import Any, Mapping, Tuple
 
-logger = get_logger(__name__)
 
-import os
 import argparse
+import os
 from pathlib import Path
 from time import perf_counter
 
@@ -38,6 +35,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from data import make_dataloader
+from models import build_model
+from utils import load_config, setup_logging, get_logger
+
+logger = get_logger(__name__)
+
 # ----------------------- helpers -----------------------
 def set_seed(seed: int = 42):
     import random, numpy as np
@@ -45,7 +48,7 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-def ensure_dirs(cfg: dict):
+def ensure_dirs(cfg: Mapping[str, Any]) -> Tuple[Path, Path]:
     log_cfg = cfg.get("logging", {})
     ckpt = Path(log_cfg.get("checkpoint_dir", "./checkpoints")).expanduser()
     logd = Path(log_cfg.get("log_dir", "./logs")).expanduser()
@@ -169,13 +172,23 @@ class FocalBCE(nn.Module):
 
 def _set_onoff_head_bias(model, prior=0.12): #CAL prior was 0.01 END CAL
     """Calibrate onset/offset last-layer biases to a small prior P≈1% (negative logits)."""
-    import math, torch, torch.nn as nn
+    import math
+    from typing import Optional
+    import torch
+    import torch.nn as nn
+
+    def _seed_bias(module: Optional[nn.Module]) -> None:
+        if not isinstance(module, nn.Sequential) or not module:
+            return
+        last = module[-1]
+        bias = getattr(last, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            nn.init.constant_(bias, b0)
+
     b0 = math.log(prior / (1.0 - prior))
     with torch.no_grad():
-        if isinstance(model.head_onset, nn.Sequential) and hasattr(model.head_onset[-1], "bias"):
-            model.head_onset[-1].bias.fill_(b0)
-        if isinstance(model.head_offset, nn.Sequential) and hasattr(model.head_offset[-1], "bias"):
-            model.head_offset[-1].bias.fill_(b0)
+        _seed_bias(getattr(model, "head_onset", None))
+        _seed_bias(getattr(model, "head_offset", None))
 
 def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
     # Guard: if logits are time-distributed but we're in clip-loss, pool over time
