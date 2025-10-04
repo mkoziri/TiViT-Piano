@@ -111,24 +111,24 @@ training:
     
     # light prior (keep 0.00 while fixing heads; re-enable later if you want)
     onoff_prior_mean: 0.02
-    onoff_prior_weight: 0.20
+    onoff_prior_weight: 0.05
     
     # per-task weights
-    onset: 3.0
-    offset: 2.5
+    onset: 2.0
+    offset: 2.0
     pitch: 1.0
     hand: 0.5
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.80 #It was 0.20
+    prob_threshold: 0.45 #It was 0.20
 
 optim:
   grad_clip: 1.0
 
 train:
   accumulate_steps: 4  #It was 1
-  freeze_backbone_epochs: 1
+  freeze_backbone_epochs: 0
 
 logging:
   log_dir: "logs"
