@@ -76,7 +76,7 @@ model:
     depth_global: 1
     global_tokens: 2
     mlp_ratio: 3.0
-    dropout: 0.10
+    dropout: 0.20
 
 tiling:
   patch_w: 16
@@ -84,7 +84,7 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 3
+  epochs: 5
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -101,8 +101,8 @@ training:
     onoff_loss: "bce_pos"          # "bce_pos" or "focal"
     
     #if "bce_pos":
-    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
-    onoff_pos_weight: 0.00              # used only when mode == "fixed"
+    onoff_pos_weight_mode: "fixed"  # "adaptive" or "fixed"
+    onoff_pos_weight: 20.00              # used only when mode == "fixed"
     onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
@@ -116,12 +116,12 @@ training:
     # per-task weights
     onset: 2.0
     offset: 2.0
-    pitch: 1.0
+    pitch: 2.0
     hand: 0.5
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.45 #It was 0.20
+    prob_threshold: 0.3 #It was 0.20
 
 optim:
   grad_clip: 1.0
