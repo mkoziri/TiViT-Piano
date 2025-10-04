@@ -84,7 +84,7 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 5
+  epochs: 3
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -98,12 +98,12 @@ training:
     onoff_prior_mean: 0.02
   loss_weights:
     #choose the on/off loss family
-    onoff_loss: "bce_pos"          # or "focal"
+    onoff_loss: "focal"          # "bce_pos" or "focal"
     
     #if "bce_pos":
     onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
     onoff_pos_weight: 0.00              # used only when mode == "fixed"
-    onoff_neg_smooth: 0.01             # e.g., 0.02 if you need it
+    onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
     focal_gamma: 2.0
@@ -111,7 +111,7 @@ training:
     
     # light prior (keep 0.00 while fixing heads; re-enable later if you want)
     onoff_prior_mean: 0.02
-    onoff_prior_weight: 0.05
+    onoff_prior_weight: 0.15
     
     # per-task weights
     onset: 3.0
@@ -121,7 +121,7 @@ training:
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.20 #It was 0.20
+    prob_threshold: 0.70 #It was 0.20
 
 optim:
   grad_clip: 1.0
