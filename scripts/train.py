@@ -16,7 +16,7 @@ CLI:
     configuration file.
 """
 
-from typing import Any, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 import argparse
@@ -71,7 +71,42 @@ def make_criterions():
         "clef": nn.CrossEntropyLoss(),
     }
 
-# --- add this helper near the top of scripts/train.py ---
+# --- diagnostics helpers (easy to strip post-debugging) --------------------
+def _prediction_stats_from_logits(logits: torch.Tensor) -> Dict[str, float]:
+    """Compute basic statistics on sigmoid probabilities for monitoring."""
+    if logits is None:
+        return {}
+    probs = torch.sigmoid(logits.detach())
+    if probs.numel() == 0:
+        return {}
+    stats = {
+        "mean": float(probs.mean().item()),
+        "std": float(probs.std(unbiased=False).item()),
+        "min": float(probs.amin().item()),
+        "max": float(probs.amax().item()),
+    }
+    return stats
+
+def _log_prediction_stats(prefix: str, stats: Dict[str, Dict[str, float]], *, writer=None, step: Optional[int] = None) -> None:
+    """Log nested onset/offset stat dict to logger/TensorBoard (diagnostic)."""
+    if not stats:
+        return
+    msg_bits = []
+    for head, vals in stats.items():
+        if not vals:
+            continue
+        msg_bits.append(
+            f"{head}: "
+            + ", ".join(f"{k}={v:.3f}" for k, v in vals.items() if isinstance(v, float))
+        )
+        if writer is not None and step is not None:
+            for k, v in vals.items():
+                if isinstance(v, float):
+                    writer.add_scalar(f"{prefix}/{head}_{k}", v, step)
+    if msg_bits:
+        logger.info("[pred-stats:%s] %s", prefix, " | ".join(msg_bits))
+# --- End of diagnostics helpers (easy to strip post-debugging)---
+
 def _print_head_grad_norms(model, step_tag=""):
     import math
     head_norms = {}
@@ -787,6 +822,34 @@ def main():
     # Model & optimizer
     model = build_model(cfg)
     
+    # --- diag: baseline random prediction stats right after init (removable) ---
+    _baseline_batch = None
+    try:
+        _baseline_batch = next(iter(train_loader))
+    except StopIteration:
+        logger.warning("No batches available for baseline prediction check.")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Could not grab batch for baseline prediction check: %s", exc)
+    if _baseline_batch is not None and isinstance(_baseline_batch, dict) and "video" in _baseline_batch:
+        video = _baseline_batch["video"]
+        model_device = next(model.parameters()).device
+        dtype = video.dtype if torch.is_floating_point(video) else torch.float32
+        rand_input = torch.rand(video.shape, device=model_device, dtype=dtype)
+        model_mode = model.training
+        model.eval()
+        with torch.no_grad():
+            init_out = model(rand_input)
+        init_stats = {
+            "onset": _prediction_stats_from_logits(init_out.get("onset_logits")),
+            "offset": _prediction_stats_from_logits(init_out.get("offset_logits")),
+        }
+        _log_prediction_stats("init_random", init_stats, writer=writer, step=0)
+        if model_mode:
+            model.train()
+        del rand_input, init_out
+    _baseline_batch = None  
+    # --- End of diag: baseline random prediction stats right after init (removable) ---
+    
     def build_optimizer(model, optim_cfg):
         base_lr = float(optim_cfg["learning_rate"])
         wd = float(optim_cfg.get("weight_decay", 0.0))
@@ -912,8 +975,16 @@ def main():
         count = 0
         avg_events_recent = None  # for TB data stat
 
+        # --- diag accumulators for onset/offset prediction variance ---
+        pred_stat_accum = {
+            "onset": {"mean_sum": 0.0, "std_sum": 0.0, "min_sum": 0.0, "max_sum": 0.0, "min_all": math.inf, "max_all": -math.inf, "count": 0},
+            "offset": {"mean_sum": 0.0, "std_sum": 0.0, "min_sum": 0.0, "max_sum": 0.0, "min_all": math.inf, "max_all": -math.inf, "count": 0},
+        }
+        low_std_streak = {"onset": 0, "offset": 0}
+        low_std_patience = int(cfg.get("training", {}).get("pred_std_warn_patience", 5))
+        # ---End of diag accumulators for onset/offset prediction variance ---
+
         #CAL
-        # after you build train_loader / just before the for-it loop
         _first_batch = next(iter(train_loader))
         _have_frame_keys = all(k in _first_batch for k in ("pitch_roll","onset_roll","offset_roll","hand_frame","clef_frame"))
         print(f"[DEBUG] frame-mode keys present: {_have_frame_keys}")
@@ -943,15 +1014,53 @@ def main():
 
             out = model(x)
 
-            #DEB
-            if it % 20 == 0:
-                with torch.no_grad():
-                    on = out["onset_logits"]             # expect (B, T') or (B, T', 1)
-                    if on.dim() == 3 and on.size(-1) == 1: on = on.squeeze(-1)
-                    std_per_sample = on.std(dim=1).mean().item()   # average temporal std over batch
-                pbar.write(f"[diag] onset temporal std (mean over batch) = {std_per_sample:.4f}")
+            # --- diag: prediction distribution monitoring (remove post-debug) ---
+            batch_pred_stats = {
+                "onset": _prediction_stats_from_logits(out.get("onset_logits")),
+                "offset": _prediction_stats_from_logits(out.get("offset_logits")),
+            }
+            if any(batch_pred_stats.values()):
+                for head, stats in batch_pred_stats.items():
+                    if not stats:
+                        continue
+                    acc = pred_stat_accum[head]
+                    acc["mean_sum"] += stats["mean"]
+                    acc["std_sum"] += stats["std"]
+                    acc["min_sum"] += stats["min"]
+                    acc["max_sum"] += stats["max"]
+                    acc["min_all"] = min(acc["min_all"], stats["min"])
+                    acc["max_all"] = max(acc["max_all"], stats["max"])
+                    acc["count"] += 1
+                    if stats["std"] < 0.1:
+                        low_std_streak[head] += 1
+                    else:
+                        low_std_streak[head] = 0
+                    if low_std_patience > 0 and low_std_streak[head] >= low_std_patience:
+                        warn_msg = (
+                            f"[{head}] prediction std {stats['std']:.3f} < 0.1 for {low_std_patience} consecutive batches"
+                        )
+                        logger.warning(warn_msg)
+                        pbar.write(warn_msg)
+                        low_std_streak[head] = 0
 
-            #END DEB
+                if (it + 1) % log_interval == 0:
+                    diag_line = []
+                    for head, stats in batch_pred_stats.items():
+                        if not stats:
+                            continue
+                        diag_line.append(
+                            f"{head}: mean={stats['mean']:.3f} std={stats['std']:.3f} min={stats['min']:.3f} max={stats['max']:.3f}"
+                        )
+                        if writer is not None:
+                            global_step = (epoch - 1) * len(train_loader) + (it + 1)
+                            for key, val in stats.items():
+                                writer.add_scalar(f"train_batch_pred/{head}_{key}", val, global_step)
+                    if diag_line:
+                        msg = f"[pred-stats] batch {it + 1}: " + " | ".join(diag_line)
+                        pbar.write(msg)
+                        logger.debug(msg)
+            # --- End of diag: prediction distribution monitoring ---
+
             # --- Route to frame loss iff model is in frame mode AND batch has frame targets ---
             use_frame = (
                 getattr(model, "head_mode", "clip") == "frame"
@@ -997,8 +1106,30 @@ def main():
         
         # epoch metrics
         train_metrics = {k: running[k] / max(1, count) for k in running}
+
+        # diag: epoch-level prediction stats
+        pred_epoch_summary = {}
+        for head in ("onset", "offset"):
+            acc = pred_stat_accum[head]
+            if not acc["count"]:
+                continue
+            pred_epoch_summary[f"{head}_mean"] = acc["mean_sum"] / acc["count"]
+            pred_epoch_summary[f"{head}_std"] = acc["std_sum"] / acc["count"]
+            pred_epoch_summary[f"{head}_min_avg"] = acc["min_sum"] / acc["count"]
+            pred_epoch_summary[f"{head}_max_avg"] = acc["max_sum"] / acc["count"]
+            pred_epoch_summary[f"{head}_min_global"] = acc["min_all"]
+            pred_epoch_summary[f"{head}_max_global"] = acc["max_all"]
+        # End of diag: epoch-level prediction stats
+
         dt = perf_counter() - t0
         print(f"Epoch {epoch} | time {dt:.1f}s | " + " ".join([f"{k}={v:.3f}" for k, v in train_metrics.items()]))
+
+        # diag: epoch-level prediction stats
+        if pred_epoch_summary:
+            summary_bits = ", ".join(f"{k}={v:.3f}" for k, v in pred_epoch_summary.items())
+            print(f"    ↳ pred-stats: {summary_bits}")
+            logger.info("[pred-epoch] %s", summary_bits)
+        # End of diag: epoch-level prediction stats
 
         # TB logging (train scalars + data stat)
         if writer is not None:
@@ -1006,6 +1137,10 @@ def main():
                 writer.add_scalar(f"train/{k}", v, epoch)
             if avg_events_recent is not None:
                 writer.add_scalar("data/avg_events_per_clip", avg_events_recent, epoch)
+            # diag: epoch-level prediction stats
+            for k, v in pred_epoch_summary.items():
+                writer.add_scalar(f"train_pred/{k}", v, epoch)
+            # End of diag: epoch-level prediction stats
 
         # --- evaluation & best checkpoint ---
         val_total = None
