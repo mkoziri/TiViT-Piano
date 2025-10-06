@@ -101,8 +101,8 @@ training:
     onoff_loss: "bce_pos"          # "bce_pos" or "focal"
     
     #if "bce_pos":
-    onoff_pos_weight_mode: "fixed"  # "adaptive" or "fixed"
-    onoff_pos_weight: 100.00              # used only when mode == "fixed"
+    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
+    onoff_pos_weight: 0.00              # used only when mode == "fixed"
     onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
@@ -111,7 +111,7 @@ training:
     
     # light prior (keep 0.00 while fixing heads; re-enable later if you want)
     onoff_prior_mean: 0.02
-    onoff_prior_weight: 1.00  # keep small, e.g. 0.05
+    onoff_prior_weight: 0.10  # keep small, e.g. 0.05
     
     # per-task weights
     onset: 2.0

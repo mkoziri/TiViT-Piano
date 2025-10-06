@@ -128,8 +128,11 @@ def _event_f1(pred, target, hop_seconds: float, tol_sec: float, eps=1e-8):
     if pred_pos.numel() == 0 and true_pos.numel() == 0:
         return None
 
-    pred_times = frame_to_sec(pred_pos[:, 0], hop_seconds)
-    true_times = frame_to_sec(true_pos[:, 0], hop_seconds)
+    # ``frame_to_sec`` returns ``TensorLike`` which can be ``int`` from Pylance's
+    # perspective.  Explicitly convert to tensors so static analyzers know these
+    # support indexing and broadcasting.
+    pred_times = torch.as_tensor(frame_to_sec(pred_pos[:, 0], hop_seconds))
+    true_times = torch.as_tensor(frame_to_sec(true_pos[:, 0], hop_seconds))
     pred_pitch = pred_pos[:, 1]
     true_pitch = true_pos[:, 1]
 
@@ -212,6 +215,16 @@ def main():
         default="",
         help="Optional path to save per-frame logits as a compressed NPZ",
     )
+    ap.add_argument(
+        "--grid_prob_thresholds",
+        action="store_true",
+        help="Evaluate the Cartesian product of onset/offset probability thresholds",
+    )
+    ap.add_argument(
+        "--sweep_k_onset",
+        action="store_true",
+        help="When aggregation mode is k_of_p, sweep k_onset over {1,2,3}",
+    )
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
@@ -238,6 +251,12 @@ def main():
         cfg["dataset"].get("frame_targets", {}).get("tolerance", hop_seconds)
     )
     split = args.split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
+
+    metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
+    agg_cfg = metrics_cfg.get("aggregation", {}) or {}
+    agg_mode = str(agg_cfg.get("mode", "any")).lower()
+    agg_k_cfg = agg_cfg.get("k", {}) or {}
+    default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
 
     # build loader
     val_loader = make_dataloader(cfg, split=split)
@@ -373,7 +392,9 @@ def main():
     onset_true_bin = (onset_tgts > 0).float()
     offset_true_bin = (offset_tgts > 0).float()
     
-    def _eval_pair(on_thr, off_thr, use_logits):
+    def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None):
+        if k_onset is None:
+            k_onset = default_k_onset
         if use_logits:
             onset_pred_bin = (onset_logits >= on_thr).float()
             offset_pred_bin = (offset_logits >= off_thr).float()
@@ -381,6 +402,11 @@ def main():
             onset_pred_bin = (onset_probs >= on_thr).float()
             offset_pred_bin = (offset_probs >= off_thr).float()
 
+        if agg_mode == "k_of_p" and k_onset > 1:
+            counts = onset_pred_bin.sum(dim=-1, keepdim=True)
+            keep = (counts >= k_onset).float()
+            onset_pred_bin = onset_pred_bin * keep
+        
         f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
         f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
         ev_f1_on = _event_f1(onset_pred_bin, onset_true_bin, hop_seconds, event_tolerance)
@@ -393,15 +419,83 @@ def main():
         ev_f1_on = 0.0 if ev_f1_on is None else ev_f1_on
         ev_f1_off = 0.0 if ev_f1_off is None else ev_f1_off
 
-        print(f"{on_thr:.2f}\t{off_thr:.2f}\t{f1_on:0.3f}\t{f1_off:0.3f}\t{onset_pred_rate:0.3f}\t{onset_pos_rate:0.3f}\t{ev_f1_on:0.3f}\t{ev_f1_off:0.3f}")
-
+        return {
+            "onset_thr": float(on_thr),
+            "offset_thr": float(off_thr),
+            "f1_on": float(f1_on),
+            "f1_off": float(f1_off),
+            "onset_pred_rate": float(onset_pred_rate),
+            "onset_pos_rate": float(onset_pos_rate),
+            "ev_f1_on": float(ev_f1_on),
+            "ev_f1_off": float(ev_f1_off),
+            "k_onset": int(k_onset),
+            "use_logits": bool(use_logits),
+        }
+    
     printed_header = False
+
+    include_k_column = agg_mode == "k_of_p"
 
     def _header():
         nonlocal printed_header
         if not printed_header:
-            print("onset_thr\toffset_thr\tonset_f1\toffset_f1\tonset_pred_rate\tonset_pos_rate\tonset_event_f1\toffset_event_f1")
+            cols = [
+                "onset_thr",
+                "offset_thr",
+            ]
+            if include_k_column:
+                cols.append("k_onset")
+            cols.extend(
+                [
+                    "onset_f1",
+                    "offset_f1",
+                    "onset_pred_rate",
+                    "onset_pos_rate",
+                    "onset_event_f1",
+                    "offset_event_f1",
+                ]
+            )
+            print("\t".join(cols))
             printed_header = True
+    
+    def _print_row(res: dict):
+        values = [f"{res['onset_thr']:.2f}", f"{res['offset_thr']:.2f}"]
+        if include_k_column:
+            values.append(str(res["k_onset"]))
+        values.extend(
+            [
+                f"{res['f1_on']:0.3f}",
+                f"{res['f1_off']:0.3f}",
+                f"{res['onset_pred_rate']:0.3f}",
+                f"{res['onset_pos_rate']:0.3f}",
+                f"{res['ev_f1_on']:0.3f}",
+                f"{res['ev_f1_off']:0.3f}",
+            ]
+        )
+        print("\t".join(values))
+
+    if agg_mode == "k_of_p" and args.sweep_k_onset:
+        k_candidates = sorted({default_k_onset, 1, 2, 3})
+    else:
+        k_candidates = [default_k_onset]
+
+    best_result = None
+    total_evals = 0
+
+    def _update_best(res: dict):
+        nonlocal best_result
+        nonlocal total_evals
+        total_evals += 1
+        ev_mean = 0.5 * (res["ev_f1_on"] + res["ev_f1_off"])
+        if best_result is None:
+            best_result = {**res, "ev_mean": ev_mean}
+            return
+        best_mean = best_result.get("ev_mean", -1.0)
+        if ev_mean > best_mean + 1e-9:
+            best_result = {**res, "ev_mean": ev_mean}
+        elif abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
+            best_result = {**res, "ev_mean": ev_mean}
+
 
     if args.head is None:
         # Evaluate at calibrated thresholds if provided.
@@ -412,10 +506,24 @@ def main():
             off_cal = calib.get("offset", {})
             if "best_logit" in on_cal and "best_logit" in off_cal:
                 _header()
-                _eval_pair(on_cal["best_logit"], off_cal["best_logit"], use_logits=True)
+                res = _eval_pair(
+                    on_cal["best_logit"],
+                    off_cal["best_logit"],
+                    use_logits=True,
+                    k_onset=default_k_onset,
+                )
+                _print_row(res)
+                _update_best(res)
             elif "best_prob" in on_cal and "best_prob" in off_cal:
                 _header()
-                _eval_pair(on_cal["best_prob"], off_cal["best_prob"], use_logits=False)
+                res = _eval_pair(
+                    on_cal["best_prob"],
+                    off_cal["best_prob"],
+                    use_logits=False,
+                    k_onset=default_k_onset,
+                )
+                _print_row(res)
+                _update_best(res)
             else:
                 print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
 
@@ -423,11 +531,20 @@ def main():
         if args.thresholds:
             _header()
             for t in args.thresholds:
-                _eval_pair(t, t, use_logits=True)
+                res = _eval_pair(t, t, use_logits=True, k_onset=default_k_onset)
+                _print_row(res)
+                _update_best(res)
         if args.prob_thresholds:
             _header()
-            for t in args.prob_thresholds:
-                _eval_pair(t, t, use_logits=False)
+            for k_val in k_candidates:
+                for on_thr in args.prob_thresholds:
+                    off_candidates = (
+                        args.prob_thresholds if args.grid_prob_thresholds else [on_thr]
+                    )
+                    for off_thr in off_candidates:
+                        res = _eval_pair(on_thr, off_thr, use_logits=False, k_onset=k_val)
+                        _print_row(res)
+                        _update_best(res)
     else:
         # Per-head sweep
         if args.thresholds is not None:
@@ -439,6 +556,13 @@ def main():
             use_logits = False
             mode = "prob"
 
+        if sweep_vals is None:
+            print(
+                "error: specify --thresholds or --prob_thresholds for per-head sweep",
+                file=sys.stderr,
+            )
+            return
+        
         other_head = "offset" if args.head == "onset" else "onset"
         fixed_thr = None
         source = None
@@ -485,7 +609,27 @@ def main():
                 on_thr, off_thr = t, fixed_thr
             else:
                 on_thr, off_thr = fixed_thr, t
-            _eval_pair(on_thr, off_thr, use_logits)
+            res = _eval_pair(on_thr, off_thr, use_logits, k_onset=default_k_onset)
+            _print_row(res)
+            _update_best(res)
+
+    if best_result is not None and total_evals > 0:
+        print(
+            "[best-event] mean_event_f1={:.3f} onset_event_f1={:.3f} offset_event_f1={:.3f} k_onset={}".format(
+                best_result["ev_mean"],
+                best_result["ev_f1_on"],
+                best_result["ev_f1_off"],
+                best_result["k_onset"],
+            )
+        )
+        if not best_result.get("use_logits", False):
+            print(
+                "[best-yaml] onset_prob_threshold={:.2f}, offset_prob_threshold={:.2f}, k_onset={}".format(
+                    best_result["onset_thr"],
+                    best_result["offset_thr"],
+                    best_result["k_onset"],
+                )
+            )
 
 if __name__ == "__main__":
     main()
