@@ -124,6 +124,13 @@ training:
     prob_threshold: 0.5 #It was 0.20
     onset_prob_threshold: 0.51
     offset_prob_threshold: 0.55
+    aggregation:
+      mode: any
+      k:
+        onset: 1
+        offset: 1
+      top_k: 0
+      tau_sum: 0.0
 
 optim:
   grad_clip: 1.0

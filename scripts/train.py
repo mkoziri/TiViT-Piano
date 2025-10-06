@@ -469,6 +469,87 @@ def _binarize_sigmoid(logits, threshold):
     # logits: (B,), returns 0/1 float tensor
     probs = torch.sigmoid(logits)
     return (probs >= threshold).float()
+
+
+def _get_onoff_thresholds(cfg: Mapping[str, Any]):
+    metrics_cfg = cfg.get("training", {}).get("metrics", {})
+    default_thr = float(metrics_cfg.get("prob_threshold", 0.5))
+    onset_thr = float(metrics_cfg.get("prob_threshold_onset", default_thr))
+    offset_thr = float(metrics_cfg.get("prob_threshold_offset", default_thr))
+    return onset_thr, offset_thr
+
+
+def _get_aggregation_config(cfg: Mapping[str, Any]):
+    metrics_cfg = cfg.get("training", {}).get("metrics", {})
+    agg_cfg = metrics_cfg.get("aggregation", {}) or {}
+    mode = str(agg_cfg.get("mode", "any")).lower()
+    top_k = int(agg_cfg.get("top_k", 0) or 0)
+    tau_sum = float(agg_cfg.get("tau_sum", 0.0) or 0.0)
+    k_cfg = agg_cfg.get("k", {}) or {}
+    k_onset = int(k_cfg.get("onset", 1) or 1)
+    k_offset = int(k_cfg.get("offset", 1) or 1)
+    return {
+        "mode": mode,
+        "top_k": max(0, top_k),
+        "tau_sum": max(0.0, tau_sum),
+        "k_onset": max(1, k_onset),
+        "k_offset": max(1, k_offset),
+    }
+
+
+def _aggregate_onoff_predictions(
+    logits: torch.Tensor,
+    threshold: float,
+    *,
+    mode: str,
+    k: int,
+    top_k: int,
+    tau_sum: float,
+):
+    squeeze_time = logits.dim() == 2
+    if squeeze_time:
+        logits = logits.unsqueeze(1)
+
+    probs = torch.sigmoid(logits)
+
+    if mode == "top_k_cap" and top_k > 0:
+        P = probs.shape[-1]
+        if top_k < P:
+            topk_idx = probs.topk(top_k, dim=-1).indices
+            keep_mask = torch.zeros_like(probs, dtype=torch.bool)
+            keep_mask.scatter_(-1, topk_idx, True)
+            probs = torch.where(keep_mask, probs, torch.zeros_like(probs))
+
+    key_mask = probs >= threshold
+    key_counts = key_mask.sum(dim=-1).float()
+
+    if mode == "k_of_p":
+        P = probs.shape[-1]
+        k_eff = max(1, min(int(k), P))
+        pred = key_counts >= k_eff
+    elif mode == "sum_prob":
+        if tau_sum <= 0.0:
+            pred = key_mask.any(dim=-1)
+        else:
+            summed = probs.sum(dim=-1)
+            pred = summed >= tau_sum
+    else:  # "any" and fallback, including "top_k_cap"
+        pred = key_mask.any(dim=-1)
+
+    if squeeze_time:
+        key_counts = key_counts.squeeze(1)
+        pred = pred.squeeze(1)
+
+    return pred, key_counts
+
+
+def _accumulate_pred_key_histogram(hist_bins: list[float], counts: torch.Tensor):
+    flat_counts = counts.reshape(-1).to(torch.int64)
+    hist_bins[0] += (flat_counts == 0).sum().item()
+    hist_bins[1] += (flat_counts == 1).sum().item()
+    hist_bins[2] += (flat_counts == 2).sum().item()
+    hist_bins[3] += (flat_counts == 3).sum().item()
+    hist_bins[4] += (flat_counts >= 4).sum().item()
     
 # ----------------------- train loop -----------------------
 
@@ -583,19 +664,16 @@ def evaluate_one_epoch(model, loader, cfg):
     crit = make_criterions()
     w = cfg["training"]["loss_weights"]   
     #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
-    metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
-    prob_threshold = metrics_cfg.get("prob_threshold", 0.5)
-    thr_default = float(prob_threshold)
-    onset_threshold = metrics_cfg.get("onset_prob_threshold", 0.5)
-    offset_threshold = metrics_cfg.get("offset_prob_threshold", 0.5)
-    thr_on = float(onset_threshold) if onset_threshold is not None else thr_default
-    thr_off = float(offset_threshold) if offset_threshold is not None else thr_default
+    metrics_cfg = cfg.get("training", {}).get("metrics", {})
+    thr_pitch = float(metrics_cfg.get("prob_threshold", 0.5))
+    thr_on, thr_off = _get_onoff_thresholds(cfg)
+    agg_cfg = _get_aggregation_config(cfg)
 
     logger.info(
         "[eval-thresholds] onset=%.3f offset=%.3f (default=%.3f)",
         thr_on,
         thr_off,
-        thr_default,
+        thr_pitch,
     )
 
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
@@ -613,6 +691,12 @@ def evaluate_one_epoch(model, loader, cfg):
         "offset_pos_rate": 0.0,
         "onset_pred_rate": 0.0,
         "offset_pred_rate": 0.0,
+        "onset_key_sum": 0.0,
+        "offset_key_sum": 0.0,
+        "onset_frame_count": 0,
+        "offset_frame_count": 0,
+        "onset_hist": [0.0] * 5,
+        "offset_hist": [0.0] * 5,
         "n_on":  0,   # batches contributing to onset_f1
         "n_off": 0,   # batches contributing to offset_f1
     }
@@ -697,8 +781,31 @@ def evaluate_one_epoch(model, loader, cfg):
                 offset_any = (offset_roll > 0).any(dim=-1).float()   # (B, T_logits)
 
                 # --- binarize predictions ---
-                onset_pred_any  = (torch.sigmoid(out["onset_logits"])  >= thr_on).any(dim=-1).float()  # (B, T_logits)
-                offset_pred_any = (torch.sigmoid(out["offset_logits"]) >= thr_off).any(dim=-1).float()  # (B, T_logits)
+                onset_pred_any, onset_key_counts = _aggregate_onoff_predictions(
+                    out["onset_logits"],
+                    thr_on,
+                    mode=agg_cfg["mode"],
+                    k=agg_cfg["k_onset"],
+                    top_k=agg_cfg["top_k"],
+                    tau_sum=agg_cfg["tau_sum"],
+                )
+                offset_pred_any, offset_key_counts = _aggregate_onoff_predictions(
+                    out["offset_logits"],
+                    thr_off,
+                    mode=agg_cfg["mode"],
+                    k=agg_cfg["k_offset"],
+                    top_k=agg_cfg["top_k"],
+                    tau_sum=agg_cfg["tau_sum"],
+                )
+                onset_pred_any = onset_pred_any.float()
+                offset_pred_any = offset_pred_any.float()
+
+                metric_counts["onset_key_sum"] += onset_key_counts.sum().item()
+                metric_counts["offset_key_sum"] += offset_key_counts.sum().item()
+                metric_counts["onset_frame_count"] += onset_key_counts.numel()
+                metric_counts["offset_frame_count"] += offset_key_counts.numel()
+                _accumulate_pred_key_histogram(metric_counts["onset_hist"], onset_key_counts)
+                _accumulate_pred_key_histogram(metric_counts["offset_hist"], offset_key_counts)
 
                 # --- masked F1 and positive-rate diagnostics ---
                 f1_on  = _binary_f1(onset_pred_any.reshape(-1),  onset_any.reshape(-1))
@@ -729,7 +836,7 @@ def evaluate_one_epoch(model, loader, cfg):
 
             else:
                 # ---- clip-level metrics (existing path) ----
-                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_default).float()
+                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_pitch).float()
                 pitch_gt   = (tgt["pitch"] >= 0.5).float()
                 f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
                 if f1_pitch is not None:
@@ -740,8 +847,24 @@ def evaluate_one_epoch(model, loader, cfg):
                 metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
                 metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
 
-                onset_pred_c  = (torch.sigmoid(out["onset_logits"])  >= thr_on).any(dim=-1).float()
-                offset_pred_c = (torch.sigmoid(out["offset_logits"]) >= thr_off).any(dim=-1).float()
+                onset_pred_c, _ = _aggregate_onoff_predictions(
+                    out["onset_logits"],
+                    thr_on,
+                    mode=agg_cfg["mode"],
+                    k=agg_cfg["k_onset"],
+                    top_k=agg_cfg["top_k"],
+                    tau_sum=agg_cfg["tau_sum"],
+                )
+                offset_pred_c, _ = _aggregate_onoff_predictions(
+                    out["offset_logits"],
+                    thr_off,
+                    mode=agg_cfg["mode"],
+                    k=agg_cfg["k_offset"],
+                    top_k=agg_cfg["top_k"],
+                    tau_sum=agg_cfg["tau_sum"],
+                )
+                onset_pred_c = onset_pred_c.float()
+                offset_pred_c = offset_pred_c.float()
 
                 onset_gt_bin  = (tgt["onset"]  >= 0.5).float().any(dim=-1)
                 offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
@@ -771,6 +894,39 @@ def evaluate_one_epoch(model, loader, cfg):
     metrics["offset_pos_rate"] = metric_counts["offset_pos_rate"] / max(1, metric_n)
     metrics["onset_pred_rate"]  = metric_counts["onset_pred_rate"]  / max(1, metric_n)
     metrics["offset_pred_rate"] = metric_counts["offset_pred_rate"] / max(1, metric_n)
+    onset_frames = metric_counts["onset_frame_count"]
+    offset_frames = metric_counts["offset_frame_count"]
+    if onset_frames > 0:
+        metrics["mean_pred_keys_per_frame_onset"] = metric_counts["onset_key_sum"] / onset_frames
+        onset_hist = metric_counts["onset_hist"]
+        metrics["pred_keys_hist_onset_0"] = onset_hist[0] / onset_frames
+        metrics["pred_keys_hist_onset_1"] = onset_hist[1] / onset_frames
+        metrics["pred_keys_hist_onset_2"] = onset_hist[2] / onset_frames
+        metrics["pred_keys_hist_onset_3"] = onset_hist[3] / onset_frames
+        metrics["pred_keys_hist_onset_ge4"] = onset_hist[4] / onset_frames
+    else:
+        metrics["mean_pred_keys_per_frame_onset"] = 0.0
+        metrics["pred_keys_hist_onset_0"] = 0.0
+        metrics["pred_keys_hist_onset_1"] = 0.0
+        metrics["pred_keys_hist_onset_2"] = 0.0
+        metrics["pred_keys_hist_onset_3"] = 0.0
+        metrics["pred_keys_hist_onset_ge4"] = 0.0
+
+    if offset_frames > 0:
+        metrics["mean_pred_keys_per_frame_offset"] = metric_counts["offset_key_sum"] / offset_frames
+        offset_hist = metric_counts["offset_hist"]
+        metrics["pred_keys_hist_offset_0"] = offset_hist[0] / offset_frames
+        metrics["pred_keys_hist_offset_1"] = offset_hist[1] / offset_frames
+        metrics["pred_keys_hist_offset_2"] = offset_hist[2] / offset_frames
+        metrics["pred_keys_hist_offset_3"] = offset_hist[3] / offset_frames
+        metrics["pred_keys_hist_offset_ge4"] = offset_hist[4] / offset_frames
+    else:
+        metrics["mean_pred_keys_per_frame_offset"] = 0.0
+        metrics["pred_keys_hist_offset_0"] = 0.0
+        metrics["pred_keys_hist_offset_1"] = 0.0
+        metrics["pred_keys_hist_offset_2"] = 0.0
+        metrics["pred_keys_hist_offset_3"] = 0.0
+        metrics["pred_keys_hist_offset_ge4"] = 0.0
 
     return {**losses, **metrics}
 
