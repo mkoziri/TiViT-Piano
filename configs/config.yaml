@@ -101,8 +101,8 @@ training:
     onoff_loss: "bce_pos"          # "bce_pos" or "focal"
     
     #if "bce_pos":
-    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
-    onoff_pos_weight: 0.00              # used only when mode == "fixed"
+    onoff_pos_weight_mode: "fixed"  # "adaptive" or "fixed"
+    onoff_pos_weight: 50.00              # used only when mode == "fixed"
     onoff_neg_smooth: 0.01             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
