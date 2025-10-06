@@ -122,8 +122,8 @@ training:
 
   metrics:
     prob_threshold: 0.5 #It was 0.20
-    onset_prob_threshold: 0.51
-    offset_prob_threshold: 0.55
+    prob_threshold_onset: 0.51
+    prob_threshold_offset: 0.55
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
