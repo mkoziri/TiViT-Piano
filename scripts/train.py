@@ -700,6 +700,15 @@ def evaluate_one_epoch(model, loader, cfg):
         "n_on":  0,   # batches contributing to onset_f1
         "n_off": 0,   # batches contributing to offset_f1
     }
+    legacy_counts = {
+        "onset_f1": 0.0,
+        "offset_f1": 0.0,
+        "onset_pred_rate": 0.0,
+        "offset_pred_rate": 0.0,
+        "n_on": 0,
+        "n_off": 0,
+        "metric_n": 0,
+    }
     metric_n = 0
 
     want = ("pitch", "onset", "offset", "hand", "clef")
@@ -781,7 +790,7 @@ def evaluate_one_epoch(model, loader, cfg):
                 offset_any = (offset_roll > 0).any(dim=-1).float()   # (B, T_logits)
 
                 # --- binarize predictions ---
-                onset_pred_any, onset_key_counts = _aggregate_onoff_predictions(
+                onset_pred_sel, onset_key_counts = _aggregate_onoff_predictions(
                     out["onset_logits"],
                     thr_on,
                     mode=agg_cfg["mode"],
@@ -789,7 +798,7 @@ def evaluate_one_epoch(model, loader, cfg):
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
                 )
-                offset_pred_any, offset_key_counts = _aggregate_onoff_predictions(
+                offset_pred_sel, offset_key_counts = _aggregate_onoff_predictions(
                     out["offset_logits"],
                     thr_off,
                     mode=agg_cfg["mode"],
@@ -797,8 +806,27 @@ def evaluate_one_epoch(model, loader, cfg):
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
                 )
-                onset_pred_any = onset_pred_any.float()
-                offset_pred_any = offset_pred_any.float()
+                onset_pred_sel = onset_pred_sel.float()
+                offset_pred_sel = offset_pred_sel.float()
+
+                onset_pred_legacy, _ = _aggregate_onoff_predictions(
+                    out["onset_logits"],
+                    thr_on,
+                    mode="any",
+                    k=1,
+                    top_k=0,
+                    tau_sum=0.0,
+                )
+                offset_pred_legacy, _ = _aggregate_onoff_predictions(
+                    out["offset_logits"],
+                    thr_off,
+                    mode="any",
+                    k=1,
+                    top_k=0,
+                    tau_sum=0.0,
+                )
+                onset_pred_legacy = onset_pred_legacy.float()
+                offset_pred_legacy = offset_pred_legacy.float()
 
                 metric_counts["onset_key_sum"] += onset_key_counts.sum().item()
                 metric_counts["offset_key_sum"] += offset_key_counts.sum().item()
@@ -808,19 +836,30 @@ def evaluate_one_epoch(model, loader, cfg):
                 _accumulate_pred_key_histogram(metric_counts["offset_hist"], offset_key_counts)
 
                 # --- masked F1 and positive-rate diagnostics ---
-                f1_on  = _binary_f1(onset_pred_any.reshape(-1),  onset_any.reshape(-1))
-                f1_off = _binary_f1(offset_pred_any.reshape(-1), offset_any.reshape(-1))
-                if f1_on is not None:
-                    metric_counts["onset_f1"] += f1_on
+                f1_on_sel = _binary_f1(onset_pred_sel.reshape(-1), onset_any.reshape(-1))
+                f1_off_sel = _binary_f1(offset_pred_sel.reshape(-1), offset_any.reshape(-1))
+                f1_on_legacy = _binary_f1(onset_pred_legacy.reshape(-1), onset_any.reshape(-1))
+                f1_off_legacy = _binary_f1(offset_pred_legacy.reshape(-1), offset_any.reshape(-1))
+                if f1_on_sel is not None:
+                    metric_counts["onset_f1"] += f1_on_sel
                     metric_counts["n_on"] += 1
-                if f1_off is not None:
-                    metric_counts["offset_f1"] += f1_off
+                if f1_off_sel is not None:
+                    metric_counts["offset_f1"] += f1_off_sel
                     metric_counts["n_off"] += 1
+                if f1_on_legacy is not None:
+                    legacy_counts["onset_f1"] += f1_on_legacy
+                    legacy_counts["n_on"] += 1
+                if f1_off_legacy is not None:
+                    legacy_counts["offset_f1"] += f1_off_legacy
+                    legacy_counts["n_off"] += 1
 
                 metric_counts["onset_pos_rate"]  += onset_any.mean().item()
                 metric_counts["offset_pos_rate"] += offset_any.mean().item()
-                metric_counts["onset_pred_rate"]  += onset_pred_any.mean().item()
-                metric_counts["offset_pred_rate"] += offset_pred_any.mean().item()
+                metric_counts["onset_pred_rate"]  += onset_pred_sel.mean().item()
+                metric_counts["offset_pred_rate"] += offset_pred_sel.mean().item()
+                legacy_counts["onset_pred_rate"]  += onset_pred_legacy.mean().item()
+                legacy_counts["offset_pred_rate"] += offset_pred_legacy.mean().item()
+                legacy_counts["metric_n"] += 1
 
                 # --- per-frame hand/clef accuracy ---
                 hand_prob = F.softmax(out["hand_logits"], dim=-1)
@@ -847,7 +886,7 @@ def evaluate_one_epoch(model, loader, cfg):
                 metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
                 metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
 
-                onset_pred_c, _ = _aggregate_onoff_predictions(
+                onset_pred_sel, _ = _aggregate_onoff_predictions(
                     out["onset_logits"],
                     thr_on,
                     mode=agg_cfg["mode"],
@@ -855,7 +894,7 @@ def evaluate_one_epoch(model, loader, cfg):
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
                 )
-                offset_pred_c, _ = _aggregate_onoff_predictions(
+                offset_pred_sel, _ = _aggregate_onoff_predictions(
                     out["offset_logits"],
                     thr_off,
                     mode=agg_cfg["mode"],
@@ -863,20 +902,47 @@ def evaluate_one_epoch(model, loader, cfg):
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
                 )
-                onset_pred_c = onset_pred_c.float()
-                offset_pred_c = offset_pred_c.float()
+                onset_pred_sel = onset_pred_sel.float()
+                offset_pred_sel = offset_pred_sel.float()
+
+                onset_pred_legacy, _ = _aggregate_onoff_predictions(
+                    out["onset_logits"],
+                    thr_on,
+                    mode="any",
+                    k=1,
+                    top_k=0,
+                    tau_sum=0.0,
+                )
+                offset_pred_legacy, _ = _aggregate_onoff_predictions(
+                    out["offset_logits"],
+                    thr_off,
+                    mode="any",
+                    k=1,
+                    top_k=0,
+                    tau_sum=0.0,
+                )
+                onset_pred_legacy = onset_pred_legacy.float()
+                offset_pred_legacy = offset_pred_legacy.float()
 
                 onset_gt_bin  = (tgt["onset"]  >= 0.5).float().any(dim=-1)
                 offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
 
-                onset_f1  = _binary_f1(onset_pred_c,  onset_gt_bin)
-                offset_f1 = _binary_f1(offset_pred_c, offset_gt_bin)
-                if onset_f1 is not None:
-                    metric_counts["onset_f1"] += onset_f1
+                onset_f1_sel = _binary_f1(onset_pred_sel, onset_gt_bin)
+                offset_f1_sel = _binary_f1(offset_pred_sel, offset_gt_bin)
+                onset_f1_legacy = _binary_f1(onset_pred_legacy, onset_gt_bin)
+                offset_f1_legacy = _binary_f1(offset_pred_legacy, offset_gt_bin)
+                if onset_f1_sel is not None:
+                    metric_counts["onset_f1"] += onset_f1_sel
                     metric_counts["n_on"] += 1
-                if offset_f1 is not None:
-                    metric_counts["offset_f1"] += offset_f1
+                if offset_f1_sel is not None:
+                    metric_counts["offset_f1"] += offset_f1_sel
                     metric_counts["n_off"] += 1
+                if onset_f1_legacy is not None:
+                    legacy_counts["onset_f1"] += onset_f1_legacy
+                    legacy_counts["n_on"] += 1
+                if offset_f1_legacy is not None:
+                    legacy_counts["offset_f1"] += offset_f1_legacy
+                    legacy_counts["n_off"] += 1
 
                 metric_counts["onset_pos_rate"]  += onset_gt_bin.mean().item()
                 metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
@@ -928,7 +994,27 @@ def evaluate_one_epoch(model, loader, cfg):
         metrics["pred_keys_hist_offset_3"] = 0.0
         metrics["pred_keys_hist_offset_ge4"] = 0.0
 
-    return {**losses, **metrics}
+    metrics_any = dict(metrics)
+    metrics_any["onset_f1"] = legacy_counts["onset_f1"] / max(1, legacy_counts.get("n_on", 0))
+    metrics_any["offset_f1"] = legacy_counts["offset_f1"] / max(1, legacy_counts.get("n_off", 0))
+    metrics_any["onset_pred_rate"] = legacy_counts["onset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
+    metrics_any["offset_pred_rate"] = legacy_counts["offset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
+
+    val_metrics = {**losses, **metrics}
+    legacy_metrics = {**losses, **metrics_any}
+
+    def _fmt_metrics_line(items: Mapping[str, float]):
+        return " ".join(f"{k}={v:.3f}" for k, v in items.items())
+
+    agg_label = agg_cfg["mode"].replace("_", "-")
+    selected_line = _fmt_metrics_line(val_metrics)
+    legacy_line = _fmt_metrics_line(legacy_metrics)
+    print(f"[{agg_label}] {selected_line}")
+    print(f"[any] {legacy_line}")
+    logger.info("[%s] %s", agg_label, selected_line)
+    logger.info("[any] %s", legacy_line)
+
+    return val_metrics
 
 def main():
     ap = argparse.ArgumentParser()

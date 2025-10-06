@@ -125,9 +125,9 @@ training:
     onset_prob_threshold: 0.51
     offset_prob_threshold: 0.55
     aggregation:
-      mode: any
+      mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 1
+        onset: 2
         offset: 1
       top_k: 0
       tau_sum: 0.0
