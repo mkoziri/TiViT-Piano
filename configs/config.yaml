@@ -121,7 +121,9 @@ training:
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.3 #It was 0.20
+    prob_threshold: 0.5 #It was 0.20
+    onset_prob_threshold: 0.51
+    offset_prob_threshold: 0.55
 
 optim:
   grad_clip: 1.0

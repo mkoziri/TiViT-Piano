@@ -583,7 +583,20 @@ def evaluate_one_epoch(model, loader, cfg):
     crit = make_criterions()
     w = cfg["training"]["loss_weights"]   
     #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
-    thr = float(cfg.get("training", {}).get("metrics", {}).get("prob_threshold", 0.5))
+    metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
+    prob_threshold = metrics_cfg.get("prob_threshold", 0.5)
+    thr_default = float(prob_threshold)
+    onset_threshold = metrics_cfg.get("onset_prob_threshold", 0.5)
+    offset_threshold = metrics_cfg.get("offset_prob_threshold", 0.5)
+    thr_on = float(onset_threshold) if onset_threshold is not None else thr_default
+    thr_off = float(offset_threshold) if offset_threshold is not None else thr_default
+
+    logger.info(
+        "[eval-thresholds] onset=%.3f offset=%.3f (default=%.3f)",
+        thr_on,
+        thr_off,
+        thr_default,
+    )
 
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
     n_batches = 0
@@ -684,9 +697,8 @@ def evaluate_one_epoch(model, loader, cfg):
                 offset_any = (offset_roll > 0).any(dim=-1).float()   # (B, T_logits)
 
                 # --- binarize predictions ---
-                thr = float(cfg.get("training", {}).get("metrics", {}).get("prob_threshold", 0.5))
-                onset_pred_any  = (torch.sigmoid(out["onset_logits"])  >= thr).any(dim=-1).float()  # (B, T_logits)
-                offset_pred_any = (torch.sigmoid(out["offset_logits"]) >= thr).any(dim=-1).float()  # (B, T_logits)
+                onset_pred_any  = (torch.sigmoid(out["onset_logits"])  >= thr_on).any(dim=-1).float()  # (B, T_logits)
+                offset_pred_any = (torch.sigmoid(out["offset_logits"]) >= thr_off).any(dim=-1).float()  # (B, T_logits)
 
                 # --- masked F1 and positive-rate diagnostics ---
                 f1_on  = _binary_f1(onset_pred_any.reshape(-1),  onset_any.reshape(-1))
@@ -717,7 +729,7 @@ def evaluate_one_epoch(model, loader, cfg):
 
             else:
                 # ---- clip-level metrics (existing path) ----
-                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr).float()
+                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_default).float()
                 pitch_gt   = (tgt["pitch"] >= 0.5).float()
                 f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
                 if f1_pitch is not None:
@@ -728,8 +740,8 @@ def evaluate_one_epoch(model, loader, cfg):
                 metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
                 metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
 
-                onset_pred_c  = (torch.sigmoid(out["onset_logits"])  >= thr).any(dim=-1).float()
-                offset_pred_c = (torch.sigmoid(out["offset_logits"]) >= thr).any(dim=-1).float()
+                onset_pred_c  = (torch.sigmoid(out["onset_logits"])  >= thr_on).any(dim=-1).float()
+                offset_pred_c = (torch.sigmoid(out["offset_logits"]) >= thr_off).any(dim=-1).float()
 
                 onset_gt_bin  = (tgt["onset"]  >= 0.5).float().any(dim=-1)
                 offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
