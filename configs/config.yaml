@@ -84,7 +84,7 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 1
+  epochs: 2
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -92,8 +92,8 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: false
-  reset_head_bias: true
+  resume: true
+  reset_head_bias: false
   bias_seed:
     onoff_prior_mean: 0.02
   loss_weights:
@@ -122,12 +122,12 @@ training:
 
   metrics:
     prob_threshold: 0.5 
-    prob_threshold_onset: 0.60
-    prob_threshold_offset: 0.60
+    prob_threshold_onset: 0.55
+    prob_threshold_offset: 0.55
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 2
+        onset: 3
         offset: 1
       top_k: 3
       tau_sum: 0.0

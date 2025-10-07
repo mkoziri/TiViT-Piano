@@ -1226,7 +1226,7 @@ def main():
             "offset": {"mean_sum": 0.0, "std_sum": 0.0, "min_sum": 0.0, "max_sum": 0.0, "min_all": math.inf, "max_all": -math.inf, "count": 0},
         }
         low_std_streak = {"onset": 0, "offset": 0}
-        low_std_patience = int(cfg.get("training", {}).get("pred_std_warn_patience", 5))
+        low_std_patience = int(cfg.get("training", {}).get("pred_std_warn_patience", 25))
         # ---End of diag accumulators for onset/offset prediction variance ---
 
         #CAL
@@ -1280,13 +1280,15 @@ def main():
                         low_std_streak[head] += 1
                     else:
                         low_std_streak[head] = 0
+                    #MK - Remove printing of stats per batch 
                     if low_std_patience > 0 and low_std_streak[head] >= low_std_patience:
-                        warn_msg = (
-                            f"[{head}] prediction std {stats['std']:.3f} < 0.1 for {low_std_patience} consecutive batches"
-                        )
-                        logger.warning(warn_msg)
-                        pbar.write(warn_msg)
+                    #    warn_msg = (
+                    #        f"[{head}] prediction std {stats['std']:.3f} < 0.1 for {low_std_patience} consecutive batches"
+                    #    )
+                    #    logger.warning(warn_msg)
+                    #    pbar.write(warn_msg)
                         low_std_streak[head] = 0
+                    #End MK
 
                 if (it + 1) % log_interval == 0:
                     diag_line = []

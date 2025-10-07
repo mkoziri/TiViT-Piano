@@ -91,6 +91,7 @@ def list_targets(root: Path, preset: str, keep_best: bool, from_cfg=True):
     pyc_data   = root / "src" / "data"   / "__pycache__"
     pyc_models = root / "src" / "models" / "__pycache__"
     pyc_utils  = root / "src" / "utils"  / "__pycache__"
+    pyc_scripts = root / "scripts" / "__pycache__"  # less common, but just in case
 
     logs_dir, ckpt_dir = load_cfg_paths(root) if from_cfg else (root / "logs", root / "checkpoints")
 
@@ -99,7 +100,7 @@ def list_targets(root: Path, preset: str, keep_best: bool, from_cfg=True):
         "ckpts":  [ckpt_dir],
         "caches": [data_cache, data_processed],
         "tmp":    [tmp_dir],
-        "pycache": [pyc_data, pyc_models, pyc_utils],
+        "pycache": [pyc_data, pyc_models, pyc_utils, pyc_scripts],
     }
 
     # When keeping the best checkpoint, replace full dir removal with selective file removals
