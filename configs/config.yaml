@@ -127,8 +127,8 @@ training:
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 6
-        offset: 3
+        onset: 1
+        offset: 1
       top_k: 0.0
       tau_sum: 0.0
 
