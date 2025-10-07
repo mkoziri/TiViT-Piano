@@ -44,7 +44,7 @@ dataset:
   crop_rescale: "auto"
   include_low_res: false
   batch_size: 2
-  num_workers: 4  #Should be 4, changed for desktop's memory 
+  num_workers: 4   
   shuffle: true
   require_labels: true
   frame_targets:
@@ -84,7 +84,7 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 2
+  epochs: 1
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -101,8 +101,8 @@ training:
     onoff_loss: "bce_pos"          # "bce_pos" or "focal"
     
     #if "bce_pos":
-    onoff_pos_weight_mode: "adaptive"  # "adaptive" or "fixed"
-    onoff_pos_weight: 0.00              # used only when mode == "fixed"
+    onoff_pos_weight_mode: "fixed"  # "adaptive" or "fixed"
+    onoff_pos_weight: 20.00              # used only when mode == "fixed"
     onoff_neg_smooth: 0.00             # e.g., 0.02 if you need it
     
     # focal params (used only when onoff_loss == "focal")
@@ -111,25 +111,25 @@ training:
     
     # light prior (keep 0.00 while fixing heads; re-enable later if you want)
     onoff_prior_mean: 0.02
-    onoff_prior_weight: 0.05  # keep small, e.g. 0.05
+    onoff_prior_weight: 0.10  # keep small, e.g. 0.05
     
     # per-task weights
-    onset: 2.0
-    offset: 2.0
+    onset: 1.5
+    offset: 1.5
     pitch: 2.0
     hand: 0.5
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.5 #It was 0.20
-    prob_threshold_onset: 0.55
-    prob_threshold_offset: 0.55
+    prob_threshold: 0.5 
+    prob_threshold_onset: 0.60
+    prob_threshold_offset: 0.60
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
         onset: 2
         offset: 1
-      top_k: 0
+      top_k: 3
       tau_sum: 0.0
 
 optim:
