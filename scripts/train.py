@@ -728,11 +728,6 @@ def evaluate_one_epoch(model, loader, cfg):
                 tgt = fabricate_dummy_targets(x.shape[0])
 
             out = model(x)
-           # use_frame = (
-           #     "pitch_roll" in batch and "onset_roll" in batch and "offset_roll" in batch
-           #     and "hand_frame" in batch and "clef_frame" in batch
-           #     and hasattr(model, "head_mode") and model.head_mode == "frame"
-           # )
            
             use_frame = (
                 getattr(model, "head_mode", "clip") == "frame" and
@@ -780,11 +775,7 @@ def evaluate_one_epoch(model, loader, cfg):
                     offset_roll = _pool_bool_BT(offset_roll, T_logits)
                     hand_frame  = _interp_labels_BT(hand_frame, T_logits)
                     clef_frame  = _interp_labels_BT(clef_frame, T_logits)
-                    #onset_roll  = _pool_bt128(onset_roll,  T_logits)
-                    #offset_roll = _pool_bt128(offset_roll, T_logits)
-                    #hand_frame  = _interp_bt(hand_frame,   T_logits)
-                    #clef_frame  = _interp_bt(clef_frame,   T_logits)
-
+                   
                 # --- derive ANY-note targets at logits time ---
                 onset_any  = (onset_roll  > 0).any(dim=-1).float()   # (B, T_logits)
                 offset_any = (offset_roll > 0).any(dim=-1).float()   # (B, T_logits)
@@ -1004,13 +995,13 @@ def evaluate_one_epoch(model, loader, cfg):
     legacy_metrics = {**losses, **metrics_any}
 
     def _fmt_metrics_line(items: Mapping[str, float]):
-        return " ".join(f"{k}={v:.3f}" for k, v in items.items())
+        return " ".join(f"{k}={v:.3f}\t" for k, v in items.items())
 
     agg_label = agg_cfg["mode"].replace("_", "-")
     selected_line = _fmt_metrics_line(val_metrics)
     legacy_line = _fmt_metrics_line(legacy_metrics)
-    print(f"[{agg_label}] {selected_line}")
-    print(f"[any] {legacy_line}")
+    print(f"[{agg_label}] {selected_line}\n")
+    print(f"[any] {legacy_line}\n")
     logger.info("[%s] %s", agg_label, selected_line)
     logger.info("[any] %s", legacy_line)
 
@@ -1400,7 +1391,7 @@ def main():
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
             val_metrics = evaluate_one_epoch(model, val_loader, cfg)
-            print("Val:", " ".join([f"{k}={v:.3f}" for k, v in val_metrics.items()]))
+            print("Val:", " ".join([f"{k}={v:.3f}\t" for k, v in val_metrics.items()]))
             logger.info("Val: %s", " ".join(f"{k}={v:.3f}" for k, v in val_metrics.items()))
             if writer is not None:
                 for k, v in val_metrics.items():
