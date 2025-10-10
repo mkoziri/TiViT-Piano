@@ -121,7 +121,7 @@ def _ensure_frame_targets(cfg: dict) -> None:
 
 
 def _build_rolls_from_labels(
-    labels: torch.Tensor,
+    labels: Optional[torch.Tensor],
     start_sec: float,
     seconds: float,
     hop_seconds: float,
