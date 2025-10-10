@@ -17,7 +17,7 @@ CLI:
     size.
 """
 
-import sys, json, argparse
+import sys, json, argparse, time
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +39,47 @@ from models import build_model
 # -----------------------------------------------------------------------------
 # Helper utilities
 # -----------------------------------------------------------------------------
+
+PARTIAL_WRITE_INTERVAL = 32
+
+
+def _print_progress(processed: int, total: int) -> None:
+    if total > 0:
+        pct = 100.0 * processed / total
+        msg = f"[calib] processed {processed}/{total} clips ({pct:5.1f}%)"
+    else:
+        msg = f"[calib] processed {processed} clips"
+    print(msg, flush=True)
+
+
+def _write_partial_calibration(
+    onset_logits_list,
+    offset_logits_list,
+    onset_probs_list,
+    offset_probs_list,
+    onset_tgts_list,
+    offset_tgts_list,
+) -> None:
+    if not onset_logits_list:
+        return
+    onset_logits = torch.cat(onset_logits_list, dim=0)
+    offset_logits = torch.cat(offset_logits_list, dim=0)
+    onset_probs = torch.cat(onset_probs_list, dim=0)
+    offset_probs = torch.cat(offset_probs_list, dim=0)
+    onset_tgts = torch.cat(onset_tgts_list, dim=0)
+    offset_tgts = torch.cat(offset_tgts_list, dim=0)
+    onset_stats = _compute_metrics(onset_logits, onset_probs, onset_tgts, "onset")
+    offset_stats = _compute_metrics(offset_logits, offset_probs, offset_tgts, "offset")
+    with open("calibration.json", "w") as f:
+        json.dump(
+            {
+                "onset": {"best_logit": onset_stats["best_logit"], "best_prob": onset_stats["best_prob"]},
+                "offset": {"best_logit": offset_stats["best_logit"], "best_prob": offset_stats["best_prob"]},
+            },
+            f,
+            indent=2,
+        )
+
 
 def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
     """Downsample a (B,T,P) pianoroll along time using max pooling."""
@@ -83,44 +124,113 @@ def _reliability_curve(probs: np.ndarray, targets: np.ndarray, n_bins: int, name
     plt.close()
     return ece, brier
 
-def _collect(model, loader):
-    onset_logits, offset_logits = [], []
-    onset_probs, offset_probs = [], []
-    onset_tgts, offset_tgts = [], []
+def _collect(model, loader, max_clips: int, timeout_secs: float):
+    onset_logits_list, offset_logits_list = [], []
+    onset_probs_list, offset_probs_list = [], []
+    onset_tgts_list, offset_tgts_list = [], []
+
+    processed = 0
+    timeout_hit = False
+    target_total = max(0, max_clips)
+    start_time = time.monotonic()
 
     with torch.no_grad():
         for batch in loader:
+            remaining = None if target_total == 0 else target_total - processed
+            if remaining is not None and remaining <= 0:
+                break
+
             x = batch["video"]
+            batch_size = x.shape[0]
+            if remaining is not None and batch_size > remaining:
+                idx = slice(0, remaining)
+            else:
+                idx = slice(None)
+
+            x = x[idx]
             out = model(x)
 
             on_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
             off_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
 
-            onset_logits.append(on_logits.cpu())
-            offset_logits.append(off_logits.cpu())
-            onset_probs.append(torch.sigmoid(on_logits).cpu())
-            offset_probs.append(torch.sigmoid(off_logits).cpu())
-            onset_tgts.append(batch["onset_roll"].float().cpu())
-            offset_tgts.append(batch["offset_roll"].float().cpu())
+            onset_probs = torch.sigmoid(on_logits)
+            offset_probs = torch.sigmoid(off_logits)
 
-    onset_logits = torch.cat(onset_logits, dim=0)
-    offset_logits = torch.cat(offset_logits, dim=0)
-    onset_probs = torch.cat(onset_probs, dim=0)
-    offset_probs = torch.cat(offset_probs, dim=0)
-    onset_tgts = torch.cat(onset_tgts, dim=0)
-    offset_tgts = torch.cat(offset_tgts, dim=0)
+            onset_roll = batch["onset_roll"][idx].float()
+            offset_roll = batch["offset_roll"][idx].float()
 
-    T_logits, P_logits = onset_logits.shape[1], onset_logits.shape[2]
-    if onset_tgts.shape[1] != T_logits:
-        onset_tgts = _pool_roll_BT(onset_tgts, T_logits)
-        offset_tgts = _pool_roll_BT(offset_tgts, T_logits)
-    onset_tgts = align_pitch_dim(onset_logits, onset_tgts, "onset")
-    offset_tgts = align_pitch_dim(offset_logits, offset_tgts, "offset")
+            T_logits = on_logits.shape[1]
+            if onset_roll.shape[1] != T_logits:
+                onset_roll = _pool_roll_BT(onset_roll, T_logits)
+                offset_roll = _pool_roll_BT(offset_roll, T_logits)
 
-    onset_tgts = (onset_tgts > 0).float()
-    offset_tgts = (offset_tgts > 0).float()
+            onset_roll = align_pitch_dim(on_logits, onset_roll, "onset")
+            offset_roll = align_pitch_dim(off_logits, offset_roll, "offset")
 
-    return onset_logits, offset_logits, onset_probs, offset_probs, onset_tgts, offset_tgts
+            onset_roll = (onset_roll > 0).float()
+            offset_roll = (offset_roll > 0).float()
+
+            onset_logits_list.append(on_logits.cpu())
+            offset_logits_list.append(off_logits.cpu())
+            onset_probs_list.append(onset_probs.cpu())
+            offset_probs_list.append(offset_probs.cpu())
+            onset_tgts_list.append(onset_roll.cpu())
+            offset_tgts_list.append(offset_roll.cpu())
+
+            processed += x.shape[0]
+            _print_progress(processed, target_total)
+
+            if processed % PARTIAL_WRITE_INTERVAL == 0 or (target_total and processed >= target_total):
+                _write_partial_calibration(
+                    onset_logits_list,
+                    offset_logits_list,
+                    onset_probs_list,
+                    offset_probs_list,
+                    onset_tgts_list,
+                    offset_tgts_list,
+                )
+
+            if timeout_secs and time.monotonic() - start_time >= timeout_secs:
+                timeout_hit = True
+                _write_partial_calibration(
+                    onset_logits_list,
+                    offset_logits_list,
+                    onset_probs_list,
+                    offset_probs_list,
+                    onset_tgts_list,
+                    offset_tgts_list,
+                )
+                break
+
+    if not onset_logits_list:
+        raise RuntimeError("No clips processed during calibration")
+
+    _write_partial_calibration(
+        onset_logits_list,
+        offset_logits_list,
+        onset_probs_list,
+        offset_probs_list,
+        onset_tgts_list,
+        offset_tgts_list,
+    )
+
+    onset_logits = torch.cat(onset_logits_list, dim=0)
+    offset_logits = torch.cat(offset_logits_list, dim=0)
+    onset_probs = torch.cat(onset_probs_list, dim=0)
+    offset_probs = torch.cat(offset_probs_list, dim=0)
+    onset_tgts = torch.cat(onset_tgts_list, dim=0)
+    offset_tgts = torch.cat(offset_tgts_list, dim=0)
+
+    return (
+        onset_logits,
+        offset_logits,
+        onset_probs,
+        offset_probs,
+        onset_tgts,
+        offset_tgts,
+        processed,
+        timeout_hit,
+    )
 
 def _compute_metrics(logits: torch.Tensor, probs: torch.Tensor, targets: torch.Tensor, name: str):
     logits_flat = logits.reshape(-1)
@@ -171,15 +281,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
     ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
-    ap.add_argument("--max-clips", type=int)
-    ap.add_argument("--frames", type=int)
+    ap.add_argument("--max-clips", type=int, default=400, help="Limit number of clips evaluated (default: 400)")
+    ap.add_argument("--frames", type=int, default=64, help="Frames per clip during calibration (default: 64)")
+    ap.add_argument(
+        "--timeout-mins",
+        type=float,
+        help="Optional timeout in minutes; stops early while keeping partial stats",
+    )
     args = ap.parse_args()
 
     cfg = load_config("configs/config.yaml")
-    if args.max_clips is not None:
-        cfg["dataset"]["max_clips"] = args.max_clips
-    if args.frames is not None:
-        cfg["dataset"]["frames"] = args.frames
+    if args.max_clips:
+        cfg["dataset"]["max_clips"] = int(args.max_clips)
+    if args.frames:
+        cfg["dataset"]["frames"] = int(args.frames)
     decode_fps = float(cfg["dataset"].get("decode_fps", 1.0))
     hop_seconds = float(cfg["dataset"].get("hop_seconds", 1.0 / decode_fps))
     split = args.split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
@@ -194,7 +309,20 @@ def main():
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
     model.eval()
 
-    onset_logits, offset_logits, onset_probs, offset_probs, onset_tgts, offset_tgts = _collect(model, loader)
+    timeout_secs = float(args.timeout_mins * 60.0) if args.timeout_mins else 0.0
+    (
+        onset_logits,
+        offset_logits,
+        onset_probs,
+        offset_probs,
+        onset_tgts,
+        offset_tgts,
+        processed_clips,
+        timeout_hit,
+    ) = _collect(model, loader, int(args.max_clips or 0), timeout_secs)
+
+    if timeout_hit:
+        print(f"[calib] timeout reached after {processed_clips} clips", flush=True)
 
     onset_stats = _compute_metrics(onset_logits, onset_probs, onset_tgts, "onset")
     offset_stats = _compute_metrics(offset_logits, offset_probs, offset_tgts, "offset")

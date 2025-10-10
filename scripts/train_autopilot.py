@@ -46,9 +46,10 @@ PARSE_SWEEP = REPO / "scripts" / "calib" / "parse_sweep.py"
 
 VAL_LINE_RE = re.compile(r"^Val:\s*(.*)$")
 TABLE_HEADER_RE = re.compile(r"^onset_thr\t")
+EPOCH_CKPT_RE = re.compile(r"tivit_epoch_(\d+)\.pt$")
 
-DEFAULT_RESULTS = REPO / "runs" / "auto" / "results.txt"
-DEFAULT_STDOUT_DIR = REPO / "runs" / "auto"
+DEFAULT_RESULTS = REPO / "logs" / "auto" / "results.txt"
+DEFAULT_STDOUT_DIR = REPO / "logs" / "auto"
 CALIB_JSON = REPO / "calibration.json"
 
 
@@ -197,6 +198,7 @@ def run_fast_eval(
     extra_probs: Optional[Tuple[float, float, float]] = None,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
+    sweep_k_onset: bool = False,
 ) -> Tuple[int, List[str]]:
     log_path = log_dir / "eval_fast.txt"
     cmd = [
@@ -217,6 +219,8 @@ def run_fast_eval(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    if sweep_k_onset:
+        cmd.append("--sweep_k_onset")
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
     return ret, lines
 
@@ -229,24 +233,42 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
             break
     if header_idx is None:
         return None
+    header = lines[header_idx].strip().split("\t")
+    col_idx = {name: idx for idx, name in enumerate(header)}
+    required = {
+        "onset_thr",
+        "offset_thr",
+        "onset_f1",
+        "offset_f1",
+        "onset_pred_rate",
+        "onset_pos_rate",
+        "onset_event_f1",
+        "offset_event_f1",
+    }
+    if not required.issubset(col_idx):
+        return None
     best = None
     for line in lines[header_idx + 1 :]:
         if not line.strip() or line.startswith("["):
             continue
         parts = line.strip().split("\t")
-        if len(parts) < 8:
-            continue
         try:
-            onset_thr = float(parts[0])
-            offset_thr = float(parts[1])
-            onset_f1 = float(parts[2])
-            offset_f1 = float(parts[3])
-            onset_pr = float(parts[4])
-            onset_pos = float(parts[5])
-            onset_ev = float(parts[6])
-            offset_ev = float(parts[7])
-        except ValueError:
+            onset_thr = float(parts[col_idx["onset_thr"]])
+            offset_thr = float(parts[col_idx["offset_thr"]])
+            onset_f1 = float(parts[col_idx["onset_f1"]])
+            offset_f1 = float(parts[col_idx["offset_f1"]])
+            onset_pr = float(parts[col_idx["onset_pred_rate"]])
+            onset_pos = float(parts[col_idx["onset_pos_rate"]])
+            onset_ev = float(parts[col_idx["onset_event_f1"]])
+            offset_ev = float(parts[col_idx["offset_event_f1"]])
+        except (ValueError, KeyError, IndexError):
             continue
+        k_onset = 1
+        if "k_onset" in col_idx:
+            try:
+                k_onset = int(float(parts[col_idx["k_onset"]]))
+            except (ValueError, IndexError):
+                k_onset = 1
         ev_mean = 0.5 * (onset_ev + offset_ev)
         row = {
             "onset_thr": onset_thr,
@@ -258,10 +280,110 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
             "onset_event_f1": onset_ev,
             "offset_event_f1": offset_ev,
             "ev_f1_mean": ev_mean,
+            "k_onset": k_onset,
         }
         if best is None or row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
             best = row
     return best
+
+
+FAST_GRID_THRESHOLDS = [0.52, 0.54, 0.56, 0.58, 0.60]
+
+
+def run_fast_grid_calibration(
+    ckpt: Path,
+    log_dir: Path,
+    split: str,
+    temperature: Optional[float] = None,
+    bias: Optional[float] = None,
+) -> Tuple[int, Optional[Dict[str, float]], List[str]]:
+    log_path = log_dir / "calibration_fast_grid.txt"
+    cmd = [
+        sys.executable,
+        str(EVAL_THRESH),
+        "--ckpt",
+        str(ckpt),
+    ]
+    if split:
+        cmd.extend(["--split", split])
+    cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in FAST_GRID_THRESHOLDS)])
+    cmd.append("--grid_prob_thresholds")
+    cmd.append("--sweep_k_onset")
+    cmd.extend(["--max-clips", "80", "--frames", "64"])
+    if temperature is not None:
+        cmd.extend(["--temperature", str(temperature)])
+    if bias is not None:
+        cmd.extend(["--bias", str(bias)])
+    ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
+    if ret != 0:
+        return ret, None, lines
+    metrics = parse_eval_table(lines)
+    return ret, metrics, lines
+
+
+def ensure_calibration_json(metrics: Dict[str, float]) -> None:
+    data = load_calibration(CALIB_JSON) or {}
+    onset = data.get("onset", {})
+    offset = data.get("offset", {})
+    onset["best_prob"] = float(metrics["onset_thr"])
+    offset["best_prob"] = float(metrics["offset_thr"])
+    data["onset"] = onset
+    data["offset"] = offset
+    with CALIB_JSON.open("w") as f:
+        json.dump(data, f, indent=2)
+
+
+def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
+    cfg = load_cfg()
+    train_cfg = cfg.setdefault("training", {})
+    metrics_cfg = train_cfg.setdefault("metrics", {})
+    agg_cfg = metrics_cfg.setdefault("aggregation", {})
+    k_cfg = agg_cfg.setdefault("k", {})
+    metrics_cfg["prob_threshold"] = float(metrics["onset_thr"])
+    metrics_cfg["prob_threshold_onset"] = float(metrics["onset_thr"])
+    metrics_cfg["prob_threshold_offset"] = float(metrics["offset_thr"])
+    agg_cfg["mode"] = "k_of_p"
+    agg_cfg["top_k"] = 0
+    onset_k = int(metrics.get("k_onset", k_cfg.get("onset", 1)))
+    if onset_k <= 0:
+        onset_k = 1
+    k_cfg["onset"] = onset_k
+    if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
+        k_cfg["offset"] = 1
+    save_cfg(cfg)
+
+
+def infer_current_epoch(ckpt_dir: Path) -> int:
+    best_epoch = 0
+    for ckpt in ckpt_dir.glob("tivit_epoch_*.pt"):
+        m = EPOCH_CKPT_RE.match(ckpt.name)
+        if not m:
+            continue
+        try:
+            epoch_val = int(m.group(1))
+        except ValueError:
+            continue
+        best_epoch = max(best_epoch, epoch_val)
+    if best_epoch > 0:
+        return best_epoch
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return best_epoch
+    for name in ("tivit_last.pt", "tivit_best.pt"):
+        path = ckpt_dir / name
+        if not path.exists():
+            continue
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+        except Exception:
+            continue
+        if isinstance(ckpt, dict):
+            for key in ("epoch", "current_epoch", "global_epoch"):
+                value = ckpt.get(key)
+                if isinstance(value, int) and value > 0:
+                    return int(value)
+    return best_epoch
 
 
 def load_calibration(calibration_json: Path) -> Optional[dict]:
@@ -269,6 +391,103 @@ def load_calibration(calibration_json: Path) -> Optional[dict]:
         return None
     with calibration_json.open("r") as f:
         return json.load(f)
+
+
+def perform_calibration(
+    *,
+    ckpt: Path,
+    args,
+    results_path: Path,
+    stdout_dir: Path,
+    split: str,
+    calibration_count: int,
+) -> Tuple[Optional[Dict[str, float]], int]:
+    first_calibration = calibration_count == 0
+    prefer_fast_grid = first_calibration and args.fast_first_calib
+    desired_kind = args.first_calib if first_calibration else "fast"
+
+    def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
+        banner = "NOTICE: Running FAST calibration — this may take a while"
+        log_banner(results_path, banner)
+        onset_prob = float(calib.get("onset", {}).get("best_prob", 0.3))
+        offset_prob = float(calib.get("offset", {}).get("best_prob", 0.3))
+        prob_delta = 0.05
+        extra_probs = (
+            max(0.0, onset_prob - prob_delta),
+            onset_prob,
+            min(1.0, onset_prob + prob_delta),
+        )
+        eval_ret, lines = run_fast_eval(
+            ckpt,
+            stdout_dir,
+            split,
+            CALIB_JSON,
+            extra_probs=extra_probs,
+            temperature=args.temperature,
+            bias=args.bias,
+            sweep_k_onset=True,
+        )
+        if eval_ret != 0:
+            return None, eval_ret
+        metrics = parse_eval_table(lines)
+        if metrics is None:
+            return None, 1
+        metrics["onset_thr"] = metrics.get("onset_thr", onset_prob)
+        metrics["offset_thr"] = metrics.get("offset_thr", offset_prob)
+        calib.setdefault("onset", {})["best_prob"] = metrics["onset_thr"]
+        calib.setdefault("offset", {})["best_prob"] = metrics["offset_thr"]
+        with CALIB_JSON.open("w") as f:
+            json.dump(calib, f, indent=2)
+        return metrics, eval_ret
+
+    def _run_fast_grid(reason: Optional[str] = None) -> Tuple[Optional[Dict[str, float]], int]:
+        if reason:
+            print(f"[autopilot] WARNING: {reason} → falling back to fast grid calibration")
+        banner = "NOTICE: Running FAST calibration — this may take a while"
+        log_banner(results_path, banner)
+        ret, metrics, _ = run_fast_grid_calibration(
+            ckpt,
+            stdout_dir,
+            split,
+            temperature=args.temperature,
+            bias=args.bias,
+        )
+        if ret != 0 or metrics is None:
+            return None, ret or 1
+        ensure_calibration_json(metrics)
+        return metrics, ret
+
+    if prefer_fast_grid:
+        return _run_fast_grid()
+
+    if desired_kind == "thorough":
+        banner = "NOTICE: Running THOROUGH calibration — this may take a while"
+        log_banner(results_path, banner)
+        ret = run_calibration(
+            "thorough",
+            ckpt,
+            stdout_dir,
+            split,
+            args.calib_max_clips,
+            args.calib_frames,
+        )
+        if ret != 0:
+            return _run_fast_grid("thorough calibration failed")
+        calib = load_calibration(CALIB_JSON)
+        if calib is None:
+            return _run_fast_grid("calibration.json missing after thorough calibration")
+        metrics, eval_ret = _run_fast_eval_with_calib(calib)
+        if metrics is None:
+            return _run_fast_grid("fast evaluation failed after thorough calibration")
+        return metrics, eval_ret
+
+    calib = load_calibration(CALIB_JSON)
+    if calib is None:
+        return _run_fast_grid("calibration.json missing for fast calibration")
+    metrics, eval_ret = _run_fast_eval_with_calib(calib)
+    if metrics is None:
+        return _run_fast_grid("fast evaluation failed")
+    return metrics, eval_ret
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +569,9 @@ def main() -> int:
     ap.add_argument("--mode", choices=["fresh", "resume"], default="fresh")
     ap.add_argument("--burst_epochs", type=int, default=2)
     ap.add_argument("--first_calib", choices=["thorough", "fast"], default="thorough")
+    ap.add_argument("--first_step", choices=["train", "calib"], default="train")
+    ap.add_argument("--skip_train_round1", action="store_true")
+    ap.add_argument("--fast_first_calib", action="store_true")
     ap.add_argument("--target_ev_f1", type=float, default=0.15)
     ap.add_argument("--max_rounds", type=int, default=12)
     ap.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
@@ -414,34 +636,83 @@ def main() -> int:
 
     patience_left = 3
     best_ev_mean = -1.0
-    first_round_kind = args.first_calib
+    calibration_count = 0
 
     for round_idx in range(1, args.max_rounds + 1):
         cfg = load_cfg()
         train_cfg = cfg.setdefault("training", {})
         metrics_cfg = train_cfg.setdefault("metrics", {})
-        train_cfg["epochs"] = int(args.burst_epochs)
+        agg_cfg = metrics_cfg.setdefault("aggregation", {})
+        k_cfg = agg_cfg.setdefault("k", {})
+        agg_cfg["top_k"] = 0
+        if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
+            k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
         resuming = round_idx > 1 or args.mode == "resume"
         train_cfg["resume"] = resuming
         if resuming:
             train_cfg["reset_head_bias"] = False
-            sync_last_to_best(ckpt_dir)
+            current_epoch = infer_current_epoch(ckpt_dir) if resuming else 0
+        epochs_target = args.burst_epochs
+        if resuming and current_epoch > 0:
+            epochs_target = current_epoch + args.burst_epochs
+        train_cfg["epochs"] = int(epochs_target)
         save_cfg(cfg)
+        if resuming:
+            sync_last_to_best(ckpt_dir)
 
-        banner = "NOTICE: Starting training burst (this may take a while)"
-        log_banner(results_path, banner)
+        train_ret = 0
+        last_val: Optional[str] = None
+        training_executed = False
+        metrics: Optional[Dict[str, float]] = None
+        eval_ret = 0
+        ckpt = find_ckpt(ckpt_dir)
+
+        pre_round_calib = (
+            round_idx == 1
+            and args.first_step == "calib"
+            and ckpt is not None
+            and not args.dry_run
+        )
+        if pre_round_calib:
+            metrics, eval_ret = perform_calibration(
+                ckpt=ckpt,
+                args=args,
+                results_path=results_path,
+                stdout_dir=stdout_dir,
+                split=args.split_eval,
+                calibration_count=calibration_count,
+            )
+            if metrics is None:
+                print("Calibration failed", file=sys.stderr)
+                return eval_ret or 1
+            calibration_count += 1
+            apply_metrics_to_config(metrics)
+
+        skip_training = (
+            round_idx == 1
+            and args.skip_train_round1
+            and ckpt is not None
+        )
         if args.dry_run:
+            banner = "NOTICE: Training burst — this may take a while"
+            log_banner(results_path, banner)
             print("[autopilot] dry-run: skipping training execution")
             train_ret = 0
             last_val = None
+        elif skip_training:
+            print("[autopilot] skip_train_round1 enabled → skipping training for round 1")
         else:
+            banner = "NOTICE: Training burst — this may take a while"
+            log_banner(results_path, banner)
             log_path = stdout_dir / f"stdout_round{round_idx:02d}_train.txt"
             train_ret, last_val, _ = run_command(
                 [sys.executable, str(TRAIN), "--config", str(CONFIG)],
                 log_path,
                 capture_last_val=True,
             )
+            training_executed = True
+
         if train_ret != 0:
             print(f"Training failed with return code {train_ret}", file=sys.stderr)
             append_results(
@@ -468,20 +739,8 @@ def main() -> int:
             return train_ret
 
         if args.dry_run:
-            ckpt = ckpt_dir / "dry_run.pt"
-        else:
-            ckpt = find_ckpt(ckpt_dir)
-            if ckpt is None:
-                print(f"No checkpoint found in {ckpt_dir}", file=sys.stderr)
-                return 1
-
-        calib_kind = first_round_kind if round_idx == 1 else "fast"
-        if args.dry_run:
-            if calib_kind == "thorough":
-                banner = "NOTICE: Running THOROUGH calibration (first round; will compute reliability & ECE/Brier)"
-            else:
-                banner = "NOTICE: Running FAST calibration (subsequent rounds)"
-            log_banner(results_path, banner)
+            training_executed = True
+        
             metrics = {
                 "onset_thr": 0.3,
                 "offset_thr": 0.3,
@@ -492,78 +751,44 @@ def main() -> int:
                 "ev_f1_mean": 0.0,
                 "onset_pred_rate": 0.0,
                 "onset_pos_rate": 0.0,
+                "k_onset": 1,
             }
             eval_ret = 0
         else:
-            if calib_kind == "thorough":
-                banner = "NOTICE: Running THOROUGH calibration (first round; will compute reliability & ECE/Brier)"
-                log_banner(results_path, banner)
-                ret = run_calibration(calib_kind, ckpt, stdout_dir, args.split_eval, args.calib_max_clips, args.calib_frames)
-                if ret != 0:
+            if training_executed:
+                ckpt = find_ckpt(ckpt_dir)
+            if ckpt is None:
+                print(f"No checkpoint found in {ckpt_dir}", file=sys.stderr)
+                return 1
+            ckpt_used = ckpt
+            need_post_calib = metrics is None or training_executed
+            if need_post_calib:
+                metrics, eval_ret = perform_calibration(
+                    ckpt=ckpt,
+                    args=args,
+                    results_path=results_path,
+                    stdout_dir=stdout_dir,
+                    split=args.split_eval,
+                    calibration_count=calibration_count,
+                )
+                if metrics is None:
                     print("Calibration failed", file=sys.stderr)
-                    return ret
-            else:
-                banner = "NOTICE: Running FAST calibration (subsequent rounds)"
-                log_banner(results_path, banner)
-                if not CALIB_JSON.exists():
-                    print("[autopilot] calibration.json missing; falling back to thorough calibration")
-                    ret = run_calibration("thorough", ckpt, stdout_dir, args.split_eval, args.calib_max_clips, args.calib_frames)
-                    if ret != 0:
-                        print("Calibration failed", file=sys.stderr)
-                        return ret
+                    return eval_ret or 1
+                calibration_count += 1
+                apply_metrics_to_config(metrics)
 
-            calib = load_calibration(CALIB_JSON)
-            if calib is None:
-                print("calibration.json not found after calibration", file=sys.stderr)
-                return 1
-
-            onset_prob = float(calib.get("onset", {}).get("best_prob", 0.3))
-            offset_prob = float(calib.get("offset", {}).get("best_prob", 0.3))
-            prob_delta = 0.05
-            extra_probs = (
-                max(0.0, onset_prob - prob_delta),
-                onset_prob,
-                min(1.0, onset_prob + prob_delta),
-            )
-            eval_ret, lines = run_fast_eval(
-                ckpt,
-                stdout_dir,
-                args.split_eval,
-                CALIB_JSON,
-                extra_probs=extra_probs,
-                temperature=args.temperature,
-                bias=args.bias,
-            )
-            if eval_ret != 0:
-                print("Evaluation failed", file=sys.stderr)
-                return eval_ret
-            metrics = parse_eval_table(lines)
-            if metrics is None:
-                print("Failed to parse evaluation output", file=sys.stderr)
-                return 1
-            metrics["onset_thr"] = metrics.get("onset_thr", onset_prob)
-            metrics["offset_thr"] = metrics.get("offset_thr", offset_prob)
-            calib.setdefault("onset", {})["best_prob"] = metrics["onset_thr"]
-            calib.setdefault("offset", {})["best_prob"] = metrics["offset_thr"]
-            with CALIB_JSON.open("w") as f:
-                json.dump(calib, f, indent=2)
-
-        cfg = load_cfg()
-        metrics_cfg = cfg.setdefault("training", {}).setdefault("metrics", {})
-        metrics_cfg["prob_threshold"] = metrics["onset_thr"]
-        save_cfg(cfg)
+        if metrics is None:
+            print("Calibration metrics missing", file=sys.stderr)
+            return 1
 
         val_line = format_val_line(metrics, last_val)
         ev_mean = metrics["ev_f1_mean"]
-        ckpt_last = ckpt_dir / "tivit_last.pt"
-        ckpt_best = ckpt_dir / "tivit_best.pt"
-        improved = ckpt_last.exists() and ev_mean > best_ev_mean + 1e-9
-        patience_record = 3 if improved else max(patience_left - 1, 0)
+        patience_record = 3 if ev_mean > best_ev_mean + 1e-9 else max(patience_left - 1, 0)
         append_results(
             results_path,
             round_idx,
             args.burst_epochs,
-            ckpt,
+            ckpt_used,
             metrics,
             patience_record,
             cfg.get("experiment", {}).get("name", ""),
@@ -588,8 +813,12 @@ def main() -> int:
             capture_last_val=False,
         )
 
+        improved = ev_mean > best_ev_mean + 1e-9
         if improved:
-            shutil.copy2(ckpt_last, ckpt_best)
+            target_ckpt = ckpt_dir / "tivit_last.pt"
+            if not target_ckpt.exists() or not training_executed:
+                target_ckpt = ckpt_used
+            shutil.copy2(target_ckpt, ckpt_dir / "tivit_best.pt")
             best_ev_mean = ev_mean
             patience_left = 3
             print(f"[autopilot] New best ev_f1_mean={ev_mean:.4f} (round {round_idx}); updated tivit_best.pt")
