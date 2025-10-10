@@ -122,12 +122,12 @@ training:
 
   metrics:
     prob_threshold: 0.5 
-    prob_threshold_onset: 0.58
-    prob_threshold_offset: 0.60
+    prob_threshold_onset: 0.54
+    prob_threshold_offset: 0.54
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 1
+        onset: 3
         offset: 1
       top_k: 3.0
       tau_sum: 0.0
