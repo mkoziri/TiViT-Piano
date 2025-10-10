@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Automated training/calibration driver for TiViT-Piano.
-
-This script coordinates short training bursts with calibration/evaluation
+""Purpose:
+    This script coordinates short training bursts with calibration/evaluation
 rounds.  It keeps a ledger of results, updates ``configs/config.yaml`` with the
 latest thresholds, and mirrors stdout from the invoked helpers.
+
+Key Functions/Classes:
+    To be added
+
+CLI:
+    To be added
 """
+
 from __future__ import annotations
 
 import argparse

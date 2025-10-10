@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
 """Purpose:
-    Diagnose temporal alignment between model predictions and ground-truth
-    onset/offset labels by sweeping integer frame shifts and evaluating
-    correlation and F1 scores.
+    To be added
 
 Key Functions/Classes:
-    - _align(): Crops tensors after applying a temporal shift so correlations
-      can be computed on equal-length sequences.
-    - _load_window(): Fetches a temporal window from disk using the dataset's
-      decoding parameters and tiling scheme.
-    - main(): CLI entry point that loads configuration, runs the model on a
-      selected clip, and sweeps lag offsets.
+    To be added
 
 CLI:
-    Run ``python scripts/lag_sweep.py --split val --clip <name> --seconds 5 --ckpt``
-    to analyze a specific window.  Optional flags include ``--head`` to choose
-    onset or offset logits and ``--max_shift`` for the sweep range.
+    To be added
 """
 
 from __future__ import annotations
