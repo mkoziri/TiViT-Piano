@@ -123,6 +123,27 @@ script saves NPZ files containing flattened logits for each requested head; the
 NPZ artefacts can be rescored or re-evaluated without rerunning the forward
 pass.
 
+## Autopilot training loop
+
+For unattended experiments use `scripts/train_autopilot.py`. The helper applies
+safe defaults to `configs/config.yaml`, alternates between short training
+bursts, calibration sweeps, and evaluations, and writes the metrics for each
+round to `runs/auto/results.txt` alongside per-round stdout logs.
+
+```bash
+python scripts/train_autopilot.py \
+  --mode fresh \
+  --burst_epochs 3 \
+  --target_ev_f1 0.20 \
+  --results runs/auto/results.txt \
+  --ckpt_dir checkpoints \
+  --split_eval val
+```
+
+Pass `--dry_run` to exercise the control flow without launching training or
+calibration. Subsequent invocations with `--mode resume` keep the current
+experiment name and reuse the latest checkpoints.
+
 ## Key-aware decoding
 
 The theory decoder estimates a 24-key posterior using the Krumhansl–Schmuckler

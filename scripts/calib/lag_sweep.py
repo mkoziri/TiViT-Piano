@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Purpose:
-    To be added
+    Inspect the temporal alignment between model predictions and frame targets
+    by sweeping positive and negative frame shifts. The script crops a
+    specified clip, runs a checkpoint, and reports correlation/F1 statistics to
+    help diagnose systematic lag.
 
 Key Functions/Classes:
-    To be added
+    - _align: Trim tensors to a shared length after applying a frame shift.
+    - _safe_corr: Compute a numerically safe normalised cross-correlation.
+    - _select_clip_index: Resolve the dataset index for a clip identifier.
+    - _build_rolls_from_labels: Create onset/offset rolls from sparse labels.
+    - main: CLI entry point orchestrating data loading, inference, and sweep.
 
 CLI:
-    To be added
+    python scripts/calib/lag_sweep.py --split val --ckpt checkpoints/tivit_best.pt \
+        --seconds 6 --start_sec 12 --head onset --clip_key mazurka
 """
 
 from __future__ import annotations
@@ -16,7 +24,7 @@ import copy
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Mapping
+from typing import Any, Dict, Optional, Tuple, Mapping, Protocol, cast
 import torch.nn.functional as F
 
 import numpy as np
@@ -53,16 +61,27 @@ def _safe_corr(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a * b).sum().item() / (na.item() * nb.item()))
 
 
-def _extract_dataset(loader_obj, split: str):
+class _IndexableDataset(Protocol):
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        ...
+
+    def __len__(self) -> int:
+        ...
+
+
+def _extract_dataset(loader_obj, split: str) -> Tuple[Any, _IndexableDataset]:
     if isinstance(loader_obj, dict):
         loader_obj = loader_obj.get(split) or next(iter(loader_obj.values()))
     if isinstance(loader_obj, (list, tuple)):
         loader_obj = loader_obj[0]
-    dataset = getattr(loader_obj, "dataset", loader_obj)
+    dataset_obj = getattr(loader_obj, "dataset", loader_obj)
+    if not hasattr(dataset_obj, "__getitem__") or not hasattr(dataset_obj, "__len__"):
+        raise TypeError("Loader does not expose an indexable dataset")
+    dataset = cast(_IndexableDataset, dataset_obj)
     return loader_obj, dataset
 
 
-def _select_clip_index(dataset, key: Optional[str], explicit_idx: Optional[int]) -> int:
+def _select_clip_index(dataset: _IndexableDataset, key: Optional[str], explicit_idx: Optional[int]) -> int:
     if explicit_idx is not None:
         if explicit_idx < 0 or explicit_idx >= len(dataset):
             raise IndexError(f"clip_idx {explicit_idx} out of range (len={len(dataset)})")
@@ -90,8 +109,8 @@ def _compute_frames_needed(seconds: float, start_sec: float, hop_seconds: float,
     return frames_needed, start_frame, window_frames
 
 
-def _clone_cfg(cfg: dict) -> dict:
-    return copy.deepcopy(cfg)
+def _clone_cfg(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    return cast(Dict[str, Any], copy.deepcopy(cfg))
 
 
 def _ensure_frame_targets(cfg: dict) -> None:

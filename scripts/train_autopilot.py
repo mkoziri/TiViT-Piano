@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Automated training/calibration driver for TiViT-Piano.
 ""Purpose:
-    This script coordinates short training bursts with calibration/evaluation
-rounds.  It keeps a ledger of results, updates ``configs/config.yaml`` with the
-latest thresholds, and mirrors stdout from the invoked helpers.
+    Cycle through repeated "train → calibrate → evaluate" rounds until the
+    event-level F1 target is met or patience runs out. The driver modifies
+    ``configs/config.yaml`` with sensible defaults, mirrors helper stdout to log
+    files, and appends a tab-separated ledger of every round.
 
 Key Functions/Classes:
-    To be added
+    - run_command: Execute helper scripts while teeing stdout/stderr to disk.
+    - run_calibration / run_fast_eval: Invoke calibration/eval helpers and
+      return parsed metrics.
+    - append_results: Persist round metadata to ``runs/auto/results.txt``.
+    - main: CLI entry point implementing the training/autocalibration loop.
 
 CLI:
-    To be added
+    python scripts/train_autopilot.py --mode fresh --burst_epochs 3 \
+        --results runs/auto/results.txt --ckpt_dir checkpoints --target_ev_f1 0.2
 """
 
 from __future__ import annotations
