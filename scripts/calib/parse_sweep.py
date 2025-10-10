@@ -21,6 +21,20 @@ import argparse, csv, math, re, sys
 from pathlib import Path
 
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
+DEFAULT_HEADER = [
+    "iso8601",
+    "gamma",
+    "alpha",
+    "thr",
+    "prior_mean",
+    "prior_wt",
+    "tol",
+    "dilate",
+    "max_clips",
+    "exp",
+    "val_line",
+    "retcode",
+]
 
 def to_num_or_none(s: str):
     if s is None: return None
@@ -60,29 +74,35 @@ def main():
     if not results_path.exists():
         print(f"ERROR: {results_path} not found", file=sys.stderr); sys.exit(1)
 
+    header = None
     rows = []
     with results_path.open("r") as f:
         for line in f:
-            if line.startswith("#") or not line.strip():
+            if line.startswith("#"):
+                if line.lower().startswith("# columns:"):
+                    header = [tok for tok in line.split(":", 1)[1].strip().split("\t") if tok]
+                continue
+            if not line.strip():
                 continue
             parts = line.rstrip("\n").split("\t")
-            # Expect: 12 columns: iso, gamma, alpha, thr, pm, pw, tol, dil, mclips, exp, val_line, retcode
-            if len(parts) < 12:
+            cols = header or DEFAULT_HEADER
+            if len(parts) < len(cols):
                 continue
-            iso8601, gamma, alpha, thr, pm, pw, tol, dil, mclips, exp, val_line, retcode = parts[:12]
-            row = {
-                "iso8601": iso8601,
-                "gamma": to_num_or_none(gamma),
-                "alpha": to_num_or_none(alpha),
-                "thr": to_num_or_none(thr),
-                "prior_mean": to_num_or_none(pm),
-                "prior_wt": to_num_or_none(pw),
-                "tol": to_num_or_none(tol),
-                "dilate": to_num_or_none(dil),
-                "max_clips": to_num_or_none(mclips),
-                "exp": exp,
-                "retcode": to_num_or_none(retcode),
-            }
+            if len(parts) > len(cols) and "val_line" in cols:
+                val_idx = cols.index("val_line")
+                prefix = parts[:val_idx]
+                suffix_len = len(cols) - val_idx - 1
+                val_tokens = parts[val_idx : len(parts) - suffix_len]
+                suffix = parts[len(parts) - suffix_len :]
+                parts = prefix + ["\t".join(val_tokens)] + suffix
+            mapped = dict(zip(cols, parts[: len(cols)]))
+            val_line = mapped.get("val_line", "")
+            row = {}
+            for key, value in mapped.items():
+                if key == "val_line":
+                    continue
+                num = to_num_or_none(value)
+                row[key] = num if num is not None else value
             row.update(parse_val_line(val_line))
             rows.append(row)
 
@@ -93,7 +113,10 @@ def main():
         print("No data rows after filtering.", file=sys.stderr); sys.exit(1)
 
     # columns
-    fixed_cols = ["iso8601","gamma","alpha","thr","prior_mean","prior_wt","tol","dilate","max_clips","exp","retcode"]
+    cols_from_header = header or DEFAULT_HEADER
+    fixed_cols = [c for c in cols_from_header if c not in {"val_line"}]
+    if "retcode" not in fixed_cols:
+        fixed_cols.append("retcode")
     metric_cols = sorted({k for r in rows for k in r.keys()} - set(fixed_cols))
     cols_all = fixed_cols + metric_cols
 
