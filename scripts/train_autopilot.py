@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -507,6 +508,14 @@ def perform_calibration(
 # ---------------------------------------------------------------------------
 # Ledger helpers
 # ---------------------------------------------------------------------------
+@dataclass
+class ResumeState:
+    next_round: int
+    best_ev_mean: float
+    patience_left: int
+    calibration_count: int
+
+
 RESULT_HEADER = [
     "iso8601",
     "round",
@@ -524,6 +533,54 @@ RESULT_HEADER = [
     "val_line",
     "retcode",
 ]
+
+
+def load_resume_state(results_path: Path) -> Optional[ResumeState]:
+    if not results_path.exists():
+        return None
+
+    rows: List[Dict[str, str]] = []
+    try:
+        with results_path.open("r") as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < len(RESULT_HEADER):
+                    continue
+                rows.append(dict(zip(RESULT_HEADER, parts)))
+    except OSError:
+        return None
+
+    if not rows:
+        return None
+
+    best_ev_mean = -1.0
+    for row in rows:
+        try:
+            val = float(row.get("ev_f1_mean", "nan"))
+        except (TypeError, ValueError):
+            continue
+        if not (val != val):  # NaN guard
+            best_ev_mean = max(best_ev_mean, val)
+
+    last_row = rows[-1]
+    try:
+        next_round = int(last_row.get("round", "0")) + 1
+    except (TypeError, ValueError):
+        next_round = len(rows) + 1
+    try:
+        patience_left = int(last_row.get("patience", "3"))
+    except (TypeError, ValueError):
+        patience_left = 3
+    patience_left = max(patience_left, 0)
+
+    return ResumeState(
+        next_round=next_round,
+        best_ev_mean=best_ev_mean,
+        patience_left=patience_left,
+        calibration_count=len(rows),
+    )
 
 
 def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
@@ -652,7 +709,22 @@ def main() -> int:
     best_ev_mean = -1.0
     calibration_count = 0
 
-    for round_idx in range(1, args.max_rounds + 1):
+    resume_state: Optional[ResumeState] = None
+    start_round = 1
+    if args.mode == "resume":
+        resume_state = load_resume_state(results_path)
+        if resume_state:
+            start_round = max(resume_state.next_round, 1)
+            best_ev_mean = resume_state.best_ev_mean
+            patience_left = resume_state.patience_left
+            calibration_count = resume_state.calibration_count
+            print(
+                "[autopilot] resume state → "
+                f"starting from round {start_round} "
+                f"(best ev_f1_mean={best_ev_mean:.4f}, patience={patience_left})"
+            )
+
+    for round_idx in range(start_round, args.max_rounds + 1):
         cfg = load_cfg()
         train_cfg = cfg.setdefault("training", {})
         metrics_cfg = train_cfg.setdefault("metrics", {})
@@ -683,7 +755,7 @@ def main() -> int:
         ckpt = find_ckpt(ckpt_dir)
 
         pre_round_calib = (
-            round_idx == 1
+            round_idx == start_round
             and args.first_step == "calib"
             and ckpt is not None
             and not args.dry_run
@@ -705,9 +777,10 @@ def main() -> int:
             apply_metrics_to_config(metrics)
 
         skip_training = (
-            round_idx == 1
+            round_idx == start_round
             and args.skip_train_round1
             and ckpt is not None
+            and args.first_step != "train"
         )
         if args.dry_run:
             banner = "NOTICE: Training burst — this may take a while"
