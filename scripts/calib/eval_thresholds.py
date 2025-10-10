@@ -17,7 +17,7 @@ CLI:
     dataset split, and ``--dump_logits`` to save logits to NPZ.
 """
 
-import sys, json, torch
+import sys, json, time, torch
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
@@ -225,6 +225,23 @@ def main():
         action="store_true",
         help="When aggregation mode is k_of_p, sweep k_onset over {1,2,3}",
     )
+    ap.add_argument(
+        "--progress",
+        action="argparse.BooleanOptionalAction",
+        default=True,
+        help="Enable or disable periodic progress logging",
+    )
+    ap.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Minimum number of seconds between progress prints",
+    )
+    ap.add_argument(
+        "--log-file",
+        type=str,
+        help="Optional file path to tee progress logs",
+    )
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
@@ -232,6 +249,26 @@ def main():
     if args.thresholds is not None and args.prob_thresholds is not None:
         print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
         return
+    log_handle = None
+    if args.log_file:
+        log_path = Path(args.log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(log_path, "a", encoding="utf-8")
+        import atexit
+
+        atexit.register(log_handle.close)
+
+    def _log_progress(msg: str) -> None:
+        print(msg, flush=True)
+        if log_handle is not None:
+            log_handle.write(msg + "\n")
+            log_handle.flush()
+
+    def _format_seconds(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes:02d}:{secs:02d}"
+    
 
     # Unless a calibration file is provided and no head is specified, default to
     # sweeping over probability thresholds when none were specified explicitly.
@@ -258,12 +295,86 @@ def main():
     agg_k_cfg = agg_cfg.get("k", {}) or {}
     default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
 
+    calibration_data = None
+    if args.calibration:
+        with open(args.calibration) as f:
+            calibration_data = json.load(f)
+
+    include_k_column = agg_mode == "k_of_p"
+    if include_k_column and args.sweep_k_onset and args.head is None:
+        k_candidates = sorted({default_k_onset, 1, 2, 3})
+    else:
+        k_candidates = [default_k_onset]
+
     # build loader
     val_loader = make_dataloader(cfg, split=split)
     if isinstance(val_loader, dict):
         val_loader = val_loader.get(split, next(iter(val_loader.values())))
     if isinstance(val_loader, (list, tuple)):
         val_loader = val_loader[0]
+
+    num_clips_est = args.max_clips
+    if num_clips_est is None:
+        dataset = getattr(val_loader, "dataset", None)
+        if dataset is not None:
+            try:
+                num_clips_est = len(dataset)
+            except TypeError:
+                num_clips_est = None
+
+    per_head_sweep_vals = None
+    per_head_use_logits = False
+    per_head_mode = "prob"
+    if args.head is not None:
+        if args.thresholds is not None:
+            per_head_sweep_vals = args.thresholds
+            per_head_use_logits = True
+            per_head_mode = "logit"
+        else:
+            per_head_sweep_vals = args.prob_thresholds
+            per_head_use_logits = False
+            per_head_mode = "prob"
+
+    if args.head is None:
+        calib_pairs = 0
+        if calibration_data:
+            on_cal = calibration_data.get("onset", {})
+            off_cal = calibration_data.get("offset", {})
+            if "best_logit" in on_cal and "best_logit" in off_cal:
+                calib_pairs = 1
+            elif "best_prob" in on_cal and "best_prob" in off_cal:
+                calib_pairs = 1
+        logit_pairs = len(args.thresholds) if args.thresholds else 0
+        prob_list = args.prob_thresholds or []
+        prob_pairs = len(prob_list) * (len(prob_list) if args.grid_prob_thresholds else 1)
+        num_prob_combos = prob_pairs * len(k_candidates)
+        num_thr_pairs = calib_pairs + logit_pairs + prob_pairs
+        num_combos = calib_pairs + logit_pairs + num_prob_combos
+        num_k = len(k_candidates) if prob_pairs > 0 and len(k_candidates) > 1 else 1
+        thr_parts = []
+        if logit_pairs:
+            thr_parts.append(f"logit:{logit_pairs}")
+        if prob_pairs:
+            thr_parts.append(f"prob_pairs:{prob_pairs}")
+        if calib_pairs:
+            thr_parts.append(f"calib:{calib_pairs}")
+        if not thr_parts:
+            thr_parts.append("none")
+        thr_desc = ",".join(thr_parts)
+        k_sweep_state = "on" if len(k_candidates) > 1 else "off"
+    else:
+        sweep_len = len(per_head_sweep_vals) if per_head_sweep_vals is not None else 0
+        num_thr_pairs = sweep_len
+        num_combos = sweep_len
+        num_k = 1
+        thr_desc = str(sweep_len)
+        k_sweep_state = "off"
+
+    if args.progress:
+        clips_est_str = str(num_clips_est) if num_clips_est is not None else "?"
+        _log_progress(
+            f"[progress] starting: clips≈{clips_est_str} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})"
+        )
 
     # load model + ckpt
     model = build_model(cfg)
@@ -276,6 +387,9 @@ def main():
     pitch_logits_list = []
     onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
+    clips_done = 0
+    t_data0 = time.time()
+    last_clip_print = t_data0
     with torch.no_grad():
         for batch in val_loader:
             x = batch["video"]
@@ -314,6 +428,33 @@ def main():
                     int(batch["offset_roll"].sum().item()),
                 )
                 
+            batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
+            clips_done += batch_size
+            if args.progress:
+                now = time.time()
+                if now - last_clip_print >= args.progress_interval:
+                    elapsed = now - t_data0
+                    if num_clips_est:
+                        pct = min(clips_done, num_clips_est) / max(num_clips_est, 1) * 100.0
+                        pct_display = f"{pct:5.1f}"
+                        remaining = max(num_clips_est - clips_done, 0)
+                        eta_seconds = (elapsed / max(clips_done, 1)) * remaining
+                        eta_display = _format_seconds(eta_seconds)
+                    else:
+                        pct_display = "?"
+                        eta_display = "??:??"
+                    clips_total_display = num_clips_est if num_clips_est is not None else "?"
+                    _log_progress(
+                        f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                    )
+                    last_clip_print = now
+
+    if args.progress:
+        elapsed_data = time.time() - t_data0
+        _log_progress(
+            f"[progress] data pass done: clips={clips_done}, elapsed={_format_seconds(elapsed_data)}"
+        )
+
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
     pitch_logits = torch.cat(pitch_logits_list, dim=0) if pitch_logits_list else None
@@ -434,8 +575,6 @@ def main():
     
     printed_header = False
 
-    include_k_column = agg_mode == "k_of_p"
-
     def _header():
         nonlocal printed_header
         if not printed_header:
@@ -474,11 +613,6 @@ def main():
         )
         print("\t".join(values))
 
-    if agg_mode == "k_of_p" and args.sweep_k_onset:
-        k_candidates = sorted({default_k_onset, 1, 2, 3})
-    else:
-        k_candidates = [default_k_onset]
-
     best_result = None
     total_evals = 0
 
@@ -495,35 +629,57 @@ def main():
             best_result = {**res, "ev_mean": ev_mean}
         elif abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
             best_result = {**res, "ev_mean": ev_mean}
+    
+    combo_idx = 0
+    t_grid0 = time.time()
+    last_grid_print = t_grid0
+
+    def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None):
+        nonlocal combo_idx
+        nonlocal last_grid_print
+        res = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset)
+        _print_row(res)
+        _update_best(res)
+        combo_idx += 1
+        if args.progress and num_combos > 0:
+            now = time.time()
+            if now - last_grid_print >= args.progress_interval:
+                elapsed = now - t_grid0
+                if combo_idx > 0 and num_combos:
+                    remaining = max(num_combos - combo_idx, 0)
+                    eta_seconds = (elapsed / combo_idx) * remaining if combo_idx else 0.0
+                    eta_display = _format_seconds(eta_seconds)
+                else:
+                    eta_display = "??:??"
+                k_display = k_onset if k_onset is not None else default_k_onset
+                _log_progress(
+                    f"[progress] grid {combo_idx}/{num_combos}  onset_thr={on_thr:.3f}  offset_thr={off_thr:.3f}  k_onset={k_display}  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                )
+                last_grid_print = now
+        return res
 
 
     if args.head is None:
         # Evaluate at calibrated thresholds if provided.
-        if args.calibration:
-            with open(args.calibration) as f:
-                calib = json.load(f)
-            on_cal = calib.get("onset", {})
-            off_cal = calib.get("offset", {})
+        if calibration_data:
+            on_cal = calibration_data.get("onset", {})
+            off_cal = calibration_data.get("offset", {})
             if "best_logit" in on_cal and "best_logit" in off_cal:
                 _header()
-                res = _eval_pair(
+                _run_eval(
                     on_cal["best_logit"],
                     off_cal["best_logit"],
-                    use_logits=True,
+                    True,
                     k_onset=default_k_onset,
                 )
-                _print_row(res)
-                _update_best(res)
             elif "best_prob" in on_cal and "best_prob" in off_cal:
                 _header()
-                res = _eval_pair(
+                _run_eval(
                     on_cal["best_prob"],
                     off_cal["best_prob"],
-                    use_logits=False,
+                    False,
                     k_onset=default_k_onset,
                 )
-                _print_row(res)
-                _update_best(res)
             else:
                 print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
 
@@ -531,9 +687,7 @@ def main():
         if args.thresholds:
             _header()
             for t in args.thresholds:
-                res = _eval_pair(t, t, use_logits=True, k_onset=default_k_onset)
-                _print_row(res)
-                _update_best(res)
+                _run_eval(t, t, True, k_onset=default_k_onset)
         if args.prob_thresholds:
             _header()
             for k_val in k_candidates:
@@ -542,19 +696,12 @@ def main():
                         args.prob_thresholds if args.grid_prob_thresholds else [on_thr]
                     )
                     for off_thr in off_candidates:
-                        res = _eval_pair(on_thr, off_thr, use_logits=False, k_onset=k_val)
-                        _print_row(res)
-                        _update_best(res)
+                        _run_eval(on_thr, off_thr, False, k_onset=k_val)
     else:
         # Per-head sweep
-        if args.thresholds is not None:
-            sweep_vals = args.thresholds
-            use_logits = True
-            mode = "logit"
-        else:
-            sweep_vals = args.prob_thresholds
-            use_logits = False
-            mode = "prob"
+        sweep_vals = per_head_sweep_vals
+        use_logits = per_head_use_logits
+        mode = per_head_mode
 
         if sweep_vals is None:
             print(
@@ -567,10 +714,8 @@ def main():
         fixed_thr = None
         source = None
 
-        if args.calibration:
-            with open(args.calibration) as f:
-                calib = json.load(f)
-            other_cal = calib.get(other_head, {})
+        if calibration_data:
+            other_cal = calibration_data.get(other_head, {})
             if use_logits:
                 if "best_logit" in other_cal:
                     fixed_thr = other_cal["best_logit"]
@@ -609,9 +754,13 @@ def main():
                 on_thr, off_thr = t, fixed_thr
             else:
                 on_thr, off_thr = fixed_thr, t
-            res = _eval_pair(on_thr, off_thr, use_logits, k_onset=default_k_onset)
-            _print_row(res)
-            _update_best(res)
+            _run_eval(on_thr, off_thr, use_logits, k_onset=default_k_onset)
+
+    if args.progress:
+        grid_elapsed = time.time() - t_grid0
+        _log_progress(
+            f"[progress] grid pass done: combos={num_combos}, elapsed={_format_seconds(grid_elapsed)}"
+        )
 
     if best_result is not None and total_evals > 0:
         print(
