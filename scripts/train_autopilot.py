@@ -422,8 +422,10 @@ def main() -> int:
         metrics_cfg = train_cfg.setdefault("metrics", {})
         train_cfg["epochs"] = int(args.burst_epochs)
         train_cfg["eval_freq"] = 1
-        train_cfg["resume"] = round_idx > 1 or args.mode == "resume"
-        if round_idx > 1 or args.mode == "resume":
+        resuming = round_idx > 1 or args.mode == "resume"
+        train_cfg["resume"] = resuming
+        if resuming:
+            train_cfg["reset_head_bias"] = False
             sync_last_to_best(ckpt_dir)
         save_cfg(cfg)
 
