@@ -689,6 +689,7 @@ def main() -> int:
             and not args.dry_run
         )
         if pre_round_calib:
+            assert ckpt is not None
             metrics, eval_ret = perform_calibration(
                 ckpt=ckpt,
                 args=args,
