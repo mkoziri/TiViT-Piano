@@ -227,7 +227,7 @@ def main():
     )
     ap.add_argument(
         "--progress",
-        action="argparse.BooleanOptionalAction",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable or disable periodic progress logging",
     )
