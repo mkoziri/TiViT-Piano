@@ -2,20 +2,26 @@
 """Automated training/calibration driver for TiViT-Piano.
 ""Purpose:
     Cycle through repeated "train → calibrate → evaluate" rounds until the
-    event-level F1 target is met or patience runs out. The driver modifies
-    ``configs/config.yaml`` with sensible defaults, mirrors helper stdout to log
-    files, and appends a tab-separated ledger of every round.
+    event-level F1 target is met or patience runs out. The driver keeps
+    ``configs/config.yaml`` aligned with calibration outputs, mirrors helper
+    stdout to log files, and appends a tab-separated ledger of every round. It
+    can jump directly to calibration, skip the opening training burst, and fall
+    back to fast grid searches when thorough sweeps fail.
 
 Key Functions/Classes:
     - run_command: Execute helper scripts while teeing stdout/stderr to disk.
     - run_calibration / run_fast_eval: Invoke calibration/eval helpers and
       return parsed metrics.
+    - run_fast_grid_calibration: Perform a coarse sweep used for fast fallback
+      calibration.
     - append_results: Persist round metadata to ``runs/auto/results.txt``.
     - main: CLI entry point implementing the training/autocalibration loop.
 
 CLI:
-    python scripts/train_autopilot.py --mode fresh --burst_epochs 3 \
-        --results runs/auto/results.txt --ckpt_dir checkpoints --target_ev_f1 0.2
+    python scripts/train_autopilot.py --mode fresh --first_step train \
+        --burst_epochs 3 --first_calib thorough --fast_first_calib \
+        --results runs/auto/results.txt --ckpt_dir checkpoints \
+        --target_ev_f1 0.20
 """
 
 from __future__ import annotations
@@ -344,7 +350,15 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     metrics_cfg["prob_threshold_offset"] = float(metrics["offset_thr"])
     agg_cfg["mode"] = "k_of_p"
     agg_cfg["top_k"] = 0
-    onset_k = int(metrics.get("k_onset", k_cfg.get("onset", 1)))
+    onset_value = metrics.get("k_onset")
+    if onset_value is None:
+        onset_fallback = k_cfg.get("onset")
+        if onset_fallback is None:
+            onset_value = 1.0
+        else:
+            onset_value = float(onset_fallback)
+    onset_value = float(onset_value)
+    onset_k = int(onset_value)
     if onset_k <= 0:
         onset_k = 1
     k_cfg["onset"] = onset_k

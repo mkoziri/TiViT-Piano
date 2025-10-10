@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """Purpose:
     Evaluate onset and offset predictions to determine calibrated logit or
-    probability thresholds and produce reliability diagnostics.
+    probability thresholds, emit reliability diagnostics, and continuously write
+    partial results to ``calibration.json`` during long sweeps.
 
 Key Functions/Classes:
     - _collect(): Runs the model across a dataloader to gather logits,
-      probabilities, and aligned targets.
+      probabilities, and aligned targets while checkpointing partial metrics.
     - _compute_metrics(): Sweeps thresholds to compute F1 scores, prediction
       rates, expected calibration error, and Brier scores.
     - main(): Command-line entry point that loads checkpoints, runs evaluation,
       and writes calibration summaries.
 
 CLI:
-    Invoke ``python scripts/calibrate_thresholds.py --ckpt <path> --split val``
-    with optional ``--max-clips`` and ``--frames`` overrides to adjust dataset
-    size.
+    Invoke ``python scripts/calib/calibrate_thresholds.py --ckpt <path> --split val``
+    with optional ``--max-clips``/``--frames`` overrides or ``--timeout-mins`` to
+    stop early while preserving partial statistics.
 """
 
 import sys, json, argparse, time

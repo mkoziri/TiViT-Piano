@@ -123,16 +123,36 @@ script saves NPZ files containing flattened logits for each requested head; the
 NPZ artefacts can be rescored or re-evaluated without rerunning the forward
 pass.
 
+To recompute the default operating points from scratch, run the streaming
+calibration helper which emits running summaries to `calibration.json` and logs
+reliability diagrams:
+
+```bash
+python scripts/calib/calibrate_thresholds.py \
+  --ckpt checkpoints/tivit_best.pt \
+  --split val \
+  --max-clips 400 \
+  --timeout-mins 20
+```
+
+The script honours dataset overrides from `configs/config.yaml` and stops early
+when the optional timeout elapses while still persisting partial statistics.
+
 ## Autopilot training loop
 
 For unattended experiments use `scripts/train_autopilot.py`. The helper applies
 safe defaults to `configs/config.yaml`, alternates between short training
 bursts, calibration sweeps, and evaluations, and writes the metrics for each
-round to `runs/auto/results.txt` alongside per-round stdout logs.
+round to `logs/auto/results.txt` alongside per-round stdout logs. You can start
+directly from calibration, skip the first training burst when resuming, or ask
+the driver to fall back to a fast grid search if the thorough sweep fails.
 
 ```bash
 python scripts/train_autopilot.py \
   --mode fresh \
+  --first_step train \
+  --first_calib thorough \
+  --fast_first_calib \
   --burst_epochs 3 \
   --target_ev_f1 0.20 \
   --results runs/auto/results.txt \
