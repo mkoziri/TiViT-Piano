@@ -30,7 +30,7 @@ dataset:
   hop_seconds: 0.03333333333333333  # 1 / decode_fps
   resize: [145, 800]  # It was [128, 128]
   tiles: 3
-  channels: 1
+  channels: 3
   normalize: true
   apply_crop: true
   canonical_hw: [145, 800]
