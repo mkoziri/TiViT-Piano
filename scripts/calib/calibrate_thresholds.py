@@ -19,6 +19,7 @@ CLI:
 """
 
 import sys, json, argparse, time
+from typing import Optional
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,12 @@ from models import build_model
 # -----------------------------------------------------------------------------
 
 PARTIAL_WRITE_INTERVAL = 32
+
+DEFAULT_LOGIT_GRID = torch.arange(-4.0, 2.0 + 1e-9, 0.05)
+DEFAULT_PROB_GRID = torch.arange(0.01, 0.99 + 1e-9, 0.01)
+_OFFSET_EXTRA = torch.arange(0.99, 1.001 + 1e-9, 0.002)
+OFFSET_PROB_GRID = torch.unique(torch.cat([DEFAULT_PROB_GRID, _OFFSET_EXTRA]))
+OFFSET_PROB_GRID = torch.sort(OFFSET_PROB_GRID).values.clamp(max=0.999)
 
 
 def _print_progress(processed: int, total: int) -> None:
@@ -69,17 +76,102 @@ def _write_partial_calibration(
     offset_probs = torch.cat(offset_probs_list, dim=0)
     onset_tgts = torch.cat(onset_tgts_list, dim=0)
     offset_tgts = torch.cat(offset_tgts_list, dim=0)
-    onset_stats = _compute_metrics(onset_logits, onset_probs, onset_tgts, "onset")
-    offset_stats = _compute_metrics(offset_logits, offset_probs, offset_tgts, "offset")
+    onset_stats = _compute_metrics(
+        onset_logits,
+        onset_probs,
+        onset_tgts,
+        "onset",
+        prob_grid=DEFAULT_PROB_GRID,
+        logit_grid=DEFAULT_LOGIT_GRID,
+    )
+    offset_stats = _compute_metrics(
+        offset_logits,
+        offset_probs,
+        offset_tgts,
+        "offset",
+        prob_grid=OFFSET_PROB_GRID,
+        logit_grid=DEFAULT_LOGIT_GRID,
+    )
+    onset_cal = _fit_platt_scaling(onset_logits, onset_tgts)
+    offset_cal = _fit_platt_scaling(offset_logits, offset_tgts)
+    onset_stats.update(onset_cal)
+    offset_stats.update(offset_cal)
     with open("calibration.json", "w") as f:
         json.dump(
             {
-                "onset": {"best_logit": onset_stats["best_logit"], "best_prob": onset_stats["best_prob"]},
-                "offset": {"best_logit": offset_stats["best_logit"], "best_prob": offset_stats["best_prob"]},
+                "onset": {
+                    "best_logit": onset_stats["best_logit"],
+                    "best_prob": onset_stats["best_prob"],
+                    "temperature": onset_stats["temperature"],
+                    "logit_bias": onset_stats["logit_bias"],
+                    "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
+                    "pos_rate": onset_stats["pos_rate"],
+                },
+                "offset": {
+                    "best_logit": offset_stats["best_logit"],
+                    "best_prob": offset_stats["best_prob"],
+                    "temperature": offset_stats["temperature"],
+                    "logit_bias": offset_stats["logit_bias"],
+                    "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
+                    "pos_rate": offset_stats["pos_rate"],
+                },
             },
             f,
             indent=2,
         )
+
+
+def _fit_platt_scaling(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    max_iter: int = 250,
+    lr: float = 0.05,
+) -> dict:
+    """Fit Platt scaling (temperature + bias) via logistic regression."""
+
+    device = logits.device
+    x = logits.reshape(-1, 1)
+    y = targets.reshape(-1, 1).float()
+
+    log_scale = torch.zeros(1, device=device, requires_grad=True)
+    bias = torch.zeros(1, device=device, requires_grad=True)
+    opt = torch.optim.Adam([log_scale, bias], lr=lr)
+
+    best_state = None
+    best_loss = float("inf")
+    for _ in range(max_iter):
+        opt.zero_grad()
+        scale = torch.exp(log_scale)
+        logits_adj = x * scale + bias
+        loss = F.binary_cross_entropy_with_logits(logits_adj, y)
+        loss.backward()
+        opt.step()
+
+        loss_val = float(loss.detach().cpu())
+        if loss_val < best_loss - 1e-7:
+            best_loss = loss_val
+            best_state = (log_scale.detach().clone(), bias.detach().clone())
+
+    if best_state is None:
+        best_state = (log_scale.detach().clone(), bias.detach().clone())
+
+    log_scale_best, bias_best = best_state
+    scale = torch.exp(log_scale_best)
+    logits_adj = x * scale + bias_best
+    probs = torch.sigmoid(logits_adj)
+
+    scale_val = float(scale.detach().cpu())
+    bias_val = float(bias_best.detach().cpu())
+    pred_rate = float(probs.mean().detach().cpu())
+    temperature = float(1.0 / max(scale_val, 1e-6))
+
+    return {
+        "temperature": temperature,
+        "logit_bias": bias_val,
+        "calibrated_pred_rate": pred_rate,
+        "scale": scale_val,
+    }
 
 
 def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
@@ -233,29 +325,41 @@ def _collect(model, loader, max_clips: int, timeout_secs: float):
         timeout_hit,
     )
 
-def _compute_metrics(logits: torch.Tensor, probs: torch.Tensor, targets: torch.Tensor, name: str):
+def _compute_metrics(
+    logits: torch.Tensor,
+    probs: torch.Tensor,
+    targets: torch.Tensor,
+    name: str,
+    *,
+    prob_grid: Optional[torch.Tensor] = None,
+    logit_grid: Optional[torch.Tensor] = None,
+):
     logits_flat = logits.reshape(-1)
     probs_flat = probs.reshape(-1)
     targets_flat = targets.reshape(-1)
 
-    logit_grid = torch.arange(-4.0, 2.0 + 1e-9, 0.05)
+    if logit_grid is None:
+        logit_grid = DEFAULT_LOGIT_GRID
+    logit_grid = logit_grid.to(logits_flat.device)
     best_logit, best_f1_logit, pred_rate_logit = -4.0, -1.0, 0.0
     for thr in logit_grid:
         pred = (logits_flat >= thr).float()
         f1 = _binary_f1(pred, targets_flat)
         if f1 > best_f1_logit:
             best_f1_logit = f1
-            best_logit = thr.item()
+            best_logit = float(thr.item())
             pred_rate_logit = pred.mean().item()
 
-    prob_grid = torch.arange(0.01, 0.99 + 1e-9, 0.01)
+    if prob_grid is None:
+        prob_grid = DEFAULT_PROB_GRID
+    prob_grid = prob_grid.to(probs_flat.device)
     best_prob, best_f1_prob, pred_rate_prob = 0.5, -1.0, 0.0
     for thr in prob_grid:
         pred = (probs_flat >= thr).float()
         f1 = _binary_f1(pred, targets_flat)
         if f1 > best_f1_prob:
             best_f1_prob = f1
-            best_prob = thr.item()
+            best_prob = float(thr.item())
             pred_rate_prob = pred.mean().item()
 
     pos_rate = targets_flat.mean().item()
@@ -325,20 +429,57 @@ def main():
     if timeout_hit:
         print(f"[calib] timeout reached after {processed_clips} clips", flush=True)
 
-    onset_stats = _compute_metrics(onset_logits, onset_probs, onset_tgts, "onset")
-    offset_stats = _compute_metrics(offset_logits, offset_probs, offset_tgts, "offset")
+    onset_stats = _compute_metrics(
+        onset_logits,
+        onset_probs,
+        onset_tgts,
+        "onset",
+        prob_grid=DEFAULT_PROB_GRID,
+        logit_grid=DEFAULT_LOGIT_GRID,
+    )
+    offset_stats = _compute_metrics(
+        offset_logits,
+        offset_probs,
+        offset_tgts,
+        "offset",
+        prob_grid=OFFSET_PROB_GRID,
+        logit_grid=DEFAULT_LOGIT_GRID,
+    )
+    onset_stats.update(_fit_platt_scaling(onset_logits, onset_tgts))
+    offset_stats.update(_fit_platt_scaling(offset_logits, offset_tgts))
 
     with open("calibration.json", "w") as f:
-        json.dump({
-            "onset": {"best_logit": onset_stats["best_logit"], "best_prob": onset_stats["best_prob"]},
-            "offset": {"best_logit": offset_stats["best_logit"], "best_prob": offset_stats["best_prob"]},
-        }, f, indent=2)
+        json.dump(
+            {
+                "onset": {
+                    "best_logit": onset_stats["best_logit"],
+                    "best_prob": onset_stats["best_prob"],
+                    "temperature": onset_stats["temperature"],
+                    "logit_bias": onset_stats["logit_bias"],
+                    "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
+                    "pos_rate": onset_stats["pos_rate"],
+                },
+                "offset": {
+                    "best_logit": offset_stats["best_logit"],
+                    "best_prob": offset_stats["best_prob"],
+                    "temperature": offset_stats["temperature"],
+                    "logit_bias": offset_stats["logit_bias"],
+                    "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
+                    "pos_rate": offset_stats["pos_rate"],
+                },
+            },
+            f,
+            indent=2,
+        )
 
     for name, stats in [("Onset", onset_stats), ("Offset", offset_stats)]:
+        diff = stats["calibrated_pred_rate"] - stats["pos_rate"]
         print(
             f"{name}: pos_rate={stats['pos_rate']:.4f} | "
             f"best_logit={stats['best_logit']:.2f} (pred_rate={stats['pred_rate_logit']:.4f}, F1={stats['f1_logit']:.3f}) | "
             f"best_prob={stats['best_prob']:.2f} (pred_rate={stats['pred_rate_prob']:.4f}, F1={stats['f1_prob']:.3f})"
+            f"best_prob={stats['best_prob']:.2f} (pred_rate={stats['pred_rate_prob']:.4f}, F1={stats['f1_prob']:.3f}) | "
+            f"temp={stats['temperature']:.3f} bias={stats['logit_bias']:.3f} calibrated_rate={stats['calibrated_pred_rate']:.4f} (Δ={diff:+.4f})"
         )
 
 if __name__ == "__main__":

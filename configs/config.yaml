@@ -121,9 +121,15 @@ training:
     clef: 0.5
 
   metrics:
-    prob_threshold: 0.5 
+    prob_threshold: 0.5
     prob_threshold_onset: 0.54
     prob_threshold_offset: 0.54
+    prob_temperature: 1.0
+    prob_temperature_onset: 1.0
+    prob_temperature_offset: 1.0
+    prob_logit_bias: 0.0
+    prob_logit_bias_onset: 0.0
+    prob_logit_bias_offset: 0.0
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
@@ -134,6 +140,8 @@ training:
 
 optim:
   grad_clip: 1.0
+  head_lr_multiplier: 5.0
+  offset_weight_decay_multiplier: 2.5
 
 train:
   accumulate_steps: 4  #It was 1

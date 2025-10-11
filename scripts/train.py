@@ -471,12 +471,61 @@ def _binarize_sigmoid(logits, threshold):
     return (probs >= threshold).float()
 
 
-def _get_onoff_thresholds(cfg: Mapping[str, Any]):
+def _get_onoff_calibration(cfg: Mapping[str, Any]) -> Dict[str, Dict[str, float]]:
     metrics_cfg = cfg.get("training", {}).get("metrics", {})
+
     default_thr = float(metrics_cfg.get("prob_threshold", 0.5))
-    onset_thr = float(metrics_cfg.get("prob_threshold_onset", default_thr))
-    offset_thr = float(metrics_cfg.get("prob_threshold_offset", default_thr))
-    return onset_thr, offset_thr
+    default_temp = float(metrics_cfg.get("prob_temperature", 1.0))
+    default_bias = float(metrics_cfg.get("prob_logit_bias", 0.0))
+
+    onset = {
+        "threshold": float(metrics_cfg.get("prob_threshold_onset", default_thr)),
+        "temperature": float(metrics_cfg.get("prob_temperature_onset", default_temp)),
+        "bias": float(metrics_cfg.get("prob_logit_bias_onset", default_bias)),
+    }
+    offset = {
+        "threshold": float(metrics_cfg.get("prob_threshold_offset", default_thr)),
+        "temperature": float(metrics_cfg.get("prob_temperature_offset", default_temp)),
+        "bias": float(metrics_cfg.get("prob_logit_bias_offset", default_bias)),
+    }
+
+    # Guard against degenerate temperature values that would explode logits.
+    eps = 1e-6
+    if abs(onset["temperature"]) < eps:
+        logger.warning(
+            "[metrics] onset temperature %.3g too small; clamping to %.1e",
+            onset["temperature"],
+            eps,
+        )
+        onset["temperature"] = eps
+    if abs(offset["temperature"]) < eps:
+        logger.warning(
+            "[metrics] offset temperature %.3g too small; clamping to %.1e",
+            offset["temperature"],
+            eps,
+        )
+        offset["temperature"] = eps
+
+    return {"onset": onset, "offset": offset}
+
+
+def _get_onoff_thresholds(cfg: Mapping[str, Any]):
+    cal = _get_onoff_calibration(cfg)
+    return cal["onset"]["threshold"], cal["offset"]["threshold"]
+
+
+def _apply_sigmoid_calibration(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    bias: float = 0.0,
+) -> torch.Tensor:
+    if temperature != 1.0:
+        logits = logits / temperature
+    if bias != 0.0:
+        logits = logits + bias
+    return torch.sigmoid(logits)
+
 
 
 def _get_aggregation_config(cfg: Mapping[str, Any]):
@@ -505,12 +554,14 @@ def _aggregate_onoff_predictions(
     k: int,
     top_k: int,
     tau_sum: float,
+    temperature: float = 1.0,
+    bias: float = 0.0,
 ):
     squeeze_time = logits.dim() == 2
     if squeeze_time:
         logits = logits.unsqueeze(1)
 
-    probs = torch.sigmoid(logits)
+    probs = _apply_sigmoid_calibration(logits, temperature=temperature, bias=bias)
 
     if mode == "top_k_cap" and top_k > 0:
         P = probs.shape[-1]
@@ -557,6 +608,12 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
     model.train()
     crit = make_criterions()  # used only in clip-mode
     w = cfg["training"]["loss_weights"]
+    onoff_cal = _get_onoff_calibration(cfg)
+    onset_cal = onoff_cal["onset"]
+    offset_cal = onoff_cal["offset"]
+    thr_on = onset_cal["threshold"]
+    thr_off = offset_cal["threshold"]
+    agg_cfg = _get_aggregation_config(cfg)
 
     use_amp = bool(cfg["training"].get("amp", False))
     scaler = GradScaler(enabled=use_amp)
@@ -621,9 +678,18 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
 
         # --- OPTIONAL: train-side predicted positive rates (only frame mode) ---
         if use_frame and "onset_logits" in out and "offset_logits" in out:
-            thr = float(cfg.get("training", {}).get("metrics", {}).get("prob_threshold", 0.5))
-            onset_pred  = (torch.sigmoid(out["onset_logits"])  >= thr).float()
-            offset_pred = (torch.sigmoid(out["offset_logits"]) >= thr).float()
+            onset_probs = _apply_sigmoid_calibration(
+                out["onset_logits"],
+                temperature=onset_cal["temperature"],
+                bias=onset_cal["bias"],
+            )
+            offset_probs = _apply_sigmoid_calibration(
+                out["offset_logits"],
+                temperature=offset_cal["temperature"],
+                bias=offset_cal["bias"],
+            )
+            onset_pred = (onset_probs >= onset_cal["threshold"]).float()
+            offset_pred = (offset_probs >= offset_cal["threshold"]).float()
             if "train_onset_pred_rate" not in sums:
                 sums["train_onset_pred_rate"] = 0.0
                 sums["train_offset_pred_rate"] = 0.0
@@ -666,14 +732,22 @@ def evaluate_one_epoch(model, loader, cfg):
     #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
     metrics_cfg = cfg.get("training", {}).get("metrics", {})
     thr_pitch = float(metrics_cfg.get("prob_threshold", 0.5))
-    thr_on, thr_off = _get_onoff_thresholds(cfg)
+    onoff_cal = _get_onoff_calibration(cfg)
+    onset_cal = onoff_cal["onset"]
+    offset_cal = onoff_cal["offset"]
+    thr_on = onset_cal["threshold"]
+    thr_off = offset_cal["threshold"]
     agg_cfg = _get_aggregation_config(cfg)
 
     logger.info(
-        "[eval-thresholds] onset=%.3f offset=%.3f (default=%.3f)",
+        "[eval-thresholds] onset=%.3f offset=%.3f (default=%.3f) | temps (on=%.2f, off=%.2f) bias (on=%.3f, off=%.3f)",
         thr_on,
         thr_off,
         thr_pitch,
+        onset_cal["temperature"],
+        offset_cal["temperature"],
+        onset_cal["bias"],
+        offset_cal["bias"],
     )
 
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
@@ -788,6 +862,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=agg_cfg["k_onset"],
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
+                    temperature=onset_cal["temperature"],
+                    bias=onset_cal["bias"],
                 )
                 offset_pred_sel, offset_key_counts = _aggregate_onoff_predictions(
                     out["offset_logits"],
@@ -796,6 +872,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=agg_cfg["k_offset"],
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
+                    temperature=offset_cal["temperature"],
+                    bias=offset_cal["bias"],
                 )
                 onset_pred_sel = onset_pred_sel.float()
                 offset_pred_sel = offset_pred_sel.float()
@@ -807,6 +885,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=1,
                     top_k=0,
                     tau_sum=0.0,
+                    temperature=onset_cal["temperature"],
+                    bias=onset_cal["bias"],
                 )
                 offset_pred_legacy, _ = _aggregate_onoff_predictions(
                     out["offset_logits"],
@@ -815,6 +895,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=1,
                     top_k=0,
                     tau_sum=0.0,
+                    temperature=offset_cal["temperature"],
+                    bias=offset_cal["bias"],
                 )
                 onset_pred_legacy = onset_pred_legacy.float()
                 offset_pred_legacy = offset_pred_legacy.float()
@@ -884,6 +966,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=agg_cfg["k_onset"],
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
+                    temperature=onset_cal["temperature"],
+                    bias=onset_cal["bias"],
                 )
                 offset_pred_sel, _ = _aggregate_onoff_predictions(
                     out["offset_logits"],
@@ -892,6 +976,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=agg_cfg["k_offset"],
                     top_k=agg_cfg["top_k"],
                     tau_sum=agg_cfg["tau_sum"],
+                    temperature=offset_cal["temperature"],
+                    bias=offset_cal["bias"],
                 )
                 onset_pred_sel = onset_pred_sel.float()
                 offset_pred_sel = offset_pred_sel.float()
@@ -903,6 +989,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=1,
                     top_k=0,
                     tau_sum=0.0,
+                    temperature=onset_cal["temperature"],
+                    bias=onset_cal["bias"],
                 )
                 offset_pred_legacy, _ = _aggregate_onoff_predictions(
                     out["offset_logits"],
@@ -911,6 +999,8 @@ def evaluate_one_epoch(model, loader, cfg):
                     k=1,
                     top_k=0,
                     tau_sum=0.0,
+                    temperature=offset_cal["temperature"],
+                    bias=offset_cal["bias"],
                 )
                 onset_pred_legacy = onset_pred_legacy.float()
                 offset_pred_legacy = offset_pred_legacy.float()
@@ -1098,41 +1188,62 @@ def main():
     def build_optimizer(model, optim_cfg):
         base_lr = float(optim_cfg["learning_rate"])
         wd = float(optim_cfg.get("weight_decay", 0.0))
-        head_params, base_params = [], []
+        head_lr_mult = float(optim_cfg.get("head_lr_multiplier", 5.0))
+        onset_lr_mult = float(optim_cfg.get("onset_lr_multiplier", head_lr_mult))
+        offset_lr_mult = float(optim_cfg.get("offset_lr_multiplier", head_lr_mult))
+        onset_wd = float(optim_cfg.get("onset_weight_decay", wd * float(optim_cfg.get("onset_weight_decay_multiplier", 1.0))))
+        offset_wd = float(optim_cfg.get("offset_weight_decay", wd * float(optim_cfg.get("offset_weight_decay_multiplier", 1.0))))
+
+        base_params: list[torch.nn.Parameter] = []
+        onset_params: list[torch.nn.Parameter] = []
+        offset_params: list[torch.nn.Parameter] = []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             lname = name.lower()
-            if "onset" in lname or "offset" in lname:
-                head_params.append(p)
+            if "offset" in lname:
+                offset_params.append(p)
+            elif "onset" in lname:
+                onset_params.append(p)
             else:
                 base_params.append(p)
-        
-        if head_params:
-            opt = torch.optim.AdamW([
-                {"params": base_params, "lr": base_lr, "weight_decay": wd},
-                {"params": head_params, "lr": base_lr * 5.0, "weight_decay": wd},
-            ])
-            num_head = sum(p.numel() for p in head_params)
-            num_base = sum(p.numel() for p in base_params)
-            logger.info(
-                "[OPT] base params: %s @ lr=%s | head params: %s @ lr=%s",
-                f"{num_base:,}",
-                base_lr,
-                f"{num_head:,}",
-                base_lr * 5.0,
-            )
-        else:
-            # Fallback: treat all parameters as base params if no onset/offset heads exist
-            opt = torch.optim.AdamW([
-                {"params": base_params, "lr": base_lr, "weight_decay": wd},
-            ])
-            num_base = sum(p.numel() for p in base_params)
-            logger.info(
-                "[OPT] base params: %s @ lr=%s | head params: 0 @ lr=n/a",
-                f"{num_base:,}",
-                base_lr,
-            )
+
+        param_groups = []
+        if base_params:
+            param_groups.append({"params": base_params, "lr": base_lr, "weight_decay": wd})
+        if onset_params:
+            param_groups.append({
+                "params": onset_params,
+                "lr": base_lr * onset_lr_mult,
+                "weight_decay": onset_wd,
+            })
+        if offset_params:
+            param_groups.append({
+                "params": offset_params,
+                "lr": base_lr * offset_lr_mult,
+                "weight_decay": offset_wd,
+            })
+
+        if not param_groups:
+            raise RuntimeError("No trainable parameters found for optimizer setup")
+
+        opt = torch.optim.AdamW(param_groups)
+
+        num_base = sum(p.numel() for p in base_params)
+        num_onset = sum(p.numel() for p in onset_params)
+        num_offset = sum(p.numel() for p in offset_params)
+        logger.info(
+            "[OPT] base params: %s @ lr=%.2e wd=%.2e | onset: %s @ lr=%.2e wd=%.2e | offset: %s @ lr=%.2e wd=%.2e",
+            f"{num_base:,}",
+            base_lr,
+            wd,
+            f"{num_onset:,}",
+            base_lr * onset_lr_mult,
+            onset_wd,
+            f"{num_offset:,}",
+            base_lr * offset_lr_mult,
+            offset_wd,
+        )
         return opt
 
     optimizer = build_optimizer(model, cfg["training"])
