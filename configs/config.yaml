@@ -1,5 +1,5 @@
 experiment:
-  name: "TiViT-Piano_OMAPS_v1"
+  name: "TiViT-Piano_PianoYT_autopilot_v1"
   seed: 1332 #It was 42
   output_dir: "outputs"
 
@@ -92,7 +92,7 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: true
+  resume: false
   reset_head_bias: true
   bias_seed:
     onoff_prior_mean: 0.02
@@ -115,7 +115,7 @@ training:
     
     # per-task weights
     onset: 1.5
-    offset: 1.5
+    offset: 1.2
     pitch: 2.0
     hand: 0.5
     clef: 0.5
@@ -126,7 +126,7 @@ training:
     prob_threshold_offset: 0.54
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
-    prob_temperature_offset: 1.0
+    prob_temperature_offset: 1.15
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
     prob_logit_bias_offset: 0.0
@@ -141,7 +141,7 @@ training:
 optim:
   grad_clip: 1.0
   head_lr_multiplier: 5.0
-  offset_weight_decay_multiplier: 2.5
+  offset_weight_decay_multiplier: 3.0
 
 train:
   accumulate_steps: 4  #It was 1
