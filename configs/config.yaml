@@ -28,9 +28,9 @@ dataset:
   # Time-grid parameters
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333  # 1 / decode_fps
-  resize: [128, 128]
+  resize: [145, 800]  # It was [128, 128]
   tiles: 3
-  channels: 3
+  channels: 1
   normalize: true
   apply_crop: true
   canonical_hw: [145, 800]
@@ -110,15 +110,15 @@ training:
     focal_alpha: 0.25
     
     # light prior (keep 0.00 while fixing heads; re-enable later if you want)
-    onoff_prior_mean: 0.02
-    onoff_prior_weight: 0.10  # keep small, e.g. 0.05
+    onoff_prior_mean: 0.012
+    onoff_prior_weight: 0.15  # keep small, e.g. 0.05
     
     # per-task weights
-    onset: 1.5
-    offset: 1.2
-    pitch: 2.0
-    hand: 0.5
-    clef: 0.5
+    onset: 1.8
+    offset: 0.8
+    pitch: 1.2
+    hand: 0.3
+    clef: 0.3
 
   metrics:
     prob_threshold: 0.5
@@ -129,13 +129,13 @@ training:
     prob_temperature_offset: 1.15
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
-    prob_logit_bias_offset: 0.0
+    prob_logit_bias_offset: -0.08
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 3
+        onset: 1
         offset: 1
-      top_k: 3.0
+      top_k: 1.0
       tau_sum: 0.0
 
 optim:
@@ -144,7 +144,7 @@ optim:
   offset_weight_decay_multiplier: 3.0
 
 train:
-  accumulate_steps: 4  #It was 1
+  accumulate_steps: 12  #It was 1
   freeze_backbone_epochs: 0
 
 logging:
