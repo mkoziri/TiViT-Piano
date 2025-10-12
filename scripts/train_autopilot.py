@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import re
 import shutil
@@ -58,6 +59,12 @@ EPOCH_CKPT_RE = re.compile(r"tivit_epoch_(\d+)\.pt$")
 DEFAULT_RESULTS = REPO / "logs" / "auto" / "results.txt"
 DEFAULT_STDOUT_DIR = REPO / "logs" / "auto"
 CALIB_JSON = REPO / "calibration.json"
+
+TARGET_METRIC_FIELDS = {
+    "ev_f1_mean": "ev_f1_mean",
+    "onset_ev_f1": "onset_event_f1",
+    "offset_ev_f1": "offset_event_f1",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +372,24 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     k_cfg["onset"] = onset_k
     if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
         k_cfg["offset"] = 1
+    platt = read_platt_params(CALIB_JSON)
+    if platt:
+        onset_platt = platt.get("onset")
+        if onset_platt:
+            onset_temp = 0.5 * float(onset_platt["temp"]) + 0.5 * 1.0
+            onset_bias = 0.5 * float(onset_platt["bias"]) + 0.5 * 0.0
+            onset_temp = min(max(onset_temp, 0.80), 1.50)
+            onset_bias = min(max(onset_bias, -2.0), 2.0)
+            metrics_cfg["prob_temperature_onset"] = onset_temp
+            metrics_cfg["prob_logit_bias_onset"] = onset_bias
+        offset_platt = platt.get("offset")
+        if offset_platt:
+            offset_temp = 0.5 * float(offset_platt["temp"]) + 0.5 * 1.0
+            offset_bias = 0.5 * float(offset_platt["bias"]) + 0.5 * 0.0
+            offset_temp = min(max(offset_temp, 0.80), 1.80)
+            offset_bias = min(max(offset_bias, -2.5), 2.5)
+            metrics_cfg["prob_temperature_offset"] = offset_temp
+            metrics_cfg["prob_logit_bias_offset"] = offset_bias
     save_cfg(cfg)
 
 
@@ -406,6 +431,65 @@ def load_calibration(calibration_json: Path) -> Optional[dict]:
         return None
     with calibration_json.open("r") as f:
         return json.load(f)
+
+
+def _extract_platt_from_mapping(mapping: dict) -> Optional[Dict[str, float]]:
+    candidates = []
+    platt = mapping.get("platt")
+    if isinstance(platt, dict):
+        candidates.append(platt)
+    candidates.append(mapping)
+
+    temp_val: Optional[float] = None
+    bias_val: Optional[float] = None
+    temp_keys = {"temp", "temperature", "a"}
+    bias_keys = {"bias", "b", "logit_bias"}
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key, value in candidate.items():
+            if isinstance(value, (int, float)):
+                val = float(value)
+            elif isinstance(value, str):
+                try:
+                    val = float(value)
+                except ValueError:
+                    continue
+            else:
+                continue
+
+            norm_key = key.lower()
+            for prefix in ("platt_", "prob_", "logit_"):
+                if norm_key.startswith(prefix):
+                    norm_key = norm_key[len(prefix) :]
+            if norm_key in temp_keys:
+                temp_val = val
+            elif norm_key in bias_keys:
+                bias_val = val
+
+    if temp_val is None or bias_val is None:
+        return None
+    if not (math.isfinite(temp_val) and math.isfinite(bias_val)):
+        return None
+    return {"temp": float(temp_val), "bias": float(bias_val)}
+
+
+def read_platt_params(calibration_json: Path) -> Dict[str, Dict[str, float]]:
+    data = load_calibration(calibration_json)
+    if not isinstance(data, dict):
+        return {}
+
+    platt: Dict[str, Dict[str, float]] = {}
+    for head in ("onset", "offset"):
+        head_data = data.get(head)
+        if not isinstance(head_data, dict):
+            continue
+        extracted = _extract_platt_from_mapping(head_data)
+        if extracted is None:
+            continue
+        platt[head] = extracted
+    return platt
 
 
 def perform_calibration(
@@ -511,7 +595,7 @@ def perform_calibration(
 @dataclass
 class ResumeState:
     next_round: int
-    best_ev_mean: float
+    best_metric: float
     patience_left: int
     calibration_count: int
 
@@ -535,7 +619,7 @@ RESULT_HEADER = [
 ]
 
 
-def load_resume_state(results_path: Path) -> Optional[ResumeState]:
+def load_resume_state(results_path: Path, metric_key: str) -> Optional[ResumeState]:
     if not results_path.exists():
         return None
 
@@ -555,14 +639,15 @@ def load_resume_state(results_path: Path) -> Optional[ResumeState]:
     if not rows:
         return None
 
-    best_ev_mean = -1.0
+    metric_key = metric_key or "ev_f1_mean"
+    best_metric = -1.0
     for row in rows:
         try:
-            val = float(row.get("ev_f1_mean", "nan"))
+            val = float(row.get(metric_key, "nan"))
         except (TypeError, ValueError):
             continue
         if not (val != val):  # NaN guard
-            best_ev_mean = max(best_ev_mean, val)
+            best_metric = max(best_metric, val)
 
     last_row = rows[-1]
     try:
@@ -577,7 +662,7 @@ def load_resume_state(results_path: Path) -> Optional[ResumeState]:
 
     return ResumeState(
         next_round=next_round,
-        best_ev_mean=best_ev_mean,
+        best_metric=best_metric,
         patience_left=patience_left,
         calibration_count=len(rows),
     )
@@ -644,6 +729,7 @@ def main() -> int:
     ap.add_argument("--skip_train_round1", action="store_true")
     ap.add_argument("--fast_first_calib", action="store_true")
     ap.add_argument("--target_ev_f1", type=float, default=0.65)
+    ap.add_argument("--target_metric", choices=["ev_f1_mean", "onset_ev_f1", "offset_ev_f1"], default="ev_f1_mean")
     ap.add_argument("--max_rounds", type=int, default=12)
     ap.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
     ap.add_argument("--ckpt_dir", type=Path, default=Path("checkpoints"))
@@ -657,6 +743,8 @@ def main() -> int:
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
 
+    target_metric_field = TARGET_METRIC_FIELDS[args.target_metric]
+    
     cfg = load_cfg()
     exp_cfg = cfg.setdefault("experiment", {})
     base_name = base_from_config_name(exp_cfg.get("name", "TiViT"))
@@ -706,22 +794,22 @@ def main() -> int:
     stdout_dir.mkdir(parents=True, exist_ok=True)
 
     patience_left = 3
-    best_ev_mean = -1.0
+    best_metric = -1.0
     calibration_count = 0
 
     resume_state: Optional[ResumeState] = None
     start_round = 1
     if args.mode == "resume":
-        resume_state = load_resume_state(results_path)
+        resume_state = load_resume_state(results_path, args.target_metric)
         if resume_state:
             start_round = max(resume_state.next_round, 1)
-            best_ev_mean = resume_state.best_ev_mean
+            best_metric = resume_state.best_metric
             patience_left = resume_state.patience_left
             calibration_count = resume_state.calibration_count
             print(
                 "[autopilot] resume state → "
                 f"starting from round {start_round} "
-                f"(best ev_f1_mean={best_ev_mean:.4f}, patience={patience_left})"
+                f"(best {args.target_metric}={best_metric:.4f}, patience={patience_left})"
             )
 
     for round_idx in range(start_round, args.max_rounds + 1):
@@ -870,8 +958,12 @@ def main() -> int:
             return 1
 
         val_line = format_val_line(metrics, last_val)
-        ev_mean = metrics["ev_f1_mean"]
-        patience_record = 3 if ev_mean > best_ev_mean + 1e-9 else max(patience_left - 1, 0)
+        metric_raw = metrics.get(target_metric_field)
+        if metric_raw is None:
+            metric_raw = metrics.get("ev_f1_mean", 0.0)
+        metric_value = float(metric_raw)
+        ev_mean = float(metrics["ev_f1_mean"])
+        patience_record = 3 if metric_value > best_metric + 1e-9 else max(patience_left - 1, 0)
         append_results(
             results_path,
             round_idx,
@@ -901,32 +993,46 @@ def main() -> int:
             capture_last_val=False,
         )
 
-        improved = ev_mean > best_ev_mean + 1e-9
+        improved = metric_value > best_metric + 1e-9
         if improved:
             target_ckpt = ckpt_dir / "tivit_last.pt"
             if not target_ckpt.exists() or not training_executed:
                 target_ckpt = ckpt_used
             best_ckpt = ckpt_dir / "tivit_best.pt"
             try:
-                same_target = target_ckpt.exists() and best_ckpt.exists() and target_ckpt.samefile(best_ckpt)
-            except FileNotFoundError:
+                same_target = target_ckpt.resolve(strict=False) == best_ckpt.resolve(strict=False)
+            except OSError:
                 same_target = False
 
             if not same_target:
-                shutil.copy2(target_ckpt, best_ckpt)
-            best_ev_mean = ev_mean
+                tmp_ckpt = best_ckpt.with_name(best_ckpt.name + ".tmp")
+                try:
+                    tmp_ckpt.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                shutil.copy2(target_ckpt, tmp_ckpt)
+                os.replace(tmp_ckpt, best_ckpt)
+            best_metric = metric_value
             patience_left = 3
-            print(f"[autopilot] New best ev_f1_mean={ev_mean:.4f} (round {round_idx}); updated tivit_best.pt")
+            print(
+                f"[autopilot] New best {args.target_metric}={metric_value:.4f} "
+                f"(round {round_idx}); updated tivit_best.pt | ev_f1_mean={ev_mean:.4f}"
+            )
         else:
             patience_left = patience_record
-            print(f"[autopilot] ev_f1_mean={ev_mean:.4f} (best={best_ev_mean:.4f}) patience_left={patience_left}")
+            print(
+                f"[autopilot] {args.target_metric}={metric_value:.4f} "
+                f"(best={best_metric:.4f}), ev_f1_mean={ev_mean:.4f} "
+                f"patience_left={patience_left}"
+            )
 
-        if ev_mean >= args.target_ev_f1:
+        if metric_value >= args.target_ev_f1:
             print("SUCCESS: target reached")
             return 0
         if patience_left <= 0:
             print("EARLY STOP: no improvement for 3 rounds")
             return 0
+
 
     print("Reached max rounds without meeting target.")
     return 0
