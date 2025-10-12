@@ -115,33 +115,33 @@ training:
     
     # per-task weights
     onset: 1.8
-    offset: 0.8
+    offset: 0.6
     pitch: 1.2
     hand: 0.3
     clef: 0.3
 
   metrics:
     prob_threshold: 0.5
-    prob_threshold_onset: 0.54
-    prob_threshold_offset: 0.54
+    prob_threshold_onset: 0.50
+    prob_threshold_offset: 0.62
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
-    prob_temperature_offset: 1.15
+    prob_temperature_offset: 1.35
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
-    prob_logit_bias_offset: -0.08
+    prob_logit_bias_offset: -0.90
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
         onset: 1
         offset: 1
-      top_k: 1.0
+      top_k: 999.0
       tau_sum: 0.0
 
 optim:
   grad_clip: 1.0
   head_lr_multiplier: 5.0
-  offset_weight_decay_multiplier: 3.0
+  offset_weight_decay_multiplier: 4.0
 
 train:
   accumulate_steps: 12  #It was 1
