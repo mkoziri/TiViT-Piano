@@ -906,7 +906,14 @@ def main() -> int:
             target_ckpt = ckpt_dir / "tivit_last.pt"
             if not target_ckpt.exists() or not training_executed:
                 target_ckpt = ckpt_used
-            shutil.copy2(target_ckpt, ckpt_dir / "tivit_best.pt")
+            best_ckpt = ckpt_dir / "tivit_best.pt"
+            try:
+                same_target = target_ckpt.exists() and best_ckpt.exists() and target_ckpt.samefile(best_ckpt)
+            except FileNotFoundError:
+                same_target = False
+
+            if not same_target:
+                shutil.copy2(target_ckpt, best_ckpt)
             best_ev_mean = ev_mean
             patience_left = 3
             print(f"[autopilot] New best ev_f1_mean={ev_mean:.4f} (round {round_idx}); updated tivit_best.pt")

@@ -122,20 +122,20 @@ training:
 
   metrics:
     prob_threshold: 0.5
-    prob_threshold_onset: 0.50
-    prob_threshold_offset: 0.62
+    prob_threshold_onset: 0.53
+    prob_threshold_offset: 0.58
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
-    prob_temperature_offset: 1.35
+    prob_temperature_offset: 1.25
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
-    prob_logit_bias_offset: -0.90
+    prob_logit_bias_offset: -0.40
     aggregation:
       mode: "k_of_p"  # "any" | "k_of_p" | "top_k_cap" | "sum_prob"
       k:
-        onset: 1
+        onset: 2
         offset: 1
-      top_k: 999.0
+      top_k: 3.0
       tau_sum: 0.0
 
 optim:
