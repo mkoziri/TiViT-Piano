@@ -107,6 +107,28 @@ def _parse_list(argv, name):
     return None
 
 
+def _resolve_threshold_lists(onset_vals, offset_vals):
+    """Return onset/offset lists, cloning inputs and reusing values when missing."""
+
+    reuse_flags = {"onset_from_offset": False, "offset_from_onset": False}
+    if onset_vals is None and offset_vals is None:
+        return None, None, reuse_flags
+
+    if onset_vals is None:
+        onset_vals = list(offset_vals)
+        reuse_flags["onset_from_offset"] = True
+    else:
+        onset_vals = list(onset_vals)
+
+    if offset_vals is None:
+        offset_vals = list(onset_vals)
+        reuse_flags["offset_from_onset"] = True
+    else:
+        offset_vals = list(offset_vals)
+
+    return onset_vals, offset_vals, reuse_flags
+
+
 def _binary_f1(pred, target, eps=1e-8):
     """Binary F1 score for tensors in {0,1}.
 
@@ -173,6 +195,8 @@ def main():
     try:
         logit_thrs = _parse_list(argv, "thresholds")
         prob_thrs = _parse_list(argv, "prob_thresholds")
+        offset_logit_thrs = _parse_list(argv, "offset_thresholds")
+        offset_prob_thrs = _parse_list(argv, "offset_prob_thresholds")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return
@@ -181,10 +205,22 @@ def main():
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
     ap.add_argument("--thresholds", metavar="T", nargs="*", help="Logit threshold values")
     ap.add_argument(
+        "--offset_thresholds",
+        metavar="T",
+        nargs="*",
+        help="Logit threshold values for the offset head (default: reuse onset thresholds)",
+    )
+    ap.add_argument(
         "--prob_thresholds",
         metavar="P",
         nargs="*",
         help="Probability threshold values",
+    )
+    ap.add_argument(
+        "--offset_prob_thresholds",
+        metavar="P",
+        nargs="*",
+        help="Probability threshold values for the offset head (default: reuse onset thresholds)",
     )
     ap.add_argument("--calibration", help="JSON file with calibrated thresholds")
     ap.add_argument("--head", choices=["onset", "offset"], help="Sweep thresholds for only one head")
@@ -245,11 +281,62 @@ def main():
     args = ap.parse_args(argv)
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
+    args.offset_thresholds = offset_logit_thrs
+    args.offset_prob_thresholds = offset_prob_thrs
 
     if args.thresholds is not None and args.prob_thresholds is not None:
         print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
         return
+    if args.offset_thresholds is not None and args.offset_prob_thresholds is not None:
+        print(
+            "error: --offset_thresholds and --offset_prob_thresholds are mutually exclusive",
+            file=sys.stderr,
+        )
+        return
+
+    onset_logit_list, offset_logit_list, logit_reuse = _resolve_threshold_lists(
+        args.thresholds, args.offset_thresholds
+    )
+    onset_prob_list, offset_prob_list, prob_reuse = _resolve_threshold_lists(
+        args.prob_thresholds, args.offset_prob_thresholds
+    )
+
+    args.thresholds = onset_logit_list
+    args.offset_thresholds = offset_logit_list
+    args.prob_thresholds = onset_prob_list
+    args.offset_prob_thresholds = offset_prob_list
+
+    if args.head is None:
+        has_logit_lists = args.thresholds is not None or args.offset_thresholds is not None
+        has_prob_lists = args.prob_thresholds is not None or args.offset_prob_thresholds is not None
+        if has_logit_lists and has_prob_lists:
+            print(
+                "error: specify only logit or probability threshold lists when sweeping both heads",
+                file=sys.stderr,
+            )
+            return
+
+    if args.thresholds is not None and args.offset_thresholds is not None:
+        if len(args.thresholds) != len(args.offset_thresholds):
+            print(
+                "error: --thresholds and --offset_thresholds must contain the same number of values",
+                file=sys.stderr,
+            )
+            return
+
+    if args.prob_thresholds is not None and args.offset_prob_thresholds is not None:
+        if not args.grid_prob_thresholds and len(args.prob_thresholds) != len(args.offset_prob_thresholds):
+            print(
+                "error: probability lists must match lengths unless --grid_prob_thresholds is enabled",
+                file=sys.stderr,
+            )
+            return
     log_handle = None
+
+    if args.head is None and args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):
+        print("[eval] offset probability thresholds not provided; reusing onset list", flush=True)
+    if args.head is None and args.thresholds is not None and logit_reuse.get("offset_from_onset"):
+        print("[eval] offset logit thresholds not provided; reusing onset list", flush=True)
     if args.log_file:
         log_path = Path(args.log_file).expanduser()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,14 +413,29 @@ def main():
     per_head_use_logits = False
     per_head_mode = "prob"
     if args.head is not None:
-        if args.thresholds is not None:
-            per_head_sweep_vals = args.thresholds
-            per_head_use_logits = True
-            per_head_mode = "logit"
+        if args.head == "onset":
+            if args.thresholds is not None:
+                per_head_sweep_vals = args.thresholds
+                per_head_use_logits = True
+                per_head_mode = "logit"
+            else:
+                per_head_sweep_vals = args.prob_thresholds
+                per_head_use_logits = False
+                per_head_mode = "prob"
         else:
-            per_head_sweep_vals = args.prob_thresholds
-            per_head_use_logits = False
-            per_head_mode = "prob"
+            if args.offset_thresholds is not None:
+                per_head_sweep_vals = args.offset_thresholds
+                per_head_use_logits = True
+                per_head_mode = "logit"
+            else:
+                per_head_sweep_vals = args.offset_prob_thresholds
+                per_head_use_logits = False
+                per_head_mode = "prob"
+
+        if per_head_sweep_vals is None:
+            per_head_sweep_vals = args.thresholds if args.thresholds is not None else args.prob_thresholds
+            per_head_use_logits = args.thresholds is not None
+            per_head_mode = "logit" if per_head_use_logits else "prob"
 
     if args.head is None:
         calib_pairs = 0
@@ -345,8 +447,12 @@ def main():
             elif "best_prob" in on_cal and "best_prob" in off_cal:
                 calib_pairs = 1
         logit_pairs = len(args.thresholds) if args.thresholds else 0
-        prob_list = args.prob_thresholds or []
-        prob_pairs = len(prob_list) * (len(prob_list) if args.grid_prob_thresholds else 1)
+        onset_prob_list = args.prob_thresholds or []
+        offset_prob_list = args.offset_prob_thresholds or onset_prob_list
+        if args.grid_prob_thresholds:
+            prob_pairs = len(onset_prob_list) * len(offset_prob_list)
+        else:
+            prob_pairs = len(onset_prob_list)
         num_prob_combos = prob_pairs * len(k_candidates)
         num_thr_pairs = calib_pairs + logit_pairs + prob_pairs
         num_combos = calib_pairs + logit_pairs + num_prob_combos
@@ -355,7 +461,10 @@ def main():
         if logit_pairs:
             thr_parts.append(f"logit:{logit_pairs}")
         if prob_pairs:
-            thr_parts.append(f"prob_pairs:{prob_pairs}")
+            if args.grid_prob_thresholds and onset_prob_list and offset_prob_list:
+                thr_parts.append(f"prob_grid:{len(onset_prob_list)}x{len(offset_prob_list)}")
+            else:
+                thr_parts.append(f"prob_pairs:{prob_pairs}")
         if calib_pairs:
             thr_parts.append(f"calib:{calib_pairs}")
         if not thr_parts:
@@ -686,16 +795,27 @@ def main():
         # Sweep over provided threshold grids.
         if args.thresholds:
             _header()
-            for t in args.thresholds:
-                _run_eval(t, t, True, k_onset=default_k_onset)
+            offset_list = args.offset_thresholds if args.offset_thresholds else args.thresholds
+            if len(offset_list) != len(args.thresholds):
+                print("error: offset logit threshold count must match onset count", file=sys.stderr)
+                return
+            for on_thr, off_thr in zip(args.thresholds, offset_list):
+                _run_eval(on_thr, off_thr, True, k_onset=default_k_onset)
         if args.prob_thresholds:
             _header()
+            onset_list = args.prob_thresholds
+            offset_list = args.offset_prob_thresholds if args.offset_prob_thresholds else onset_list
             for k_val in k_candidates:
-                for on_thr in args.prob_thresholds:
-                    off_candidates = (
-                        args.prob_thresholds if args.grid_prob_thresholds else [on_thr]
-                    )
-                    for off_thr in off_candidates:
+                if args.grid_prob_thresholds:
+                    for on_thr in onset_list:
+                        for off_thr in offset_list:
+                            _run_eval(on_thr, off_thr, False, k_onset=k_val)
+                else:
+                    if len(onset_list) != len(offset_list):
+                        print("error: offset probability thresholds must match onset count", file=sys.stderr)
+                        return
+                    for idx, on_thr in enumerate(onset_list):
+                        off_thr = offset_list[idx]
                         _run_eval(on_thr, off_thr, False, k_onset=k_val)
     else:
         # Per-head sweep

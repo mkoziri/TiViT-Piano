@@ -209,7 +209,8 @@ def run_fast_eval(
     log_dir: Path,
     split: str,
     calibration_json: Path,
-    extra_probs: Optional[Tuple[float, float, float]] = None,
+    onset_probs: Optional[Tuple[float, float, float]] = None,
+    offset_probs: Optional[Tuple[float, float, float]] = None,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
     sweep_k_onset: bool = False,
@@ -225,10 +226,14 @@ def run_fast_eval(
     ]
     if split:
         cmd.extend(["--split", split])
-    if extra_probs is not None:
-        probs = [max(0.0, min(1.0, p)) for p in extra_probs]
-        cmd.append("--prob_thresholds")
-        cmd.extend([f"{p:.3f}" for p in probs])
+    onset_list = None
+    if onset_probs is not None:
+        onset_list = [max(0.0, min(1.0, p)) for p in onset_probs]
+        cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in onset_list)])
+    offset_list = None
+    if offset_probs is not None:
+        offset_list = [max(0.0, min(1.0, p)) for p in offset_probs]
+        cmd.extend(["--offset_prob_thresholds", ",".join(f"{p:.2f}" for p in offset_list)])
     if temperature is not None:
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
@@ -511,17 +516,24 @@ def perform_calibration(
         onset_prob = float(calib.get("onset", {}).get("best_prob", 0.3))
         offset_prob = float(calib.get("offset", {}).get("best_prob", 0.3))
         prob_delta = 0.05
-        extra_probs = (
+        onset_probs = (
             max(0.0, onset_prob - prob_delta),
             onset_prob,
             min(1.0, onset_prob + prob_delta),
         )
+        offset_probs = (
+            max(0.0, offset_prob - prob_delta),
+            offset_prob,
+            min(1.0, offset_prob + prob_delta),
+        )
+        print("[autopilot] fast eval sweep thresholds:", f"onset={','.join(f'{p:.2f}' for p in onset_probs)} offset={','.join(f'{p:.2f}' for p in offset_probs)}")
         eval_ret, lines = run_fast_eval(
             ckpt,
             stdout_dir,
             split,
             CALIB_JSON,
-            extra_probs=extra_probs,
+            onset_probs=onset_probs,
+            offset_probs=offset_probs,
             temperature=args.temperature,
             bias=args.bias,
             sweep_k_onset=True,
