@@ -362,7 +362,6 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     metrics_cfg["prob_threshold_onset"] = float(metrics["onset_thr"])
     metrics_cfg["prob_threshold_offset"] = float(metrics["offset_thr"])
     agg_cfg["mode"] = "k_of_p"
-    agg_cfg["top_k"] = 0
     onset_value = metrics.get("k_onset")
     if onset_value is None:
         onset_fallback = k_cfg.get("onset")
@@ -631,7 +630,7 @@ RESULT_HEADER = [
 ]
 
 
-def load_resume_state(results_path: Path, metric_key: str) -> Optional[ResumeState]:
+def load_resume_state(results_path: Path, metric_key: str, default_patience: int) -> Optional[ResumeState]:
     if not results_path.exists():
         return None
 
@@ -667,9 +666,9 @@ def load_resume_state(results_path: Path, metric_key: str) -> Optional[ResumeSta
     except (TypeError, ValueError):
         next_round = len(rows) + 1
     try:
-        patience_left = int(last_row.get("patience", "3"))
+        patience_left = int(last_row.get("patience", str(default_patience)))
     except (TypeError, ValueError):
-        patience_left = 3
+        patience_left = default_patience
     patience_left = max(patience_left, 0)
 
     return ResumeState(
@@ -706,7 +705,7 @@ def append_results(
     val_line: str,
     retcode: int,
 ) -> None:
-    iso = _dt.datetime.utcnow().isoformat(timespec="seconds")
+    iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
     row = [
         iso,
         str(round_idx),
@@ -743,6 +742,7 @@ def main() -> int:
     ap.add_argument("--target_ev_f1", type=float, default=0.65)
     ap.add_argument("--target_metric", choices=["ev_f1_mean", "onset_ev_f1", "offset_ev_f1"], default="ev_f1_mean")
     ap.add_argument("--max_rounds", type=int, default=12)
+    ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--results", type=Path, default=DEFAULT_RESULTS)
     ap.add_argument("--ckpt_dir", type=Path, default=Path("checkpoints"))
     ap.add_argument("--split_eval", default="val")
@@ -754,6 +754,7 @@ def main() -> int:
     ap.add_argument("--dataset_max_clips", type=int)
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
+    patience_budget = max(args.patience, 0)
 
     target_metric_field = TARGET_METRIC_FIELDS[args.target_metric]
     
@@ -762,7 +763,7 @@ def main() -> int:
     base_name = base_from_config_name(exp_cfg.get("name", "TiViT"))
 
     if args.mode == "fresh":
-        new_tag = short_id(_dt.datetime.utcnow().isoformat())
+        new_tag = short_id(_dt.datetime.now(_dt.UTC).isoformat())
         new_name = f"{base_name}_sw_{new_tag}_auto"
         exp_cfg["name"] = new_name
         print(f"[autopilot] fresh mode → experiment name set to {new_name}")
@@ -805,14 +806,14 @@ def main() -> int:
     stdout_dir = args.stdout_dir.expanduser()
     stdout_dir.mkdir(parents=True, exist_ok=True)
 
-    patience_left = 3
+    patience_left = patience_budget
     best_metric = -1.0
     calibration_count = 0
 
     resume_state: Optional[ResumeState] = None
     start_round = 1
     if args.mode == "resume":
-        resume_state = load_resume_state(results_path, args.target_metric)
+        resume_state = load_resume_state(results_path, args.target_metric, patience_budget)
         if resume_state:
             start_round = max(resume_state.next_round, 1)
             best_metric = resume_state.best_metric
@@ -830,7 +831,6 @@ def main() -> int:
         metrics_cfg = train_cfg.setdefault("metrics", {})
         agg_cfg = metrics_cfg.setdefault("aggregation", {})
         k_cfg = agg_cfg.setdefault("k", {})
-        agg_cfg["top_k"] = 0
         if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
             k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
@@ -975,7 +975,7 @@ def main() -> int:
             metric_raw = metrics.get("ev_f1_mean", 0.0)
         metric_value = float(metric_raw)
         ev_mean = float(metrics["ev_f1_mean"])
-        patience_record = 3 if metric_value > best_metric + 1e-9 else max(patience_left - 1, 0)
+        patience_record = patience_budget if metric_value > best_metric + 1e-9 else max(patience_left - 1, 0)
         append_results(
             results_path,
             round_idx,
@@ -1025,7 +1025,7 @@ def main() -> int:
                 shutil.copy2(target_ckpt, tmp_ckpt)
                 os.replace(tmp_ckpt, best_ckpt)
             best_metric = metric_value
-            patience_left = 3
+            patience_left = patience_budget
             print(
                 f"[autopilot] New best {args.target_metric}={metric_value:.4f} "
                 f"(round {round_idx}); updated tivit_best.pt | ev_f1_mean={ev_mean:.4f}"
@@ -1042,7 +1042,7 @@ def main() -> int:
             print("SUCCESS: target reached")
             return 0
         if patience_left <= 0:
-            print("EARLY STOP: no improvement for 3 rounds")
+            print(f"EARLY STOP: no improvement for {patience_budget} rounds")
             return 0
 
 
