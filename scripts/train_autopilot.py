@@ -509,11 +509,40 @@ def perform_calibration(
     prefer_fast_grid = first_calibration and args.fast_first_calib
     desired_kind = args.first_calib if first_calibration else "fast"
 
+    def _parse_prob_from_calib(entry: dict, default: float) -> Tuple[float, Optional[float]]:
+        prob_val: Optional[float] = None
+        logit_val: Optional[float] = None
+        raw_prob = entry.get("best_prob") if isinstance(entry, dict) else None
+        if isinstance(raw_prob, (int, float)):
+            prob_val = float(raw_prob)
+        elif isinstance(raw_prob, str):
+            try:
+                prob_val = float(raw_prob)
+            except ValueError:
+                prob_val = None
+        if prob_val is None and isinstance(entry, dict):
+            raw_logit = entry.get("best_logit")
+            if isinstance(raw_logit, (int, float)):
+                logit_val = float(raw_logit)
+            elif isinstance(raw_logit, str):
+                try:
+                    logit_val = float(raw_logit)
+                except ValueError:
+                    logit_val = None
+            if logit_val is not None:
+                prob_val = 1.0 / (1.0 + math.exp(-logit_val))
+        if prob_val is None:
+            prob_val = default
+        prob_val = max(0.0, min(1.0, float(prob_val)))
+        return prob_val, logit_val
+    
     def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
-        onset_prob = float(calib.get("onset", {}).get("best_prob", 0.3))
-        offset_prob = float(calib.get("offset", {}).get("best_prob", 0.3))
+        onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
+        offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
+        onset_prob, onset_logit = _parse_prob_from_calib(onset_entry, 0.3)
+        offset_prob, offset_logit = _parse_prob_from_calib(offset_entry, 0.3)
         prob_delta = 0.05
         onset_probs = (
             max(0.0, onset_prob - prob_delta),
@@ -542,8 +571,16 @@ def perform_calibration(
         metrics = parse_eval_table(lines)
         if metrics is None:
             return None, 1
-        metrics["onset_thr"] = metrics.get("onset_thr", onset_prob)
-        metrics["offset_thr"] = metrics.get("offset_thr", offset_prob)
+        onset_thr = metrics.get("onset_thr")
+        offset_thr = metrics.get("offset_thr")
+        if onset_thr is None or onset_thr < 0.0 or onset_thr > 1.0:
+            metrics["onset_thr"] = onset_prob
+        elif onset_logit is not None and math.isclose(onset_thr, onset_logit, rel_tol=1e-9, abs_tol=1e-6):
+            metrics["onset_thr"] = onset_prob
+        if offset_thr is None or offset_thr < 0.0 or offset_thr > 1.0:
+            metrics["offset_thr"] = offset_prob
+        elif offset_logit is not None and math.isclose(offset_thr, offset_logit, rel_tol=1e-9, abs_tol=1e-6):
+            metrics["offset_thr"] = offset_prob
         calib.setdefault("onset", {})["best_prob"] = metrics["onset_thr"]
         calib.setdefault("offset", {})["best_prob"] = metrics["offset_thr"]
         with CALIB_JSON.open("w") as f:

@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_autopilot_v3
+  name: TiViT-Piano_PianoYT_autopilot_v4
   seed: 1332
   output_dir: outputs
 dataset:
