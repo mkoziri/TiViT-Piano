@@ -96,8 +96,8 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: false
-  reset_head_bias: true
+  resume: true
+  reset_head_bias: false
   bias_seed:
     onoff_prior_mean: 0.02
   loss_weights:

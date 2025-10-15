@@ -352,15 +352,72 @@ def ensure_calibration_json(metrics: Dict[str, float]) -> None:
         json.dump(data, f, indent=2)
 
 
+def _coerce_optional_float(value) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        if math.isfinite(value):
+            return float(value)
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return None
+        return float(parsed) if math.isfinite(parsed) else None
+    return None
+
+
+def _extract_best_probability(
+    calibration: Optional[dict], head: str, fallback: Optional[float]
+) -> Optional[float]:
+    entry = calibration.get(head) if isinstance(calibration, dict) else None
+    prob_val: Optional[float] = None
+    if isinstance(entry, dict):
+        best_prob = _coerce_optional_float(entry.get("best_prob"))
+        if best_prob is not None:
+            prob_val = best_prob
+        else:
+            best_logit = _coerce_optional_float(entry.get("best_logit"))
+            if best_logit is not None:
+                prob_val = 1.0 / (1.0 + math.exp(-best_logit))
+    if prob_val is None:
+        prob_val = fallback
+    if prob_val is None:
+        return None
+    prob_val = max(0.0, min(1.0, float(prob_val)))
+    return prob_val
+
+
 def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     cfg = load_cfg()
     train_cfg = cfg.setdefault("training", {})
     metrics_cfg = train_cfg.setdefault("metrics", {})
     agg_cfg = metrics_cfg.setdefault("aggregation", {})
     k_cfg = agg_cfg.setdefault("k", {})
-    metrics_cfg["prob_threshold"] = float(metrics["onset_thr"])
-    metrics_cfg["prob_threshold_onset"] = float(metrics["onset_thr"])
-    metrics_cfg["prob_threshold_offset"] = float(metrics["offset_thr"])
+    calibration = load_calibration(CALIB_JSON)
+
+    existing_onset = _coerce_optional_float(metrics_cfg.get("prob_threshold_onset"))
+    existing_offset = _coerce_optional_float(metrics_cfg.get("prob_threshold_offset"))
+    onset_fallback = _coerce_optional_float(metrics.get("onset_thr")) or existing_onset or 0.5
+    offset_fallback = _coerce_optional_float(metrics.get("offset_thr")) or existing_offset or 0.5
+
+    onset_prob = _extract_best_probability(calibration, "onset", onset_fallback)
+    offset_prob = _extract_best_probability(calibration, "offset", offset_fallback)
+
+    if onset_prob is not None:
+        if 0.30 <= onset_prob <= 0.80:
+            metrics_cfg["prob_threshold_onset"] = float(onset_prob)
+            metrics_cfg["prob_threshold"] = float(onset_prob)
+        else:
+            print(
+                f"[autopilot] WARNING: onset prob_threshold={onset_prob:.4f} outside [0.30, 0.80]; skipping write"
+            )
+    if offset_prob is not None:
+        if 0.30 <= offset_prob <= 0.80:
+            metrics_cfg["prob_threshold_offset"] = float(offset_prob)
+        else:
+            print(
+                f"[autopilot] WARNING: offset prob_threshold={offset_prob:.4f} outside [0.30, 0.80]; skipping write"
+            )
     agg_cfg["mode"] = "k_of_p"
     onset_value = metrics.get("k_onset")
     if onset_value is None:
@@ -380,20 +437,36 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     if platt:
         onset_platt = platt.get("onset")
         if onset_platt:
-            onset_temp = 0.5 * float(onset_platt["temp"]) + 0.5 * 1.0
-            onset_bias = 0.5 * float(onset_platt["bias"]) + 0.5 * 0.0
-            onset_temp = min(max(onset_temp, 0.80), 1.50)
-            onset_bias = min(max(onset_bias, -2.0), 2.0)
-            metrics_cfg["prob_temperature_onset"] = onset_temp
-            metrics_cfg["prob_logit_bias_onset"] = onset_bias
+            onset_temp_raw = _coerce_optional_float(onset_platt.get("temp"))
+            onset_bias_raw = _coerce_optional_float(onset_platt.get("bias"))
+            if onset_temp_raw is not None and onset_bias_raw is not None:
+                onset_temp = 0.5 * onset_temp_raw + 0.5 * 1.0
+                onset_bias = 0.5 * onset_bias_raw + 0.5 * 0.0
+                if not (0.85 <= onset_temp <= 1.50 and -1.0 <= onset_bias <= 1.0):
+                    print(
+                        "[autopilot] WARNING: onset Platt params outside safe range; skipping write"
+                    )
+                else:
+                    onset_temp = min(max(onset_temp, 0.85), 1.50)
+                    onset_bias = min(max(onset_bias, -1.0), 1.0)
+                    metrics_cfg["prob_temperature_onset"] = onset_temp
+                    metrics_cfg["prob_logit_bias_onset"] = onset_bias
         offset_platt = platt.get("offset")
         if offset_platt:
-            offset_temp = 0.5 * float(offset_platt["temp"]) + 0.5 * 1.0
-            offset_bias = 0.5 * float(offset_platt["bias"]) + 0.5 * 0.0
-            offset_temp = min(max(offset_temp, 0.80), 1.80)
-            offset_bias = min(max(offset_bias, -2.5), 2.5)
-            metrics_cfg["prob_temperature_offset"] = offset_temp
-            metrics_cfg["prob_logit_bias_offset"] = offset_bias
+            offset_temp_raw = _coerce_optional_float(offset_platt.get("temp"))
+            offset_bias_raw = _coerce_optional_float(offset_platt.get("bias"))
+            if offset_temp_raw is not None and offset_bias_raw is not None:
+                offset_temp = 0.5 * offset_temp_raw + 0.5 * 1.0
+                offset_bias = 0.5 * offset_bias_raw + 0.5 * 0.0
+                if not (0.85 <= offset_temp <= 1.80 and -1.5 <= offset_bias <= 1.0):
+                    print(
+                        "[autopilot] WARNING: offset Platt params outside safe range; skipping write"
+                    )
+                else:
+                    offset_temp = min(max(offset_temp, 0.85), 1.80)
+                    offset_bias = min(max(offset_bias, -1.5), 1.0)
+                    metrics_cfg["prob_temperature_offset"] = offset_temp
+                    metrics_cfg["prob_logit_bias_offset"] = offset_bias
     save_cfg(cfg)
 
 
