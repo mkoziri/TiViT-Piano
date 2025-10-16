@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import os
 import warnings
 from pathlib import Path
@@ -34,6 +35,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
+from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
 
@@ -409,6 +411,9 @@ class PianoYTDataset(Dataset):
         self.frame_targets_cfg: Dict[str, Any] = {}
         self.max_clips: Optional[int] = None
 
+        self._av_sync_cache = AVLagCache()
+        self._av_sync_warned = False
+
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
@@ -594,19 +599,55 @@ class PianoYTDataset(Dataset):
 
         T = self.frames
         fps = self.decode_fps
-        t0 = frame_to_sec(start_idx, 1.0 / fps)
-        t1 = frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps)
+        hop_seconds = self.stride / max(fps, 1e-6)
+        t0: float = float(frame_to_sec(start_idx, 1.0 / fps))
+        t1: float = float(frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps))
 
         sample = {"video": clip, "path": str(video_path)}
 
         labels_tensor: Optional[torch.Tensor] = None
         if midi_path is not None and midi_path.exists():
             labels_tensor = _read_midi_events(midi_path)
-            if labels_tensor.numel() > 0:
-                sample["labels"] = labels_tensor
         elif getattr(self, "require_labels", False):
             raise FileNotFoundError(f"Missing MIDI annotations for {video_path}")
 
+        lag_result = None
+        if labels_tensor is not None and labels_tensor.numel() > 0:
+            lag_result = estimate_av_lag(
+                video_id=video_id,
+                frames=clip,
+                labels=labels_tensor,
+                clip_start=t0,
+                clip_end=t1,
+                hop_seconds=hop_seconds,
+                cache=self._av_sync_cache,
+            )
+            if not lag_result.success and not self._av_sync_warned:
+                LOGGER.warning(
+                    "Unable to compute A/V lag for clip %s; using lag=0", video_id
+                )
+                self._av_sync_warned = True
+            lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
+            labels_tensor = shift_label_events(
+                labels_tensor,
+                lag_seconds,
+                clip_start=t0,
+                clip_end=t1,
+            )
+            lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
+            corr_val = lag_result.corr if lag_result.success else float("nan")
+            corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
+            LOGGER.info(
+                "clip=%s av_lag_ms=%+d corr=%s frames=%d",
+                video_id,
+                int(round(lag_ms_display)),
+                corr_str,
+                T,
+            )
+
+        if labels_tensor is not None and labels_tensor.numel() > 0:
+            sample["labels"] = labels_tensor
+        
         clip_targets: Optional[Dict[str, torch.Tensor]] = None
         if labels_tensor is not None and labels_tensor.numel() > 0:
             onset = labels_tensor[:, 0]

@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
 
@@ -723,6 +724,9 @@ class OMAPSDataset(Dataset):
         self.frame_targets_cfg: Dict[str, Any] = {}
         self.max_clips: Optional[int] = None
 
+        self._av_sync_cache = AVLagCache()
+        self._av_sync_warned = False
+
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
@@ -857,6 +861,7 @@ class OMAPSDataset(Dataset):
         # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames
         fps = self.decode_fps
+        hop_seconds = self.stride / max(fps, 1e-6)
         t0 = frame_to_sec(start_idx, 1.0 / fps)
         t1 = frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps)
 
@@ -865,16 +870,49 @@ class OMAPSDataset(Dataset):
     
         # --- locate sidecar annotation file ---
         ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
-        if ann_path is not None and ann_path.suffix.lower() == ".txt":
-            labels_tensor = _read_txt_events(ann_path)  # (N,3) or (0,3)
-            if labels_tensor is not None:
-                sample["labels"] = labels_tensor
 
         # --- parse raw labels if .txt is present: labels := (N,3) [onset, offset, pitch] ---
         labels_tensor = None
         if ann_path is not None and ann_path.suffix.lower() == ".txt":
             labels_tensor = _read_txt_events(ann_path)  # (N,3) float32
         
+        lag_result = None
+        if labels_tensor is not None and labels_tensor.numel() > 0:
+            lag_result = estimate_av_lag(
+                video_id=path.stem,
+                frames=clip,
+                labels=labels_tensor,
+                clip_start=t0,
+                clip_end=t1,
+                hop_seconds=hop_seconds,
+                cache=self._av_sync_cache,
+            )
+            if not lag_result.success and not self._av_sync_warned:
+                LOGGER.warning(
+                    "Unable to compute A/V lag for clip %s; using lag=0", path.stem
+                )
+                self._av_sync_warned = True
+            lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
+            labels_tensor = shift_label_events(
+                labels_tensor,
+                lag_seconds,
+                clip_start=t0,
+                clip_end=t1,
+            )
+            lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
+            corr_val = lag_result.corr if lag_result.success else float("nan")
+            corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
+            LOGGER.info(
+                "clip=%s av_lag_ms=%+d corr=%s frames=%d",
+                path.stem,
+                int(round(lag_ms_display)),
+                corr_str,
+                T,
+            )
+        elif labels_tensor is not None:
+            # Ensure downstream code receives a tensor even when empty.
+            labels_tensor = labels_tensor.clone()
+            
         # --- derive clip-level targets from events overlapping [t0, t1) ---
         clip_targets = None
         if labels_tensor is not None and labels_tensor.numel() > 0:
