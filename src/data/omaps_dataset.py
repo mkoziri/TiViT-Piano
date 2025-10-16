@@ -18,6 +18,7 @@ CLI:
 import os
 import glob
 import math
+import random
 import zlib
 import logging
 from pathlib import Path
@@ -717,15 +718,22 @@ class OMAPSDataset(Dataset):
         # Define sensible defaults here so static type checkers know these fields
         # exist and so callers can rely on their presence even before
         # configuration hooks run.
-        self.annotations_root: Optional[str] = None
-        self.label_format: str = "txt"
-        self.label_targets: Sequence[str] = ("pitch", "onset", "offset", "hand", "clef")
-        self.require_labels: bool = False
+        self.annotations_root: Optional[str] = self.dataset_cfg.get("annotations_root")
+        self.label_format: str = str(self.dataset_cfg.get("label_format", "txt"))
+        self.label_targets: Sequence[str] = tuple(
+            self.dataset_cfg.get(
+                "label_targets", ["pitch", "onset", "offset", "hand", "clef"]
+            )
+        )
+        self.require_labels: bool = bool(self.dataset_cfg.get("require_labels", False))
         self.frame_targets_cfg: Dict[str, Any] = {}
         self.max_clips: Optional[int] = None
 
         self._av_sync_cache = AVLagCache()
         self._av_sync_warned = False
+        self._valid_indices: List[int] = []
+        self._label_warned: set = set()
+        self._num_windows: int = 0
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -788,23 +796,38 @@ class OMAPSDataset(Dataset):
         if len(self.videos) == 0:
             raise FileNotFoundError(f"No .mp4 files found under {self.root} (split='{split}').")
         
+        self._rebuild_valid_index_cache(log_summary=True)
+        
 
 
     def __len__(self):
-        return len(self.videos)
+        return len(self._valid_indices)
 
 
     def __getitem__(self, idx: int):
-        path = self.videos[idx]
+        if not self._valid_indices:
+            raise RuntimeError("OMAPSDataset has no valid labeled windows to sample.")
 
-        # --- load video clip (existing logic) ---
-        #if HAVE_DECORD:
-        #    clip = _load_clip_decord(path, self.frames, self.stride, self.resize, self.channels)
-        #else:
-        #    clip = _load_clip_cv2(path, self.frames, self.stride, self.resize, self.channels)
-        #changed so it should always start from frame 0 when training.
-        # --- load video clip with randomized start for train, deterministic for val/test ---
-        is_train = (self.split == "train")
+        max_attempts = len(self._valid_indices)
+        attempt = 0
+        logical_idx = idx % len(self._valid_indices)
+
+        while attempt < max_attempts and self._valid_indices:
+            video_idx = self._valid_indices[logical_idx]
+            sample = self._load_sample_for_video(video_idx, idx)
+            if sample is not None:
+                return sample
+            attempt += 1
+            if not self._valid_indices:
+                break
+            logical_idx = random.randrange(len(self._valid_indices))
+
+        raise RuntimeError("OMAPSDataset: exhausted attempts to fetch a valid sample.")
+
+    def _load_sample_for_video(self, video_idx: int, sample_index: int) -> Optional[Dict[str, Any]]:
+        path = self.videos[video_idx]
+
+        is_train = self.split == "train"
         clip, start_idx = _load_clip_with_random_start(
             path=path,
             frames=self.frames,
@@ -813,36 +836,25 @@ class OMAPSDataset(Dataset):
             training=is_train,
             decode_fps=self.decode_fps,
         )
-        native_h, native_w = clip.shape[-2:]
-        #print(f"decode {path.name}: native {native_h}x{native_w}", flush=True)
+        
         if self.registration_enabled and self.apply_crop:
-            before_h, before_w = clip.shape[-2:]
             meta = self.registration_cfg.get("crop")
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
-            after_h, after_w = clip.shape[-2:]
-            #print(f"registration crop {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
         elif not self.registration_enabled and not self._registration_off_logged:
-            #print("registration=off → decode→resize→aug→tile", flush=True)
             self._registration_off_logged = True
 
-        before_h, before_w = clip.shape[-2:]
         clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
-        after_h, after_w = clip.shape[-2:]
-        target_h, target_w = self.canonical_hw
-        #print(f"canonical resize {path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",flush=True,)
-        if self.global_aug_enabled and self.split == "train":
-            before_h, before_w = clip.shape[-2:]
+
+        if self.global_aug_enabled and is_train:
             clip = apply_global_augment(
                 clip,
                 self.global_aug_cfg,
                 base_seed=self.data_seed,
-                sample_index=idx,
+                sample_index=sample_index,
                 start_idx=start_idx,
                 interp=self.global_aug_cfg.get("interp", self.registration_interp),
                 id_key=path.stem,
             )
-            after_h, after_w = clip.shape[-2:]
-            #print(f"global aug {path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
 
         _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
             clip,
@@ -855,38 +867,42 @@ class OMAPSDataset(Dataset):
             clip = clip[..., :aligned_w]
         if not self._tiling_log_once:
             width_sum = sum(widths_px)
-            print(f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",flush=True,)
+            print(
+                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                flush=True,
+            )
             self._tiling_log_once = True
 
-        # --- compute the clip's time window [t0, t1) in seconds ---
         T = self.frames
         fps = self.decode_fps
         hop_seconds = self.stride / max(fps, 1e-6)
         t0 = float(frame_to_sec(start_idx, 1.0 / fps))
         t1 = float(frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps))
 
-        sample = {"video": clip, "path": str(path)}  # <- create up-front
-        labels_tensor = None                          # <- define up-front
-    
-        # --- locate sidecar annotation file ---
-        ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
+        sample = {"video": clip, "path": str(path)}
 
-        # --- parse raw labels if .txt is present: labels := (N,3) [onset, offset, pitch] ---
-        labels_tensor = None
+        ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
+        labels_tensor: Optional[torch.Tensor] = None
         if ann_path is not None and ann_path.suffix.lower() == ".txt":
-            labels_tensor = _read_txt_events(ann_path)  # (N,3) float32
-        
-        lag_result = None
-        if labels_tensor is not None and labels_tensor.numel() > 0:
-            lag_result = estimate_av_lag(
-                video_id=path.stem,
-                frames=clip,
-                labels=labels_tensor,
-                clip_start=t0,
-                clip_end=t1,
-                hop_seconds=hop_seconds,
-                cache=self._av_sync_cache,
-            )
+            labels_tensor = _read_txt_events(ann_path)
+
+        if labels_tensor is None or labels_tensor.numel() == 0:
+            self._log_missing_labels_once(path)
+            self._invalidate_video_index(video_idx)
+            return None
+
+        lag_result = estimate_av_lag(
+            video_id=path.stem,
+            frames=clip,
+            labels=labels_tensor,
+            clip_start=t0,
+            clip_end=t1,
+            hop_seconds=hop_seconds,
+            cache=self._av_sync_cache,
+        ) if labels_tensor.numel() > 0 else None
+
+        if lag_result is not None:
             if not lag_result.success and not self._av_sync_warned:
                 LOGGER.warning(
                     "Unable to compute A/V lag for clip %s; using lag=0", path.stem
@@ -920,81 +936,71 @@ class OMAPSDataset(Dataset):
                 T,
                 flags_str,
             )
-        elif labels_tensor is not None:
-            # Ensure downstream code receives a tensor even when empty.
-            labels_tensor = labels_tensor.clone()
 
-        # --- derive clip-level targets from events overlapping [t0, t1) ---
+        if labels_tensor is not None and labels_tensor.numel() > 0:
+            sample["labels"] = labels_tensor
+
         clip_targets = None
         if labels_tensor is not None and labels_tensor.numel() > 0:
-            # Select events that overlap window
             onset = labels_tensor[:, 0]
             offset = labels_tensor[:, 1]
-            pitch = labels_tensor[:, 2].to(torch.int64)  # integer MIDI pitch
+            pitch = labels_tensor[:, 2].to(torch.int64)
 
-            # overlap condition: onset < t1 and offset > t0
             mask = (onset < t1) & (offset > t0)
             sel_pitches = pitch[mask]
-            sel_onsets  = onset[mask]
+            sel_onsets = onset[mask]
             sel_offsets = offset[mask]
 
             P = 88
             note_min_clip = 21
-            pitch_vec  = torch.zeros(P, dtype=torch.float32)
-            onset_vec  = torch.zeros(P, dtype=torch.float32)
+            pitch_vec = torch.zeros(P, dtype=torch.float32)
+            onset_vec = torch.zeros(P, dtype=torch.float32)
             offset_vec = torch.zeros(P, dtype=torch.float32)
             if sel_pitches.numel() == 0:
                 pitch_class = 60
-                onset_flag, offset_flag = 0.0, 0.0
+                onset_flag = 0.0
+                offset_flag = 0.0
             else:
                 uniq, counts = sel_pitches.unique(return_counts=True)
                 pitch_class = int(uniq[counts.argmax()].item())
-                onset_flag  = 1.0 if ((sel_onsets >= t0) & (sel_onsets < t1)).any().item() else 0.0
-                offset_flag = 1.0 if ((sel_offsets >  t0) & (sel_offsets <= t1)).any().item() else 0.0
+                onset_flag = 1.0 if ((sel_onsets >= t0) & (sel_onsets < t1)).any().item() else 0.0
+                offset_flag = 1.0 if ((sel_offsets > t0) & (sel_offsets <= t1)).any().item() else 0.0
 
-            idx = int(pitch_class - note_min_clip)
-            if 0 <= idx < P:
-                pitch_vec[idx] = 1.0
-                if onset_flag:  onset_vec[idx] = 1.0
-                if offset_flag: offset_vec[idx] = 1.0
+            idx_pitch = int(pitch_class - note_min_clip)
+            if 0 <= idx_pitch < P:
+                pitch_vec[idx_pitch] = 1.0
+                if onset_flag:
+                    onset_vec[idx_pitch] = 1.0
+                if offset_flag:
+                    offset_vec[idx_pitch] = 1.0
 
             hand = 0 if pitch_class < 60 else 1
             clef = 0 if pitch_class < 60 else (1 if pitch_class > 64 else 2)
             
             clip_targets = {
-                "pitch":  pitch_vec,
-                "onset":  onset_vec,
+                "pitch": pitch_vec,
+                "onset": onset_vec,
                 "offset": offset_vec,
-                "hand":   torch.tensor(hand, dtype=torch.long),
-                "clef":   torch.tensor(clef, dtype=torch.long),
+                "hand": torch.tensor(hand, dtype=torch.long),
+                "clef": torch.tensor(clef, dtype=torch.long),
             }
-
-        # --- build sample dict ---
-        sample = {"video": clip, "path": str(path)}
-        if labels_tensor is not None:
-            sample["labels"] = labels_tensor  # (N,3): raw events for this video
 
         if clip_targets is not None:
             sample.update(clip_targets)
-        else:
-            # honor strict mode if requested
-            if getattr(self, "require_labels", False):
-                raise FileNotFoundError(f"No usable labels for {path}")
+        elif getattr(self, "require_labels", False):
+            self._log_missing_labels_once(path)
+            return None
 
-        # --- NOW attach frame-level targets (optional) ---
         ft_cfg = getattr(self, "frame_targets_cfg", None)
         if ft_cfg and bool(ft_cfg.get("enable", False)):
-            labels_ft = None
-            if labels_tensor is not None:
-                labels_ft = labels_tensor.clone()
-                # Shift label times so frame 0 corresponds to the clip start.
+            labels_ft = labels_tensor.clone() if labels_tensor is not None else torch.zeros((0, 3), dtype=torch.float32)
+            if labels_ft.numel() > 0:
                 labels_ft[:, 0:2] -= t0
-            else:
-                # Ensure labels_ft is always a Tensor (empty if no labels)
-                labels_ft = torch.zeros((0, 3), dtype=torch.float32)
             ft = _build_frame_targets(
                 labels=labels_ft,
-                T=T, stride=self.stride, fps=fps,
+                T=T,
+                stride=self.stride,
+                fps=fps,
                 note_min=int(ft_cfg.get("note_min", 21)),
                 note_max=int(ft_cfg.get("note_max", 108)),
                 tol=float(ft_cfg.get("tolerance", 0.025)),
@@ -1004,15 +1010,59 @@ class OMAPSDataset(Dataset):
                 dilate_active_frames=int(ft_cfg.get("dilate_active_frames", 0)),
                 targets_sparse=bool(ft_cfg.get("targets_sparse", False)),
             )
-            sample.update({
-                "pitch_roll":  ft["pitch_roll"],
-                "onset_roll":  ft["onset_roll"],
-                "offset_roll": ft["offset_roll"],
-                "hand_frame":  ft["hand_frame"],
-                "clef_frame":  ft["clef_frame"],
-            })
-        
+            sample.update(
+                {
+                    "pitch_roll": ft["pitch_roll"],
+                    "onset_roll": ft["onset_roll"],
+                    "offset_roll": ft["offset_roll"],
+                    "hand_frame": ft["hand_frame"],
+                    "clef_frame": ft["clef_frame"],
+                }
+            )
+
         return sample
+    def _log_missing_labels_once(self, path: Path) -> None:
+        name = path.name
+        if name in self._label_warned:
+            return
+        self._label_warned.add(name)
+        LOGGER.warning("skip_no_labels %s", name)
+
+    def _invalidate_video_index(self, video_idx: int) -> None:
+        if video_idx >= len(self.videos):
+            return
+        self._valid_indices = [i for i in self._valid_indices if i != video_idx]
+        self._num_windows = len(self._valid_indices)
+
+    def _rebuild_valid_index_cache(self, *, log_summary: bool = False) -> None:
+        self._valid_indices = []
+        total = len(self.videos)
+        skipped = 0
+        for idx, path in enumerate(self.videos):
+            ann_path = _find_annotation_for_video(path, getattr(self, "annotations_root", None))
+            labels_tensor: Optional[torch.Tensor] = None
+            if ann_path is not None and ann_path.suffix.lower() == ".txt":
+                labels_tensor = _read_txt_events(ann_path)
+            if labels_tensor is None or labels_tensor.numel() == 0:
+                self._log_missing_labels_once(path)
+                skipped += 1
+                continue
+            self._valid_indices.append(idx)
+
+        self._num_windows = len(self._valid_indices)
+        if log_summary:
+            LOGGER.info(
+                "videos: %d, N_skipped_no_labels: %d, windows: %d",
+                total,
+                skipped,
+                self._num_windows,
+            )
+        if total > 0 and not self._valid_indices:
+            LOGGER.warning(
+                "OMAPS dataset split %s has no valid labeled windows after filtering.",
+                self.split,
+            )
+
 
 
 def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
@@ -1048,6 +1098,7 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     dataset.require_labels = bool(dcfg.get("require_labels", False))
     dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
     dataset.max_clips = max_clips
+    dataset._rebuild_valid_index_cache(log_summary=False)
 
     # --- robust collate that preserves extra fields (labels, targets) ---
     def _collate(batch):

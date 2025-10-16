@@ -23,6 +23,7 @@ import csv
 import logging
 import math
 import os
+import random
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -404,15 +405,22 @@ class PianoYTDataset(Dataset):
         # Provide defaults so static analyzers are aware of these attributes and
         # so runtime code can safely assume their existence prior to external
         # configuration.
-        self.annotations_root: Optional[str] = None
-        self.label_format: str = "midi"
-        self.label_targets: Sequence[str] = ("pitch", "onset", "offset", "hand", "clef")
-        self.require_labels: bool = False
+        self.annotations_root: Optional[str] = self.dataset_cfg.get("annotations_root")
+        self.label_format: str = str(self.dataset_cfg.get("label_format", "midi"))
+        self.label_targets: Sequence[str] = tuple(
+            self.dataset_cfg.get(
+                "label_targets", ["pitch", "onset", "offset", "hand", "clef"]
+            )
+        )
+        self.require_labels: bool = bool(self.dataset_cfg.get("require_labels", False))
         self.frame_targets_cfg: Dict[str, Any] = {}
         self.max_clips: Optional[int] = None
 
         self._av_sync_cache = AVLagCache()
         self._av_sync_warned = False
+        self._valid_indices: List[int] = []
+        self._label_warned: set = set()
+        self._num_windows: int = 0
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -512,6 +520,8 @@ class PianoYTDataset(Dataset):
             raise FileNotFoundError(
                 f"No PianoYT media found under {self.root} for split '{split}'."
             )
+        
+        self._rebuild_valid_index_cache(log_summary=True)
 
     def configure(self, *, include_low_res: bool, excluded_ids: set, apply_crop: bool, crop_rescale: str):
         self.include_low_res = include_low_res
@@ -523,6 +533,7 @@ class PianoYTDataset(Dataset):
             self.videos = [s["video"] for s in self.samples]
         if len(self.samples) == 0:
             raise RuntimeError("All PianoYT samples were filtered out by configuration.")
+        self._rebuild_valid_index_cache(log_summary=False)
 
     def limit_max_clips(self, max_clips: Optional[int]):
         if max_clips is None:
@@ -530,12 +541,33 @@ class PianoYTDataset(Dataset):
         if max_clips < len(self.samples):
             self.samples = self.samples[:max_clips]
             self.videos = [s["video"] for s in self.samples]
+        self._rebuild_valid_index_cache(log_summary=False)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self._valid_indices)
 
     def __getitem__(self, idx: int):
-        record = self.samples[idx]
+        if not self._valid_indices:
+            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
+
+        max_attempts = len(self._valid_indices)
+        attempt = 0
+        logical_idx = idx % len(self._valid_indices)
+
+        while attempt < max_attempts and self._valid_indices:
+            record_idx = self._valid_indices[logical_idx]
+            sample = self._load_sample_for_index(record_idx, idx)
+            if sample is not None:
+                return sample
+            attempt += 1
+            if not self._valid_indices:
+                break
+            logical_idx = random.randrange(len(self._valid_indices))
+
+        raise RuntimeError("PianoYTDataset: exhausted attempts to fetch a valid sample.")
+
+    def _load_sample_for_index(self, record_idx: int, dataset_index: int) -> Optional[Dict[str, Any]]:
+        record = self.samples[record_idx]
         video_path = record["video"]
         midi_path = record["midi"]
         video_id = record["id"]
@@ -549,40 +581,26 @@ class PianoYTDataset(Dataset):
             training=is_train,
             decode_fps=self.decode_fps,
         )
-        
-        native_h, native_w = clip.shape[-2:]
-        #print(f"decode {video_path.name}: native {native_h}x{native_w}", flush=True)
 
         if self.registration_enabled and self.apply_crop:
-            before_h, before_w = clip.shape[-2:]
             meta = self.metadata.get(video_id)
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
-            after_h, after_w = clip.shape[-2:]
-            #print(f"registration crop {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
         elif not self.registration_enabled and not self._registration_off_logged:
-            #print("registration=off → decode→resize→aug→tile", flush=True)
             self._registration_off_logged = True
 
-        before_h, before_w = clip.shape[-2:]
         clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
-        after_h, after_w = clip.shape[-2:]
-        target_h, target_w = self.canonical_hw
-        #print(f"canonical resize {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w} (target={target_h}x{target_w})",flush=True,)
-
+        
         if self.global_aug_enabled and is_train:
-            before_h, before_w = clip.shape[-2:]
             clip = apply_global_augment(
                 clip,
                 self.global_aug_cfg,
                 base_seed=self.data_seed,
-                sample_index=idx,
+                sample_index=dataset_index,
                 start_idx=start_idx,
                 interp=self.global_aug_cfg.get("interp", self.registration_interp),
                 id_key=video_id,
             )
-            after_h, after_w = clip.shape[-2:]
-            #print(f"global aug {video_path.name}: {before_h}x{before_w} -> {after_h}x{after_w}",flush=True,)
-
+            
         _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
             clip,
             self.tiles,
@@ -594,7 +612,11 @@ class PianoYTDataset(Dataset):
             clip = clip[..., :aligned_w]
         if not self._tiling_log_once:
             width_sum = sum(widths_px)
-            print(f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",flush=True,)
+            print(
+                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                flush=True,
+            )
             self._tiling_log_once = True
 
         T = self.frames
@@ -608,20 +630,27 @@ class PianoYTDataset(Dataset):
         labels_tensor: Optional[torch.Tensor] = None
         if midi_path is not None and midi_path.exists():
             labels_tensor = _read_midi_events(midi_path)
-        elif getattr(self, "require_labels", False):
-            raise FileNotFoundError(f"Missing MIDI annotations for {video_path}")
+        else:
+            self._log_missing_labels_once(video_path)
+            self._invalidate_sample_index(record_idx)
+            return None
 
-        lag_result = None
-        if labels_tensor is not None and labels_tensor.numel() > 0:
-            lag_result = estimate_av_lag(
-                video_id=video_id,
-                frames=clip,
-                labels=labels_tensor,
-                clip_start=t0,
-                clip_end=t1,
-                hop_seconds=hop_seconds,
-                cache=self._av_sync_cache,
-            )
+        if labels_tensor is None or labels_tensor.numel() == 0:
+            self._log_missing_labels_once(video_path)
+            self._invalidate_sample_index(record_idx)
+            return None
+
+        lag_result = estimate_av_lag(
+            video_id=video_id,
+            frames=clip,
+            labels=labels_tensor,
+            clip_start=t0,
+            clip_end=t1,
+            hop_seconds=hop_seconds,
+            cache=self._av_sync_cache,
+        ) if labels_tensor.numel() > 0 else None
+
+        if lag_result is not None:
             if not lag_result.success and not self._av_sync_warned:
                 LOGGER.warning(
                     "Unable to compute A/V lag for clip %s; using lag=0", video_id
@@ -707,7 +736,8 @@ class PianoYTDataset(Dataset):
         if clip_targets is not None:
             sample.update(clip_targets)
         elif getattr(self, "require_labels", False):
-            raise FileNotFoundError(f"No usable labels for {video_path}")
+            self._log_missing_labels_once(video_path)
+            return None
 
         ft_cfg = getattr(self, "frame_targets_cfg", None)
         if (
@@ -744,6 +774,47 @@ class PianoYTDataset(Dataset):
             )
 
         return sample
+
+def _log_missing_labels_once(self, video_path: Path) -> None:
+        name = video_path.name
+        if name in self._label_warned:
+            return
+        self._label_warned.add(name)
+        LOGGER.warning("skip_no_labels %s", name)
+
+    def _invalidate_sample_index(self, record_idx: int) -> None:
+        if record_idx >= len(self.samples):
+            return
+        self._valid_indices = [i for i in self._valid_indices if i != record_idx]
+        self._num_windows = len(self._valid_indices)
+
+    def _rebuild_valid_index_cache(self, *, log_summary: bool) -> None:
+        self._valid_indices = []
+        total = len(self.samples)
+        skipped = 0
+        for idx, record in enumerate(self.samples):
+            midi_path = record.get("midi")
+            labels_tensor: Optional[torch.Tensor] = None
+            if midi_path is not None and midi_path.exists():
+                labels_tensor = _read_midi_events(midi_path)
+            if labels_tensor is None or labels_tensor.numel() == 0:
+                self._log_missing_labels_once(record["video"])
+                skipped += 1
+                continue
+            self._valid_indices.append(idx)
+
+        self._num_windows = len(self._valid_indices)
+        if log_summary:
+            LOGGER.info(
+                "videos: %d, N_skipped_no_labels: %d, windows: %d",
+                total,
+                skipped,
+                self._num_windows,
+            )
+        if not self._valid_indices:
+            LOGGER.warning(
+                "[PianoYT] No valid labeled samples remain for split %s.", self.split
+            )
 
 
 def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
@@ -790,6 +861,7 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     dataset.label_targets = dcfg.get("label_targets", ["pitch", "onset", "offset", "hand", "clef"])
     dataset.require_labels = bool(dcfg.get("require_labels", False))
     dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
+    dataset._rebuild_valid_index_cache(log_summary=False)
 
     def _collate(batch):
         vids = [b["video"] for b in batch]
