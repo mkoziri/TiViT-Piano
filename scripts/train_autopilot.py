@@ -242,8 +242,8 @@ def run_fast_eval(
     log_dir: Path,
     split: str,
     calibration_json: Path,
-    onset_probs: Optional[Tuple[float, float, float]] = None,
-    offset_probs: Optional[Tuple[float, float, float]] = None,
+    onset_probs: Optional[Iterable[float]] = None,
+    offset_probs: Optional[Iterable[float]] = None,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
 ) -> Tuple[int, List[str]]:
