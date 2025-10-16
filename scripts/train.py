@@ -163,6 +163,20 @@ def _pick_loader(obj, split_key=None):
         return obj[0]
     return obj
 
+def _targets_summary(loader) -> Optional[str]:
+    dl = _pick_loader(loader)
+    dataset = getattr(dl, 'dataset', None)
+    if dataset is None:
+        return None
+    summary = getattr(dataset, 'frame_target_summary', None)
+    if isinstance(summary, str):
+        return summary
+    spec = getattr(dataset, 'frame_target_spec', None)
+    if spec is not None:
+        return spec.summary()
+    return None
+
+
 def _time_pool_out_to_clip(out: dict) -> dict:
     """
     If logits are time-distributed (B,T,...) but we're about to use clip losses,
@@ -605,6 +619,9 @@ def _accumulate_pred_key_histogram(hist_bins: list[float], counts: torch.Tensor)
 # ----------------------- train loop -----------------------
 
 def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
+    summary = _targets_summary(train_loader)
+    if summary:
+        logger.info(summary)
     model.train()
     crit = make_criterions()  # used only in clip-mode
     w = cfg["training"]["loss_weights"]
@@ -726,6 +743,9 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: Mapping[str, 
     torch.save(state, path)
     
 def evaluate_one_epoch(model, loader, cfg):
+    summary = _targets_summary(loader)
+    if summary:
+        logger.info(summary)
     model.eval()
     crit = make_criterions()
     w = cfg["training"]["loss_weights"]   

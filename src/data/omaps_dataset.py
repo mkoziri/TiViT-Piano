@@ -31,10 +31,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
-from utils.frame_target_cache import (
-    FrameTargetCache,
-    FrameTargetMeta,
-    make_frame_target_cache_key,
+from utils.frame_target_cache import FrameTargetCache
+from utils.frame_targets import (
+    FrameTargetResult,
+    FrameTargetSpec,
+    prepare_frame_targets,
+    resolve_frame_target_spec,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
@@ -591,104 +593,7 @@ def apply_global_augment(frames: torch.Tensor,
     return frames
   
   
-def _build_frame_targets(labels: Optional[torch.Tensor],
-                         T: int, stride: int, fps: float,
-                         note_min: int = 21, note_max: int = 108,
-                         tol: float = 0.025,
-                         fill_mode: str = "overlap",
-                         hand_from_pitch: bool = True,
-                         clef_thresholds=(60, 64),
-                         dilate_active_frames: int = 0,
-                         targets_sparse: bool = False):
-    """Build per-frame targets aligned to sampled frames."""
-    hop_seconds = stride / max(1.0, float(fps))
-    
-    T = int(T)
-    P = int(note_max - note_min + 1)
-    pitch_roll = torch.zeros((T, P), dtype=torch.float32)
-    onset_roll = torch.zeros((T, P), dtype=torch.float32)
-    offset_roll = torch.zeros((T, P), dtype=torch.float32)
 
-    if labels is None or labels.numel() == 0:
-        hand_frame = torch.zeros((T,), dtype=torch.long)
-        clef_frame = torch.full((T,), 2, dtype=torch.long)  # ambiguous
-        return {
-            "pitch_roll": pitch_roll,
-            "onset_roll": onset_roll,
-            "offset_roll": offset_roll,
-            "hand_frame": hand_frame,
-            "clef_frame": clef_frame,
-        }
-
-    on = labels[:, 0]
-    off = labels[:, 1]
-    pit = labels[:, 2].to(torch.int64)
-
-    # optional pitch range clamp  and shift to 0-index
-    mask_pitch = (pit >= int(note_min)) & (pit <= int(note_max))
-    on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch] - int(note_min)
-
-    # ``sec_to_frame`` preserves the input type.  When ``labels`` originate from
-    # numpy arrays they can surface here as Python scalars/lists which do not
-    # implement ``.clamp``.  Normalise to tensors before clamping so the code
-    # path works regardless of the upstream type.
-    on_frames = torch.as_tensor(sec_to_frame(on, hop_seconds), dtype=torch.int64)
-    off_frames = torch.as_tensor(sec_to_frame(off, hop_seconds), dtype=torch.int64)
-    on_frames = torch.clamp(on_frames, 0, T - 1)
-    off_frames = torch.clamp(off_frames, 0, T)
-
-    for s, e, p in zip(on_frames, off_frames, pit):
-        s = int(s)
-        e = int(e)
-        if e <= s:
-            e = min(s + 1, T)
-        pitch_roll[s:e, p] = 1.0
-        onset_roll[s, p] = 1.0
-        off_idx = min(e, T - 1)
-        offset_roll[off_idx, p] = 1.0
-        
-    # optional temporal dilation by N frames
-    if dilate_active_frames and dilate_active_frames > 0:
-        import torch.nn.functional as F
-        ksz = 2 * dilate_active_frames + 1
-        ker = torch.ones((1, 1, ksz), dtype=torch.float32)
-        for roll in (pitch_roll, onset_roll, offset_roll):
-            # (T, P) -> (P, 1, T), conv, then back
-            x = roll.transpose(0, 1).unsqueeze(1)  # (P,1,T)
-            x = F.conv1d(x, ker, padding=dilate_active_frames)
-            roll.copy_((x.squeeze(1) > 0).transpose(0, 1).float())
-
-    # simple per-frame hand/clef heuristic from active pitches
-    if hand_from_pitch:
-        active = (pitch_roll > 0)
-        # average pitch per frame (fallback to 60 if none active)
-        pitch_ids = torch.arange(P, dtype=torch.float32) + float(note_min)
-        sums = (pitch_roll * pitch_ids[None, :]).sum(dim=1)
-        counts = active.sum(dim=1).clamp(min=1)
-        avg_pitch = torch.where(active.any(dim=1), sums / counts, torch.full((T,), 60.0))
-
-        lh_thr, rh_thr = int(clef_thresholds[0]), int(clef_thresholds[1])
-        hand_frame = (avg_pitch >= lh_thr).long()  # 0=left (<lh_thr), 1=right (>=lh_thr)
-        clef_frame = torch.where(
-            avg_pitch < lh_thr, torch.zeros_like(hand_frame),
-            torch.where(avg_pitch > rh_thr, torch.ones_like(hand_frame),
-                        torch.full_like(hand_frame, 2))
-        )
-    else:
-        hand_frame = torch.zeros((T,), dtype=torch.long)
-        clef_frame = torch.full((T,), 2, dtype=torch.long)
-
-    if targets_sparse:
-        # (optional) return sparse indices instead of dense rolls (not used now)
-        pass
-
-    return {
-        "pitch_roll":  pitch_roll,
-        "onset_roll":  onset_roll,
-        "offset_roll": offset_roll,
-        "hand_frame":  hand_frame,
-        "clef_frame":  clef_frame,
-    }
 
 
 class OMAPSDataset(Dataset):
@@ -748,6 +653,8 @@ class OMAPSDataset(Dataset):
         self._frame_target_cache = FrameTargetCache()
         self._frame_target_log_once: set[str] = set()
         self._frame_target_failures: set[str] = set()
+        self.frame_target_spec: Optional[FrameTargetSpec] = None
+        self.frame_target_summary: Optional[str] = None
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -1005,86 +912,42 @@ class OMAPSDataset(Dataset):
             self._log_missing_labels_once(path)
             return None
 
-        ft_cfg = getattr(self, "frame_targets_cfg", None)
-        if ft_cfg and bool(ft_cfg.get("enable", False)):
-            tolerance = float(ft_cfg.get("tolerance", 0.025))
-            dilation = int(ft_cfg.get("dilate_active_frames", 0))
-            lag_ms_final = (
-                lag_result.lag_ms if lag_result is not None and lag_result.success else 0.0
-            )
-            key_hash, key_meta_raw = make_frame_target_cache_key(
-                split=self.split,
-                video_id=path.stem,
-                lag_ms=lag_ms_final,
-                fps=fps,
-                frames=T,
-                tolerance=tolerance,
-                dilation=dilation,
-                canonical_hw=self.canonical_hw,
-            )
-            key_meta: FrameTargetMeta = key_meta_raw
-            cached_targets, _ = self._frame_target_cache.load(key_hash)
-            lag_ms_meta: int = key_meta["lag_ms"]
-            required_keys = (
-                "pitch_roll",
-                "onset_roll",
-                "offset_roll",
-                "hand_frame",
-                "clef_frame",
-            )
-            if cached_targets is not None and all(k in cached_targets for k in required_keys):
-                sample.update(cached_targets)
-                self._log_frame_target_status(
-                    path.stem, "reused", key_hash, lag_ms_meta
+        spec = getattr(self, "frame_target_spec", None)
+        if spec is not None:
+            try:
+                ft_result: FrameTargetResult = prepare_frame_targets(
+                    labels=labels_tensor,
+                    lag_result=lag_result,
+                    spec=spec,
+                    cache=self._frame_target_cache,
+                    split=self.split,
+                    video_id=path.stem,
+                    clip_start=t0,
                 )
-            else:
-                labels_ft = (
-                    labels_tensor.clone()
-                    if labels_tensor is not None
-                    else torch.zeros((0, 3), dtype=torch.float32)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning(
+                    "Failed to build frame targets for %s: %s",
+                    path.stem,
+                    exc,
                 )
-                if labels_ft.numel() > 0:
-                    labels_ft[:, 0:2] -= t0
-                try:
-                    ft = _build_frame_targets(
-                        labels=labels_ft,
-                        T=T,
-                        stride=self.stride,
-                        fps=fps,
-                        note_min=int(ft_cfg.get("note_min", 21)),
-                        note_max=int(ft_cfg.get("note_max", 108)),
-                        tol=tolerance,
-                        fill_mode=str(ft_cfg.get("fill_mode", "overlap")),
-                        hand_from_pitch=bool(ft_cfg.get("hand_from_pitch", True)),
-                        clef_thresholds=tuple(ft_cfg.get("clef_thresholds", [60, 64])),
-                        dilate_active_frames=dilation,
-                        targets_sparse=bool(ft_cfg.get("targets_sparse", False)),
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.warning(
-                        "Failed to build frame targets for %s (key=%s): %s",
-                        path.stem,
-                        key_hash,
-                        exc,
-                    )
-                    self._log_frame_target_status(
-                        path.stem, "failed", key_hash, lag_ms_meta
-                    )
-                    self._mark_frame_target_failure(video_idx, path.stem)
-                    return None
+                self._log_frame_target_status(path.stem, "failed", "-", 0)
+                self._mark_frame_target_failure(video_idx, path.stem)
+                return None
 
-                target_payload = {
-                    "pitch_roll": ft["pitch_roll"],
-                    "onset_roll": ft["onset_roll"],
-                    "offset_roll": ft["offset_roll"],
-                    "hand_frame": ft["hand_frame"],
-                    "clef_frame": ft["clef_frame"],
-                }
-                sample.update(target_payload)
-                self._frame_target_cache.save(key_hash, key_meta, target_payload)
+            if ft_result.cache_key is not None:
                 self._log_frame_target_status(
-                    path.stem, "built", key_hash, lag_ms_meta
+                    path.stem,
+                    ft_result.status,
+                    ft_result.cache_key,
+                    ft_result.lag_ms,
                 )
+
+            if ft_result.payload is not None:
+                sample.update(ft_result.payload)
+            elif ft_result.status == "missing" and getattr(self, "require_labels", False):
+                self._log_missing_labels_once(path)
+                self._mark_frame_target_failure(video_idx, path.stem)
+                return None
 
         return sample
     def _log_missing_labels_once(self, path: Path) -> None:
@@ -1183,6 +1046,18 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     dataset.label_targets = dcfg.get("label_targets", ["pitch","onset","offset","hand","clef"])
     dataset.require_labels = bool(dcfg.get("require_labels", False))
     dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
+    dataset.frame_target_spec = resolve_frame_target_spec(
+        dataset.frame_targets_cfg,
+        frames=dataset.frames,
+        stride=stride,
+        fps=decode_fps,
+        canonical_hw=dataset.canonical_hw,
+    )
+    dataset.frame_target_summary = (
+        dataset.frame_target_spec.summary()
+        if dataset.frame_target_spec is not None
+        else "targets_conf: disabled"
+    )
     dataset.max_clips = max_clips
     dataset._rebuild_valid_index_cache(log_summary=False)
 
