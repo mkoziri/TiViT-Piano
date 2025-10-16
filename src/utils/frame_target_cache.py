@@ -26,11 +26,24 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple, TypedDict
 
 import torch
 
 LOGGER = logging.getLogger(__name__)
+
+
+class FrameTargetMeta(TypedDict):
+    """Metadata stored alongside cached frame targets."""
+
+    split: str
+    video_id: str
+    lag_ms: int
+    fps: float
+    frames: int
+    tolerance: float
+    dilation: int
+    canonical_hw: Tuple[int, int]
 
 
 def make_frame_target_cache_key(
@@ -43,7 +56,7 @@ def make_frame_target_cache_key(
     tolerance: float,
     dilation: int,
     canonical_hw: Sequence[int],
-) -> Tuple[str, Dict[str, object]]:
+) -> Tuple[str, FrameTargetMeta]:
     """Serialise cache key inputs and return a SHA1 hash plus metadata.
 
     The ``lag_ms`` component is rounded to the nearest millisecond before
@@ -55,7 +68,7 @@ def make_frame_target_cache_key(
     if len(hw_values) < 2:
         raise ValueError("canonical_hw must provide at least (H, W)")
     hw_tuple = (int(hw_values[0]), int(hw_values[1]))
-    key_data: Dict[str, object] = {
+    key_data: FrameTargetMeta = {
         "split": str(split),
         "video_id": str(video_id),
         "lag_ms": int(round(float(lag_ms))),
@@ -108,7 +121,10 @@ class FrameTargetCache:
         return tensors, True
 
     def save(
-        self, key_hash: str, metadata: Mapping[str, object], data: Mapping[str, torch.Tensor]
+        self,
+        key_hash: str,
+        metadata: Mapping[str, object],
+        data: Mapping[str, torch.Tensor],
     ) -> bool:
         """Persist tensors for ``key_hash``; return ``True`` on success."""
 

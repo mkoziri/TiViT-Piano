@@ -31,7 +31,11 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
-from utils.frame_target_cache import FrameTargetCache, make_frame_target_cache_key
+from utils.frame_target_cache import (
+    FrameTargetCache,
+    FrameTargetMeta,
+    make_frame_target_cache_key,
+)
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
 
@@ -1002,7 +1006,7 @@ class OMAPSDataset(Dataset):
             lag_ms_final = (
                 lag_result.lag_ms if lag_result is not None and lag_result.success else 0.0
             )
-            key_hash, key_meta = make_frame_target_cache_key(
+            key_hash, key_meta_raw = make_frame_target_cache_key(
                 split=self.split,
                 video_id=path.stem,
                 lag_ms=lag_ms_final,
@@ -1012,7 +1016,9 @@ class OMAPSDataset(Dataset):
                 dilation=dilation,
                 canonical_hw=self.canonical_hw,
             )
+            key_meta: FrameTargetMeta = key_meta_raw
             cached_targets, _ = self._frame_target_cache.load(key_hash)
+            lag_ms_meta: int = key_meta["lag_ms"]
             required_keys = (
                 "pitch_roll",
                 "onset_roll",
@@ -1023,7 +1029,7 @@ class OMAPSDataset(Dataset):
             if cached_targets is not None and all(k in cached_targets for k in required_keys):
                 sample.update(cached_targets)
                 self._log_frame_target_status(
-                    path.stem, "reused", key_hash, int(key_meta["lag_ms"])
+                    path.stem, "reused", key_hash, lag_ms_meta
                 )
             else:
                 labels_ft = (
@@ -1056,7 +1062,7 @@ class OMAPSDataset(Dataset):
                         exc,
                     )
                     self._log_frame_target_status(
-                        path.stem, "failed", key_hash, int(key_meta["lag_ms"])
+                        path.stem, "failed", key_hash, lag_ms_meta
                     )
                     self._mark_frame_target_failure(video_idx, path.stem)
                     return None
@@ -1071,7 +1077,7 @@ class OMAPSDataset(Dataset):
                 sample.update(target_payload)
                 self._frame_target_cache.save(key_hash, key_meta, target_payload)
                 self._log_frame_target_status(
-                    path.stem, "built", key_hash, int(key_meta["lag_ms"])
+                    path.stem, "built", key_hash, lag_ms_meta
                 )
 
         return sample
