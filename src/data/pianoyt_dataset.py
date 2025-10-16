@@ -775,7 +775,7 @@ class PianoYTDataset(Dataset):
 
         return sample
 
-def _log_missing_labels_once(self, video_path: Path) -> None:
+    def _log_missing_labels_once(self, video_path: Path) -> None:
         name = video_path.name
         if name in self._label_warned:
             return
