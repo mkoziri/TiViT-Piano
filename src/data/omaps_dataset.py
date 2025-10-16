@@ -862,8 +862,8 @@ class OMAPSDataset(Dataset):
         T = self.frames
         fps = self.decode_fps
         hop_seconds = self.stride / max(fps, 1e-6)
-        t0 = frame_to_sec(start_idx, 1.0 / fps)
-        t1 = frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps)
+        t0 = float(frame_to_sec(start_idx, 1.0 / fps))
+        t1 = float(frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps))
 
         sample = {"video": clip, "path": str(path)}  # <- create up-front
         labels_tensor = None                          # <- define up-front
@@ -912,7 +912,7 @@ class OMAPSDataset(Dataset):
         elif labels_tensor is not None:
             # Ensure downstream code receives a tensor even when empty.
             labels_tensor = labels_tensor.clone()
-            
+
         # --- derive clip-level targets from events overlapping [t0, t1) ---
         clip_targets = None
         if labels_tensor is not None and labels_tensor.numel() > 0:

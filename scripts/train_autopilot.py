@@ -340,6 +340,7 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
 FAST_GRID_THRESHOLDS = [0.52, 0.54, 0.56, 0.58, 0.60]
 
 
+
 def run_fast_grid_calibration(
     ckpt: Path,
     log_dir: Path,
@@ -397,25 +398,41 @@ def _coerce_optional_float(value) -> Optional[float]:
     return None
 
 
+def _logit_to_probability(logit: float) -> float:
+    if logit >= 0.0:
+        z = math.exp(-logit)
+        return 1.0 / (1.0 + z)
+    z = math.exp(logit)
+    return z / (1.0 + z)
+
+
+def _clamp_probability(prob: float) -> float:
+    return max(0.0, min(1.0, float(prob)))
+
+
 def _extract_best_probability(
     calibration: Optional[dict], head: str, fallback: Optional[float]
 ) -> Optional[float]:
     entry = calibration.get(head) if isinstance(calibration, dict) else None
     prob_val: Optional[float] = None
     if isinstance(entry, dict):
-        best_prob = _coerce_optional_float(entry.get("best_prob"))
-        if best_prob is not None:
-            prob_val = best_prob
-        else:
+        if "best_prob" in entry:
+            best_prob = _coerce_optional_float(entry.get("best_prob"))
+            if best_prob is not None:
+                prob_val = _clamp_probability(best_prob)
+        if prob_val is None:
             best_logit = _coerce_optional_float(entry.get("best_logit"))
             if best_logit is not None:
-                prob_val = 1.0 / (1.0 + math.exp(-best_logit))
+                prob_val = _clamp_probability(_logit_to_probability(best_logit))
     if prob_val is None:
-        prob_val = fallback
-    if prob_val is None:
-        return None
-    prob_val = max(0.0, min(1.0, float(prob_val)))
-    return prob_val
+        fallback_val = _coerce_optional_float(fallback)
+        if fallback_val is None:
+            return None
+        if 0.0 <= fallback_val <= 1.0:
+            prob_val = fallback_val
+        else:
+            prob_val = _logit_to_probability(fallback_val)
+    return _clamp_probability(prob_val)
 
 
 def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
@@ -604,28 +621,20 @@ def perform_calibration(
     def _parse_prob_from_calib(entry: dict, default: float) -> Tuple[float, Optional[float]]:
         prob_val: Optional[float] = None
         logit_val: Optional[float] = None
-        raw_prob = entry.get("best_prob") if isinstance(entry, dict) else None
-        if isinstance(raw_prob, (int, float)):
-            prob_val = float(raw_prob)
-        elif isinstance(raw_prob, str):
-            try:
-                prob_val = float(raw_prob)
-            except ValueError:
-                prob_val = None
-        if prob_val is None and isinstance(entry, dict):
-            raw_logit = entry.get("best_logit")
-            if isinstance(raw_logit, (int, float)):
-                logit_val = float(raw_logit)
-            elif isinstance(raw_logit, str):
-                try:
-                    logit_val = float(raw_logit)
-                except ValueError:
-                    logit_val = None
-            if logit_val is not None:
-                prob_val = 1.0 / (1.0 + math.exp(-logit_val))
+        if isinstance(entry, dict):
+            if "best_prob" in entry:
+                raw_prob = entry.get("best_prob")
+                prob_val = _coerce_optional_float(raw_prob)
+                if prob_val is not None:
+                    prob_val = _clamp_probability(prob_val)
+            if "best_logit" in entry:
+                raw_logit = entry.get("best_logit")
+                logit_val = _coerce_optional_float(raw_logit)
+                if logit_val is not None and prob_val is None:
+                    prob_val = _logit_to_probability(logit_val)
         if prob_val is None:
             prob_val = default
-        prob_val = max(0.0, min(1.0, float(prob_val)))
+        prob_val = _clamp_probability(prob_val)
         return prob_val, logit_val
     
     def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
