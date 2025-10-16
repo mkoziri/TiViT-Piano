@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
 from utils.frame_target_cache import FrameTargetCache
+from utils.identifiers import canonical_video_id
 from utils.frame_targets import (
     FrameTargetResult,
     FrameTargetSpec,
@@ -91,7 +92,7 @@ def _read_manifest(path: str) -> set:
         for line in f:
             line = line.split('#', 1)[0].strip()
             if line:
-                ids.add(line)
+                ids.add(canonical_video_id(line))
     return ids
 
 def _load_clip_decord(path: Path, frames: int, stride: int,

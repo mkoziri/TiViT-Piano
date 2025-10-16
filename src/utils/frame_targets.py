@@ -287,12 +287,13 @@ def prepare_frame_targets(
     if cached_targets is not None and all(k in cached_targets for k in FRAME_TARGET_KEYS):
         return FrameTargetResult(cached_targets, "reused", key_hash, key_meta, lag_ms_meta, lag_source)
 
+    labels_local: Optional[torch.Tensor]
     if labels is None or labels.numel() == 0:
-        return FrameTargetResult(None, "missing", key_hash, key_meta, lag_ms_meta, lag_source)
-
-    labels_local = labels.clone()
-    if labels_local.numel() > 0:
-        labels_local[:, 0:2] -= float(clip_start)
+        labels_local = None
+    else:
+        labels_local = labels.clone()
+        if labels_local.numel() > 0:
+            labels_local[:, 0:2] -= float(clip_start)
 
     ft = build_dense_frame_targets(
         labels_local,
@@ -311,7 +312,8 @@ def prepare_frame_targets(
 
     cache_payload = {key: ft[key] for key in FRAME_TARGET_KEYS}
     cache.save(key_hash, key_meta, cache_payload)
-    return FrameTargetResult(cache_payload, "built", key_hash, key_meta, lag_ms_meta, lag_source)
+    status = "built" if labels_local is not None and labels_local.numel() > 0 else "empty"
+    return FrameTargetResult(cache_payload, status, key_hash, key_meta, lag_ms_meta, lag_source)
 
 
 __all__ = [

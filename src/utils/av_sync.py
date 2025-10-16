@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .identifiers import canonical_video_id
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -63,13 +65,15 @@ class AVLagCache:
     def get(self, video_id: str) -> Optional[float]:
         self._load()
         assert self._cache is not None
-        value = self._cache.get(video_id)
+        key = canonical_video_id(video_id)
+        value = self._cache.get(key)
         return float(value) if value is not None else None
 
     def set(self, video_id: str, lag_ms: float) -> None:
         self._load()
         assert self._cache is not None
-        self._cache[video_id] = float(lag_ms)
+        key = canonical_video_id(video_id)
+        self._cache[key] = float(lag_ms)
         try:
             with self.cache_path.open("w", encoding="utf-8") as handle:
                 json.dump(self._cache, handle, indent=2, sort_keys=True)
@@ -184,7 +188,8 @@ _HIGH_CONFIDENCE_CORR = 0.35
 
 
 def _get_video_median(video_id: str) -> Optional[float]:
-    history = _VIDEO_LAG_HISTORY.get(video_id)
+    key = canonical_video_id(video_id)
+    history = _VIDEO_LAG_HISTORY.get(key)
     if not history:
         return None
     return float(median(history))
@@ -193,7 +198,8 @@ def _get_video_median(video_id: str) -> Optional[float]:
 def _record_video_lag(video_id: str, lag_ms: float) -> None:
     if not math.isfinite(lag_ms):
         return
-    history = _VIDEO_LAG_HISTORY.setdefault(video_id, [])
+    key = canonical_video_id(video_id)
+    history = _VIDEO_LAG_HISTORY.setdefault(key, [])
     history.append(float(lag_ms))
 
 
@@ -220,6 +226,7 @@ def _apply_guardrails(video_id: str,
                       corr: float,
                       from_cache: bool,
                       hit_bound: bool) -> AVLagResult:
+    video_id = canonical_video_id(video_id)
     used_video_median = False
     low_corr_zero = False
     clamped = False
@@ -281,6 +288,7 @@ def estimate_av_lag(video_id: str,
                     hop_seconds: float,
                     cache: Optional[AVLagCache] = None,
                     max_lag_ms: float = 500.0) -> AVLagResult:
+    video_id = canonical_video_id(video_id)
     T = int(frames.shape[0]) if frames is not None else 0
     video_env = _motion_envelope(frames)
     audio_env = _label_envelope(labels, clip_start, clip_end, hop_seconds, T)

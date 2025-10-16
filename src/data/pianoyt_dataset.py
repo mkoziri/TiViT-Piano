@@ -25,6 +25,7 @@ import math
 import os
 import warnings
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 try:
     from typing import TypedDict
@@ -36,11 +37,13 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
+from utils.identifiers import canonical_video_id
 from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
     FrameTargetResult,
     FrameTargetSpec,
     prepare_frame_targets,
+    resolve_lag_ms,
     resolve_frame_target_spec,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
@@ -60,6 +63,26 @@ class SampleRecord(TypedDict):
     id: str
     video: Path
     midi: Optional[Path]
+
+
+@dataclass(frozen=True)
+class WindowEntry:
+    record_idx: int
+    start_idx: Optional[int]
+    has_events: bool = True
+
+
+@dataclass
+class SampleBuildResult:
+    sample: Optional[Dict[str, Any]]
+    status: str
+    lag_ms: Optional[int]
+    lag_source: str
+    events_on: int
+    events_off: int
+    has_events: bool
+    start_idx: int
+    video_id: str
 
 
 def _safe_expanduser(path: Union[str, Path]) -> Path:
@@ -106,8 +129,15 @@ def _read_split_ids(root: Path, split: str) -> List[str]:
             for line in handle:
                 line = line.strip()
                 if line:
-                    ids.append(line)
-        return ids
+                    ids.append(canonical_video_id(line))
+        # preserve ordering but drop duplicates introduced by canonicalisation
+        seen = set()
+        ordered = []
+        for vid in ids:
+            if vid not in seen:
+                ordered.append(vid)
+                seen.add(vid)
+        return ordered
 
     split_dir = root / split
     if not split_dir.exists():
@@ -127,11 +157,11 @@ def _read_split_ids(root: Path, split: str) -> List[str]:
     for video_path in split_dir.glob("video_*.0*"):
         vid = _extract_id(video_path.name, "video_")
         if vid:
-            ids_set.add(vid)
+            ids_set.add(canonical_video_id(f"video_{vid}"))
     for midi_path in split_dir.glob("audio_*.0.midi"):
         vid = _extract_id(midi_path.name, "audio_")
         if vid:
-            ids_set.add(vid)
+            ids_set.add(canonical_video_id(f"video_{vid}"))
 
     if not ids_set:
         raise FileNotFoundError(
@@ -240,7 +270,8 @@ def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
                         return
                 except (TypeError, ValueError):
                     return
-                table[vid] = (values[0], values[1], values[2], values[3])
+                canon = canonical_video_id(vid)
+                table[canon] = (values[0], values[1], values[2], values[3])
 
             for raw_row in reader:
                 parse_with_header(raw_row)
@@ -259,7 +290,8 @@ def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
                     max_x = int(float(row[6]))
                 except (TypeError, ValueError):
                     return
-                table[vid] = (min_y, max_y, min_x, max_x)
+                canon = canonical_video_id(vid)
+                table[canon] = (min_y, max_y, min_x, max_x)
 
             parse_headerless_row(first_row)
             for raw_row in reader:
@@ -267,9 +299,23 @@ def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
     return table
 
 
+def _media_token_from_id(video_id: str) -> str:
+    canon = canonical_video_id(video_id)
+    if canon.startswith("video_"):
+        token = canon[6:]
+    elif canon.startswith("video"):
+        token = canon[5:]
+    else:
+        token = canon
+    token = token.strip("_")
+    return token or canon
+
+
 def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optional[Path], Optional[Path]]:
     """Find the video and MIDI paths for ``video_id`` within ``split``."""
 
+    canon_id = canonical_video_id(video_id)
+    token = _media_token_from_id(canon_id)
     search_dirs: List[Path] = []
     split_dir = root / split
     if split_dir.exists():
@@ -282,10 +328,10 @@ def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optiona
         search_dirs.append(split_dir)
 
     for base in search_dirs:
-        midi = base / f"audio_{video_id}.0.midi"
+        midi = base / f"audio_{token}.0.midi"
         video = None
         for ext in _VIDEO_EXTS:
-            cand = base / f"video_{video_id}.0{ext}"
+            cand = base / f"video_{token}.0{ext}"
             if cand.exists():
                 video = cand
                 break
@@ -303,7 +349,7 @@ def _read_excluded(root: Path, path: Optional[str]) -> set:
         for line in handle:
             line = line.strip()
             if line:
-                ids.add(line)
+                ids.add(canonical_video_id(line))
     return ids
 
 
@@ -418,19 +464,31 @@ class PianoYTDataset(Dataset):
             )
         )
         self.require_labels: bool = bool(self.dataset_cfg.get("require_labels", False))
-        self.frame_targets_cfg: Dict[str, Any] = {}
+        self.frame_targets_cfg: Dict[str, Any] = dict(
+            self.dataset_cfg.get("frame_targets", {}) or {}
+        )
         self.max_clips: Optional[int] = None
 
         self._av_sync_cache = AVLagCache()
         self._av_sync_warned = False
-        self._valid_indices: List[int] = []
+        self._valid_entries: List[WindowEntry] = []
         self._label_warned: set = set()
         self._num_windows: int = 0
         self._frame_target_cache = FrameTargetCache()
         self._frame_target_log_once: set[str] = set()
         self._frame_target_failures: set[str] = set()
-        self.frame_target_spec: Optional[FrameTargetSpec] = None
-        self.frame_target_summary: Optional[str] = None
+        self.frame_target_spec: Optional[FrameTargetSpec] = resolve_frame_target_spec(
+            self.frame_targets_cfg,
+            frames=self.frames,
+            stride=self.stride,
+            fps=self.decode_fps,
+            canonical_hw=self.canonical_hw,
+        )
+        self.frame_target_summary: Optional[str] = (
+            self.frame_target_spec.summary()
+            if self.frame_target_spec is not None
+            else "targets_conf: disabled"
+        )
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -497,10 +555,12 @@ class PianoYTDataset(Dataset):
         self.metadata = _load_metadata(self.root)
         self.samples: List[SampleRecord] = []
         for vid in ids:
-            video_path, midi_path = _resolve_media_paths(self.root, split, vid)
+            canon = canonical_video_id(vid)
+            video_path, midi_path = _resolve_media_paths(self.root, split, canon)
             if video_path is None:
+                LOGGER.warning("[PianoYT] Missing video file for id=%s", canon)
                 continue
-            self.samples.append({"id": vid, "video": video_path, "midi": midi_path})
+            self.samples.append({"id": canon, "video": video_path, "midi": midi_path})
 
         # --- Robustness: drop unreadable/corrupt videos up-front ---
         try:
@@ -554,29 +614,33 @@ class PianoYTDataset(Dataset):
         self._rebuild_valid_index_cache(log_summary=False)
 
     def __len__(self) -> int:
-        return len(self._valid_indices)
+        return len(self._valid_entries)
 
     def __getitem__(self, idx: int):
-        if not self._valid_indices:
+        if not self._valid_entries:
+            if self.split == "val":
+                raise RuntimeError(
+                    "Val split has 0 valid videos after audit; check labels/lag or widen search."
+                )
             raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
 
-        logical_idx = idx % len(self._valid_indices)
-        record_idx = self._valid_indices[logical_idx]
-        sample = self._load_sample_for_index(record_idx, idx)
-        if sample is not None:
-            return sample
+        if idx < 0 or idx >= len(self._valid_entries):
+            raise IndexError(idx)
 
-        if not self._valid_indices:
-            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
+        entry = self._valid_entries[idx]
+        result = self._build_sample(
+            entry.record_idx,
+            dataset_index=idx,
+            preferred_start_idx=entry.start_idx,
+            audit=False,
+        )
+        if result.sample is None:
+            raise RuntimeError(
+                f"PianoYTDataset: unable to fetch sample for {result.video_id} ({result.status})"
+            )
+        return result.sample
 
-        logical_idx = idx % len(self._valid_indices)
-        record_idx = self._valid_indices[logical_idx]
-        sample = self._load_sample_for_index(record_idx, idx)
-        if sample is None:
-            raise RuntimeError("PianoYTDataset: unable to fetch a valid sample after filtering.")
-        return sample
-
-    def _load_sample_for_index(
+    def _build_sample(
         self,
         record_idx: int,
         dataset_index: int,
@@ -586,9 +650,25 @@ class PianoYTDataset(Dataset):
         record = self.samples[record_idx]
         video_path = record["video"]
         midi_path = record["midi"]
-        video_id = record["id"]
+        video_id = canonical_video_id(record["id"])
+        start_hint = int(preferred_start_idx or 0)
 
-        is_train = self.split == "train" and preferred_start_idx is None
+        if video_path is None or not video_path.exists():
+            if not audit:
+                self._invalidate_sample_index(record_idx)
+            return SampleBuildResult(None, "no_file", None, "", 0, 0, False, start_hint, video_id)
+
+        if midi_path is None or not midi_path.exists():
+            self._log_missing_labels_once(video_path)
+            if not audit:
+                self._invalidate_sample_index(record_idx)
+            return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_hint, video_id)
+
+        labels_tensor = _read_midi_events(midi_path)
+        if labels_tensor is None:
+            labels_tensor = torch.zeros((0, 3), dtype=torch.float32)
+
+        is_train = self.split == "train" and preferred_start_idx is None and not audit
         clip, start_idx = _load_clip_with_random_start(
             path=video_path,
             frames=self.frames,
@@ -642,47 +722,38 @@ class PianoYTDataset(Dataset):
         t0: float = float(frame_to_sec(start_idx, 1.0 / fps))
         t1: float = float(frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps))
 
-        sample = {"video": clip, "path": str(video_path)}
+        sample: Dict[str, Any] = {"video": clip, "path": str(video_path)}
 
-        labels_tensor: Optional[torch.Tensor] = None
-        if midi_path is not None and midi_path.exists():
-            labels_tensor = _read_midi_events(midi_path)
-        else:
-            self._log_missing_labels_once(video_path)
-            self._invalidate_sample_index(record_idx)
-            return None
+        lag_result = None
+        if labels_tensor.numel() > 0:
+            lag_result = estimate_av_lag(
+                video_id=video_id,
+                frames=clip,
+                labels=labels_tensor,
+                clip_start=t0,
+                clip_end=t1,
+                hop_seconds=hop_seconds,
+                cache=self._av_sync_cache,
+            )
 
-        if labels_tensor is None or labels_tensor.numel() == 0:
-            self._log_missing_labels_once(video_path)
-            self._invalidate_sample_index(record_idx)
-            self._invalidate_sample_index(record_idx)
-            return None
-
-        lag_result = estimate_av_lag(
-            video_id=video_id,
-            frames=clip,
-            labels=labels_tensor,
-            clip_start=t0,
-            clip_end=t1,
-            hop_seconds=hop_seconds,
-            cache=self._av_sync_cache,
-        ) if labels_tensor.numel() > 0 else None
+        shifted_labels = labels_tensor
 
         if lag_result is not None:
             if not lag_result.success and not self._av_sync_warned:
                 LOGGER.warning(
-                    "Unable to compute A/V lag for clip %s; using lag=0", video_id
+                    "Unable to compute A/V lag for clip %s; using lag=0",
+                    video_id,
                 )
                 self._av_sync_warned = True
-            lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
-            labels_tensor = shift_label_events(
+            lag_seconds = (lag_result.lag_frames * hop_seconds) if getattr(lag_result, "success", False) else 0.0
+            shifted_labels = shift_label_events(
                 labels_tensor,
                 lag_seconds,
                 clip_start=t0,
                 clip_end=t1,
             )
-            lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
-            corr_val = lag_result.corr if lag_result.success else float("nan")
+            lag_ms_display = lag_result.lag_ms if getattr(lag_result, "success", False) else 0.0
+            corr_val = lag_result.corr if getattr(lag_result, "success", False) else float("nan")
             corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
             flags = []
             if lag_result.used_video_median:
@@ -702,15 +773,22 @@ class PianoYTDataset(Dataset):
                 T,
                 flags_str,
             )
+        else:
+            shifted_labels = shifted_labels.reshape(0, 3)
 
-        if labels_tensor is not None and labels_tensor.numel() > 0:
-            sample["labels"] = labels_tensor
-        
+        has_events = shifted_labels.numel() > 0
+        sample["labels"] = shifted_labels
+
+        if not has_events and self.require_labels and self.split == "train" and not audit:
+            self._log_missing_labels_once(video_path)
+            self._invalidate_sample_index(record_idx)
+            return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
+
         clip_targets: Optional[Dict[str, torch.Tensor]] = None
-        if labels_tensor is not None and labels_tensor.numel() > 0:
-            onset = labels_tensor[:, 0]
-            offset = labels_tensor[:, 1]
-            pitch = labels_tensor[:, 2].to(torch.int64)
+        if has_events:
+            onset = shifted_labels[:, 0]
+            offset = shifted_labels[:, 1]
+            pitch = shifted_labels[:, 2].to(torch.int64)
 
             mask = (onset < t1) & (offset > t0)
             sel_pitches = pitch[mask]
@@ -753,15 +831,19 @@ class PianoYTDataset(Dataset):
 
         if clip_targets is not None:
             sample.update(clip_targets)
-        elif getattr(self, "require_labels", False):
+        elif self.require_labels and self.split == "train" and not audit:
             self._log_missing_labels_once(video_path)
-            return None
+            self._invalidate_sample_index(record_idx)
+            return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
+
+        lag_ms_value, lag_source = resolve_lag_ms(lag_result)
+        lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
 
         spec = getattr(self, "frame_target_spec", None)
         if spec is not None:
             try:
                 ft_result: FrameTargetResult = prepare_frame_targets(
-                    labels=labels_tensor,
+                    labels=shifted_labels,
                     lag_result=lag_result,
                     spec=spec,
                     cache=self._frame_target_cache,
@@ -775,11 +857,12 @@ class PianoYTDataset(Dataset):
                     video_id,
                     exc,
                 )
-                self._log_frame_target_status(video_id, "failed", "-", 0)
-                self._mark_frame_target_failure(record_idx, video_id)
-                return None
+                if not audit:
+                    self._log_frame_target_status(video_id, "failed", "-", 0)
+                    self._mark_frame_target_failure(record_idx, video_id)
+                return SampleBuildResult(None, "build_fail", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
 
-            if ft_result.cache_key is not None:
+            if ft_result.cache_key is not None and not audit:
                 self._log_frame_target_status(
                     video_id,
                     ft_result.status,
@@ -789,13 +872,33 @@ class PianoYTDataset(Dataset):
 
             if ft_result.payload is not None:
                 sample.update(ft_result.payload)
-            elif ft_result.status == "missing" and getattr(self, "require_labels", False):
+            elif self.require_labels and self.split == "train" and not audit:
                 self._log_missing_labels_once(video_path)
                 self._mark_frame_target_failure(record_idx, video_id)
-                return None
-            
+                return SampleBuildResult(None, "build_fail", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
 
-        return sample
+            lag_ms_int = ft_result.lag_ms
+            lag_source = ft_result.lag_source
+
+        events_on = int(((shifted_labels[:, 0] >= t0) & (shifted_labels[:, 0] < t1)).sum().item()) if has_events else 0
+        events_off = int(((shifted_labels[:, 1] > t0) & (shifted_labels[:, 1] <= t1)).sum().item()) if has_events else 0
+
+        return SampleBuildResult(sample, "ok", lag_ms_int, lag_source, events_on, events_off, has_events, start_idx, video_id)
+
+    def _load_sample_for_index(
+        self,
+        record_idx: int,
+        dataset_index: int,
+        *,
+        preferred_start_idx: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        result = self._build_sample(
+            record_idx,
+            dataset_index,
+            preferred_start_idx=preferred_start_idx,
+            audit=False,
+        )
+        return result.sample
 
     def _log_missing_labels_once(self, video_path: Path) -> None:
         name = video_path.name
@@ -827,8 +930,10 @@ class PianoYTDataset(Dataset):
     def _invalidate_sample_index(self, record_idx: int) -> None:
         if record_idx >= len(self.samples):
             return
-        self._valid_indices = [i for i in self._valid_indices if i != record_idx]
-        self._num_windows = len(self._valid_indices)
+        self._valid_entries = [
+            entry for entry in self._valid_entries if entry.record_idx != record_idx
+        ]
+        self._num_windows = len(self._valid_entries)
 
     def _candidate_start_indices(self, labels_tensor: Optional[torch.Tensor]) -> List[int]:
         if labels_tensor is None or labels_tensor.numel() == 0:
@@ -870,10 +975,11 @@ class PianoYTDataset(Dataset):
         start_indices = self._candidate_start_indices(labels_tensor)
         for start_idx in start_indices:
             try:
-                sample = self._load_sample_for_index(
+                result = self._build_sample(
                     record_idx,
                     dataset_index=0,
                     preferred_start_idx=start_idx,
+                    audit=True,
                 )
             except Exception as exc:  # pragma: no cover - defensive path
                 LOGGER.warning(
@@ -882,25 +988,125 @@ class PianoYTDataset(Dataset):
                     start_idx,
                     exc,
                 )
-                sample = None
-            if sample is not None:
+                result = SampleBuildResult(None, "error", None, "", 0, 0, False, start_idx, record.get("id", ""))
+            if result.sample is not None and result.has_events:
                 return True
 
         if video_path is not None:
             self._log_missing_labels_once(video_path)
         return False
     
+    def _plan_eval_entries(
+        self, record_idx: int
+    ) -> Tuple[List[WindowEntry], str, int, int, Optional[int]]:
+        record = self.samples[record_idx]
+        video_path = record.get("video")
+        midi_path = record.get("midi")
+        video_id = record.get("id", "")
+
+        if video_path is None or not video_path.exists():
+            return [], "no_file", 0, 0, None
+
+        if midi_path is None or not midi_path.exists():
+            self._log_missing_labels_once(video_path)
+            return [], "no_labels", 0, 0, None
+
+        labels_tensor = _read_midi_events(midi_path)
+        if labels_tensor is None:
+            labels_tensor = torch.zeros((0, 3), dtype=torch.float32)
+
+        start_indices = self._candidate_start_indices(labels_tensor)
+        seen: set[int] = set()
+        event_entries: List[Tuple[WindowEntry, SampleBuildResult]] = []
+        neg_entries: List[Tuple[WindowEntry, SampleBuildResult]] = []
+        lag_ms_value: Optional[int] = None
+
+        for start_idx in start_indices:
+            if start_idx in seen:
+                continue
+            seen.add(start_idx)
+            try:
+                result = self._build_sample(
+                    record_idx,
+                    dataset_index=0,
+                    preferred_start_idx=start_idx,
+                    audit=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive path
+                LOGGER.warning(
+                    "Failed to audit clip %s at start_idx=%d (%s)",
+                    video_id,
+                    start_idx,
+                    exc,
+                )
+                continue
+
+            if result.sample is None:
+                continue
+
+            if lag_ms_value is None and result.lag_ms is not None:
+                lag_ms_value = result.lag_ms
+
+            entry = WindowEntry(record_idx=record_idx, start_idx=result.start_idx, has_events=result.has_events)
+            if result.has_events:
+                event_entries.append((entry, result))
+            else:
+                neg_entries.append((entry, result))
+
+        if not event_entries and not neg_entries:
+            return [], "build_fail", 0, 0, lag_ms_value
+
+        entries: List[WindowEntry] = []
+        events_on_total = 0
+        events_off_total = 0
+
+        for entry, res in event_entries:
+            entries.append(entry)
+            events_on_total += res.events_on
+            events_off_total += res.events_off
+
+        if event_entries:
+            allowed_neg = min(len(neg_entries), len(event_entries))
+        else:
+            allowed_neg = min(len(neg_entries), 1)
+
+        for entry, res in neg_entries[:allowed_neg]:
+            entries.append(WindowEntry(entry.record_idx, entry.start_idx, res.has_events))
+            events_on_total += res.events_on
+            events_off_total += res.events_off
+
+        status = "ok" if entries else "build_fail"
+        return entries, status, events_on_total, events_off_total, lag_ms_value
+
     def _rebuild_valid_index_cache(self, *, log_summary: bool) -> None:
-        self._valid_indices = []
+        self._valid_entries = []
         total = len(self.samples)
         skipped = 0
-        for idx, record in enumerate(self.samples):
-            if self._record_has_valid_window(idx):
-                self._valid_indices.append(idx)
-            else:
-                skipped += 1
+        if self.split == "train":
+            for idx in range(total):
+                if self._record_has_valid_window(idx):
+                    self._valid_entries.append(WindowEntry(idx, None, True))
+                else:
+                    skipped += 1
+        else:
+            for idx, record in enumerate(self.samples):
+                entries, status, events_on, events_off, lag_ms = self._plan_eval_entries(idx)
+                if self.split == "val":
+                    lag_display = lag_ms if lag_ms is not None else "?"
+                    LOGGER.info(
+                        "val_audit | vid=%s lag_ms=%s events_on=%d events_off=%d status=%s",
+                        record.get("id", ""),
+                        lag_display,
+                        events_on,
+                        events_off,
+                        status,
+                    )
+                if status == "ok" and entries:
+                    self._valid_entries.extend(entries)
+                else:
+                    skipped += 1
 
-        self._num_windows = len(self._valid_indices)
+        self._num_windows = len(self._valid_entries)
         if log_summary:
             LOGGER.info(
                 "videos: %d, N_skipped_no_labels: %d, windows: %d",
@@ -958,6 +1164,18 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     dataset.label_targets = dcfg.get("label_targets", ["pitch", "onset", "offset", "hand", "clef"])
     dataset.require_labels = bool(dcfg.get("require_labels", False))
     dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
+    dataset.frame_target_spec = resolve_frame_target_spec(
+        dataset.frame_targets_cfg,
+        frames=dataset.frames,
+        stride=stride,
+        fps=decode_fps,
+        canonical_hw=dataset.canonical_hw,
+    )
+    dataset.frame_target_summary = (
+        dataset.frame_target_spec.summary()
+        if dataset.frame_target_spec is not None
+        else "targets_conf: disabled"
+    )
     dataset._rebuild_valid_index_cache(log_summary=False)
 
     def _collate(batch):
