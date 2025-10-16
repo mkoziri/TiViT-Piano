@@ -37,6 +37,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
+from utils.frame_target_cache import FrameTargetCache, make_frame_target_cache_key
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
 
@@ -421,6 +422,9 @@ class PianoYTDataset(Dataset):
         self._valid_indices: List[int] = []
         self._label_warned: set = set()
         self._num_windows: int = 0
+        self._frame_target_cache = FrameTargetCache()
+        self._frame_target_log_once: set[str] = set()
+        self._frame_target_failures: set[str] = set()
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -746,32 +750,77 @@ class PianoYTDataset(Dataset):
             and ft_cfg
             and bool(ft_cfg.get("enable", False))
         ):
-            labels_ft = labels_tensor.clone()
-            labels_ft[:, 0:2] -= t0
-
-            ft = _build_frame_targets(
-                labels=labels_ft,
-                T=T,
-                stride=self.stride,
-                fps=fps,
-                note_min=int(ft_cfg.get("note_min", 21)),
-                note_max=int(ft_cfg.get("note_max", 108)),
-                tol=float(ft_cfg.get("tolerance", 0.025)),
-                fill_mode=str(ft_cfg.get("fill_mode", "overlap")),
-                hand_from_pitch=bool(ft_cfg.get("hand_from_pitch", True)),
-                clef_thresholds=tuple(ft_cfg.get("clef_thresholds", [60, 64])),
-                dilate_active_frames=int(ft_cfg.get("dilate_active_frames", 0)),
-                targets_sparse=bool(ft_cfg.get("targets_sparse", False)),
+            tolerance = float(ft_cfg.get("tolerance", 0.025))
+            dilation = int(ft_cfg.get("dilate_active_frames", 0))
+            lag_ms_final = (
+                lag_result.lag_ms if lag_result is not None and lag_result.success else 0.0
             )
-            sample.update(
-                {
+            key_hash, key_meta = make_frame_target_cache_key(
+                split=self.split,
+                video_id=video_id,
+                lag_ms=lag_ms_final,
+                fps=fps,
+                frames=T,
+                tolerance=tolerance,
+                dilation=dilation,
+                canonical_hw=self.canonical_hw,
+            )
+            cached_targets, _ = self._frame_target_cache.load(key_hash)
+            required_keys = (
+                "pitch_roll",
+                "onset_roll",
+                "offset_roll",
+                "hand_frame",
+                "clef_frame",
+            )
+            if cached_targets is not None and all(k in cached_targets for k in required_keys):
+                sample.update(cached_targets)
+                self._log_frame_target_status(
+                    video_id, "reused", key_hash, int(key_meta["lag_ms"])
+                )
+            else:
+                labels_ft = labels_tensor.clone()
+                labels_ft[:, 0:2] -= t0
+                try:
+                    ft = _build_frame_targets(
+                        labels=labels_ft,
+                        T=T,
+                        stride=self.stride,
+                        fps=fps,
+                        note_min=int(ft_cfg.get("note_min", 21)),
+                        note_max=int(ft_cfg.get("note_max", 108)),
+                        tol=tolerance,
+                        fill_mode=str(ft_cfg.get("fill_mode", "overlap")),
+                        hand_from_pitch=bool(ft_cfg.get("hand_from_pitch", True)),
+                        clef_thresholds=tuple(ft_cfg.get("clef_thresholds", [60, 64])),
+                        dilate_active_frames=dilation,
+                        targets_sparse=bool(ft_cfg.get("targets_sparse", False)),
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning(
+                        "Failed to build frame targets for %s (key=%s): %s",
+                        video_id,
+                        key_hash,
+                        exc,
+                    )
+                    self._log_frame_target_status(
+                        video_id, "failed", key_hash, int(key_meta["lag_ms"])
+                    )
+                    self._mark_frame_target_failure(record_idx, video_id)
+                    return None
+
+                target_payload = {
                     "pitch_roll": ft["pitch_roll"],
                     "onset_roll": ft["onset_roll"],
                     "offset_roll": ft["offset_roll"],
                     "hand_frame": ft["hand_frame"],
                     "clef_frame": ft["clef_frame"],
                 }
-            )
+                sample.update(target_payload)
+                self._frame_target_cache.save(key_hash, key_meta, target_payload)
+                self._log_frame_target_status(
+                    video_id, "built", key_hash, int(key_meta["lag_ms"])
+                )
 
         return sample
 
@@ -782,6 +831,26 @@ class PianoYTDataset(Dataset):
         self._label_warned.add(name)
         LOGGER.warning("skip_no_labels %s", name)
 
+    def _log_frame_target_status(
+        self, video_id: str, status: str, key_hash: str, lag_ms: int
+    ) -> None:
+        if video_id in self._frame_target_log_once:
+            return
+        self._frame_target_log_once.add(video_id)
+        LOGGER.info(
+            "targets: %s key=%s lag_ms=%+d video=%s",
+            status,
+            key_hash,
+            lag_ms,
+            video_id,
+        )
+
+    def _mark_frame_target_failure(self, record_idx: int, video_id: str) -> None:
+        if video_id in self._frame_target_failures:
+            return
+        self._frame_target_failures.add(video_id)
+        self._invalidate_sample_index(record_idx)
+    
     def _invalidate_sample_index(self, record_idx: int) -> None:
         if record_idx >= len(self.samples):
             return
