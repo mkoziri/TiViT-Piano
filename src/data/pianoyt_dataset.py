@@ -477,6 +477,16 @@ class PianoYTDataset(Dataset):
         self._frame_target_cache = FrameTargetCache()
         self._frame_target_log_once: set[str] = set()
         self._frame_target_failures: set[str] = set()
+
+        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
+        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
+            self.canonical_hw = (
+                int(round(float(canonical_cfg[0]))),
+                int(round(float(canonical_cfg[1]))),
+            )
+        else:
+            self.canonical_hw = tuple(self.resize)
+
         self.frame_target_spec: Optional[FrameTargetSpec] = resolve_frame_target_spec(
             self.frame_targets_cfg,
             frames=self.frames,
@@ -494,15 +504,6 @@ class PianoYTDataset(Dataset):
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
-
-        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
-        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
-            self.canonical_hw = (
-                int(round(float(canonical_cfg[0]))),
-                int(round(float(canonical_cfg[1]))),
-            )
-        else:
-            self.canonical_hw = tuple(self.resize)
 
         global_aug_cfg = self.dataset_cfg.get("global_aug")
         if not isinstance(global_aug_cfg, dict):
