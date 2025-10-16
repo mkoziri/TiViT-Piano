@@ -38,6 +38,7 @@ from utils.frame_targets import (
     FrameTargetSpec,
     prepare_frame_targets,
     resolve_frame_target_spec,
+    resolve_lag_ms,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
@@ -862,6 +863,9 @@ class OMAPSDataset(Dataset):
         if labels_tensor is not None and labels_tensor.numel() > 0:
             sample["labels"] = labels_tensor
 
+        lag_ms_value, lag_source = resolve_lag_ms(lag_result)
+        lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
+
         clip_targets = None
         if labels_tensor is not None and labels_tensor.numel() > 0:
             onset = labels_tensor[:, 0]
@@ -949,8 +953,13 @@ class OMAPSDataset(Dataset):
                 self._log_missing_labels_once(path)
                 self._mark_frame_target_failure(video_idx, path.stem)
                 return None
+            lag_ms_int = ft_result.lag_ms
+            lag_source = ft_result.lag_source
 
+        sample["lag_ms"] = lag_ms_int
+        sample["lag_source"] = lag_source
         return sample
+
     def _log_missing_labels_once(self, path: Path) -> None:
         name = path.name
         if name in self._label_warned:
@@ -1101,5 +1110,3 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         collate_fn=_collate,
     )
     return loader
-
-

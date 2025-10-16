@@ -884,6 +884,8 @@ class PianoYTDataset(Dataset):
 
         events_on = int(((shifted_labels[:, 0] >= t0) & (shifted_labels[:, 0] < t1)).sum().item()) if has_events else 0
         events_off = int(((shifted_labels[:, 1] > t0) & (shifted_labels[:, 1] <= t1)).sum().item()) if has_events else 0
+        sample["lag_ms"] = lag_ms_int
+        sample["lag_source"] = lag_source
 
         return SampleBuildResult(sample, "ok", lag_ms_int, lag_source, events_on, events_off, has_events, start_idx, video_id)
 

@@ -17,7 +17,8 @@ CLI:
     dataset split, and ``--dump_logits`` to save logits to NPZ.
 """
 
-import sys, json, time, torch
+import sys, json, time, math, torch
+from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
@@ -192,6 +193,7 @@ def main():
     import argparse
 
     argv = sys.argv[1:]
+    t_main_start = time.time()
     try:
         logit_thrs = _parse_list(argv, "thresholds")
         prob_thrs = _parse_list(argv, "prob_thresholds")
@@ -345,8 +347,10 @@ def main():
 
         atexit.register(log_handle.close)
 
-    def _log_progress(msg: str) -> None:
-        print(msg, flush=True)
+    def _log_progress(msg: str, *, force: bool = False) -> None:
+        should_print = force or bool(args.progress)
+        if should_print:
+            print(msg, flush=True)
         if log_handle is not None:
             log_handle.write(msg + "\n")
             log_handle.flush()
@@ -356,7 +360,99 @@ def main():
         minutes, secs = divmod(int(seconds), 60)
         return f"{minutes:02d}:{secs:02d}"
     
+    stage_durations = {}
+    BAD_CLIP_RETRY_LIMIT = 3
+    bad_clip_counts = Counter()
+    skip_paths = set()
+    lag_ms_samples = []
+    lag_source_counter = Counter()
+    skipped_batches = 0
 
+    def _extract_lag_values(value):
+        vals = []
+        if value is None:
+            return vals
+        if torch.is_tensor(value):
+            flat = value.detach().cpu().reshape(-1).tolist()
+            for item in flat:
+                try:
+                    fval = float(item)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(fval):
+                    vals.append(fval)
+            return vals
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                vals.extend(_extract_lag_values(item))
+            return vals
+        try:
+            fval = float(value)
+        except (TypeError, ValueError):
+            return vals
+        if math.isfinite(fval):
+            vals.append(fval)
+        return vals
+
+    def _extract_lag_sources(value):
+        sources = []
+        if value is None:
+            return sources
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item:
+                    sources.append(item)
+        elif isinstance(value, str) and value:
+            sources.append(value)
+        return sources
+
+    def _filter_batch(batch, keep_indices):
+        if not keep_indices:
+            return None
+        paths_field = batch.get("path")
+        total = len(paths_field) if isinstance(paths_field, list) else None
+        filtered = {}
+        for key, value in batch.items():
+            if key == "path" and isinstance(paths_field, list):
+                filtered[key] = [paths_field[i] for i in keep_indices]
+                continue
+            if total is not None:
+                if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == total:
+                    idx_tensor = torch.as_tensor(keep_indices, dtype=torch.long, device=value.device)
+                    filtered[key] = value.index_select(0, idx_tensor)
+                    continue
+                if isinstance(value, list) and len(value) == total:
+                    filtered[key] = [value[i] for i in keep_indices]
+                    continue
+                if isinstance(value, tuple) and len(value) == total:
+                    filtered[key] = [value[i] for i in keep_indices]
+                    continue
+            filtered[key] = value
+        return filtered
+
+    def _handle_bad_batch(paths, exc):
+        nonlocal skipped_batches
+        skipped_batches += 1
+        safe_paths = [str(p) for p in (paths or []) if p]
+        if safe_paths:
+            first = Path(safe_paths[0]).name
+            extra = len(safe_paths) - 1
+            clip_desc = f"{first}+{extra} more" if extra > 0 else first
+        else:
+            clip_desc = "<unknown>"
+        err_type = type(exc).__name__
+        _log_progress(
+            f"[warn] batch failed ({err_type}): clip={clip_desc} error={exc}",
+            force=True,
+        )
+        for path in set(safe_paths):
+            bad_clip_counts[path] += 1
+            if bad_clip_counts[path] >= BAD_CLIP_RETRY_LIMIT and path not in skip_paths:
+                skip_paths.add(path)
+                _log_progress(
+                    f"[progress] marked clip as bad after {BAD_CLIP_RETRY_LIMIT} failures: {Path(path).name}",
+                    force=True,
+                )
     # Unless a calibration file is provided and no head is specified, default to
     # sweeping over probability thresholds when none were specified explicitly.
     if args.thresholds is None and args.prob_thresholds is None:
@@ -394,20 +490,40 @@ def main():
         k_candidates = [default_k_onset]
 
     # build loader
+    t_dataset_build0 = time.time()
     val_loader = make_dataloader(cfg, split=split)
     if isinstance(val_loader, dict):
         val_loader = val_loader.get(split, next(iter(val_loader.values())))
     if isinstance(val_loader, (list, tuple)):
         val_loader = val_loader[0]
 
+    dataset = getattr(val_loader, "dataset", None)
+    dataset_elapsed = time.time() - t_dataset_build0
+    stage_durations["dataset_init"] = dataset_elapsed
+    dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
+    dataset_count = "?"
+    if dataset is not None:
+        try:
+            dataset_count = str(len(dataset))
+        except TypeError:
+            dataset_count = "?"
+    batch_size_val = getattr(val_loader, "batch_size", None)
+    batch_display = str(batch_size_val) if batch_size_val is not None else "?"
+    _log_progress(
+        f"[progress] dataset ready in {_format_seconds(dataset_elapsed)} ({dataset_elapsed:.2f}s) "
+        f"backend={dataset_name} len={dataset_count} batch={batch_display}",
+        force=True,
+    )
+    frame_summary = getattr(dataset, "frame_target_summary", None)
+    if frame_summary:
+        _log_progress(f"[progress] {frame_summary}", force=True)
+
     num_clips_est = args.max_clips
-    if num_clips_est is None:
-        dataset = getattr(val_loader, "dataset", None)
-        if dataset is not None:
-            try:
-                num_clips_est = len(dataset)
-            except TypeError:
-                num_clips_est = None
+    if num_clips_est is None and dataset is not None:
+        try:
+            num_clips_est = len(dataset)
+        except TypeError:
+            num_clips_est = None
 
     per_head_sweep_vals = None
     per_head_use_logits = False
@@ -479,11 +595,11 @@ def main():
         thr_desc = str(sweep_len)
         k_sweep_state = "off"
 
-    if args.progress:
-        clips_est_str = str(num_clips_est) if num_clips_est is not None else "?"
-        _log_progress(
-            f"[progress] starting: clips≈{clips_est_str} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})"
-        )
+    clips_est_str = str(num_clips_est) if num_clips_est is not None else "?"
+    _log_progress(
+        f"[progress] starting: clips≈{clips_est_str} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})",
+        force=True,
+    )
 
     # load model + ckpt
     model = build_model(cfg)
@@ -499,70 +615,150 @@ def main():
     clips_done = 0
     t_data0 = time.time()
     last_clip_print = t_data0
+    first_batch_time = None
     with torch.no_grad():
         for batch in val_loader:
-            x = batch["video"]
-            out = model(x)
-
-            # prefer *_logits if present; fallback to old naming
-            onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
-            offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
-            pitch_logits = out.get("pitch_logits")
-            
-            # Apply temperature scaling and bias for calibration
-            onset_logits = onset_logits / args.temperature + args.bias
-            offset_logits = offset_logits / args.temperature + args.bias
-            onset_prob = torch.sigmoid(onset_logits)
-            offset_prob = torch.sigmoid(offset_logits)
-
-            onset_logits_list.append(onset_logits.detach().cpu())
-            offset_logits_list.append(offset_logits.detach().cpu())
-            onset_probs.append(onset_prob.detach().cpu())
-            offset_probs.append(offset_prob.detach().cpu())
-
-            if pitch_logits is not None:
-                if pitch_logits.dim() == 2:
-                    pitch_logits = pitch_logits.unsqueeze(1)
-                pitch_logits_list.append(pitch_logits.detach().cpu())
-                
-            onset_tgts.append(batch["onset_roll"].float().cpu())
-            offset_tgts.append(batch["offset_roll"].float().cpu())
-
-            if args.debug and len(onset_logits_list) == 1:
-                print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
-                print(
-                    "[DEBUG] onset_roll nonzero=",
-                    int(batch["onset_roll"].sum().item()),
-                    "offset_roll nonzero=",
-                    int(batch["offset_roll"].sum().item()),
-                )
-                
-            batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
-            clips_done += batch_size
-            if args.progress:
-                now = time.time()
-                if now - last_clip_print >= args.progress_interval:
-                    elapsed = now - t_data0
-                    if num_clips_est:
-                        pct = min(clips_done, num_clips_est) / max(num_clips_est, 1) * 100.0
-                        pct_display = f"{pct:5.1f}"
-                        remaining = max(num_clips_est - clips_done, 0)
-                        eta_seconds = (elapsed / max(clips_done, 1)) * remaining
-                        eta_display = _format_seconds(eta_seconds)
+            raw_paths = batch.get("path")
+            if isinstance(raw_paths, (list, tuple)):
+                paths = [str(p) for p in raw_paths]
+            elif raw_paths is None:
+                paths = []
+            else:
+                paths = [str(raw_paths)]
+            if skip_paths and paths:
+                keep_indices = [idx for idx, p in enumerate(paths) if p not in skip_paths]
+                if len(keep_indices) != len(paths):
+                    filtered_batch = _filter_batch(batch, keep_indices)
+                    if filtered_batch is None:
+                        blocked = ", ".join(Path(p).name for p in paths if p) or "<unknown>"
+                        _log_progress(
+                            f"[progress] skipped batch (all blocked clips): {blocked}",
+                            force=True,
+                        )
+                        continue
+                    batch = filtered_batch
+                    raw_paths = batch.get("path")
+                    if isinstance(raw_paths, (list, tuple)):
+                        paths = [str(p) for p in raw_paths]
+                    elif raw_paths is None:
+                        paths = []
                     else:
-                        pct_display = "?"
-                        eta_display = "??:??"
-                    clips_total_display = num_clips_est if num_clips_est is not None else "?"
+                        paths = [str(raw_paths)]
+            try:
+                x = batch["video"]
+                if first_batch_time is None:
+                    first_batch_time = time.time()
+                    first_wait = first_batch_time - t_data0
+                    stage_durations["first_batch"] = first_wait
                     _log_progress(
-                        f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                        f"[progress] first batch ready in {_format_seconds(first_wait)} ({first_wait:.2f}s) – includes decode/A/V lag warmup",
+                        force=True,
                     )
-                    last_clip_print = now
+                out = model(x)
 
-    if args.progress:
-        elapsed_data = time.time() - t_data0
+                # prefer *_logits if present; fallback to old naming
+                onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
+                offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+                pitch_logits = out.get("pitch_logits")
+                
+                # Apply temperature scaling and bias for calibration
+                onset_logits = onset_logits / args.temperature + args.bias
+                offset_logits = offset_logits / args.temperature + args.bias
+                onset_prob = torch.sigmoid(onset_logits)
+                offset_prob = torch.sigmoid(offset_logits)
+
+                onset_logits_list.append(onset_logits.detach().cpu())
+                offset_logits_list.append(offset_logits.detach().cpu())
+                onset_probs.append(onset_prob.detach().cpu())
+                offset_probs.append(offset_prob.detach().cpu())
+
+                if pitch_logits is not None:
+                    if pitch_logits.dim() == 2:
+                        pitch_logits = pitch_logits.unsqueeze(1)
+                    pitch_logits_list.append(pitch_logits.detach().cpu())
+                
+                onset_tgts.append(batch["onset_roll"].float().cpu())
+                offset_tgts.append(batch["offset_roll"].float().cpu())
+
+                lag_vals = _extract_lag_values(batch.get("lag_ms"))
+                if lag_vals:
+                    lag_ms_samples.extend(lag_vals)
+                lag_sources = _extract_lag_sources(batch.get("lag_source"))
+                if lag_sources:
+                    lag_source_counter.update(lag_sources)
+
+                if args.debug and len(onset_logits_list) == 1:
+                    print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
+                    print(
+                        "[DEBUG] onset_roll nonzero=",
+                        int(batch["onset_roll"].sum().item()),
+                        "offset_roll nonzero=",
+                        int(batch["offset_roll"].sum().item()),
+                    )
+                
+                batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
+                clips_done += batch_size
+                if args.progress:
+                    now = time.time()
+                    if now - last_clip_print >= args.progress_interval:
+                        elapsed = now - t_data0
+                        if num_clips_est:
+                            pct = min(clips_done, num_clips_est) / max(num_clips_est, 1) * 100.0
+                            pct_display = f"{pct:5.1f}"
+                            remaining = max(num_clips_est - clips_done, 0)
+                            eta_seconds = (elapsed / max(clips_done, 1)) * remaining
+                            eta_display = _format_seconds(eta_seconds)
+                        else:
+                            pct_display = "?"
+                            eta_display = "??:??"
+                        clips_total_display = num_clips_est if num_clips_est is not None else "?"
+                        _log_progress(
+                            f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                        )
+                        last_clip_print = now
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                _handle_bad_batch(paths, exc)
+                continue
+
+    elapsed_data = time.time() - t_data0
+    stage_durations["data_pass"] = elapsed_data
+    throughput = clips_done / elapsed_data if elapsed_data > 0 else 0.0
+    _log_progress(
+        f"[progress] data pass done: clips={clips_done}, elapsed={_format_seconds(elapsed_data)} ({elapsed_data:.2f}s), throughput={throughput:.2f} clips/s",
+        force=True,
+    )
+    if lag_ms_samples:
+        lag_arr = np.asarray(lag_ms_samples, dtype=np.float32)
+        lag_mean = float(lag_arr.mean())
+        lag_median = float(np.median(lag_arr))
+        lag_p95 = float(np.percentile(lag_arr, 95))
         _log_progress(
-            f"[progress] data pass done: clips={clips_done}, elapsed={_format_seconds(elapsed_data)}"
+            "[progress] A/V lag ms stats: mean={:.1f} median={:.1f} p95={:.1f} samples={}".format(
+                lag_mean,
+                lag_median,
+                lag_p95,
+                lag_arr.size,
+            ),
+            force=True,
         )
+    if lag_source_counter:
+        top_sources = ", ".join(f"{src}:{cnt}" for src, cnt in lag_source_counter.most_common(3))
+        _log_progress(f"[progress] lag sources top: {top_sources}", force=True)
+    if skipped_batches:
+        _log_progress(f"[progress] batches skipped due to errors: {skipped_batches}", force=True)
+    if bad_clip_counts:
+        summary_bits = ", ".join(f"{Path(p).name}:{count}" for p, count in bad_clip_counts.items())
+        _log_progress(f"[progress] bad clip retries: {summary_bits}", force=True)
+    if skip_paths:
+        skip_names = ", ".join(Path(p).name for p in sorted(skip_paths))
+        _log_progress(f"[progress] permanently skipped clips: {skip_names}", force=True)
+
+    if not onset_logits_list:
+        _log_progress("[progress] no valid clips processed; aborting.", force=True)
+        print("error: no valid clips processed; aborting.", file=sys.stderr)
+        return
 
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
@@ -742,6 +938,7 @@ def main():
     combo_idx = 0
     t_grid0 = time.time()
     last_grid_print = t_grid0
+    _log_progress(f"[progress] grid sweep start: combos={num_combos}", force=True)
 
     def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None):
         nonlocal combo_idx
@@ -876,11 +1073,30 @@ def main():
                 on_thr, off_thr = fixed_thr, t
             _run_eval(on_thr, off_thr, use_logits, k_onset=default_k_onset)
 
-    if args.progress:
-        grid_elapsed = time.time() - t_grid0
-        _log_progress(
-            f"[progress] grid pass done: combos={num_combos}, elapsed={_format_seconds(grid_elapsed)}"
-        )
+    grid_elapsed = time.time() - t_grid0
+    stage_durations["grid_pass"] = grid_elapsed
+    grid_rate = total_evals / grid_elapsed if grid_elapsed > 0 else 0.0
+    _log_progress(
+        f"[progress] grid pass done: combos={num_combos}, elapsed={_format_seconds(grid_elapsed)} ({grid_elapsed:.2f}s), rate={grid_rate:.2f}/s",
+        force=True,
+    )
+    total_elapsed = time.time() - t_main_start
+    stage_order = [
+        ("dataset_init", "dataset"),
+        ("first_batch", "first_batch"),
+        ("data_pass", "data_pass"),
+        ("grid_pass", "grid_sweep"),
+    ]
+    stage_parts = []
+    for key, label in stage_order:
+        if key in stage_durations:
+            dur_val = stage_durations[key]
+            stage_parts.append(f"{label}={_format_seconds(dur_val)}")
+    stage_summary = ", ".join(stage_parts) if stage_parts else "n/a"
+    _log_progress(
+        f"[progress] stages: {stage_summary} | total={_format_seconds(total_elapsed)} ({total_elapsed:.2f}s)",
+        force=True,
+    )
 
     if best_result is not None and total_evals > 0:
         print(
@@ -902,4 +1118,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
