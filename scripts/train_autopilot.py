@@ -204,6 +204,39 @@ def run_calibration(kind: str, ckpt: Path, log_dir: Path, split: str, max_clips:
     return ret
 
 
+def _format_eval_value(value: Optional[object]) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, (int, float)):
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _log_eval_settings() -> None:
+    cfg = load_cfg()
+    train_cfg = cfg.get("training", {}) if isinstance(cfg, dict) else {}
+    metrics_cfg = train_cfg.get("metrics", {}) if isinstance(train_cfg, dict) else {}
+    agg_cfg = metrics_cfg.get("aggregation", {}) if isinstance(metrics_cfg, dict) else {}
+    k_cfg = agg_cfg.get("k", {}) if isinstance(agg_cfg, dict) else {}
+
+    k_onset_val = k_cfg.get("onset") if isinstance(k_cfg, dict) else None
+    top_k_val = agg_cfg.get("top_k") if isinstance(agg_cfg, dict) else None
+    onset_thr = metrics_cfg.get("prob_threshold_onset") if isinstance(metrics_cfg, dict) else None
+    offset_thr = metrics_cfg.get("prob_threshold_offset") if isinstance(metrics_cfg, dict) else None
+
+    message = (
+        "[autopilot] eval config: "
+        f"k_onset={_format_eval_value(k_onset_val)} "
+        f"top_k={_format_eval_value(top_k_val)} "
+        f"prob_threshold_onset={_format_eval_value(onset_thr)} "
+        f"prob_threshold_offset={_format_eval_value(offset_thr)}"
+    )
+    print(message)
+
+
 def run_fast_eval(
     ckpt: Path,
     log_dir: Path,
@@ -213,7 +246,6 @@ def run_fast_eval(
     offset_probs: Optional[Tuple[float, float, float]] = None,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
-    sweep_k_onset: bool = False,
 ) -> Tuple[int, List[str]]:
     log_path = log_dir / "eval_fast.txt"
     cmd = [
@@ -238,8 +270,7 @@ def run_fast_eval(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
-    if sweep_k_onset:
-        cmd.append("--sweep_k_onset")
+    _log_eval_settings()
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
     return ret, lines
 
@@ -327,12 +358,12 @@ def run_fast_grid_calibration(
         cmd.extend(["--split", split])
     cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in FAST_GRID_THRESHOLDS)])
     cmd.append("--grid_prob_thresholds")
-    cmd.append("--sweep_k_onset")
     cmd.extend(["--max-clips", "80", "--frames", "64"])
     if temperature is not None:
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    _log_eval_settings()
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
     if ret != 0:
         return ret, None, lines
@@ -419,18 +450,6 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
                 f"[autopilot] WARNING: offset prob_threshold={offset_prob:.4f} outside [0.30, 0.80]; skipping write"
             )
     agg_cfg["mode"] = "k_of_p"
-    onset_value = metrics.get("k_onset")
-    if onset_value is None:
-        onset_fallback = k_cfg.get("onset")
-        if onset_fallback is None:
-            onset_value = 1.0
-        else:
-            onset_value = float(onset_fallback)
-    onset_value = float(onset_value)
-    onset_k = int(onset_value)
-    if onset_k <= 0:
-        onset_k = 1
-    k_cfg["onset"] = onset_k
     if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
         k_cfg["offset"] = 1
     platt = read_platt_params(CALIB_JSON)
@@ -637,7 +656,6 @@ def perform_calibration(
             offset_probs=offset_probs,
             temperature=args.temperature,
             bias=args.bias,
-            sweep_k_onset=True,
         )
         if eval_ret != 0:
             return None, eval_ret
@@ -941,6 +959,7 @@ def main() -> int:
         metrics_cfg = train_cfg.setdefault("metrics", {})
         agg_cfg = metrics_cfg.setdefault("aggregation", {})
         k_cfg = agg_cfg.setdefault("k", {})
+        k_cfg["onset"] = 1
         if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
             k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
