@@ -646,7 +646,8 @@ class PianoYTDataset(Dataset):
         dataset_index: int,
         *,
         preferred_start_idx: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
+        audit: bool = False,
+    ) -> SampleBuildResult:
         record = self.samples[record_idx]
         video_path = record["video"]
         midi_path = record["midi"]
@@ -1114,7 +1115,7 @@ class PianoYTDataset(Dataset):
                 skipped,
                 self._num_windows,
             )
-        if not self._valid_indices:
+        if not self._valid_entries:
             LOGGER.warning(
                 "[PianoYT] No valid labeled samples remain for split %s.", self.split
             )
@@ -1163,7 +1164,19 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     dataset.label_format = dcfg.get("label_format", "midi")
     dataset.label_targets = dcfg.get("label_targets", ["pitch", "onset", "offset", "hand", "clef"])
     dataset.require_labels = bool(dcfg.get("require_labels", False))
-    dataset.frame_targets_cfg = dcfg.get("frame_targets", {})
+    dataset.frame_targets_cfg = dict(dcfg.get("frame_targets", {}) or {})
+    dataset.frame_target_spec = resolve_frame_target_spec(
+        dataset.frame_targets_cfg,
+        frames=dataset.frames,
+        stride=stride,
+        fps=decode_fps,
+        canonical_hw=dataset.canonical_hw,
+    )
+    dataset.frame_target_summary = (
+        dataset.frame_target_spec.summary()
+        if dataset.frame_target_spec is not None
+        else "targets_conf: disabled"
+    )
     dataset.frame_target_spec = resolve_frame_target_spec(
         dataset.frame_targets_cfg,
         frames=dataset.frames,
