@@ -265,7 +265,9 @@ def _load_clip_with_random_start(path: Path,
                                  stride: int,
                                  channels: int,
                                  training: bool,
-                                 decode_fps: float):
+                                 decode_fps: float,
+                                 *,
+                                 preferred_start_idx: Optional[int] = None):
     """
     Load a clip using a randomized start (training=True) or start=0 (else).
     Decoding is performed on a fixed "decode_fps" grid so that all clips
@@ -291,7 +293,9 @@ def _load_clip_with_random_start(path: Path,
         clip_span = (frames - 1) * hop_seconds
         max_start_sec = max(0.0, duration - clip_span)
         max_start_idx = max(num_frames - safe_margin - required_span, 0)
-        if training and max_start_sec > 0:
+        if preferred_start_idx is not None:
+            start_idx = int(max(0, preferred_start_idx))
+        elif training and max_start_sec > 0:
             import random
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
@@ -361,7 +365,9 @@ def _load_clip_with_random_start(path: Path,
         clip_span = (frames - 1) * hop_seconds
         max_start_sec = max(0.0, duration - clip_span)
         max_start_idx = max(num_frames - safe_margin - required_span, 0)
-        if training and max_start_sec > 0:
+        if preferred_start_idx is not None:
+            start_idx = int(max(0, preferred_start_idx))
+        elif training and max_start_sec > 0:
             import random
             start_idx = random.randint(0, int(max_start_sec * decode_fps))
         else:
@@ -816,21 +822,21 @@ class OMAPSDataset(Dataset):
         if not self._valid_indices:
             raise RuntimeError("OMAPSDataset has no valid labeled windows to sample.")
 
-        max_attempts = len(self._valid_indices)
-        attempt = 0
         logical_idx = idx % len(self._valid_indices)
+        video_idx = self._valid_indices[logical_idx]
+        sample = self._load_sample_for_video(video_idx, idx)
+        if sample is not None:
+            return sample
 
-        while attempt < max_attempts and self._valid_indices:
-            video_idx = self._valid_indices[logical_idx]
-            sample = self._load_sample_for_video(video_idx, idx)
-            if sample is not None:
-                return sample
-            attempt += 1
-            if not self._valid_indices:
-                break
-            logical_idx = random.randrange(len(self._valid_indices))
+        if not self._valid_indices:
+            raise RuntimeError("OMAPSDataset has no valid labeled windows to sample.")
 
-        raise RuntimeError("OMAPSDataset: exhausted attempts to fetch a valid sample.")
+        logical_idx = idx % len(self._valid_indices)
+        video_idx = self._valid_indices[logical_idx]
+        sample = self._load_sample_for_video(video_idx, idx)
+        if sample is None:
+            raise RuntimeError("OMAPSDataset: unable to fetch a valid sample after filtering.")
+        return sample
 
     def _load_sample_for_video(self, video_idx: int, sample_index: int) -> Optional[Dict[str, Any]]:
         path = self.videos[video_idx]

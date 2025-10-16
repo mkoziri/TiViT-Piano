@@ -23,7 +23,6 @@ import csv
 import logging
 import math
 import os
-import random
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -558,29 +557,35 @@ class PianoYTDataset(Dataset):
         if not self._valid_indices:
             raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
 
-        max_attempts = len(self._valid_indices)
-        attempt = 0
         logical_idx = idx % len(self._valid_indices)
+        record_idx = self._valid_indices[logical_idx]
+        sample = self._load_sample_for_index(record_idx, idx)
+        if sample is not None:
+            return sample
 
-        while attempt < max_attempts and self._valid_indices:
-            record_idx = self._valid_indices[logical_idx]
-            sample = self._load_sample_for_index(record_idx, idx)
-            if sample is not None:
-                return sample
-            attempt += 1
-            if not self._valid_indices:
-                break
-            logical_idx = random.randrange(len(self._valid_indices))
+        if not self._valid_indices:
+            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
 
-        raise RuntimeError("PianoYTDataset: exhausted attempts to fetch a valid sample.")
+        logical_idx = idx % len(self._valid_indices)
+        record_idx = self._valid_indices[logical_idx]
+        sample = self._load_sample_for_index(record_idx, idx)
+        if sample is None:
+            raise RuntimeError("PianoYTDataset: unable to fetch a valid sample after filtering.")
+        return sample
 
-    def _load_sample_for_index(self, record_idx: int, dataset_index: int) -> Optional[Dict[str, Any]]:
+    def _load_sample_for_index(
+        self,
+        record_idx: int,
+        dataset_index: int,
+        *,
+        preferred_start_idx: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         record = self.samples[record_idx]
         video_path = record["video"]
         midi_path = record["midi"]
         video_id = record["id"]
 
-        is_train = self.split == "train"
+        is_train = self.split == "train" and preferred_start_idx is None
         clip, start_idx = _load_clip_with_random_start(
             path=video_path,
             frames=self.frames,
@@ -588,6 +593,7 @@ class PianoYTDataset(Dataset):
             channels=self.channels,
             training=is_train,
             decode_fps=self.decode_fps,
+            preferred_start_idx=preferred_start_idx,
         )
 
         if self.registration_enabled and self.apply_crop:
@@ -645,6 +651,7 @@ class PianoYTDataset(Dataset):
 
         if labels_tensor is None or labels_tensor.numel() == 0:
             self._log_missing_labels_once(video_path)
+            self._invalidate_sample_index(record_idx)
             self._invalidate_sample_index(record_idx)
             return None
 
@@ -863,20 +870,75 @@ class PianoYTDataset(Dataset):
         self._valid_indices = [i for i in self._valid_indices if i != record_idx]
         self._num_windows = len(self._valid_indices)
 
+    def _candidate_start_indices(self, labels_tensor: Optional[torch.Tensor]) -> List[int]:
+        if labels_tensor is None or labels_tensor.numel() == 0:
+            return [0]
+        fps = max(self.decode_fps, 1e-6)
+        window_frames = (self.frames - 1) * self.stride + 1
+        window_span = window_frames / fps
+        starts: set[int] = {0}
+        for onset, offset in labels_tensor[:, 0:2].tolist():
+            midpoint = (onset + offset) * 0.5
+            candidate_starts = [
+                max(0.0, onset - 0.5 * window_span),
+                max(0.0, onset),
+                max(0.0, midpoint - 0.5 * window_span),
+                max(0.0, midpoint),
+                max(0.0, offset - window_span),
+            ]
+            for start_sec in candidate_starts:
+                starts.add(int(round(start_sec * fps)))
+        ordered = sorted(starts)
+        max_candidates = 8
+        return ordered[:max_candidates]
+
+    def _record_has_valid_window(self, record_idx: int) -> bool:
+        record = self.samples[record_idx]
+        midi_path = record.get("midi")
+        video_path = record.get("video")
+        if midi_path is None or not midi_path.exists():
+            if video_path is not None:
+                self._log_missing_labels_once(video_path)
+            return False
+
+        labels_tensor = _read_midi_events(midi_path)
+        if labels_tensor is None or labels_tensor.numel() == 0:
+            if video_path is not None:
+                self._log_missing_labels_once(video_path)
+            return False
+
+        start_indices = self._candidate_start_indices(labels_tensor)
+        for start_idx in start_indices:
+            try:
+                sample = self._load_sample_for_index(
+                    record_idx,
+                    dataset_index=0,
+                    preferred_start_idx=start_idx,
+                )
+            except Exception as exc:  # pragma: no cover - defensive path
+                LOGGER.warning(
+                    "Failed to validate clip %s at start_idx=%d (%s)",
+                    record.get("id"),
+                    start_idx,
+                    exc,
+                )
+                sample = None
+            if sample is not None:
+                return True
+
+        if video_path is not None:
+            self._log_missing_labels_once(video_path)
+        return False
+    
     def _rebuild_valid_index_cache(self, *, log_summary: bool) -> None:
         self._valid_indices = []
         total = len(self.samples)
         skipped = 0
         for idx, record in enumerate(self.samples):
-            midi_path = record.get("midi")
-            labels_tensor: Optional[torch.Tensor] = None
-            if midi_path is not None and midi_path.exists():
-                labels_tensor = _read_midi_events(midi_path)
-            if labels_tensor is None or labels_tensor.numel() == 0:
-                self._log_missing_labels_once(record["video"])
+            if self._record_has_valid_window(idx):
+                self._valid_indices.append(idx)
+            else:
                 skipped += 1
-                continue
-            self._valid_indices.append(idx)
 
         self._num_windows = len(self._valid_indices)
         if log_summary:
