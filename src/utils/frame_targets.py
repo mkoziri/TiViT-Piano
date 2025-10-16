@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -18,6 +18,18 @@ FRAME_TARGET_KEYS: Tuple[str, ...] = (
     "hand_frame",
     "clef_frame",
 )
+
+
+def _normalise_clef_thresholds(cfg: Any) -> Tuple[int, int]:
+    """Coerce the clef threshold configuration into a 2-tuple of ints."""
+
+    if isinstance(cfg, Sequence) and not isinstance(cfg, (str, bytes)):
+        values = [int(v) for v in list(cfg)[:2]]
+        if len(values) == 1:
+            values.append(values[0])
+        if len(values) >= 2:
+            return int(values[0]), int(values[1])
+    return 60, 64
 
 
 @dataclass(frozen=True)
@@ -96,7 +108,7 @@ class FrameTargetResult:
 
 
 def resolve_frame_target_spec(
-    frame_cfg: Optional[Mapping[str, object]],
+    frame_cfg: Optional[Mapping[str, Any]],
     *,
     frames: int,
     stride: int,
@@ -114,7 +126,7 @@ def resolve_frame_target_spec(
     note_min = int(frame_cfg.get("note_min", 21))
     note_max = int(frame_cfg.get("note_max", 108))
     clef_cfg = frame_cfg.get("clef_thresholds", [60, 64])
-    clef_tuple = tuple(int(c) for c in list(clef_cfg)[:2]) if isinstance(clef_cfg, Sequence) else (60, 64)
+    clef_tuple = _normalise_clef_thresholds(clef_cfg)
 
     return FrameTargetSpec(
         frames=int(frames),
