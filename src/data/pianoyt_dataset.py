@@ -637,12 +637,23 @@ class PianoYTDataset(Dataset):
             lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
             corr_val = lag_result.corr if lag_result.success else float("nan")
             corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
+            flags = []
+            if lag_result.used_video_median:
+                flags.append("used_video_median")
+            if lag_result.low_corr_zero:
+                flags.append("low_corr_zero")
+            if lag_result.hit_bound:
+                flags.append("hit_bound")
+            if lag_result.clamped:
+                flags.append("clamped")
+            flags_str = ",".join(flags) if flags else "-"
             LOGGER.info(
-                "clip=%s av_lag_ms=%+d corr=%s frames=%d",
+                "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
                 video_id,
                 int(round(lag_ms_display)),
                 corr_str,
                 T,
+                flags_str,
             )
 
         if labels_tensor is not None and labels_tensor.numel() > 0:

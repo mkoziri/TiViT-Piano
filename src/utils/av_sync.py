@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from statistics import median
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,10 @@ class AVLagResult:
     corr: float
     from_cache: bool
     success: bool
+    used_video_median: bool = False
+    low_corr_zero: bool = False
+    hit_bound: bool = False
+    clamped: bool = False
 
 
 class AVLagCache:
@@ -162,6 +168,110 @@ def _corr_at_lag(video_env: np.ndarray, audio_env: np.ndarray, lag: int) -> floa
     return float(np.dot(v_center, a_center) / denom)
 
 
+_VIDEO_LAG_HISTORY: dict[str, list[float]] = {}
+_BOUND_TRACKER = {
+    "hits": 0,
+    "total": 0,
+    "expanded": False,
+}
+_BOUND_THRESHOLD = 0.10
+_DEFAULT_WINDOW_MS = 500.0
+_EXPANDED_WINDOW_MS = 800.0
+_CLAMP_LIMIT_MS = 400.0
+_LOW_CORR_THRESHOLD = 0.15
+_BORDERLINE_CORR_THRESHOLD = 0.25
+_HIGH_CONFIDENCE_CORR = 0.35
+
+
+def _get_video_median(video_id: str) -> Optional[float]:
+    history = _VIDEO_LAG_HISTORY.get(video_id)
+    if not history:
+        return None
+    return float(median(history))
+
+
+def _record_video_lag(video_id: str, lag_ms: float) -> None:
+    if not math.isfinite(lag_ms):
+        return
+    history = _VIDEO_LAG_HISTORY.setdefault(video_id, [])
+    history.append(float(lag_ms))
+
+
+def _maybe_expand_window() -> None:
+    total = _BOUND_TRACKER["total"]
+    hits = _BOUND_TRACKER["hits"]
+    if total == 0 or _BOUND_TRACKER["expanded"]:
+        return
+    if hits / float(total) >= _BOUND_THRESHOLD:
+        _BOUND_TRACKER["expanded"] = True
+
+
+def _select_window_ms(requested_ms: float) -> float:
+    limit = requested_ms if requested_ms > 0 else 0.0
+    if _BOUND_TRACKER["expanded"]:
+        limit = max(limit, _EXPANDED_WINDOW_MS)
+    return limit
+
+
+def _apply_guardrails(video_id: str,
+                      *,
+                      hop_seconds: float,
+                      raw_lag_ms: float,
+                      corr: float,
+                      from_cache: bool,
+                      hit_bound: bool) -> AVLagResult:
+    used_video_median = False
+    low_corr_zero = False
+    clamped = False
+    selected_ms = float(raw_lag_ms)
+    video_median_ms = _get_video_median(video_id)
+
+    if hit_bound:
+        if video_median_ms is not None:
+            selected_ms = video_median_ms
+            used_video_median = True
+        else:
+            selected_ms = 0.0
+
+    if math.isfinite(corr):
+        if corr < _LOW_CORR_THRESHOLD:
+            selected_ms = 0.0
+            low_corr_zero = True
+        elif corr < _BORDERLINE_CORR_THRESHOLD and not used_video_median:
+            if video_median_ms is not None:
+                selected_ms = video_median_ms
+                used_video_median = True
+            else:
+                selected_ms = 0.0
+                low_corr_zero = True
+
+    if math.isfinite(corr) and abs(selected_ms) > _CLAMP_LIMIT_MS and corr < _HIGH_CONFIDENCE_CORR:
+        selected_ms = max(-_CLAMP_LIMIT_MS, min(_CLAMP_LIMIT_MS, selected_ms))
+        clamped = True
+
+    if hop_seconds > 0:
+        lag_frames = int(round((selected_ms / 1000.0) / hop_seconds))
+        lag_ms = lag_frames * hop_seconds * 1000.0
+    else:
+        lag_frames = 0
+        lag_ms = 0.0
+
+    result = AVLagResult(
+        lag_frames=lag_frames,
+        lag_ms=float(lag_ms),
+        corr=float(corr),
+        from_cache=from_cache,
+        success=True,
+        used_video_median=used_video_median,
+        low_corr_zero=low_corr_zero,
+        hit_bound=hit_bound,
+        clamped=clamped,
+    )
+
+    _record_video_lag(video_id, result.lag_ms)
+    return result
+
+
 def estimate_av_lag(video_id: str,
                     frames: torch.Tensor,
                     labels: torch.Tensor,
@@ -181,20 +291,42 @@ def estimate_av_lag(video_id: str,
     if cached_ms is not None:
         lag_frames = int(round((cached_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
         corr = _corr_at_lag(video_env, audio_env, lag_frames)
-        return AVLagResult(lag_frames, float(cached_ms), corr, True, True)
+        if not math.isfinite(corr):
+            return AVLagResult(lag_frames, float(cached_ms), float("nan"), True, False)
+        result = _apply_guardrails(
+            video_id,
+            hop_seconds=hop_seconds,
+            raw_lag_ms=float(cached_ms),
+            corr=corr,
+            from_cache=True,
+            hit_bound=False,
+        )
+        if cache is not None and result.success:
+            cache.set(video_id, result.lag_ms)
+        return result
 
-    max_lag_frames = int(round((max_lag_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
+    search_window_ms = _select_window_ms(max_lag_ms if max_lag_ms > 0 else _DEFAULT_WINDOW_MS)
+    max_lag_frames = int(round((search_window_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
     max_lag_frames = max(0, max_lag_frames)
     if max_lag_frames == 0:
         corr = _corr_at_lag(video_env, audio_env, 0)
         if not math.isfinite(corr):
             return AVLagResult(0, 0.0, float("nan"), False, False)
-        if cache is not None:
-            cache.set(video_id, 0.0)
-        return AVLagResult(0, 0.0, corr, False, True)
+        result = _apply_guardrails(
+            video_id,
+            hop_seconds=hop_seconds,
+            raw_lag_ms=0.0,
+            corr=corr,
+            from_cache=False,
+            hit_bound=False,
+        )
+        if cache is not None and result.success:
+            cache.set(video_id, result.lag_ms)
+        return result
 
     best_corr = float("-inf")
     best_lag = 0
+    _BOUND_TRACKER["total"] += 1
     for lag in range(-max_lag_frames, max_lag_frames + 1):
         corr = _corr_at_lag(video_env, audio_env, lag)
         if not math.isfinite(corr):
@@ -205,10 +337,23 @@ def estimate_av_lag(video_id: str,
     if not math.isfinite(best_corr) or best_corr == float("-inf"):
         return AVLagResult(0, 0.0, float("nan"), False, False)
 
+    hit_bound = max_lag_frames > 0 and abs(best_lag) == max_lag_frames
+    if hit_bound:
+        _BOUND_TRACKER["hits"] += 1
+    _maybe_expand_window()
+
     lag_ms = best_lag * hop_seconds * 1000.0
-    if cache is not None:
-        cache.set(video_id, lag_ms)
-    return AVLagResult(best_lag, lag_ms, best_corr, False, True)
+    result = _apply_guardrails(
+        video_id,
+        hop_seconds=hop_seconds,
+        raw_lag_ms=lag_ms,
+        corr=best_corr,
+        from_cache=False,
+        hit_bound=hit_bound,
+    )
+    if cache is not None and result.success:
+        cache.set(video_id, result.lag_ms)
+    return result
 
 
 def shift_label_events(labels: torch.Tensor,
