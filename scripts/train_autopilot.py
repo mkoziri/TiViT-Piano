@@ -589,6 +589,16 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
                 metrics_cfg["prob_logit_bias_offset"] = offset_bias
             elif offset_oob:
                 print("[autopilot] WARNING: offset Platt params outside safe range; skipping write")
+    onset_final = _coerce_optional_float(metrics_cfg.get("prob_threshold_onset"))
+    offset_final = _coerce_optional_float(metrics_cfg.get("prob_threshold_offset"))
+    k_onset_final = _coerce_positive_int(k_cfg.get("onset"))
+    print(
+        "[autopilot] final thresholds: onset={onset}, offset={offset}, k_onset={k_onset}".format(
+            onset=f"{onset_final:.4f}" if onset_final is not None else "None",
+            offset=f"{offset_final:.4f}" if offset_final is not None else "None",
+            k_onset=k_onset_final if k_onset_final is not None else "None",
+        )
+    )
     save_cfg(cfg)
 
 
