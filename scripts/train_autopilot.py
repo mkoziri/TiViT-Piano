@@ -337,7 +337,12 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
     return best
 
 
-FAST_GRID_THRESHOLDS = [0.52, 0.54, 0.56, 0.58, 0.60]
+FAST_GRID_THRESHOLDS = [0.40, 0.44, 0.48, 0.52, 0.56, 0.60]
+
+FAST_SWEEP_MIN = 0.40
+FAST_SWEEP_MAX = 0.60
+FAST_RESULT_MIN = 0.30
+FAST_RESULT_MAX = 0.80
 
 
 
@@ -376,8 +381,8 @@ def ensure_calibration_json(metrics: Dict[str, float]) -> None:
     data = load_calibration(CALIB_JSON) or {}
     onset = data.get("onset", {})
     offset = data.get("offset", {})
-    onset["best_prob"] = float(metrics["onset_thr"])
-    offset["best_prob"] = float(metrics["offset_thr"])
+    onset["best_prob"] = _clamp_fast_result(float(metrics["onset_thr"]))
+    offset["best_prob"] = _clamp_fast_result(float(metrics["offset_thr"]))
     data["onset"] = onset
     data["offset"] = offset
     with CALIB_JSON.open("w") as f:
@@ -410,6 +415,32 @@ def _clamp_probability(prob: float) -> float:
     return max(0.0, min(1.0, float(prob)))
 
 
+def _clamp_range(prob: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, float(prob)))
+
+
+def _bounded_fast_sweep_candidates(center: float, delta: float) -> Tuple[float, ...]:
+    center = _clamp_range(center, FAST_SWEEP_MIN, FAST_SWEEP_MAX)
+    raw_candidates = (
+        _clamp_range(center - delta, FAST_SWEEP_MIN, FAST_SWEEP_MAX),
+        center,
+        _clamp_range(center + delta, FAST_SWEEP_MIN, FAST_SWEEP_MAX),
+    )
+    seen = set()
+    ordered: List[float] = []
+    for value in raw_candidates:
+        key = round(value, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(value)
+    return tuple(ordered)
+
+
+def _clamp_fast_result(prob: float) -> float:
+    return _clamp_range(prob, FAST_RESULT_MIN, FAST_RESULT_MAX)
+
+
 def _extract_best_probability(
     calibration: Optional[dict], head: str, fallback: Optional[float]
 ) -> Optional[float]:
@@ -432,7 +463,7 @@ def _extract_best_probability(
             prob_val = fallback_val
         else:
             prob_val = _logit_to_probability(fallback_val)
-    return _clamp_probability(prob_val)
+    return _clamp_fast_result(_clamp_probability(prob_val))
 
 
 def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
@@ -634,7 +665,7 @@ def perform_calibration(
                     prob_val = _logit_to_probability(logit_val)
         if prob_val is None:
             prob_val = default
-        prob_val = _clamp_probability(prob_val)
+        prob_val = _clamp_fast_result(_clamp_probability(prob_val))
         return prob_val, logit_val
     
     def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
@@ -644,17 +675,11 @@ def perform_calibration(
         offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
         onset_prob, onset_logit = _parse_prob_from_calib(onset_entry, 0.3)
         offset_prob, offset_logit = _parse_prob_from_calib(offset_entry, 0.3)
+        onset_prob = _clamp_fast_result(onset_prob)
+        offset_prob = _clamp_fast_result(offset_prob)
         prob_delta = 0.05
-        onset_probs = (
-            max(0.0, onset_prob - prob_delta),
-            onset_prob,
-            min(1.0, onset_prob + prob_delta),
-        )
-        offset_probs = (
-            max(0.0, offset_prob - prob_delta),
-            offset_prob,
-            min(1.0, offset_prob + prob_delta),
-        )
+        onset_probs = _bounded_fast_sweep_candidates(onset_prob, prob_delta)
+        offset_probs = _bounded_fast_sweep_candidates(offset_prob, prob_delta)
         print("[autopilot] fast eval sweep thresholds:", f"onset={','.join(f'{p:.2f}' for p in onset_probs)} offset={','.join(f'{p:.2f}' for p in offset_probs)}")
         eval_ret, lines = run_fast_eval(
             ckpt,
@@ -677,10 +702,14 @@ def perform_calibration(
             metrics["onset_thr"] = onset_prob
         elif onset_logit is not None and math.isclose(onset_thr, onset_logit, rel_tol=1e-9, abs_tol=1e-6):
             metrics["onset_thr"] = onset_prob
+        else:
+            metrics["onset_thr"] = _clamp_fast_result(float(onset_thr))
         if offset_thr is None or offset_thr < 0.0 or offset_thr > 1.0:
             metrics["offset_thr"] = offset_prob
         elif offset_logit is not None and math.isclose(offset_thr, offset_logit, rel_tol=1e-9, abs_tol=1e-6):
             metrics["offset_thr"] = offset_prob
+        else:
+            metrics["offset_thr"] = _clamp_fast_result(float(offset_thr))
         calib.setdefault("onset", {})["best_prob"] = metrics["onset_thr"]
         calib.setdefault("offset", {})["best_prob"] = metrics["offset_thr"]
         with CALIB_JSON.open("w") as f:
