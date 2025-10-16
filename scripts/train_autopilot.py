@@ -403,6 +403,18 @@ def _coerce_optional_float(value) -> Optional[float]:
     return None
 
 
+def _coerce_positive_int(value) -> Optional[int]:
+    float_val = _coerce_optional_float(value)
+    if float_val is None:
+        return None
+    if float_val < 1.0:
+        return None
+    rounded = int(round(float_val))
+    if abs(float_val - rounded) > 1e-6:
+        return None
+    return rounded
+
+
 def _logit_to_probability(logit: float) -> float:
     if logit >= 0.0:
         z = math.exp(-logit)
@@ -466,6 +478,45 @@ def _extract_best_probability(
     return _clamp_fast_result(_clamp_probability(prob_val))
 
 
+def _blend_and_clip_platt(
+    platt: Optional[Dict[str, float]],
+    *,
+    neutral_temp: float,
+    neutral_bias: float,
+    temp_bounds: Tuple[float, float],
+    bias_bounds: Tuple[float, float],
+) -> Tuple[Optional[Tuple[float, float]], bool]:
+    """Blend Platt params toward neutral defaults and enforce safe ranges.
+
+    Returns a tuple ``(values, out_of_range)`` where ``values`` is either a
+    ``(temperature, bias)`` pair ready for YAML persistence or ``None`` if the
+    Platt entry is unusable for this round. ``out_of_range`` is ``True`` when
+    the raw parameters existed but violated the configured bounds, signalling
+    that the caller should log a warning about skipping the write.
+    """
+
+    if not isinstance(platt, dict):
+        return None, False
+
+    temp_raw = _coerce_optional_float(platt.get("temp"))
+    bias_raw = _coerce_optional_float(platt.get("bias"))
+    if temp_raw is None or bias_raw is None:
+        return None, False
+
+    temp = 0.5 * temp_raw + 0.5 * neutral_temp
+    bias = 0.5 * bias_raw + 0.5 * neutral_bias
+
+    temp_lo, temp_hi = temp_bounds
+    bias_lo, bias_hi = bias_bounds
+
+    if not (temp_lo <= temp <= temp_hi and bias_lo <= bias <= bias_hi):
+        return None, True
+
+    temp = min(max(temp, temp_lo), temp_hi)
+    bias = min(max(bias, bias_lo), bias_hi)
+    return (temp, bias), False
+
+
 def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     cfg = load_cfg()
     train_cfg = cfg.setdefault("training", {})
@@ -498,42 +549,46 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
                 f"[autopilot] WARNING: offset prob_threshold={offset_prob:.4f} outside [0.30, 0.80]; skipping write"
             )
     agg_cfg["mode"] = "k_of_p"
+    k_onset_metric = _coerce_positive_int(metrics.get("k_onset"))
+    if k_onset_metric is not None:
+        k_cfg["onset"] = k_onset_metric
+    elif _coerce_positive_int(k_cfg.get("onset")) is None:
+        k_cfg.setdefault("onset", 1)
+
     if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
         k_cfg["offset"] = 1
     platt = read_platt_params(CALIB_JSON)
     if platt:
         onset_platt = platt.get("onset")
         if onset_platt:
-            onset_temp_raw = _coerce_optional_float(onset_platt.get("temp"))
-            onset_bias_raw = _coerce_optional_float(onset_platt.get("bias"))
-            if onset_temp_raw is not None and onset_bias_raw is not None:
-                onset_temp = 0.5 * onset_temp_raw + 0.5 * 1.0
-                onset_bias = 0.5 * onset_bias_raw + 0.5 * 0.0
-                if not (0.85 <= onset_temp <= 1.50 and -1.0 <= onset_bias <= 1.0):
-                    print(
-                        "[autopilot] WARNING: onset Platt params outside safe range; skipping write"
-                    )
-                else:
-                    onset_temp = min(max(onset_temp, 0.85), 1.50)
-                    onset_bias = min(max(onset_bias, -1.0), 1.0)
-                    metrics_cfg["prob_temperature_onset"] = onset_temp
-                    metrics_cfg["prob_logit_bias_onset"] = onset_bias
+            onset_vals, onset_oob = _blend_and_clip_platt(
+                onset_platt,
+                neutral_temp=1.0,
+                neutral_bias=0.0,
+                temp_bounds=(0.85, 1.50),
+                bias_bounds=(-1.0, 1.0),
+            )
+            if onset_vals is not None:
+                onset_temp, onset_bias = onset_vals
+                metrics_cfg["prob_temperature_onset"] = onset_temp
+                metrics_cfg["prob_logit_bias_onset"] = onset_bias
+            elif onset_oob:
+                print("[autopilot] WARNING: onset Platt params outside safe range; skipping write")
         offset_platt = platt.get("offset")
         if offset_platt:
-            offset_temp_raw = _coerce_optional_float(offset_platt.get("temp"))
-            offset_bias_raw = _coerce_optional_float(offset_platt.get("bias"))
-            if offset_temp_raw is not None and offset_bias_raw is not None:
-                offset_temp = 0.5 * offset_temp_raw + 0.5 * 1.0
-                offset_bias = 0.5 * offset_bias_raw + 0.5 * 0.0
-                if not (0.85 <= offset_temp <= 1.80 and -1.5 <= offset_bias <= 1.0):
-                    print(
-                        "[autopilot] WARNING: offset Platt params outside safe range; skipping write"
-                    )
-                else:
-                    offset_temp = min(max(offset_temp, 0.85), 1.80)
-                    offset_bias = min(max(offset_bias, -1.5), 1.0)
-                    metrics_cfg["prob_temperature_offset"] = offset_temp
-                    metrics_cfg["prob_logit_bias_offset"] = offset_bias
+            offset_vals, offset_oob = _blend_and_clip_platt(
+                offset_platt,
+                neutral_temp=1.0,
+                neutral_bias=0.0,
+                temp_bounds=(0.85, 1.80),
+                bias_bounds=(-1.5, 1.0),
+            )
+            if offset_vals is not None:
+                offset_temp, offset_bias = offset_vals
+                metrics_cfg["prob_temperature_offset"] = offset_temp
+                metrics_cfg["prob_logit_bias_offset"] = offset_bias
+            elif offset_oob:
+                print("[autopilot] WARNING: offset Platt params outside safe range; skipping write")
     save_cfg(cfg)
 
 
@@ -997,7 +1052,8 @@ def main() -> int:
         metrics_cfg = train_cfg.setdefault("metrics", {})
         agg_cfg = metrics_cfg.setdefault("aggregation", {})
         k_cfg = agg_cfg.setdefault("k", {})
-        k_cfg["onset"] = 1
+        if _coerce_positive_int(k_cfg.get("onset")) is None:
+            k_cfg.setdefault("onset", 1)
         if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
             k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
