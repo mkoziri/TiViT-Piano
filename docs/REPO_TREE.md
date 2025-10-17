@@ -28,6 +28,7 @@ tivit/
 │  │  ├─ parse_sweep.py
 │  │  └─ sweep.py
 │  ├─ check
+│  │  ├─ analyze_class_balance.py
 │  │  ├─ check_model.py
 │  │  ├─ check_omaps_integrity.py
 │  │  ├─ check_pianoyt_integrity.py
@@ -44,7 +45,8 @@ tivit/
 │  ├─ clean_tivit.py
 │  ├─ probe_timegrid.py
 │  ├─ theory_decode.py
-│  └─ train.py
+│  ├─ train.py
+│  └─ train_autopilot.py
 ├─ splits
 │  ├─ calib_list.txt
 │  └─ train_minus_calib_list.txt
@@ -61,7 +63,11 @@ tivit/
 │  │  └─ tivit_piano.py
 │  └─ utils
 │     ├─ __init__.py
+│     ├─ av_sync.py
 │     ├─ config.py
+│     ├─ frame_target_cache.py
+│     ├─ frame_targets.py
+│     ├─ identifiers.py
 │     ├─ logging.py
 │     ├─ pitch.py
 │     ├─ tiling.py
