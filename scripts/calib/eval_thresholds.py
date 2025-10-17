@@ -31,6 +31,7 @@ from utils.identifiers import canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
+from torch.utils.data import DataLoader, Subset
 
 
 # Default probability grid used when sweeping thresholds without an explicit
@@ -545,8 +546,6 @@ def main():
         val_loader = val_loader[0]
 
     dataset = getattr(val_loader, "dataset", None)
-    dataset_elapsed = time.time() - t_dataset_build0
-    stage_durations["dataset_init"] = dataset_elapsed
     dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
     dataset_len = None
     dataset_count = "?"
@@ -557,6 +556,8 @@ def main():
         except TypeError:
             dataset_len = None
             dataset_count = "?"
+    dataset_elapsed = time.time() - t_dataset_build0
+    stage_durations["dataset_init"] = dataset_elapsed
     batch_size_val = getattr(val_loader, "batch_size", None)
     batch_display = str(batch_size_val) if batch_size_val is not None else "?"
     worker_count = getattr(val_loader, "num_workers", None)
@@ -588,6 +589,57 @@ def main():
         target_clips = min(dataset_len, max_cap)
     else:
         target_clips = args.max_clips
+
+    if dataset is not None and target_clips is not None:
+        try:
+            base_len = len(dataset)
+        except TypeError:
+            base_len = None
+        if base_len is not None:
+            subset_cap = min(base_len, int(target_clips))
+            subset_indices = list(range(subset_cap))
+            dataset = Subset(dataset, subset_indices)
+            num_workers = getattr(val_loader, "num_workers", 0)
+            persistent_workers = getattr(val_loader, "persistent_workers", False)
+            if num_workers <= 0:
+                persistent_workers = False
+            loader_kwargs = {
+                "batch_size": getattr(val_loader, "batch_size", 1),
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": getattr(val_loader, "pin_memory", False),
+                "drop_last": getattr(val_loader, "drop_last", False),
+                "collate_fn": getattr(val_loader, "collate_fn", None),
+                "persistent_workers": persistent_workers,
+                "timeout": getattr(val_loader, "timeout", 0),
+            }
+            prefetch_factor = getattr(val_loader, "prefetch_factor", None)
+            if num_workers > 0 and prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = prefetch_factor
+            pin_memory_device = getattr(val_loader, "pin_memory_device", None)
+            if pin_memory_device:
+                loader_kwargs["pin_memory_device"] = pin_memory_device
+            worker_init_fn = getattr(val_loader, "worker_init_fn", None)
+            if worker_init_fn is not None:
+                loader_kwargs["worker_init_fn"] = worker_init_fn
+            generator = getattr(val_loader, "generator", None)
+            if generator is not None:
+                loader_kwargs["generator"] = generator
+            multiprocessing_context = getattr(val_loader, "multiprocessing_context", None)
+            if multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = multiprocessing_context
+            val_loader = DataLoader(dataset, **loader_kwargs)
+            dataset = getattr(val_loader, "dataset", dataset)
+            dataset_len = len(dataset)
+            dataset_count = str(dataset_len)
+            target_clips = dataset_len
+            dataset_elapsed = time.time() - t_dataset_build0
+            stage_durations["dataset_init"] = dataset_elapsed
+
+    if target_clips == 0:
+        _log_progress("[progress] target_clips resolved to 0; exiting early.", force=True)
+        return
+
 
     per_head_sweep_vals = None
     per_head_use_logits = False

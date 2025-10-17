@@ -60,6 +60,10 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
 
 LOGGER = logging.getLogger(__name__)
 
+
+_EVAL_ALT_WINDOW_ATTEMPTS = 3
+
+
 class SampleRecord(TypedDict):
     id: str
     video: Path
@@ -518,6 +522,7 @@ class PianoYTDataset(Dataset):
         self._av_sync_warned = False
         self._lag_log_once: Set[str] = set()
         self._valid_entries: List[WindowEntry] = []
+        self.eval_indices_snapshot: List[int] = []
         self._label_warned: Set[str] = set()
         self._num_windows: int = 0
         self._frame_target_cache = FrameTargetCache()
@@ -703,6 +708,8 @@ class PianoYTDataset(Dataset):
         return True
 
     def __len__(self) -> int:
+        if self._uses_eval_snapshot():
+            return len(self.eval_indices_snapshot)
         return len(self._valid_entries)
 
     def __getitem__(self, idx: int):
@@ -712,6 +719,30 @@ class PianoYTDataset(Dataset):
                     "Val split has 0 valid videos after audit; check labels/lag or widen search."
                 )
             raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
+
+        if self._uses_eval_snapshot():
+            total = len(self.eval_indices_snapshot)
+            if total == 0:
+                raise RuntimeError(
+                    "PianoYTDataset: eval snapshot empty; rerun audit or refresh dataset."
+                )
+            idx = idx % max(total, 1)
+            sample, failure_reason = self._fetch_eval_sample(idx)
+            if sample is not None:
+                return sample
+            reason = failure_reason or "unknown"
+            for step in range(1, total):
+                fallback_idx = (idx - step) % total
+                sample, _ = self._fetch_eval_sample(fallback_idx)
+                if sample is not None:
+                    print(
+                        f"[dataset] fallback idx={idx} -> idx={fallback_idx} reason={reason}",
+                        flush=True,
+                    )
+                    return sample
+            raise RuntimeError(
+                "PianoYTDataset: exhausted eval fallbacks; no valid samples available."
+            )
 
         if idx < 0 or idx >= len(self._valid_entries):
             raise IndexError(idx)
@@ -735,6 +766,82 @@ class PianoYTDataset(Dataset):
         raise RuntimeError(
             "PianoYTDataset: unable to fetch a valid sample after filtering bad clips."
         )
+
+    def _uses_eval_snapshot(self) -> bool:
+        return self.split != "train"
+
+    def _fetch_eval_sample(self, snapshot_idx: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if snapshot_idx < 0 or snapshot_idx >= len(self.eval_indices_snapshot):
+            return None, "snapshot_oob"
+
+        base_idx = self.eval_indices_snapshot[snapshot_idx]
+        if base_idx < 0 or base_idx >= len(self._valid_entries):
+            return None, "invalid_base_index"
+
+        entry = self._valid_entries[base_idx]
+        result = self._build_sample(
+            entry.record_idx,
+            dataset_index=base_idx,
+            preferred_start_idx=entry.start_idx,
+            audit=False,
+        )
+        if result.sample is not None:
+            return result.sample, None
+
+        failure_reason = result.status or "unknown"
+        if failure_reason in {"no_labels", "build_failed"}:
+            alt_sample, alt_reason = self._try_alternative_windows(
+                entry,
+                base_idx,
+                failure_reason=failure_reason,
+                original_start=result.start_idx,
+            )
+            if alt_sample is not None:
+                return alt_sample, None
+            if alt_reason:
+                failure_reason = alt_reason
+        return None, failure_reason
+
+    def _try_alternative_windows(
+        self,
+        entry: WindowEntry,
+        dataset_index: int,
+        *,
+        failure_reason: str,
+        original_start: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        record_idx = entry.record_idx
+        if record_idx >= len(self.samples):
+            return None, "record_oob"
+
+        record = self.samples[record_idx]
+        midi_path = record.get("midi")
+        if midi_path is None or not midi_path.exists():
+            return None, failure_reason
+
+        labels_tensor = _read_midi_events(midi_path)
+        if labels_tensor is None or labels_tensor.numel() == 0:
+            return None, "no_labels"
+
+        candidates = self._candidate_start_indices(labels_tensor)
+        attempts = 0
+        last_reason: Optional[str] = None
+        for start_idx in candidates:
+            if attempts >= _EVAL_ALT_WINDOW_ATTEMPTS:
+                break
+            if start_idx == original_start or (entry.start_idx is not None and start_idx == entry.start_idx):
+                continue
+            attempts += 1
+            result = self._build_sample(
+                record_idx,
+                dataset_index=dataset_index,
+                preferred_start_idx=start_idx,
+                audit=False,
+            )
+            if result.sample is not None:
+                return result.sample, None
+            last_reason = result.status or failure_reason
+        return None, last_reason or failure_reason
 
     def _build_sample(
         self,
@@ -1086,7 +1193,7 @@ class PianoYTDataset(Dataset):
             return
         self._bad_clips.add(canon)
         print(f"[data_pass] mark_bad id={canon} reason={reason}", flush=True)
-        if record_idx is not None:
+        if record_idx is not None and not self._uses_eval_snapshot():
             self._invalidate_sample_index(record_idx)
 
     def _mark_frame_target_failure(self, record_idx: int, video_id: str) -> None:
@@ -1097,12 +1204,18 @@ class PianoYTDataset(Dataset):
         self._mark_bad_clip(record_idx, canon, "build_failed")
     
     def _invalidate_sample_index(self, record_idx: int) -> None:
+        if self._uses_eval_snapshot():
+            return
         if record_idx >= len(self.samples):
             return
         self._valid_entries = [
             entry for entry in self._valid_entries if entry.record_idx != record_idx
         ]
         self._num_windows = len(self._valid_entries)
+        if self._uses_eval_snapshot():
+            self.eval_indices_snapshot = list(range(len(self._valid_entries)))
+        else:
+            self.eval_indices_snapshot = []
 
     def _candidate_start_indices(self, labels_tensor: Optional[torch.Tensor]) -> List[int]:
         if labels_tensor is None or labels_tensor.numel() == 0:
