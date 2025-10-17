@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass
+import os
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 from statistics import median
 
@@ -27,10 +30,32 @@ class AVLagResult:
     corr: float
     from_cache: bool
     success: bool
-    used_video_median: bool = False
-    low_corr_zero: bool = False
-    hit_bound: bool = False
-    clamped: bool = False
+    runtime_s: float = 0.0
+    flags: Set[str] = field(default_factory=set)
+
+    @property
+    def used_video_median(self) -> bool:
+        return "used_video_median" in self.flags
+
+    @property
+    def low_corr_zero(self) -> bool:
+        return "low_corr_zero" in self.flags
+
+    @property
+    def hit_bound(self) -> bool:
+        return "hit_bound" in self.flags
+
+    @property
+    def clamped(self) -> bool:
+        return "clamped" in self.flags
+
+    @property
+    def lag_timeout(self) -> bool:
+        return "lag_timeout" in self.flags
+
+
+_CACHE_LOCK = threading.Lock()
+_CACHE_TMP_SUFFIX = ".tmp"
 
 
 class AVLagCache:
@@ -41,44 +66,68 @@ class AVLagCache:
         default_path = project_root / "runs" / "av_lags.json"
         self.cache_path = Path(cache_path) if cache_path else default_path
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cache: Optional[dict] = None
+        self._cache: Optional[Dict[str, float]] = None
+        self._loaded = False
 
     def _load(self) -> None:
-        if self._cache is not None:
+        if self._loaded:
             return
-        self._cache = {}
-        if not self.cache_path.exists():
-            return
-        try:
-            with self.cache_path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Failed to load A/V lag cache from %s (%s)", self.cache_path, exc)
-            return
-        if isinstance(data, dict):
-            for key, value in data.items():
+        with _CACHE_LOCK:
+            if self._loaded:
+                return
+            data: Dict[str, float] = {}
+            if self.cache_path.exists():
                 try:
-                    self._cache[str(key)] = float(value)
-                except (TypeError, ValueError):
-                    continue
+                    with self.cache_path.open("r", encoding="utf-8") as handle:
+                        raw = json.load(handle)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning("Failed to load A/V lag cache from %s (%s)", self.cache_path, exc)
+                    raw = None
+                if isinstance(raw, dict):
+                    for key, value in raw.items():
+                        try:
+                            data[str(key)] = float(value)
+                        except (TypeError, ValueError):
+                            continue
+            self._cache = data
+            self._loaded = True
+
+    def preload(self) -> None:
+        """Eagerly load the cache once during dataset initialisation."""
+
+        self._load()
 
     def get(self, video_id: str) -> Optional[float]:
         self._load()
-        assert self._cache is not None
+        if self._cache is None:
+            return None
         key = canonical_video_id(video_id)
         value = self._cache.get(key)
         return float(value) if value is not None else None
 
     def set(self, video_id: str, lag_ms: float) -> None:
         self._load()
-        assert self._cache is not None
+        if self._cache is None:
+            self._cache = {}
         key = canonical_video_id(video_id)
-        self._cache[key] = float(lag_ms)
-        try:
-            with self.cache_path.open("w", encoding="utf-8") as handle:
-                json.dump(self._cache, handle, indent=2, sort_keys=True)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Failed to write A/V lag cache to %s (%s)", self.cache_path, exc)
+        new_value = float(lag_ms)
+        with _CACHE_LOCK:
+            current = self._cache.get(key)
+            if current is not None and math.isclose(current, new_value, abs_tol=1e-3):
+                return
+            self._cache[key] = new_value
+            tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + _CACHE_TMP_SUFFIX)
+            try:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(self._cache, handle, indent=2, sort_keys=True)
+                os.replace(tmp_path, self.cache_path)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning("Failed to write A/V lag cache to %s (%s)", self.cache_path, exc)
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
 
 
 def _normalize_series(values: np.ndarray) -> Optional[np.ndarray]:
@@ -92,7 +141,33 @@ def _normalize_series(values: np.ndarray) -> Optional[np.ndarray]:
     return norm.astype(np.float32, copy=False)
 
 
-def _motion_envelope(frames: torch.Tensor, downsample: int = 2) -> Optional[np.ndarray]:
+def _sanitize_bbox(
+    bbox: Optional[Sequence[int]],
+    height: int,
+    width: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    if bbox is None:
+        return None
+    if len(bbox) != 4:
+        return None
+    try:
+        min_y, max_y, min_x, max_x = (int(b) for b in bbox)
+    except (TypeError, ValueError):
+        return None
+    min_y = max(0, min(min_y, height - 1))
+    max_y = max(0, min(max_y, height))
+    min_x = max(0, min(min_x, width - 1))
+    max_x = max(0, min(max_x, width))
+    if max_y <= min_y or max_x <= min_x:
+        return None
+    return min_y, max_y, min_x, max_x
+
+
+def _motion_envelope(
+    frames: torch.Tensor,
+    keyboard_bbox: Optional[Sequence[int]] = None,
+    downsample: int = 2,
+) -> Optional[np.ndarray]:
     if frames is None or frames.ndim != 4 or frames.shape[0] < 2:
         return None
     x = frames.detach()
@@ -106,6 +181,13 @@ def _motion_envelope(frames: torch.Tensor, downsample: int = 2) -> Optional[np.n
     if downsample > 1 and x.shape[-1] >= downsample and x.shape[-2] >= downsample:
         x = F.avg_pool2d(x, kernel_size=downsample, stride=downsample)
     diff = torch.abs(x[1:] - x[:-1])
+    if keyboard_bbox is not None:
+        height = diff.shape[-2]
+        width = diff.shape[-1]
+        region = _sanitize_bbox(keyboard_bbox, height, width)
+        if region is not None:
+            min_y, max_y, min_x, max_x = region
+            diff = diff[..., min_y:max_y, min_x:max_x]
     env = diff.mean(dim=(1, 2, 3)).cpu().numpy()
     env = np.concatenate([np.zeros(1, dtype=env.dtype), env], axis=0)
     return _normalize_series(env)
@@ -172,7 +254,8 @@ def _corr_at_lag(video_env: np.ndarray, audio_env: np.ndarray, lag: int) -> floa
     return float(np.dot(v_center, a_center) / denom)
 
 
-_VIDEO_LAG_HISTORY: dict[str, list[float]] = {}
+_VIDEO_LAG_HISTORY: Dict[str, list[float]] = {}
+_VIDEO_HISTORY_LIMIT = 32
 _BOUND_TRACKER = {
     "hits": 0,
     "total": 0,
@@ -185,6 +268,7 @@ _CLAMP_LIMIT_MS = 400.0
 _LOW_CORR_THRESHOLD = 0.15
 _BORDERLINE_CORR_THRESHOLD = 0.25
 _HIGH_CONFIDENCE_CORR = 0.35
+_MAX_RUNTIME_S = 2.0
 
 
 def _get_video_median(video_id: str) -> Optional[float]:
@@ -195,12 +279,19 @@ def _get_video_median(video_id: str) -> Optional[float]:
     return float(median(history))
 
 
-def _record_video_lag(video_id: str, lag_ms: float) -> None:
-    if not math.isfinite(lag_ms):
+def _record_video_lag(video_id: str, lag_ms: float, corr: float, flags: Set[str]) -> None:
+    if not math.isfinite(lag_ms) or not math.isfinite(corr):
+        return
+    if corr < _BORDERLINE_CORR_THRESHOLD:
+        return
+    if "low_corr_zero" in flags or "lag_timeout" in flags:
         return
     key = canonical_video_id(video_id)
     history = _VIDEO_LAG_HISTORY.setdefault(key, [])
     history.append(float(lag_ms))
+    if len(history) > _VIDEO_HISTORY_LIMIT:
+        del history[0 : len(history) - _VIDEO_HISTORY_LIMIT]
+        return
 
 
 def _maybe_expand_window() -> None:
@@ -219,42 +310,46 @@ def _select_window_ms(requested_ms: float) -> float:
     return limit
 
 
-def _apply_guardrails(video_id: str,
-                      *,
-                      hop_seconds: float,
-                      raw_lag_ms: float,
-                      corr: float,
-                      from_cache: bool,
-                      hit_bound: bool) -> AVLagResult:
+def _apply_guardrails(
+    video_id: str,
+    *,
+    hop_seconds: float,
+    raw_lag_ms: float,
+    corr: float,
+    hit_bound: bool,
+) -> Tuple[int, float, Set[str]]:
     video_id = canonical_video_id(video_id)
-    used_video_median = False
-    low_corr_zero = False
-    clamped = False
     selected_ms = float(raw_lag_ms)
     video_median_ms = _get_video_median(video_id)
+    flags: Set[str] = set()
 
     if hit_bound:
+        flags.add("hit_bound")
         if video_median_ms is not None:
             selected_ms = video_median_ms
-            used_video_median = True
+            flags.add("used_video_median")
         else:
             selected_ms = 0.0
 
     if math.isfinite(corr):
         if corr < _LOW_CORR_THRESHOLD:
             selected_ms = 0.0
-            low_corr_zero = True
-        elif corr < _BORDERLINE_CORR_THRESHOLD and not used_video_median:
+            flags.add("low_corr_zero")
+        elif corr < _BORDERLINE_CORR_THRESHOLD and "used_video_median" not in flags:
             if video_median_ms is not None:
                 selected_ms = video_median_ms
-                used_video_median = True
+                flags.add("used_video_median")
             else:
                 selected_ms = 0.0
-                low_corr_zero = True
+                flags.add("low_corr_zero")
 
-    if math.isfinite(corr) and abs(selected_ms) > _CLAMP_LIMIT_MS and corr < _HIGH_CONFIDENCE_CORR:
-        selected_ms = max(-_CLAMP_LIMIT_MS, min(_CLAMP_LIMIT_MS, selected_ms))
-        clamped = True
+    if (
+        math.isfinite(corr)
+        and abs(selected_ms) > _CLAMP_LIMIT_MS
+        and corr < _HIGH_CONFIDENCE_CORR
+    ):
+        selected_ms = math.copysign(_CLAMP_LIMIT_MS, selected_ms)
+        flags.add("clamped")
 
     if hop_seconds > 0:
         lag_frames = int(round((selected_ms / 1000.0) / hop_seconds))
@@ -263,105 +358,192 @@ def _apply_guardrails(video_id: str,
         lag_frames = 0
         lag_ms = 0.0
 
-    result = AVLagResult(
+    return lag_frames, float(lag_ms), flags
+
+
+def compute_av_lag(
+    video_id: str,
+    frames: torch.Tensor,
+    *,
+    fps: Optional[float] = None,
+    hop_seconds: Optional[float] = None,
+    events: Optional[torch.Tensor] = None,
+    clip_start: float = 0.0,
+    clip_end: Optional[float] = None,
+    cache: Optional[AVLagCache] = None,
+    window_ms: float = _DEFAULT_WINDOW_MS,
+    keyboard_bbox: Optional[Sequence[int]] = None,
+    max_runtime_s: float = _MAX_RUNTIME_S,
+) -> AVLagResult:
+    canon_id = canonical_video_id(video_id)
+    start_time = time.perf_counter()
+    flags: Set[str] = set()
+    lag_frames = 0
+    lag_ms = 0.0
+    corr = float("nan")
+    from_cache = False
+    success = False
+    pending_cache_value: Optional[float] = None
+
+    if hop_seconds is None or hop_seconds <= 0:
+        if fps is None or fps <= 0:
+            raise ValueError("compute_av_lag requires fps>0 or hop_seconds>0")
+        hop_seconds = 1.0 / float(fps)
+    else:
+        hop_seconds = float(hop_seconds)
+    if hop_seconds <= 0:
+        raise ValueError("hop_seconds must be positive")
+
+    T = int(frames.shape[0]) if frames is not None else 0
+    if clip_end is None:
+        clip_end = clip_start + max(T - 1, 0) * hop_seconds
+
+    video_env = _motion_envelope(frames, keyboard_bbox)
+    audio_env = _label_envelope(events, clip_start, clip_end, hop_seconds, T)
+    if video_env is None or audio_env is None:
+        runtime_s = time.perf_counter() - start_time
+        return AVLagResult(lag_frames, lag_ms, float("nan"), False, False, runtime_s, flags)
+
+    cached_ms = cache.get(canon_id) if cache is not None else None
+    if cached_ms is not None:
+        from_cache = True
+        raw_lag_ms = float(cached_ms)
+        lag_frames_guess = int(round((raw_lag_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
+        corr = _corr_at_lag(video_env, audio_env, lag_frames_guess)
+        if math.isfinite(corr):
+            lag_frames, lag_ms, guard_flags = _apply_guardrails(
+                canon_id,
+                hop_seconds=hop_seconds,
+                raw_lag_ms=raw_lag_ms,
+                corr=corr,
+                hit_bound=False,
+            )
+            flags.update(guard_flags)
+            success = True
+            pending_cache_value = lag_ms
+        else:
+            lag_frames = lag_frames_guess
+            lag_ms = raw_lag_ms
+            success = False
+    else:
+        search_window_ms = _select_window_ms(window_ms if window_ms > 0 else _DEFAULT_WINDOW_MS)
+        max_lag_frames = int(round((search_window_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
+        max_lag_frames = max(0, max_lag_frames)
+        hit_bound = False
+        if max_lag_frames == 0:
+            corr_candidate = _corr_at_lag(video_env, audio_env, 0)
+            if math.isfinite(corr_candidate):
+                corr = corr_candidate
+                lag_frames_raw = 0
+            else:
+                corr = float("nan")
+                lag_frames_raw = 0
+        else:
+            best_corr = float("-inf")
+            best_lag = 0
+            _BOUND_TRACKER["total"] += 1
+            for lag in range(-max_lag_frames, max_lag_frames + 1):
+                candidate_corr = _corr_at_lag(video_env, audio_env, lag)
+                if not math.isfinite(candidate_corr):
+                    continue
+                if candidate_corr > best_corr:
+                    best_corr = candidate_corr
+                    best_lag = lag
+            if not math.isfinite(best_corr) or best_corr == float("-inf"):
+                corr = float("nan")
+                lag_frames_raw = 0
+            else:
+                corr = best_corr
+                lag_frames_raw = best_lag
+                hit_bound = max_lag_frames > 0 and abs(best_lag) == max_lag_frames
+                if hit_bound:
+                    _BOUND_TRACKER["hits"] += 1
+            _maybe_expand_window()
+        if math.isfinite(corr):
+            raw_lag_ms = lag_frames_raw * hop_seconds * 1000.0
+            lag_frames, lag_ms, guard_flags = _apply_guardrails(
+                canon_id,
+                hop_seconds=hop_seconds,
+                raw_lag_ms=raw_lag_ms,
+                corr=corr,
+                hit_bound=hit_bound,
+            )
+            flags.update(guard_flags)
+            success = True
+            pending_cache_value = lag_ms
+        else:
+            lag_frames = 0
+            lag_ms = 0.0
+            success = False
+
+    runtime_s = time.perf_counter() - start_time
+    if runtime_s > max_runtime_s:
+        flags = set(flags)
+        flags.add("lag_timeout")
+        success = False
+        corr = float("nan")
+        lag_frames = 0
+        lag_ms = 0.0
+        pending_cache_value = None
+
+    if success and math.isfinite(corr):
+        _record_video_lag(canon_id, lag_ms, corr, flags)
+        if cache is not None and pending_cache_value is not None:
+            cache.set(canon_id, pending_cache_value)
+
+    return AVLagResult(
         lag_frames=lag_frames,
         lag_ms=float(lag_ms),
         corr=float(corr),
         from_cache=from_cache,
-        success=True,
-        used_video_median=used_video_median,
-        low_corr_zero=low_corr_zero,
-        hit_bound=hit_bound,
-        clamped=clamped,
+        success=success,
+        runtime_s=runtime_s,
+        flags=set(flags),
     )
 
-    _record_video_lag(video_id, result.lag_ms)
-    return result
 
-
-def estimate_av_lag(video_id: str,
-                    frames: torch.Tensor,
-                    labels: torch.Tensor,
-                    *,
-                    clip_start: float,
-                    clip_end: float,
-                    hop_seconds: float,
-                    cache: Optional[AVLagCache] = None,
-                    max_lag_ms: float = 500.0) -> AVLagResult:
-    video_id = canonical_video_id(video_id)
-    T = int(frames.shape[0]) if frames is not None else 0
-    video_env = _motion_envelope(frames)
-    audio_env = _label_envelope(labels, clip_start, clip_end, hop_seconds, T)
-    if video_env is None or audio_env is None:
-        return AVLagResult(0, 0.0, float("nan"), False, False)
-
-    cached_ms = cache.get(video_id) if cache is not None else None
-    if cached_ms is not None:
-        lag_frames = int(round((cached_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
-        corr = _corr_at_lag(video_env, audio_env, lag_frames)
-        if not math.isfinite(corr):
-            return AVLagResult(lag_frames, float(cached_ms), float("nan"), True, False)
-        result = _apply_guardrails(
-            video_id,
-            hop_seconds=hop_seconds,
-            raw_lag_ms=float(cached_ms),
-            corr=corr,
-            from_cache=True,
-            hit_bound=False,
-        )
-        if cache is not None and result.success:
-            cache.set(video_id, result.lag_ms)
-        return result
-
-    search_window_ms = _select_window_ms(max_lag_ms if max_lag_ms > 0 else _DEFAULT_WINDOW_MS)
-    max_lag_frames = int(round((search_window_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
-    max_lag_frames = max(0, max_lag_frames)
-    if max_lag_frames == 0:
-        corr = _corr_at_lag(video_env, audio_env, 0)
-        if not math.isfinite(corr):
-            return AVLagResult(0, 0.0, float("nan"), False, False)
-        result = _apply_guardrails(
-            video_id,
-            hop_seconds=hop_seconds,
-            raw_lag_ms=0.0,
-            corr=corr,
-            from_cache=False,
-            hit_bound=False,
-        )
-        if cache is not None and result.success:
-            cache.set(video_id, result.lag_ms)
-        return result
-
-    best_corr = float("-inf")
-    best_lag = 0
-    _BOUND_TRACKER["total"] += 1
-    for lag in range(-max_lag_frames, max_lag_frames + 1):
-        corr = _corr_at_lag(video_env, audio_env, lag)
-        if not math.isfinite(corr):
-            continue
-        if corr > best_corr:
-            best_corr = corr
-            best_lag = lag
-    if not math.isfinite(best_corr) or best_corr == float("-inf"):
-        return AVLagResult(0, 0.0, float("nan"), False, False)
-
-    hit_bound = max_lag_frames > 0 and abs(best_lag) == max_lag_frames
-    if hit_bound:
-        _BOUND_TRACKER["hits"] += 1
-    _maybe_expand_window()
-
-    lag_ms = best_lag * hop_seconds * 1000.0
-    result = _apply_guardrails(
+def estimate_av_lag(
+    video_id: str,
+    frames: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    clip_start: float,
+    clip_end: float,
+    hop_seconds: float,
+    cache: Optional[AVLagCache] = None,
+    max_lag_ms: float = 500.0,
+) -> AVLagResult:
+    return compute_av_lag(
         video_id,
+        frames,
         hop_seconds=hop_seconds,
-        raw_lag_ms=lag_ms,
-        corr=best_corr,
-        from_cache=False,
-        hit_bound=hit_bound,
+        events=labels,
+        clip_start=clip_start,
+        clip_end=clip_end,
+        cache=cache,
+        window_ms=max_lag_ms,
     )
-    if cache is not None and result.success:
-        cache.set(video_id, result.lag_ms)
-    return result
+
+
+def round_lag_ms_for_cache(lag_ms: float, fps: float) -> int:
+    """Round ``lag_ms`` to the nearest frame duration for cache keys."""
+
+    try:
+        lag_val = float(lag_ms)
+    except (TypeError, ValueError):
+        lag_val = 0.0
+    try:
+        fps_val = float(fps)
+    except (TypeError, ValueError):
+        fps_val = 0.0
+
+    if not math.isfinite(fps_val) or fps_val <= 0:
+        return int(round(lag_val))
+
+    frame_ms = 1000.0 / fps_val
+    frames = int(round(lag_val / frame_ms))
+    rounded_ms = frames * frame_ms
+    return int(round(rounded_ms))
 
 
 def shift_label_events(labels: torch.Tensor,

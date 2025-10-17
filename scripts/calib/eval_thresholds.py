@@ -27,6 +27,7 @@ repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
 from utils import load_config, align_pitch_dim
+from utils.identifiers import canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
@@ -615,6 +616,9 @@ def main():
     clips_done = 0
     t_data0 = time.time()
     last_clip_print = t_data0
+    heartbeat_interval = max(10.0, float(args.progress_interval or 10.0))
+    last_heartbeat = t_data0
+    last_clip_name = "-"
     first_batch_time = None
     with torch.no_grad():
         for batch in val_loader:
@@ -698,8 +702,18 @@ def main():
                 
                 batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
                 clips_done += batch_size
+                now = time.time()
+                if paths:
+                    candidate_id = canonical_video_id(Path(paths[-1]).name)
+                    last_clip_name = candidate_id or Path(paths[-1]).name
+                if now - last_heartbeat >= heartbeat_interval:
+                    elapsed = now - t_data0
+                    _log_progress(
+                        f"[progress] data pass heartbeat: processed_clips={clips_done} skips={len(skip_paths)} last_clip={last_clip_name} elapsed={_format_seconds(elapsed)}",
+                        force=True,
+                    )
+                    last_heartbeat = now
                 if args.progress:
-                    now = time.time()
                     progress_force = clips_done == batch_size or (
                         num_clips_est is not None and clips_done >= num_clips_est
                     )

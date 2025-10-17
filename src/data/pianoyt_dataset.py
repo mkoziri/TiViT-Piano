@@ -26,7 +26,7 @@ import os
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 try:
     from typing import TypedDict
 except ImportError:  # Python <3.8 fallback (not expected in TiViT)
@@ -36,7 +36,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
-from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
+from utils.av_sync import AVLagCache, compute_av_lag, shift_label_events
 from utils.identifiers import canonical_video_id
 from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
@@ -470,13 +470,15 @@ class PianoYTDataset(Dataset):
         self.max_clips: Optional[int] = None
 
         self._av_sync_cache = AVLagCache()
+        self._av_sync_cache.preload()
         self._av_sync_warned = False
+        self._lag_log_once: Set[str] = set()
         self._valid_entries: List[WindowEntry] = []
-        self._label_warned: set = set()
+        self._label_warned: Set[str] = set()
         self._num_windows: int = 0
         self._frame_target_cache = FrameTargetCache()
-        self._frame_target_log_once: set[str] = set()
-        self._frame_target_failures: set[str] = set()
+        self._frame_target_log_once: Dict[str, Set[str]] = {}
+        self._frame_target_failures: Set[str] = set()
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
         if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
@@ -728,13 +730,13 @@ class PianoYTDataset(Dataset):
 
         lag_result = None
         if labels_tensor.numel() > 0:
-            lag_result = estimate_av_lag(
+            lag_result = compute_av_lag(
                 video_id=video_id,
                 frames=clip,
-                labels=labels_tensor,
+                events=labels_tensor,
+                hop_seconds=hop_seconds,
                 clip_start=t0,
                 clip_end=t1,
-                hop_seconds=hop_seconds,
                 cache=self._av_sync_cache,
             )
 
@@ -747,34 +749,28 @@ class PianoYTDataset(Dataset):
                     video_id,
                 )
                 self._av_sync_warned = True
-            lag_seconds = (lag_result.lag_frames * hop_seconds) if getattr(lag_result, "success", False) else 0.0
+            lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
             shifted_labels = shift_label_events(
                 labels_tensor,
                 lag_seconds,
                 clip_start=t0,
                 clip_end=t1,
             )
-            lag_ms_display = lag_result.lag_ms if getattr(lag_result, "success", False) else 0.0
-            corr_val = lag_result.corr if getattr(lag_result, "success", False) else float("nan")
+            lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
+            corr_val = float(lag_result.corr)
             corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
-            flags = []
-            if lag_result.used_video_median:
-                flags.append("used_video_median")
-            if lag_result.low_corr_zero:
-                flags.append("low_corr_zero")
-            if lag_result.hit_bound:
-                flags.append("hit_bound")
-            if lag_result.clamped:
-                flags.append("clamped")
-            flags_str = ",".join(flags) if flags else "-"
-            LOGGER.info(
-                "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
-                video_id,
-                int(round(lag_ms_display)),
-                corr_str,
-                T,
-                flags_str,
-            )
+            flags_set: Set[str] = set(lag_result.flags or set())
+            flags_str = ",".join(sorted(flags_set)) if flags_set else "-"
+            if not audit and video_id not in self._lag_log_once:
+                LOGGER.info(
+                    "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
+                    video_id,
+                    int(round(lag_ms_display)),
+                    corr_str,
+                    T,
+                    flags_str,
+                )
+                self._lag_log_once.add(video_id)
         else:
             shifted_labels = shifted_labels.reshape(0, 3)
 
@@ -904,24 +900,31 @@ class PianoYTDataset(Dataset):
         )
         return result.sample
 
-    def _log_missing_labels_once(self, video_path: Path) -> None:
-        name = video_path.name
-        if name in self._label_warned:
+    def _log_missing_labels_once(self, video_ref: Union[str, Path]) -> None:
+        video_id = canonical_video_id(video_ref)
+        if not video_id:
+            video_id = str(video_ref)
+        if video_id in self._label_warned:
             return
-        self._label_warned.add(name)
-        LOGGER.warning("skip_no_labels %s", name)
+        self._label_warned.add(video_id)
+        LOGGER.warning("skip_no_labels %s", video_id)
 
     def _log_frame_target_status(
         self, video_id: str, status: str, key_hash: str, lag_ms: int
     ) -> None:
-        if video_id in self._frame_target_log_once:
+        if not key_hash:
             return
-        self._frame_target_log_once.add(video_id)
+        tickets = self._frame_target_log_once.setdefault(video_id, set())
+        ticket = f"{status}:{key_hash[:8]}"
+        if ticket in tickets:
+            return
+        tickets.add(ticket)
         LOGGER.info(
-            "targets: %s key=%s lag_ms=%+d video=%s",
+            "targets: %s key=%s lag_ms=%+d split=%s id=%s",
             status,
-            key_hash,
+            key_hash[:8],
             lag_ms,
+            self.split,
             video_id,
         )
 

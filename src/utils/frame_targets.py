@@ -162,6 +162,8 @@ def resolve_lag_ms(lag_result: Optional[AVLagResult]) -> Tuple[float, str]:
         source_bits.append("bound")
     if getattr(lag_result, "clamped", False):
         source_bits.append("clamped")
+    if getattr(lag_result, "lag_timeout", False):
+        source_bits.append("timeout")
     return lag_ms, "+".join(source_bits)
 
 

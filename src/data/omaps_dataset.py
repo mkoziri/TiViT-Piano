@@ -22,7 +22,7 @@ import random
 import zlib
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from utils.av_sync import AVLagCache, estimate_av_lag, shift_label_events
+from utils.av_sync import AVLagCache, compute_av_lag, shift_label_events
 from utils.frame_target_cache import FrameTargetCache
 from utils.identifiers import canonical_video_id
 from utils.frame_targets import (
@@ -648,13 +648,15 @@ class OMAPSDataset(Dataset):
         self.max_clips: Optional[int] = None
 
         self._av_sync_cache = AVLagCache()
+        self._av_sync_cache.preload()
         self._av_sync_warned = False
+        self._lag_log_once: Set[str] = set()
         self._valid_indices: List[int] = []
-        self._label_warned: set = set()
+        self._label_warned: Set[str] = set()
         self._num_windows: int = 0
         self._frame_target_cache = FrameTargetCache()
-        self._frame_target_log_once: set[str] = set()
-        self._frame_target_failures: set[str] = set()
+        self._frame_target_log_once: Dict[str, Set[str]] = {}
+        self._frame_target_failures: Set[str] = set()
         self.frame_target_spec: Optional[FrameTargetSpec] = None
         self.frame_target_summary: Optional[str] = None
 
@@ -749,6 +751,7 @@ class OMAPSDataset(Dataset):
 
     def _load_sample_for_video(self, video_idx: int, sample_index: int) -> Optional[Dict[str, Any]]:
         path = self.videos[video_idx]
+        video_id = canonical_video_id(path.stem)
 
         is_train = self.split == "train"
         clip, start_idx = _load_clip_with_random_start(
@@ -776,7 +779,7 @@ class OMAPSDataset(Dataset):
                 sample_index=sample_index,
                 start_idx=start_idx,
                 interp=self.global_aug_cfg.get("interp", self.registration_interp),
-                id_key=path.stem,
+                id_key=video_id,
             )
 
         _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
@@ -815,20 +818,22 @@ class OMAPSDataset(Dataset):
             self._invalidate_video_index(video_idx)
             return None
 
-        lag_result = estimate_av_lag(
-            video_id=path.stem,
-            frames=clip,
-            labels=labels_tensor,
-            clip_start=t0,
-            clip_end=t1,
-            hop_seconds=hop_seconds,
-            cache=self._av_sync_cache,
-        ) if labels_tensor.numel() > 0 else None
+        lag_result = None
+        if labels_tensor.numel() > 0:
+            lag_result = compute_av_lag(
+                video_id=video_id,
+                frames=clip,
+                events=labels_tensor,
+                hop_seconds=hop_seconds,
+                clip_start=t0,
+                clip_end=t1,
+                cache=self._av_sync_cache,
+            )
 
         if lag_result is not None:
             if not lag_result.success and not self._av_sync_warned:
                 LOGGER.warning(
-                    "Unable to compute A/V lag for clip %s; using lag=0", path.stem
+                    "Unable to compute A/V lag for clip %s; using lag=0", video_id
                 )
                 self._av_sync_warned = True
             lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
@@ -839,26 +844,20 @@ class OMAPSDataset(Dataset):
                 clip_end=t1,
             )
             lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
-            corr_val = lag_result.corr if lag_result.success else float("nan")
+            corr_val = float(lag_result.corr)
             corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
-            flags = []
-            if lag_result.used_video_median:
-                flags.append("used_video_median")
-            if lag_result.low_corr_zero:
-                flags.append("low_corr_zero")
-            if lag_result.hit_bound:
-                flags.append("hit_bound")
-            if lag_result.clamped:
-                flags.append("clamped")
-            flags_str = ",".join(flags) if flags else "-"
-            LOGGER.info(
-                "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
-                path.stem,
-                int(round(lag_ms_display)),
-                corr_str,
-                T,
-                flags_str,
-            )
+            flags_set: Set[str] = set(lag_result.flags or set())
+            flags_str = ",".join(sorted(flags_set)) if flags_set else "-"
+            if video_id not in self._lag_log_once:
+                LOGGER.info(
+                    "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
+                    video_id,
+                    int(round(lag_ms_display)),
+                    corr_str,
+                    T,
+                    flags_str,
+                )
+                self._lag_log_once.add(video_id)
 
         if labels_tensor is not None and labels_tensor.numel() > 0:
             sample["labels"] = labels_tensor
@@ -926,22 +925,22 @@ class OMAPSDataset(Dataset):
                     spec=spec,
                     cache=self._frame_target_cache,
                     split=self.split,
-                    video_id=path.stem,
+                    video_id=video_id,
                     clip_start=t0,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.warning(
                     "Failed to build frame targets for %s: %s",
-                    path.stem,
+                    video_id,
                     exc,
                 )
-                self._log_frame_target_status(path.stem, "failed", "-", 0)
-                self._mark_frame_target_failure(video_idx, path.stem)
+                self._log_frame_target_status(video_id, "failed", "-", 0)
+                self._mark_frame_target_failure(video_idx, video_id)
                 return None
 
             if ft_result.cache_key is not None:
                 self._log_frame_target_status(
-                    path.stem,
+                    video_id,
                     ft_result.status,
                     ft_result.cache_key,
                     ft_result.lag_ms,
@@ -951,7 +950,7 @@ class OMAPSDataset(Dataset):
                 sample.update(ft_result.payload)
             elif ft_result.status == "missing" and getattr(self, "require_labels", False):
                 self._log_missing_labels_once(path)
-                self._mark_frame_target_failure(video_idx, path.stem)
+                self._mark_frame_target_failure(video_idx, video_id)
                 return None
             lag_ms_int = ft_result.lag_ms
             lag_source = ft_result.lag_source
@@ -961,23 +960,28 @@ class OMAPSDataset(Dataset):
         return sample
 
     def _log_missing_labels_once(self, path: Path) -> None:
-        name = path.name
-        if name in self._label_warned:
+        video_id = canonical_video_id(path)
+        if video_id in self._label_warned:
             return
-        self._label_warned.add(name)
-        LOGGER.warning("skip_no_labels %s", name)
+        self._label_warned.add(video_id)
+        LOGGER.warning("skip_no_labels %s", video_id)
 
     def _log_frame_target_status(
         self, video_id: str, status: str, key_hash: str, lag_ms: int
     ) -> None:
-        if video_id in self._frame_target_log_once:
+        if not key_hash:
             return
-        self._frame_target_log_once.add(video_id)
+        tickets = self._frame_target_log_once.setdefault(video_id, set())
+        ticket = f"{status}:{key_hash[:8]}"
+        if ticket in tickets:
+            return
+        tickets.add(ticket)
         LOGGER.info(
-            "targets: %s key=%s lag_ms=%+d video=%s",
+            "targets: %s key=%s lag_ms=%+d split=%s id=%s",
             status,
-            key_hash,
+            key_hash[:8],
             lag_ms,
+            self.split,
             video_id,
         )
 

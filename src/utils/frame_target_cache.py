@@ -30,6 +30,9 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple, TypedDict
 
 import torch
 
+from .av_sync import round_lag_ms_for_cache
+from .identifiers import canonical_video_id
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -68,10 +71,12 @@ def make_frame_target_cache_key(
     if len(hw_values) < 2:
         raise ValueError("canonical_hw must provide at least (H, W)")
     hw_tuple = (int(hw_values[0]), int(hw_values[1]))
+    canon_video_id = canonical_video_id(video_id)
+    rounded_lag_ms = round_lag_ms_for_cache(lag_ms, fps)
     key_data: FrameTargetMeta = {
         "split": str(split),
-        "video_id": str(video_id),
-        "lag_ms": int(round(float(lag_ms))),
+        "video_id": canon_video_id,
+        "lag_ms": int(rounded_lag_ms),
         "fps": float(fps),
         "frames": int(frames),
         "tolerance": float(tolerance),
