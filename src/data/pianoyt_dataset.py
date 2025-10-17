@@ -27,7 +27,7 @@ import time
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 try:
     from typing import TypedDict
 except ImportError:  # Python <3.8 fallback (not expected in TiViT)
@@ -484,6 +484,30 @@ class PianoYTDataset(Dataset):
             self.dataset_cfg.get("frame_targets", {}) or {}
         )
         self.max_clips: Optional[int] = None
+        default_audit_timeout = 10.0
+        timeout_override = self.dataset_cfg.get("audit_timeout_sec")
+        timeout_env = os.environ.get("DATASET_AUDIT_TIMEOUT_SEC")
+        self._audit_timeout_sec = float(timeout_override) if timeout_override else default_audit_timeout
+        if self._audit_timeout_sec <= 0:
+            LOGGER.warning(
+                "Invalid dataset audit_timeout_sec %.2f; using %.1fs default",
+                self._audit_timeout_sec,
+                default_audit_timeout,
+            )
+            self._audit_timeout_sec = default_audit_timeout
+        if timeout_env:
+            try:
+                parsed = float(timeout_env)
+                if parsed > 0:
+                    self._audit_timeout_sec = parsed
+                else:
+                    raise ValueError("timeout must be positive")
+            except ValueError:
+                LOGGER.warning(
+                    "Invalid DATASET_AUDIT_TIMEOUT_SEC value '%s'; using %.1fs default",
+                    timeout_env,
+                    self._audit_timeout_sec,
+                )
 
         env_disable = str(os.environ.get("AVSYNC_DISABLE", "")).strip().lower()
         env_disabled = env_disable in {"1", "true", "yes", "on"}
@@ -742,52 +766,56 @@ class PianoYTDataset(Dataset):
             labels_tensor = torch.zeros((0, 3), dtype=torch.float32)
 
         is_train = self.split == "train" and preferred_start_idx is None and not audit
-        clip, start_idx = _load_clip_with_random_start(
-            path=video_path,
-            frames=self.frames,
-            stride=self.stride,
-            channels=self.channels,
-            training=is_train,
-            decode_fps=self.decode_fps,
-            preferred_start_idx=preferred_start_idx,
-        )
+        clip: Optional[Tensor] = None
+        if audit:
+            start_idx = start_hint
+        else:
+            clip, start_idx = _load_clip_with_random_start(
+                path=video_path,
+                frames=self.frames,
+                stride=self.stride,
+                channels=self.channels,
+                training=is_train,
+                decode_fps=self.decode_fps,
+                preferred_start_idx=preferred_start_idx,
+            )
 
-        if self.registration_enabled and self.apply_crop:
-            meta = self.metadata.get(video_id)
-            clip = apply_registration_crop(clip, meta, self.registration_cfg)
-        elif not self.registration_enabled and not self._registration_off_logged:
-            self._registration_off_logged = True
+            if self.registration_enabled and self.apply_crop:
+                meta = self.metadata.get(video_id)
+                clip = apply_registration_crop(clip, meta, self.registration_cfg)
+            elif not self.registration_enabled and not self._registration_off_logged:
+                self._registration_off_logged = True
 
-        clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
-        
-        if self.global_aug_enabled and is_train:
-            clip = apply_global_augment(
+            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+
+            if self.global_aug_enabled and is_train:
+                clip = apply_global_augment(
+                    clip,
+                    self.global_aug_cfg,
+                    base_seed=self.data_seed,
+                    sample_index=dataset_index,
+                    start_idx=start_idx,
+                    interp=self.global_aug_cfg.get("interp", self.registration_interp),
+                    id_key=video_id,
+                )
+
+            _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
                 clip,
-                self.global_aug_cfg,
-                base_seed=self.data_seed,
-                sample_index=dataset_index,
-                start_idx=start_idx,
-                interp=self.global_aug_cfg.get("interp", self.registration_interp),
-                id_key=video_id,
+                self.tiles,
+                patch_w=self.tiling_patch_w,
+                tokens_split=self.tiling_tokens_split,
+                overlap_tokens=self.tiling_overlap_tokens,
             )
-            
-        _, tokens_per_tile, widths_px, _, aligned_w, original_w = tile_vertical_token_aligned(
-            clip,
-            self.tiles,
-            patch_w=self.tiling_patch_w,
-            tokens_split=self.tiling_tokens_split,
-            overlap_tokens=self.tiling_overlap_tokens,
-        )
-        if aligned_w != original_w:
-            clip = clip[..., :aligned_w]
-        if not self._tiling_log_once:
-            width_sum = sum(widths_px)
-            print(
-                f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                flush=True,
-            )
-            self._tiling_log_once = True
+            if aligned_w != original_w:
+                clip = clip[..., :aligned_w]
+            if not self._tiling_log_once:
+                width_sum = sum(widths_px)
+                print(
+                    f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
+                    f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
+                    flush=True,
+                )
+                self._tiling_log_once = True
 
         T = self.frames
         fps = self.decode_fps
@@ -798,7 +826,9 @@ class PianoYTDataset(Dataset):
         if audit:
             sample: Dict[str, Any] = {"path": str(video_path)}
         else:
-            sample = {"video": clip, "path": str(video_path)}
+            assert clip is not None
+            clip_tensor = cast(Tensor, clip)
+            sample = {"video": clip_tensor, "path": str(video_path)}
 
         lag_result = None
         lag_ms_int: Optional[int] = None
@@ -831,7 +861,7 @@ class PianoYTDataset(Dataset):
                 cache_obj = self._av_sync_cache
                 lag_result = compute_av_lag(
                     video_id=video_id,
-                    frames=clip,
+                    frames=clip_tensor,
                     events=labels_tensor,
                     hop_seconds=hop_seconds,
                     clip_start=t0,
@@ -1244,7 +1274,13 @@ class PianoYTDataset(Dataset):
                 per_start = time.perf_counter()
                 has_window = self._record_has_valid_window(idx)
                 elapsed = time.perf_counter() - per_start
-                if elapsed > 1.0:
+                status_label = "ok" if has_window else "no_window"
+                if log_summary:
+                    print(
+                        f"[dataset] audit clip={vid_id} elapsed={elapsed:.2f}s status={status_label}",
+                        flush=True,
+                    )
+                if elapsed > self._audit_timeout_sec:
                     if log_summary:
                         print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
                     self._mark_bad_clip(idx, vid_id, "audit_timeout")
@@ -1267,7 +1303,12 @@ class PianoYTDataset(Dataset):
                 per_start = time.perf_counter()
                 entries, status, events_on, events_off, lag_ms = self._plan_eval_entries(idx)
                 elapsed = time.perf_counter() - per_start
-                if elapsed > 1.0:
+                if log_summary:
+                    print(
+                        f"[dataset] audit clip={vid_id} elapsed={elapsed:.2f}s status={status}",
+                        flush=True,
+                    )
+                if elapsed > self._audit_timeout_sec:
                     if log_summary:
                         print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
                     self._mark_bad_clip(idx, vid_id, "audit_timeout")
