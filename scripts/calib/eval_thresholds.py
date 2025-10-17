@@ -700,7 +700,10 @@ def main():
                 clips_done += batch_size
                 if args.progress:
                     now = time.time()
-                    if now - last_clip_print >= args.progress_interval:
+                    progress_force = clips_done == batch_size or (
+                        num_clips_est is not None and clips_done >= num_clips_est
+                    )
+                    if progress_force or now - last_clip_print >= args.progress_interval:
                         elapsed = now - t_data0
                         if num_clips_est:
                             pct = min(clips_done, num_clips_est) / max(num_clips_est, 1) * 100.0
@@ -713,7 +716,8 @@ def main():
                             eta_display = "??:??"
                         clips_total_display = num_clips_est if num_clips_est is not None else "?"
                         _log_progress(
-                            f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                            f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
+                            force=progress_force,
                         )
                         last_clip_print = now
             except (KeyboardInterrupt, SystemExit):
@@ -949,7 +953,8 @@ def main():
         combo_idx += 1
         if args.progress and num_combos > 0:
             now = time.time()
-            if now - last_grid_print >= args.progress_interval:
+            progress_force = combo_idx == 1 or combo_idx == num_combos
+            if progress_force or now - last_grid_print >= args.progress_interval:
                 elapsed = now - t_grid0
                 if combo_idx > 0 and num_combos:
                     remaining = max(num_combos - combo_idx, 0)
@@ -959,7 +964,8 @@ def main():
                     eta_display = "??:??"
                 k_display = k_onset if k_onset is not None else default_k_onset
                 _log_progress(
-                    f"[progress] grid {combo_idx}/{num_combos}  onset_thr={on_thr:.3f}  offset_thr={off_thr:.3f}  k_onset={k_display}  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}"
+                    f"[progress] grid {combo_idx}/{num_combos}  onset_thr={on_thr:.3f}  offset_thr={off_thr:.3f}  k_onset={k_display}  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
+                    force=progress_force,
                 )
                 last_grid_print = now
         return res
