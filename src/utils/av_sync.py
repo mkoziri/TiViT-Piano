@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .identifiers import canonical_video_id
+from .identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 
 LOGGER = logging.getLogger(__name__)
 
@@ -101,9 +101,14 @@ class AVLagCache:
         self._load()
         if self._cache is None:
             return None
-        key = canonical_video_id(video_id)
-        value = self._cache.get(key)
-        return float(value) if value is not None else None
+        canon_id = canonical_video_id(video_id)
+        for alias in id_aliases(canon_id):
+            value = self._cache.get(alias)
+            if value is not None:
+                if alias != canon_id:
+                    log_legacy_id_hit(alias, canon_id, logger=LOGGER)
+                return float(value)
+        return None
 
     def set(self, video_id: str, lag_ms: float) -> None:
         self._load()
@@ -116,6 +121,9 @@ class AVLagCache:
             if current is not None and math.isclose(current, new_value, abs_tol=1e-3):
                 return
             self._cache[key] = new_value
+            legacy_key = f"{key}.0"
+            if legacy_key in self._cache and legacy_key != key:
+                del self._cache[legacy_key]
             tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + _CACHE_TMP_SUFFIX)
             try:
                 with tmp_path.open("w", encoding="utf-8") as handle:
@@ -226,6 +234,23 @@ def _label_envelope(labels: torch.Tensor,
     kernel /= kernel.sum()
     env = np.convolve(env, kernel, mode="same")
     return _normalize_series(env.astype(np.float32, copy=False))
+
+
+def _resample_to_length(values: Optional[np.ndarray], target_len: int) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    if target_len <= 0:
+        return values
+    if values.size == target_len:
+        return values.astype(np.float32, copy=False)
+    if values.size == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if values.size == 1:
+        return np.full(target_len, float(values[0]), dtype=np.float32)
+    src_idx = np.linspace(0.0, values.size - 1, num=values.size, dtype=np.float32)
+    dst_idx = np.linspace(0.0, values.size - 1, num=target_len, dtype=np.float32)
+    resampled = np.interp(dst_idx, src_idx, values.astype(np.float32, copy=False))
+    return resampled.astype(np.float32, copy=False)
 
 
 def _corr_at_lag(video_env: np.ndarray, audio_env: np.ndarray, lag: int) -> float:
@@ -377,6 +402,7 @@ def compute_av_lag(
 ) -> AVLagResult:
     canon_id = canonical_video_id(video_id)
     start_time = time.perf_counter()
+    deadline = start_time + float(max_runtime_s) if max_runtime_s and max_runtime_s > 0 else None
     flags: Set[str] = set()
     lag_frames = 0
     lag_ms = 0.0
@@ -384,6 +410,7 @@ def compute_av_lag(
     from_cache = False
     success = False
     pending_cache_value: Optional[float] = None
+    timed_out = False
 
     if hop_seconds is None or hop_seconds <= 0:
         if fps is None or fps <= 0:
@@ -394,21 +421,41 @@ def compute_av_lag(
     if hop_seconds <= 0:
         raise ValueError("hop_seconds must be positive")
 
+    if fps is not None and fps > 0:
+        fps_est = float(fps)
+    else:
+        fps_est = (1.0 / hop_seconds) if hop_seconds > 0 else 0.0
+    if not math.isfinite(fps_est) or fps_est <= 0:
+        fps_est = 0.0
+    window_frames_cap = int(round(fps_est * 0.5)) if fps_est > 0 else 0
+
     T = int(frames.shape[0]) if frames is not None else 0
     if clip_end is None:
         clip_end = clip_start + max(T - 1, 0) * hop_seconds
 
     video_env = _motion_envelope(frames, keyboard_bbox)
     audio_env = _label_envelope(events, clip_start, clip_end, hop_seconds, T)
+    video_env = _resample_to_length(video_env, T)
+    audio_env = _resample_to_length(audio_env, T)
     if video_env is None or audio_env is None:
         runtime_s = time.perf_counter() - start_time
         return AVLagResult(lag_frames, lag_ms, float("nan"), False, False, runtime_s, flags)
+
+    video_var = float(np.var(video_env)) if video_env.size > 0 else 0.0
+    audio_var = float(np.var(audio_env)) if audio_env.size > 0 else 0.0
+    if video_var <= 1e-6 or audio_var <= 1e-6:
+        flags.add("low_corr_zero")
+        runtime_s = time.perf_counter() - start_time
+        return AVLagResult(0, 0.0, 0.0, False, True, runtime_s, flags)
 
     cached_ms = cache.get(canon_id) if cache is not None else None
     if cached_ms is not None:
         from_cache = True
         raw_lag_ms = float(cached_ms)
         lag_frames_guess = int(round((raw_lag_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
+        if window_frames_cap > 0 and abs(lag_frames_guess) > window_frames_cap:
+            lag_frames_guess = int(math.copysign(window_frames_cap, lag_frames_guess))
+        raw_lag_ms = lag_frames_guess * hop_seconds * 1000.0
         corr = _corr_at_lag(video_env, audio_env, lag_frames_guess)
         if math.isfinite(corr):
             lag_frames, lag_ms, guard_flags = _apply_guardrails(
@@ -418,6 +465,9 @@ def compute_av_lag(
                 corr=corr,
                 hit_bound=False,
             )
+            if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
+                lag_frames = int(math.copysign(window_frames_cap, lag_frames))
+                lag_ms = lag_frames * hop_seconds * 1000.0
             flags.update(guard_flags)
             success = True
             pending_cache_value = lag_ms
@@ -429,27 +479,44 @@ def compute_av_lag(
         search_window_ms = _select_window_ms(window_ms if window_ms > 0 else _DEFAULT_WINDOW_MS)
         max_lag_frames = int(round((search_window_ms / 1000.0) / hop_seconds)) if hop_seconds > 0 else 0
         max_lag_frames = max(0, max_lag_frames)
+        if window_frames_cap > 0:
+            if max_lag_frames == 0:
+                max_lag_frames = window_frames_cap
+            else:
+                max_lag_frames = min(max_lag_frames, window_frames_cap)
         hit_bound = False
         if max_lag_frames == 0:
-            corr_candidate = _corr_at_lag(video_env, audio_env, 0)
-            if math.isfinite(corr_candidate):
-                corr = corr_candidate
-                lag_frames_raw = 0
-            else:
+            if deadline and time.perf_counter() > deadline:
+                timed_out = True
+            if timed_out:
                 corr = float("nan")
                 lag_frames_raw = 0
+            else:
+                corr_candidate = _corr_at_lag(video_env, audio_env, 0)
+                if math.isfinite(corr_candidate):
+                    corr = corr_candidate
+                    lag_frames_raw = 0
+                else:
+                    corr = float("nan")
+                    lag_frames_raw = 0
         else:
             best_corr = float("-inf")
             best_lag = 0
             _BOUND_TRACKER["total"] += 1
             for lag in range(-max_lag_frames, max_lag_frames + 1):
+                if deadline and time.perf_counter() > deadline:
+                    timed_out = True
+                    break
                 candidate_corr = _corr_at_lag(video_env, audio_env, lag)
                 if not math.isfinite(candidate_corr):
                     continue
                 if candidate_corr > best_corr:
                     best_corr = candidate_corr
                     best_lag = lag
-            if not math.isfinite(best_corr) or best_corr == float("-inf"):
+            if timed_out:
+                corr = float("nan")
+                lag_frames_raw = 0
+            elif not math.isfinite(best_corr) or best_corr == float("-inf"):
                 corr = float("nan")
                 lag_frames_raw = 0
             else:
@@ -468,6 +535,9 @@ def compute_av_lag(
                 corr=corr,
                 hit_bound=hit_bound,
             )
+            if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
+                lag_frames = int(math.copysign(window_frames_cap, lag_frames))
+                lag_ms = lag_frames * hop_seconds * 1000.0
             flags.update(guard_flags)
             success = True
             pending_cache_value = lag_ms
@@ -477,11 +547,11 @@ def compute_av_lag(
             success = False
 
     runtime_s = time.perf_counter() - start_time
-    if runtime_s > max_runtime_s:
+    if timed_out or (max_runtime_s > 0 and runtime_s > max_runtime_s):
         flags = set(flags)
         flags.add("lag_timeout")
         success = False
-        corr = float("nan")
+        corr = 0.0
         lag_frames = 0
         lag_ms = 0.0
         pending_cache_value = None

@@ -248,6 +248,7 @@ def main():
     ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
+    ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
     ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
     ap.add_argument(
         "--dump_logits",
@@ -360,6 +361,22 @@ def main():
         seconds = max(0.0, float(seconds))
         minutes, secs = divmod(int(seconds), 60)
         return f"{minutes:02d}:{secs:02d}"
+
+    def _dataset_video_count(ds) -> str:
+        if ds is None:
+            return "?"
+        try:
+            if hasattr(ds, "samples"):
+                return str(len(getattr(ds, "samples")))
+            if hasattr(ds, "videos"):
+                videos_attr = getattr(ds, "videos")
+                try:
+                    return str(len(videos_attr))
+                except TypeError:
+                    pass
+            return str(len(ds))
+        except Exception:
+            return "?"
     
     stage_durations = {}
     BAD_CLIP_RETRY_LIMIT = 3
@@ -461,17 +478,44 @@ def main():
             args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
 
-    cfg = load_config("configs/config.yaml")
+    cfg = dict(load_config("configs/config.yaml"))
+    dataset_raw = cfg.get("dataset")
+    if isinstance(dataset_raw, dict):
+        dataset_cfg = dict(dataset_raw)
+    else:
+        dataset_cfg = {}
+    cfg["dataset"] = dataset_cfg
     if args.max_clips is not None:
-        cfg["dataset"]["max_clips"] = args.max_clips
+        dataset_cfg["max_clips"] = args.max_clips
     if args.frames is not None:
-        cfg["dataset"]["frames"] = args.frames
-    decode_fps = float(cfg["dataset"].get("decode_fps", 1.0))
-    hop_seconds = float(cfg["dataset"].get("hop_seconds", 1.0 / decode_fps))
+        dataset_cfg["frames"] = args.frames
+    only_id = canonical_video_id(args.only) if args.only else None
+    if only_id:
+        dataset_cfg["only_video"] = only_id
+    if args.debug:
+        dataset_cfg["num_workers"] = 0
+        dataset_cfg["persistent_workers"] = False
+        dataset_cfg["pin_memory"] = False
+        print(
+            "[progress] debug mode: forcing num_workers=0, persistent_workers=False, pin_memory=False",
+            flush=True,
+        )
+    decode_fps = float(dataset_cfg.get("decode_fps", 1.0))
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 1.0 / decode_fps))
     event_tolerance = float(
-        cfg["dataset"].get("frame_targets", {}).get("tolerance", hop_seconds)
+        dataset_cfg.get("frame_targets", {}).get("tolerance", hop_seconds)
     )
-    split = args.split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+
+    frames_display = dataset_cfg.get("frames")
+    max_clips_display = dataset_cfg.get("max_clips")
+    only_display = only_id or "-"
+    frame_text = frames_display if frames_display is not None else "?"
+    max_clips_text = max_clips_display if max_clips_display is not None else "?"
+    print(
+        f"[progress] starting (split={split}, frames={frame_text}, max_clips={max_clips_text}, only={only_display})",
+        flush=True,
+    )
 
     metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
     agg_cfg = metrics_cfg.get("aggregation", {}) or {}
@@ -510,6 +554,13 @@ def main():
             dataset_count = "?"
     batch_size_val = getattr(val_loader, "batch_size", None)
     batch_display = str(batch_size_val) if batch_size_val is not None else "?"
+    worker_count = getattr(val_loader, "num_workers", None)
+    worker_display = str(worker_count) if worker_count is not None else "?"
+    video_count_display = _dataset_video_count(dataset)
+    print(
+        f"[progress] dataset ready (videos={video_count_display}, workers={worker_display})",
+        flush=True,
+    )
     _log_progress(
         f"[progress] dataset ready in {_format_seconds(dataset_elapsed)} ({dataset_elapsed:.2f}s) "
         f"backend={dataset_name} len={dataset_count} batch={batch_display}",

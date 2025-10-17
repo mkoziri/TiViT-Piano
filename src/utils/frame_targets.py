@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+import time
+
 import torch
 
 from .av_sync import AVLagResult
-from .frame_target_cache import FrameTargetCache, FrameTargetMeta, make_frame_target_cache_key
+from .frame_target_cache import FrameTargetCache, FrameTargetMeta, make_target_cache_key
+from .identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 from .time_grid import sec_to_frame
 
 FRAME_TARGET_KEYS: Tuple[str, ...] = (
@@ -53,7 +56,7 @@ class FrameTargetSpec:
     def cache_key_prefix(self) -> str:
         """Return a stable hash prefix derived from the cache configuration."""
 
-        key_hash, _ = make_frame_target_cache_key(
+        key_hash, _ = make_target_cache_key(
             split="__spec__",
             video_id="__spec__",
             lag_ms=0.0,
@@ -62,13 +65,14 @@ class FrameTargetSpec:
             tolerance=self.tolerance,
             dilation=self.dilation,
             canonical_hw=self.canonical_hw,
+            canonicalize=False,
         )
         return key_hash[:8]
 
     def make_cache_key(self, *, split: str, video_id: str, lag_ms: float) -> Tuple[str, FrameTargetMeta]:
         """Compute the cache key/meta tuple for a clip."""
 
-        return make_frame_target_cache_key(
+        return make_target_cache_key(
             split=split,
             video_id=video_id,
             lag_ms=lag_ms,
@@ -103,8 +107,9 @@ class FrameTargetResult:
     status: str
     cache_key: Optional[str]
     cache_meta: Optional[FrameTargetMeta]
-    lag_ms: int
+    lag_ms: Optional[int]
     lag_source: str
+    lag_frames: Optional[int] = None
 
 
 def resolve_frame_target_spec(
@@ -282,12 +287,66 @@ def prepare_frame_targets(
     """Load or construct frame targets for a clip using a shared pipeline."""
 
     lag_ms, lag_source = resolve_lag_ms(lag_result)
-    key_hash, key_meta = spec.make_cache_key(split=split, video_id=video_id, lag_ms=lag_ms)
-    cached_targets, _ = cache.load(key_hash)
-    lag_ms_meta = int(key_meta["lag_ms"])
+    canon_video = canonical_video_id(video_id)
+    aliases = id_aliases(canon_video)
+    key_kwargs = dict(
+        split=split,
+        lag_ms=lag_ms,
+        fps=spec.fps,
+        frames=spec.frames,
+        tolerance=spec.tolerance,
+        dilation=spec.dilation,
+        canonical_hw=spec.canonical_hw,
+    )
 
-    if cached_targets is not None and all(k in cached_targets for k in FRAME_TARGET_KEYS):
-        return FrameTargetResult(cached_targets, "reused", key_hash, key_meta, lag_ms_meta, lag_source)
+    primary_key_hash, primary_key_meta = make_target_cache_key(
+        video_id=canon_video,
+        canonicalize=True,
+        scheme="frame",
+        **key_kwargs,
+    )
+    primary_lag_ms_val = primary_key_meta.get("lag_ms")
+    primary_lag_frames_val = primary_key_meta.get("lag_frames")
+    primary_lag_ms_int = int(round(float(primary_lag_ms_val))) if primary_lag_ms_val is not None else None
+    primary_lag_frames_int = int(primary_lag_frames_val) if primary_lag_frames_val is not None else None
+
+    candidates = []
+    seen_hashes = set()
+    for scheme in ("frame", "legacy_ms"):
+        for alias in aliases:
+            canonicalize_alias = alias == canon_video
+            key_hash, key_meta = make_target_cache_key(
+                video_id=alias,
+                canonicalize=canonicalize_alias,
+                scheme=scheme,
+                **key_kwargs,
+            )
+            if key_hash in seen_hashes:
+                continue
+            seen_hashes.add(key_hash)
+            candidates.append((key_hash, key_meta, alias))
+
+    for key_hash, key_meta, alias in candidates:
+        cached_targets, _ = cache.load(key_hash)
+        if cached_targets is None:
+            continue
+        if not all(k in cached_targets for k in FRAME_TARGET_KEYS):
+            continue
+        if alias != canon_video:
+            log_legacy_id_hit(alias, canon_video)
+        lag_ms_meta = key_meta.get("lag_ms")
+        lag_frames_meta = key_meta.get("lag_frames", None)
+        lag_ms_int = int(round(float(lag_ms_meta))) if lag_ms_meta is not None else None
+        lag_frames_int = int(lag_frames_meta) if lag_frames_meta is not None else None
+        return FrameTargetResult(
+            cached_targets,
+            "reused",
+            key_hash,
+            key_meta,
+            lag_ms_int,
+            lag_source,
+            lag_frames=lag_frames_int,
+        )
 
     labels_local: Optional[torch.Tensor]
     if labels is None or labels.numel() == 0:
@@ -297,6 +356,7 @@ def prepare_frame_targets(
         if labels_local.numel() > 0:
             labels_local[:, 0:2] -= float(clip_start)
 
+    build_start = time.perf_counter()
     ft = build_dense_frame_targets(
         labels_local,
         T=spec.frames,
@@ -311,11 +371,32 @@ def prepare_frame_targets(
         dilate_active_frames=spec.dilation,
         targets_sparse=spec.targets_sparse,
     )
+    build_duration = time.perf_counter() - build_start
+    if build_duration > 3.0:
+        return FrameTargetResult(
+            None,
+            "failed",
+            primary_key_hash,
+            primary_key_meta,
+            primary_lag_ms_int,
+            lag_source,
+            lag_frames=primary_lag_frames_int,
+        )
 
     cache_payload = {key: ft[key] for key in FRAME_TARGET_KEYS}
-    cache.save(key_hash, key_meta, cache_payload)
-    status = "built" if labels_local is not None and labels_local.numel() > 0 else "empty"
-    return FrameTargetResult(cache_payload, status, key_hash, key_meta, lag_ms_meta, lag_source)
+    cache.save(primary_key_hash, primary_key_meta, cache_payload)
+    lag_ms_int = primary_lag_ms_int
+    lag_frames_int = primary_lag_frames_int
+    status = "built"
+    return FrameTargetResult(
+        cache_payload,
+        status,
+        primary_key_hash,
+        primary_key_meta,
+        lag_ms_int,
+        lag_source,
+        lag_frames=lag_frames_int,
+    )
 
 
 __all__ = [

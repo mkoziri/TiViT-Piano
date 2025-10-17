@@ -37,7 +37,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, compute_av_lag, shift_label_events
-from utils.identifiers import canonical_video_id
+from utils.identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
     FrameTargetResult,
@@ -299,23 +299,11 @@ def _load_metadata(root: Path) -> Dict[str, Tuple[int, int, int, int]]:
     return table
 
 
-def _media_token_from_id(video_id: str) -> str:
-    canon = canonical_video_id(video_id)
-    if canon.startswith("video_"):
-        token = canon[6:]
-    elif canon.startswith("video"):
-        token = canon[5:]
-    else:
-        token = canon
-    token = token.strip("_")
-    return token or canon
-
-
 def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optional[Path], Optional[Path]]:
     """Find the video and MIDI paths for ``video_id`` within ``split``."""
 
     canon_id = canonical_video_id(video_id)
-    token = _media_token_from_id(canon_id)
+    aliases = id_aliases(canon_id)
     search_dirs: List[Path] = []
     split_dir = root / split
     if split_dir.exists():
@@ -327,17 +315,42 @@ def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optiona
     if not search_dirs:
         search_dirs.append(split_dir)
 
+    video_path: Optional[Path] = None
+    video_alias: Optional[str] = None
+    midi_path: Optional[Path] = None
+    midi_alias: Optional[str] = None
+
     for base in search_dirs:
-        midi = base / f"audio_{token}.0.midi"
-        video = None
-        for ext in _VIDEO_EXTS:
-            cand = base / f"video_{token}.0{ext}"
-            if cand.exists():
-                video = cand
-                break
-        if video is not None or midi.exists():
-            return video, midi if midi.exists() else None
-    return None, None
+        if video_path is None:
+            for alias in aliases:
+                for ext in _VIDEO_EXTS:
+                    cand = base / f"{alias}{ext}"
+                    if cand.exists():
+                        video_path = cand
+                        video_alias = alias
+                        break
+                if video_path is not None:
+                    break
+        if midi_path is None:
+            for alias in aliases:
+                if alias.startswith("video_"):
+                    audio_name = "audio_" + alias[6:]
+                else:
+                    audio_name = alias
+                cand = base / f"{audio_name}.midi"
+                if cand.exists():
+                    midi_path = cand
+                    midi_alias = alias
+                    break
+        if video_path is not None and midi_path is not None:
+            break
+
+    if video_alias and video_alias != canon_id:
+        log_legacy_id_hit(video_alias, canon_id, logger=LOGGER)
+    if midi_alias and midi_alias != canon_id:
+        log_legacy_id_hit(midi_alias, canon_id, logger=LOGGER)
+
+    return video_path, midi_path
 
 
 def _read_excluded(root: Path, path: Optional[str]) -> set:
@@ -479,6 +492,7 @@ class PianoYTDataset(Dataset):
         self._frame_target_cache = FrameTargetCache()
         self._frame_target_log_once: Dict[str, Set[str]] = {}
         self._frame_target_failures: Set[str] = set()
+        self._bad_clips: Set[str] = set()
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
         if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
@@ -616,6 +630,27 @@ class PianoYTDataset(Dataset):
             self.videos = [s["video"] for s in self.samples]
         self._rebuild_valid_index_cache(log_summary=False)
 
+    def filter_to_video(self, video_id: str) -> bool:
+        """Restrict the dataset to clips originating from ``video_id``."""
+
+        target = canonical_video_id(video_id)
+        filtered = [
+            sample
+            for sample in self.samples
+            if canonical_video_id(sample.get("id", "")) == target
+        ]
+        if not filtered:
+            return False
+        self.samples = filtered
+        self.videos = [s.get("video") for s in self.samples if s.get("video") is not None]
+        self._frame_target_log_once.clear()
+        self._frame_target_failures.clear()
+        self._lag_log_once.clear()
+        self._valid_entries = []
+        self._num_windows = 0
+        self._rebuild_valid_index_cache(log_summary=False)
+        return True
+
     def __len__(self) -> int:
         return len(self._valid_entries)
 
@@ -630,18 +665,25 @@ class PianoYTDataset(Dataset):
         if idx < 0 or idx >= len(self._valid_entries):
             raise IndexError(idx)
 
-        entry = self._valid_entries[idx]
-        result = self._build_sample(
-            entry.record_idx,
-            dataset_index=idx,
-            preferred_start_idx=entry.start_idx,
-            audit=False,
-        )
-        if result.sample is None:
-            raise RuntimeError(
-                f"PianoYTDataset: unable to fetch sample for {result.video_id} ({result.status})"
+        attempts = 0
+        while self._valid_entries:
+            if idx < 0 or idx >= len(self._valid_entries):
+                idx = idx % len(self._valid_entries)
+            entry = self._valid_entries[idx]
+            result = self._build_sample(
+                entry.record_idx,
+                dataset_index=idx,
+                preferred_start_idx=entry.start_idx,
+                audit=False,
             )
-        return result.sample
+            if result.sample is not None:
+                return result.sample
+            attempts += 1
+            if attempts >= max(len(self._valid_entries), 1):
+                break
+        raise RuntimeError(
+            "PianoYTDataset: unable to fetch a valid sample after filtering bad clips."
+        )
 
     def _build_sample(
         self,
@@ -665,7 +707,7 @@ class PianoYTDataset(Dataset):
         if midi_path is None or not midi_path.exists():
             self._log_missing_labels_once(video_path)
             if not audit:
-                self._invalidate_sample_index(record_idx)
+                self._mark_bad_clip(record_idx, video_id, "no_labels")
             return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_hint, video_id)
 
         labels_tensor = _read_midi_events(midi_path)
@@ -801,9 +843,9 @@ class PianoYTDataset(Dataset):
         has_events = shifted_labels.numel() > 0
         sample["labels"] = shifted_labels
 
-        if not has_events and self.require_labels and self.split == "train" and not audit:
+        if not has_events and self.require_labels and not audit:
             self._log_missing_labels_once(video_path)
-            self._invalidate_sample_index(record_idx)
+            self._mark_bad_clip(record_idx, video_id, "no_labels")
             return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
 
         clip_targets: Optional[Dict[str, torch.Tensor]] = None
@@ -881,24 +923,29 @@ class PianoYTDataset(Dataset):
                         exc,
                     )
                     if not audit:
-                        self._log_frame_target_status(video_id, "failed", "-", 0)
+                        self._log_frame_target_status(video_id, "failed", "-", lag_frames=None)
                         self._mark_frame_target_failure(record_idx, video_id)
-                    return SampleBuildResult(None, "build_fail", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
+                    return SampleBuildResult(None, "build_failed", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
 
                 if ft_result.cache_key is not None and not audit:
                     self._log_frame_target_status(
                         video_id,
                         ft_result.status,
                         ft_result.cache_key,
-                        ft_result.lag_ms,
+                        lag_frames=ft_result.lag_frames,
                     )
 
                 if ft_result.payload is not None:
                     sample.update(ft_result.payload)
-                elif self.require_labels and self.split == "train" and not audit:
-                    self._log_missing_labels_once(video_path)
-                    self._mark_frame_target_failure(record_idx, video_id)
-                    return SampleBuildResult(None, "build_fail", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
+                else:
+                    if not audit:
+                        status_lower = (ft_result.status or "").lower()
+                        if status_lower in {"failed", "build_failed"}:
+                            self._mark_frame_target_failure(record_idx, video_id)
+                        elif self.require_labels:
+                            self._log_missing_labels_once(video_path)
+                            self._mark_bad_clip(record_idx, video_id, "no_labels")
+                    return SampleBuildResult(None, "build_failed", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
 
                 lag_ms_int = ft_result.lag_ms
                 lag_source = ft_result.lag_source
@@ -935,7 +982,12 @@ class PianoYTDataset(Dataset):
         LOGGER.warning("skip_no_labels %s", video_id)
 
     def _log_frame_target_status(
-        self, video_id: str, status: str, key_hash: str, lag_ms: int
+        self,
+        video_id: str,
+        status: str,
+        key_hash: str,
+        *,
+        lag_frames: Optional[int],
     ) -> None:
         if not key_hash:
             return
@@ -944,20 +996,31 @@ class PianoYTDataset(Dataset):
         if ticket in tickets:
             return
         tickets.add(ticket)
+        frames_display = lag_frames if lag_frames is not None else "?"
         LOGGER.info(
-            "targets: %s key=%s lag_ms=%+d split=%s id=%s",
+            "targets: %s split=%s id=%s key=%s lag_frames=%s",
             status,
-            key_hash[:8],
-            lag_ms,
             self.split,
             video_id,
+            key_hash[:8],
+            frames_display,
         )
 
-    def _mark_frame_target_failure(self, record_idx: int, video_id: str) -> None:
-        if video_id in self._frame_target_failures:
+    def _mark_bad_clip(self, record_idx: Optional[int], video_id: str, reason: str) -> None:
+        canon = canonical_video_id(video_id)
+        if canon in self._bad_clips:
             return
-        self._frame_target_failures.add(video_id)
-        self._invalidate_sample_index(record_idx)
+        self._bad_clips.add(canon)
+        print(f"[data_pass] mark_bad id={canon} reason={reason}", flush=True)
+        if record_idx is not None:
+            self._invalidate_sample_index(record_idx)
+
+    def _mark_frame_target_failure(self, record_idx: int, video_id: str) -> None:
+        canon = canonical_video_id(video_id)
+        if canon in self._frame_target_failures:
+            return
+        self._frame_target_failures.add(canon)
+        self._mark_bad_clip(record_idx, canon, "build_failed")
     
     def _invalidate_sample_index(self, record_idx: int) -> None:
         if record_idx >= len(self.samples):
@@ -991,6 +1054,9 @@ class PianoYTDataset(Dataset):
 
     def _record_has_valid_window(self, record_idx: int) -> bool:
         record = self.samples[record_idx]
+        video_id = canonical_video_id(record.get("id", ""))
+        if video_id in self._bad_clips:
+            return False
         midi_path = record.get("midi")
         video_path = record.get("video")
         if midi_path is None or not midi_path.exists():
@@ -1035,12 +1101,17 @@ class PianoYTDataset(Dataset):
         video_path = record.get("video")
         midi_path = record.get("midi")
         video_id = record.get("id", "")
+        canon_id = canonical_video_id(video_id)
+
+        if canon_id in self._bad_clips:
+            return [], "bad_clip", 0, 0, None
 
         if video_path is None or not video_path.exists():
             return [], "no_file", 0, 0, None
 
         if midi_path is None or not midi_path.exists():
             self._log_missing_labels_once(video_path)
+            self._mark_bad_clip(record_idx, video_id, "no_labels")
             return [], "no_labels", 0, 0, None
 
         labels_tensor = _read_midi_events(midi_path)
@@ -1086,7 +1157,7 @@ class PianoYTDataset(Dataset):
                 neg_entries.append((entry, result))
 
         if not event_entries and not neg_entries:
-            return [], "build_fail", 0, 0, lag_ms_value
+            return [], "build_failed", 0, 0, lag_ms_value
 
         entries: List[WindowEntry] = []
         events_on_total = 0
@@ -1107,7 +1178,10 @@ class PianoYTDataset(Dataset):
             events_on_total += res.events_on
             events_off_total += res.events_off
 
-        status = "ok" if entries else "build_fail"
+        status = "ok" if entries else "build_failed"
+        if status in {"no_labels", "build_failed"}:
+            reason = "no_labels" if status == "no_labels" else "build_failed"
+            self._mark_bad_clip(record_idx, video_id, reason)
         return entries, status, events_on_total, events_off_total, lag_ms_value
 
     def _rebuild_valid_index_cache(self, *, log_summary: bool) -> None:
@@ -1122,6 +1196,10 @@ class PianoYTDataset(Dataset):
                     skipped += 1
         else:
             for idx, record in enumerate(self.samples):
+                vid_id = canonical_video_id(record.get("id", ""))
+                if vid_id in self._bad_clips:
+                    skipped += 1
+                    continue
                 entries, status, events_on, events_off, lag_ms = self._plan_eval_entries(idx)
                 if self.split == "val":
                     lag_display = lag_ms if lag_ms is not None else "?"
@@ -1186,6 +1264,12 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         apply_crop=bool(dcfg.get("apply_crop", True)),
         crop_rescale=str(dcfg.get("crop_rescale", "auto")),
     )
+
+    only_video = dcfg.get("only_video")
+    if only_video:
+        only_canon = canonical_video_id(only_video)
+        if not dataset.filter_to_video(only_canon):
+            LOGGER.warning("[PianoYT] --only filter skipped; id=%s not found", only_canon)
 
     max_clips = dcfg.get("max_clips")
     dataset.limit_max_clips(max_clips if isinstance(max_clips, int) else None)
@@ -1257,14 +1341,20 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
                     out[k] = vals
         return out
 
+    num_workers = int(dcfg.get("num_workers", 0))
+    pin_memory = bool(dcfg.get("pin_memory", False))
+    persistent_workers_cfg = bool(dcfg.get("persistent_workers", False))
+    persistent_workers = persistent_workers_cfg if num_workers > 0 else False
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
         shuffle=bool(dcfg.get("shuffle", True)) if split == "train" else False,
-        num_workers=int(dcfg.get("num_workers", 0)),
-        pin_memory=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         drop_last=drop_last,
         collate_fn=_collate,
+        persistent_workers=persistent_workers,
     )
     return loader
 

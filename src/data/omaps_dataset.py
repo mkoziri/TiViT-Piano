@@ -724,6 +724,21 @@ class OMAPSDataset(Dataset):
         self._rebuild_valid_index_cache(log_summary=True)
         
 
+    def filter_to_video(self, video_id: str) -> bool:
+        """Restrict the dataset to clips from ``video_id``."""
+
+        target = canonical_video_id(video_id)
+        filtered = [v for v in self.videos if canonical_video_id(v.stem) == target]
+        if not filtered:
+            return False
+        self.videos = filtered
+        self._frame_target_log_once.clear()
+        self._frame_target_failures.clear()
+        self._lag_log_once.clear()
+        self._valid_indices = []
+        self._rebuild_valid_index_cache(log_summary=False)
+        return True
+
 
     def __len__(self):
         return len(self._valid_indices)
@@ -934,7 +949,7 @@ class OMAPSDataset(Dataset):
                     video_id,
                     exc,
                 )
-                self._log_frame_target_status(video_id, "failed", "-", 0)
+                self._log_frame_target_status(video_id, "failed", "-", lag_frames=None)
                 self._mark_frame_target_failure(video_idx, video_id)
                 return None
 
@@ -943,7 +958,7 @@ class OMAPSDataset(Dataset):
                     video_id,
                     ft_result.status,
                     ft_result.cache_key,
-                    ft_result.lag_ms,
+                    lag_frames=ft_result.lag_frames,
                 )
 
             if ft_result.payload is not None:
@@ -967,7 +982,12 @@ class OMAPSDataset(Dataset):
         LOGGER.warning("skip_no_labels %s", video_id)
 
     def _log_frame_target_status(
-        self, video_id: str, status: str, key_hash: str, lag_ms: int
+        self,
+        video_id: str,
+        status: str,
+        key_hash: str,
+        *,
+        lag_frames: Optional[int],
     ) -> None:
         if not key_hash:
             return
@@ -976,13 +996,14 @@ class OMAPSDataset(Dataset):
         if ticket in tickets:
             return
         tickets.add(ticket)
+        frames_display = lag_frames if lag_frames is not None else "?"
         LOGGER.info(
-            "targets: %s key=%s lag_ms=%+d split=%s id=%s",
+            "targets: %s split=%s id=%s key=%s lag_frames=%s",
             status,
-            key_hash[:8],
-            lag_ms,
             self.split,
             video_id,
+            key_hash[:8],
+            frames_display,
         )
 
     def _mark_frame_target_failure(self, video_idx: int, video_id: str) -> None:
@@ -1051,6 +1072,12 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         dataset_cfg=dcfg,
         full_cfg=cfg,
     )
+    only_video = dcfg.get("only_video")
+    if only_video:
+        only_canon = canonical_video_id(only_video)
+        if not dataset.filter_to_video(only_canon):
+            LOGGER.warning("[OMAPS] --only filter skipped; id=%s not found", only_canon)
+
     # attach annotation config if present
     max_clips = dcfg.get("max_clips")
     if isinstance(max_clips, int) and len(dataset.videos) > max_clips:
@@ -1104,13 +1131,19 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
                     out[k] = vals
         return out
 
+    num_workers = int(dcfg.get("num_workers", 0))
+    pin_memory = bool(dcfg.get("pin_memory", False))
+    persistent_workers_cfg = bool(dcfg.get("persistent_workers", False))
+    persistent_workers = persistent_workers_cfg if num_workers > 0 else False
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
         shuffle=bool(dcfg.get("shuffle", True)) if split == "train" else False,
-        num_workers=int(dcfg.get("num_workers", 0)),  # 0 while debugging prints
-        pin_memory=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         drop_last=drop_last,
         collate_fn=_collate,
+        persistent_workers=persistent_workers,
     )
     return loader

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import Union
+from typing import List, Optional, Union
+
+LOGGER = logging.getLogger(__name__)
+_LEGACY_HITS: set[str] = set()
 
 
 def canonical_video_id(path_or_id: Union[str, Path]) -> str:
@@ -67,4 +71,32 @@ def canonical_video_id(path_or_id: Union[str, Path]) -> str:
     return "video_unknown"
 
 
-__all__ = ["canonical_video_id"]
+def id_aliases(canon_id: str) -> List[str]:
+    """Return canonical plus known legacy ID aliases for ``canon_id``."""
+
+    base = canonical_video_id(canon_id)
+    if not base:
+        return []
+    aliases = [base]
+    legacy = f"{base}.0"
+    if legacy not in aliases:
+        aliases.append(legacy)
+    return aliases
+
+
+def log_legacy_id_hit(legacy_id: str, canon_id: str, *, logger: Optional[logging.Logger] = None) -> None:
+    """Emit a single compat log the first time a legacy ID mapping is used."""
+
+    legacy = str(legacy_id or "").strip()
+    canon = canonical_video_id(canon_id)
+    if not legacy or legacy == canon:
+        return
+    key = f"{legacy}->{canon}"
+    if key in _LEGACY_HITS:
+        return
+    _LEGACY_HITS.add(key)
+    target_logger = logger if logger is not None else LOGGER
+    target_logger.info("[compat] legacy_id_hit id=%s → canon=%s", legacy, canon)
+
+
+__all__ = ["canonical_video_id", "id_aliases", "log_legacy_id_hit"]
