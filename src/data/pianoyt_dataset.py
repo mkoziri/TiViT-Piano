@@ -23,6 +23,7 @@ import csv
 import logging
 import math
 import os
+import time
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
@@ -451,6 +452,8 @@ class PianoYTDataset(Dataset):
         *,
         dataset_cfg: Optional[Mapping[str, Any]] = None,
         full_cfg: Optional[Mapping[str, Any]] = None,
+        only_video: Optional[str] = None,
+        avlag_disabled: Optional[bool] = None,
     ):
         super().__init__()
         self.root = _expand_root(root_dir)
@@ -482,8 +485,12 @@ class PianoYTDataset(Dataset):
         )
         self.max_clips: Optional[int] = None
 
-        self._av_sync_cache = AVLagCache()
-        self._av_sync_cache.preload()
+        env_disable = str(os.environ.get("AVSYNC_DISABLE", "")).strip().lower()
+        env_disabled = env_disable in {"1", "true", "yes", "on"}
+        cfg_disabled = bool(self.dataset_cfg.get("avlag_disabled", False))
+        self._av_sync_disabled = bool(avlag_disabled) or cfg_disabled or env_disabled
+        self._av_sync_disabled_logged = False
+        self._av_sync_cache = AVLagCache() if not self._av_sync_disabled else None
         self._av_sync_warned = False
         self._lag_log_once: Set[str] = set()
         self._valid_entries: List[WindowEntry] = []
@@ -493,6 +500,9 @@ class PianoYTDataset(Dataset):
         self._frame_target_log_once: Dict[str, Set[str]] = {}
         self._frame_target_failures: Set[str] = set()
         self._bad_clips: Set[str] = set()
+        self._only_filter_applied: bool = False
+        self._only_video_target: Optional[str] = None
+        self._log_av_disabled_once()
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
         if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
@@ -555,6 +565,10 @@ class PianoYTDataset(Dataset):
         experiment_cfg = self.full_cfg.get("experiment", {}) if isinstance(self.full_cfg, dict) else {}
         seed_val = data_cfg.get("seed", experiment_cfg.get("seed"))
         self.data_seed = int(seed_val) if seed_val is not None else None
+        requested_only = only_video if only_video is not None else self.dataset_cfg.get("only_video")
+        if requested_only:
+            self._only_video_target = canonical_video_id(requested_only)
+            self._only_filter_applied = True
 
         ids = _read_split_ids(self.root, split)
         if manifest:
@@ -568,6 +582,14 @@ class PianoYTDataset(Dataset):
                     manifest,
                     split,
                 )
+        total_videos = len(ids)
+        print(f"[dataset] enter PianoYT(split={split}) total_videos={total_videos}", flush=True)
+        if self._only_video_target:
+            ids = [
+                vid
+                for vid in ids
+                if canonical_video_id(vid) == self._only_video_target
+            ]
 
         self.metadata = _load_metadata(self.root)
         self.samples: List[SampleRecord] = []
@@ -602,12 +624,15 @@ class PianoYTDataset(Dataset):
         self.crop_rescale = "auto"
         self.include_low_res = True
         self.excluded_ids: set = set()
+        print(f"[dataset] after filter videos={len(self.samples)}", flush=True)
 
         if len(self.samples) == 0:
             raise FileNotFoundError(
                 f"No PianoYT media found under {self.root} for split '{split}'."
             )
         
+        if self._av_sync_cache is not None:
+            self._av_sync_cache.preload()
         self._rebuild_valid_index_cache(log_summary=True)
 
     def configure(self, *, include_low_res: bool, excluded_ids: set, apply_crop: bool, crop_rescale: str):
@@ -648,6 +673,8 @@ class PianoYTDataset(Dataset):
         self._lag_log_once.clear()
         self._valid_entries = []
         self._num_windows = 0
+        self._only_filter_applied = True
+        self._only_video_target = target
         self._rebuild_valid_index_cache(log_summary=False)
         return True
 
@@ -779,8 +806,14 @@ class PianoYTDataset(Dataset):
         shifted_labels = labels_tensor
 
         if labels_tensor.numel() > 0:
-            if audit:
-                cached_lag_ms = self._av_sync_cache.get(video_id)
+            if self._av_sync_disabled:
+                self._log_av_disabled_once()
+                lag_source = "av_disabled"
+                shifted_labels = labels_tensor
+                lag_ms_int = 0
+            elif audit:
+                cache_obj = self._av_sync_cache
+                cached_lag_ms = cache_obj.get(video_id) if cache_obj is not None else None
                 if cached_lag_ms is not None and math.isfinite(float(cached_lag_ms)):
                     lag_seconds = float(cached_lag_ms) / 1000.0
                     shifted_labels = shift_label_events(
@@ -795,6 +828,7 @@ class PianoYTDataset(Dataset):
                     shifted_labels = labels_tensor
                     lag_source = "audit_skip"
             else:
+                cache_obj = self._av_sync_cache
                 lag_result = compute_av_lag(
                     video_id=video_id,
                     frames=clip,
@@ -802,7 +836,7 @@ class PianoYTDataset(Dataset):
                     hop_seconds=hop_seconds,
                     clip_start=t0,
                     clip_end=t1,
-                    cache=self._av_sync_cache,
+                    cache=cache_obj,
                 )
                 if lag_result is not None:
                     if not lag_result.success and not self._av_sync_warned:
@@ -901,8 +935,13 @@ class PianoYTDataset(Dataset):
             return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
 
         if not audit:
-            lag_ms_value, lag_source = resolve_lag_ms(lag_result)
-            lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
+            if self._av_sync_disabled:
+                lag_ms_value = 0.0
+                lag_source = "av_disabled"
+                lag_ms_int = 0
+            else:
+                lag_ms_value, lag_source = resolve_lag_ms(lag_result)
+                lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
 
             spec = getattr(self, "frame_target_spec", None)
             if spec is not None:
@@ -971,6 +1010,11 @@ class PianoYTDataset(Dataset):
             audit=False,
         )
         return result.sample
+
+    def _log_av_disabled_once(self) -> None:
+        if self._av_sync_disabled and not self._av_sync_disabled_logged:
+            print("[debug] AV-lag disabled (lag_ms=0 for all clips)", flush=True)
+            self._av_sync_disabled_logged = True
 
     def _log_missing_labels_once(self, video_ref: Union[str, Path]) -> None:
         video_id = canonical_video_id(video_ref)
@@ -1188,19 +1232,48 @@ class PianoYTDataset(Dataset):
         self._valid_entries = []
         total = len(self.samples)
         skipped = 0
+        ok_videos = 0
+        bad_videos = 0
+        audit_start = time.perf_counter()
+        if log_summary:
+            print(f"[dataset] audit start (videos={total})", flush=True)
         if self.split == "train":
             for idx in range(total):
-                if self._record_has_valid_window(idx):
+                record = self.samples[idx]
+                vid_id = canonical_video_id(record.get("id", ""))
+                per_start = time.perf_counter()
+                has_window = self._record_has_valid_window(idx)
+                elapsed = time.perf_counter() - per_start
+                if elapsed > 1.0:
+                    if log_summary:
+                        print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
+                    self._mark_bad_clip(idx, vid_id, "audit_timeout")
+                    skipped += 1
+                    bad_videos += 1
+                    continue
+                if has_window:
                     self._valid_entries.append(WindowEntry(idx, None, True))
+                    ok_videos += 1
                 else:
                     skipped += 1
+                    bad_videos += 1
         else:
             for idx, record in enumerate(self.samples):
                 vid_id = canonical_video_id(record.get("id", ""))
                 if vid_id in self._bad_clips:
                     skipped += 1
+                    bad_videos += 1
                     continue
+                per_start = time.perf_counter()
                 entries, status, events_on, events_off, lag_ms = self._plan_eval_entries(idx)
+                elapsed = time.perf_counter() - per_start
+                if elapsed > 1.0:
+                    if log_summary:
+                        print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
+                    self._mark_bad_clip(idx, vid_id, "audit_timeout")
+                    skipped += 1
+                    bad_videos += 1
+                    continue
                 if self.split == "val":
                     lag_display = lag_ms if lag_ms is not None else "?"
                     LOGGER.info(
@@ -1213,11 +1286,18 @@ class PianoYTDataset(Dataset):
                     )
                 if status == "ok" and entries:
                     self._valid_entries.extend(entries)
+                    ok_videos += 1
                 else:
                     skipped += 1
+                    bad_videos += 1
 
         self._num_windows = len(self._valid_entries)
         if log_summary:
+            elapsed_total = time.perf_counter() - audit_start
+            print(
+                f"[dataset] audit done ok={ok_videos} bad={bad_videos} elapsed={elapsed_total:.2f}s",
+                flush=True,
+            )
             LOGGER.info(
                 "videos: %d, N_skipped_no_labels: %d, windows: %d",
                 total,
@@ -1239,6 +1319,9 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     hop_seconds = float(dcfg.get("hop_seconds", 1.0 / decode_fps))
     stride = int(round(hop_seconds * decode_fps))
     
+    only_video_cfg = dcfg.get("only_video")
+    avlag_disabled_cfg = bool(dcfg.get("avlag_disabled", False))
+
     dataset = PianoYTDataset(
         root_dir=dcfg.get("root_dir"),
         split=split,
@@ -1252,6 +1335,8 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         decode_fps=decode_fps,
         dataset_cfg=dcfg,
         full_cfg=cfg,
+        only_video=only_video_cfg,
+        avlag_disabled=avlag_disabled_cfg,
     )
 
     include_low = bool(dcfg.get("include_low_res", False))
@@ -1265,9 +1350,8 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         crop_rescale=str(dcfg.get("crop_rescale", "auto")),
     )
 
-    only_video = dcfg.get("only_video")
-    if only_video:
-        only_canon = canonical_video_id(only_video)
+    if only_video_cfg and not getattr(dataset, "_only_filter_applied", False):
+        only_canon = canonical_video_id(only_video_cfg)
         if not dataset.filter_to_video(only_canon):
             LOGGER.warning("[PianoYT] --only filter skipped; id=%s not found", only_canon)
 

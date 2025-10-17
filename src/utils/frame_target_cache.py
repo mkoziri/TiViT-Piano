@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Tuple, TypedDict
 
@@ -144,21 +145,57 @@ class FrameTargetCache:
         default_dir = project_root / "runs" / "frame_targets"
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_timeout_logged = False
 
     def _path_for(self, key_hash: str) -> Path:
         return self.cache_dir / f"{key_hash}.pt"
+
+    def _lock_path(self, key_hash: str) -> Path:
+        return self._path_for(key_hash).with_suffix(".lock")
+
+    def _acquire_lock(self, lock_path: Path, timeout: float) -> bool:
+        if timeout is None or timeout < 0:
+            timeout = 0.0
+        deadline = time.perf_counter() + timeout if timeout > 0 else None
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                if deadline is None or time.perf_counter() >= deadline:
+                    return False
+                time.sleep(0.05)
+
+    def _release_lock(self, lock_path: Path) -> None:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
     def load(self, key_hash: str) -> Tuple[Optional[Dict[str, torch.Tensor]], bool]:
         """Return cached tensors and whether the cache file existed."""
 
         path = self._path_for(key_hash)
-        if not path.exists():
+        lock_path = self._lock_path(key_hash)
+        if not self._acquire_lock(lock_path, 1.0):
+            if not self._lock_timeout_logged:
+                LOGGER.warning("Frame target cache lock timeout for key=%s; skipping load", key_hash[:8])
+                self._lock_timeout_logged = True
             return None, False
+        payload = None
         try:
-            payload = torch.load(path, map_location="cpu")
-        except Exception as exc:  # pragma: no cover - defensive path
-            LOGGER.warning("Failed to load frame target cache %s (%s)", path, exc)
-            return None, False
+            if not path.exists():
+                return None, False
+            try:
+                payload = torch.load(path, map_location="cpu")
+            except Exception as exc:  # pragma: no cover - defensive path
+                LOGGER.warning("Failed to load frame target cache %s (%s)", path, exc)
+                return None, False
+        finally:
+            self._release_lock(lock_path)
 
         data = None
         if isinstance(payload, dict):
@@ -182,6 +219,12 @@ class FrameTargetCache:
         """Persist tensors for ``key_hash``; return ``True`` on success."""
 
         path = self._path_for(key_hash)
+        lock_path = self._lock_path(key_hash)
+        if not self._acquire_lock(lock_path, 1.0):
+            if not self._lock_timeout_logged:
+                LOGGER.warning("Frame target cache lock timeout for key=%s; skipping save", key_hash[:8])
+                self._lock_timeout_logged = True
+            return False
         payload = {
             "meta": dict(metadata),
             "data": {
@@ -202,3 +245,5 @@ class FrameTargetCache:
             except OSError:
                 pass
             return False
+        finally:
+            self._release_lock(lock_path)

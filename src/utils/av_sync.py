@@ -81,34 +81,88 @@ class AVLagCache:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._cache: Optional[Dict[str, float]] = None
         self._loaded = False
+        self._lock_timeout_logged = False
+        self._preload_slow_logged = False
 
-    def _load(self) -> None:
+    def _lock_path(self) -> Path:
+        return self.cache_path.with_suffix(self.cache_path.suffix + ".lock")
+
+    def _acquire_file_lock(self, timeout: float) -> bool:
+        lock_path = self._lock_path()
+        if timeout is None or timeout < 0:
+            timeout = 0.0
+        deadline = time.perf_counter() + timeout if timeout > 0 else None
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                if deadline is None or time.perf_counter() >= deadline:
+                    return False
+                time.sleep(0.05)
+
+    def _release_file_lock(self) -> None:
+        lock_path = self._lock_path()
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _load(self, *, lock_timeout: float = 1.0, warn_on_timeout: bool = False, locked: bool = False) -> bool:
         if self._loaded:
-            return
-        with _CACHE_LOCK:
-            if self._loaded:
-                return
-            data: Dict[str, float] = {}
-            if self.cache_path.exists():
-                try:
-                    with self.cache_path.open("r", encoding="utf-8") as handle:
-                        raw = json.load(handle)
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.warning("Failed to load A/V lag cache from %s (%s)", self.cache_path, exc)
-                    raw = None
-                if isinstance(raw, dict):
-                    for key, value in raw.items():
-                        try:
-                            data[str(key)] = float(value)
-                        except (TypeError, ValueError):
-                            continue
-            self._cache = data
-            self._loaded = True
+            return True
+        if not locked:
+            acquired = self._acquire_file_lock(lock_timeout)
+            if not acquired:
+                if warn_on_timeout and not self._lock_timeout_logged:
+                    print("[lag_cache] preload timeout; continuing", flush=True)
+                    self._lock_timeout_logged = True
+                return False
+        try:
+            with _CACHE_LOCK:
+                if self._loaded:
+                    return True
+                data: Dict[str, float] = {}
+                if self.cache_path.exists():
+                    try:
+                        with self.cache_path.open("r", encoding="utf-8") as handle:
+                            raw = json.load(handle)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        LOGGER.warning("Failed to load A/V lag cache from %s (%s)", self.cache_path, exc)
+                        raw = None
+                    if isinstance(raw, dict):
+                        for key, value in raw.items():
+                            try:
+                                data[str(key)] = float(value)
+                            except (TypeError, ValueError):
+                                continue
+                self._cache = data
+                self._loaded = True
+                return True
+        finally:
+            if not locked:
+                self._release_file_lock()
 
     def preload(self) -> None:
         """Eagerly load the cache once during dataset initialisation."""
 
-        self._load()
+        if self._loaded:
+            return
+        start = time.perf_counter()
+        loaded = self._load(lock_timeout=1.0, warn_on_timeout=True, locked=False)
+        elapsed = time.perf_counter() - start
+        if not loaded:
+            return
+        if elapsed > 2.0:
+            if not self._preload_slow_logged:
+                print("[lag_cache] preload exceeded 2s; skipping preload this run", flush=True)
+                self._preload_slow_logged = True
+            with _CACHE_LOCK:
+                self._cache = None
+                self._loaded = False
 
     def get(self, video_id: str) -> Optional[float]:
         self._load()
@@ -124,31 +178,37 @@ class AVLagCache:
         return None
 
     def set(self, video_id: str, lag_ms: float) -> None:
-        self._load()
-        if self._cache is None:
-            self._cache = {}
-        key = canonical_video_id(video_id)
-        new_value = float(lag_ms)
-        with _CACHE_LOCK:
-            current = self._cache.get(key)
-            if current is not None and math.isclose(current, new_value, abs_tol=1e-3):
-                return
-            self._cache[key] = new_value
-            legacy_key = f"{key}.0"
-            if legacy_key in self._cache and legacy_key != key:
-                del self._cache[legacy_key]
+        if not self._acquire_file_lock(1.0):
+            LOGGER.warning("Skipping A/V lag cache write for %s due to lock timeout", video_id)
+            return
+        try:
+            self._load(lock_timeout=0.0, warn_on_timeout=False, locked=True)
+            if self._cache is None:
+                self._cache = {}
+            key = canonical_video_id(video_id)
+            new_value = float(lag_ms)
             tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + _CACHE_TMP_SUFFIX)
-            try:
-                with tmp_path.open("w", encoding="utf-8") as handle:
-                    json.dump(self._cache, handle, indent=2, sort_keys=True)
-                os.replace(tmp_path, self.cache_path)
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning("Failed to write A/V lag cache to %s (%s)", self.cache_path, exc)
+            with _CACHE_LOCK:
+                current = self._cache.get(key)
+                if current is not None and math.isclose(current, new_value, abs_tol=1e-3):
+                    return
+                self._cache[key] = new_value
+                legacy_key = f"{key}.0"
+                if legacy_key in self._cache and legacy_key != key:
+                    del self._cache[legacy_key]
                 try:
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-                except OSError:
-                    pass
+                    with tmp_path.open("w", encoding="utf-8") as handle:
+                        json.dump(self._cache, handle, indent=2, sort_keys=True)
+                    os.replace(tmp_path, self.cache_path)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning("Failed to write A/V lag cache to %s (%s)", self.cache_path, exc)
+                    try:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    except OSError:
+                        pass
+        finally:
+            self._release_file_lock()
 
 
 def _normalize_series(values: np.ndarray) -> Optional[np.ndarray]:

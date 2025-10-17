@@ -17,7 +17,7 @@ CLI:
     dataset split, and ``--dump_logits`` to save logits to NPZ.
 """
 
-import sys, json, time, math, torch
+import sys, json, time, math, os, torch
 from collections import Counter
 import numpy as np
 import torch.nn.functional as F
@@ -250,6 +250,7 @@ def main():
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
     ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
+    ap.add_argument("--no-avlag", action="store_true", help="Disable audio/video lag estimation for isolation")
     ap.add_argument(
         "--dump_logits",
         default="",
@@ -492,14 +493,15 @@ def main():
     only_id = canonical_video_id(args.only) if args.only else None
     if only_id:
         dataset_cfg["only_video"] = only_id
+    env_disable = str(os.environ.get("AVSYNC_DISABLE", "")).strip().lower()
+    avlag_disabled = bool(args.no_avlag) or env_disable in {"1", "true", "yes", "on"}
+    if avlag_disabled:
+        dataset_cfg["avlag_disabled"] = True
     if args.debug:
         dataset_cfg["num_workers"] = 0
         dataset_cfg["persistent_workers"] = False
         dataset_cfg["pin_memory"] = False
-        print(
-            "[progress] debug mode: forcing num_workers=0, persistent_workers=False, pin_memory=False",
-            flush=True,
-        )
+        print("[debug] num_workers=0, persistent_workers=False, pin_memory=False", flush=True)
     decode_fps = float(dataset_cfg.get("decode_fps", 1.0))
     hop_seconds = float(dataset_cfg.get("hop_seconds", 1.0 / decode_fps))
     event_tolerance = float(
