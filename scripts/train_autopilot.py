@@ -131,11 +131,25 @@ def log_banner(results_path: Path, message: str) -> None:
         f.write(f"# {message}\n")
 
 
-def run_command(cmd: List[str], log_file: Path, capture_last_val: bool = False) -> Tuple[int, Optional[str], List[str]]:
+def run_command(
+    cmd: List[str],
+    log_file: Path,
+    capture_last_val: bool = False,
+    *,
+    extra_env: Optional[Dict[str, str]] = None,
+    unset_env: Optional[Iterable[str]] = None,
+    echo_cmd: bool = True,
+) -> Tuple[int, Optional[str], List[str]]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    if unset_env:
+        for key in unset_env:
+            env.pop(key, None)
+    if extra_env:
+        env.update(extra_env)
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    print(">>>", " ".join(cmd))
+    if echo_cmd:
+        print(">>>", " ".join(cmd))
     last_val = None
     lines: List[str] = []
     with log_file.open("w") as logf:
@@ -190,16 +204,40 @@ def sync_last_to_best(ckpt_dir: Path) -> None:
 # Calibration / evaluation helpers
 # ---------------------------------------------------------------------------
 
+def _build_dataset_cli(split: Optional[str], frames: Optional[int], max_clips: Optional[int]) -> List[str]:
+    args: List[str] = []
+    if split:
+        args.extend(["--split", split])
+    if frames is not None:
+        args.extend(["--frames", str(frames)])
+    if max_clips is not None:
+        args.extend(["--max-clips", str(max_clips)])
+    return args
+
+
 def run_calibration(kind: str, ckpt: Path, log_dir: Path, split: str, max_clips: Optional[int], frames: Optional[int]) -> int:
     log_name = f"calibration_{kind}.txt"
     log_path = log_dir / log_name
-    cmd = [sys.executable, str(CALIBRATE_THRESH), "--ckpt", str(ckpt)]
-    if split:
-        cmd.extend(["--split", split])
-    if max_clips is not None:
-        cmd.extend(["--max-clips", str(max_clips)])
-    if frames is not None:
-        cmd.extend(["--frames", str(frames)])
+    dataset_cli = _build_dataset_cli(split, frames, max_clips)
+    cmd = [sys.executable, "-u", str(CALIBRATE_THRESH), *dataset_cli, "--ckpt", str(ckpt)]
+    if kind == "thorough":
+        env_to_unset = ["AVSYNC_DISABLE", "DEBUG"]
+        cmd_display = [Path(cmd[0]).name] + cmd[1:]
+        print(f"[autopilot:thorough] cmd: {' '.join(cmd_display)}")
+        unset_desc = ", ".join(f"{name}=<unset>" for name in env_to_unset)
+        print(f"[autopilot:thorough] env: {unset_desc}")
+        ret, _, lines = run_command(
+            cmd,
+            log_path,
+            capture_last_val=False,
+            unset_env=env_to_unset,
+            echo_cmd=False,
+        )
+        bad_markers = ("[debug] AV-lag disabled", "lag_source=no_avlag")
+        if any(marker in line for line in lines for marker in bad_markers):
+            print("[autopilot] ERROR: thorough calibration disabled A/V lag; aborting.", flush=True)
+            return 1
+        return ret
     ret, _, _ = run_command(cmd, log_path, capture_last_val=False)
     return ret
 
@@ -242,6 +280,9 @@ def run_fast_eval(
     log_dir: Path,
     split: str,
     calibration_json: Path,
+    *,
+    frames: Optional[int] = None,
+    max_clips: Optional[int] = None,
     onset_probs: Optional[Iterable[float]] = None,
     offset_probs: Optional[Iterable[float]] = None,
     temperature: Optional[float] = None,
@@ -250,14 +291,14 @@ def run_fast_eval(
     log_path = log_dir / "eval_fast.txt"
     cmd = [
         sys.executable,
+        "-u",
         str(EVAL_THRESH),
         "--ckpt",
         str(ckpt),
         "--calibration",
         str(calibration_json),
     ]
-    if split:
-        cmd.extend(["--split", split])
+    cmd.extend(_build_dataset_cli(split, frames, max_clips))
     onset_list = None
     if onset_probs is not None:
         onset_list = [max(0.0, min(1.0, p)) for p in onset_probs]
@@ -751,6 +792,8 @@ def perform_calibration(
             stdout_dir,
             split,
             CALIB_JSON,
+            frames=args.calib_frames,
+            max_clips=args.calib_max_clips,
             onset_probs=onset_probs,
             offset_probs=offset_probs,
             temperature=args.temperature,

@@ -1582,6 +1582,37 @@ class PianoYTDataset(Dataset):
         )
         return final_entries
 
+    def materialize_eval_entries_from_labels(
+        self,
+        *,
+        max_total: Optional[int] = None,
+        target_T: Optional[int] = None,
+        fps: Optional[float] = None,
+        stride: Optional[int] = None,
+        tol_s: Optional[float] = None,
+        dilate: Optional[int] = None,
+    ) -> List[Tuple[int, int]]:
+        """
+        Public wrapper used by evaluation/calibration scripts to rebuild the eval snapshot
+        without decoding frames. Mirrors the fast-eval materialization path.
+        """
+
+        max_total_val = max_total if max_total is not None else self.args_max_clips_or_None
+        target_T_val = target_T if target_T is not None else self.frames
+        fps_val = fps if fps is not None else self.decode_fps
+        stride_val = stride if stride is not None else self.stride
+        tol_val = tol_s if tol_s is not None else self.frame_targets_cfg.get("tolerance")
+        dilate_val = dilate if dilate is not None else self.frame_targets_cfg.get("dilate_active_frames")
+
+        return self._materialize_eval_entries_from_labels(
+            max_total=max_total_val,
+            target_T=target_T_val,
+            fps=fps_val,
+            stride=stride_val,
+            tol_s=tol_val,
+            dilate=dilate_val,
+        )
+
     def _record_has_valid_window(self, record_idx: int) -> bool:
         record = self.samples[record_idx]
         video_id = canonical_video_id(record.get("id", ""))
