@@ -20,18 +20,24 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 import argparse
+import faulthandler
 import os
+import signal
+import threading
+import time
 from pathlib import Path
 from time import perf_counter
+from datetime import datetime
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -615,6 +621,188 @@ def _accumulate_pred_key_histogram(hist_bins: list[float], counts: torch.Tensor)
     hist_bins[2] += (flat_counts == 2).sum().item()
     hist_bins[3] += (flat_counts == 3).sum().item()
     hist_bins[4] += (flat_counts >= 4).sum().item()
+
+
+def _format_mmss(seconds: float) -> str:
+    total_seconds = max(0.0, float(seconds))
+    minutes = int(total_seconds // 60)
+    secs = int(total_seconds % 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class SafeEvalCollate:
+    def __init__(self, base_collate):
+        self._base_collate = base_collate
+
+    def __call__(self, batch):
+        filtered = [item for item in batch if item is not None]
+        if not filtered:
+            return None
+        if self._base_collate is None:
+            return filtered
+        return self._base_collate(filtered)
+
+
+def _unwrap_dataset(dataset):
+    current = dataset
+    visited = set()
+    while hasattr(current, "dataset"):
+        key = id(current)
+        if key in visited:
+            break
+        visited.add(key)
+        current = current.dataset
+    return current
+
+
+def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoader]) -> Optional[DataLoader]:
+    if loader is None:
+        return None
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None:
+        return loader
+
+    base_dataset = _unwrap_dataset(dataset)
+    materialize_fn = getattr(base_dataset, "materialize_eval_entries_from_labels", None)
+    snapshot = getattr(base_dataset, "eval_indices_snapshot", None)
+    if callable(materialize_fn) and (not snapshot):
+        try:
+            materialize_fn()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[train:eval] failed to materialize eval entries: %s", exc)
+
+    eval_dataset = base_dataset
+    cap_value = cfg.get("training", {}).get("inner_eval_cap")
+    if isinstance(cap_value, int) and cap_value > 0:
+        capped = min(len(base_dataset), cap_value)
+        eval_dataset = Subset(base_dataset, range(capped))
+
+    safe_collate = SafeEvalCollate(getattr(loader, "collate_fn", None))
+    batch_size = getattr(loader, "batch_size", 1)
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=False,
+        drop_last=False,
+        collate_fn=safe_collate,
+        persistent_workers=False,
+        timeout=120,
+        prefetch_factor=2,
+    )
+    setattr(eval_loader, "_base_dataset", base_dataset)
+    return eval_loader
+
+
+def _spawn_eval_heartbeat(progress: Dict[str, int], start_time: float, interval: float, stop_event: threading.Event) -> threading.Thread:
+    def _runner():
+        while not stop_event.wait(interval):
+            elapsed = time.perf_counter() - start_time
+            processed = progress.get("count", 0)
+            total = progress.get("total")
+            total_repr = total if isinstance(total, int) and total >= 0 else "?"
+            print(
+                f"[train:eval] heartbeat processed={processed}/{total_repr} elapsed={_format_mmss(elapsed)}",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=_runner, name="eval-heartbeat", daemon=True)
+    thread.start()
+    return thread
+
+
+def _spawn_eval_watchdog(start_time: float, interval: float, stop_event: threading.Event) -> threading.Thread:
+    def _runner():
+        while not stop_event.wait(interval):
+            elapsed = time.perf_counter() - start_time
+            print(
+                f"[train:eval] watchdog alive elapsed={_format_mmss(elapsed)}",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=_runner, name="eval-watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
+def _join_thread(thread: Optional[threading.Thread], timeout: float = 1.0) -> None:
+    if thread is None:
+        return
+    try:
+        thread.join(timeout=timeout)
+    except RuntimeError:
+        pass
+
+
+def _first_parameter_device(model) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _move_optimizer_state(optimizer, device: torch.device) -> None:
+    if optimizer is None:
+        return
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                if value.device != device:
+                    state[key] = value.to(device)
+
+
+def _compute_percentile(sorted_values: list[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if percentile <= 0:
+        return float(sorted_values[0])
+    if percentile >= 100:
+        return float(sorted_values[-1])
+    rank = (percentile / 100.0) * (len(sorted_values) - 1)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return float(sorted_values[lower])
+    fraction = rank - lower
+    lower_val = float(sorted_values[lower])
+    upper_val = float(sorted_values[upper])
+    return lower_val + (upper_val - lower_val) * fraction
+
+
+def _atomic_write_metrics(metrics: Mapping[str, Any], output_path: Path, lock_timeout: float = 1.0) -> bool:
+    lock_path = output_path.with_suffix(output_path.suffix + ".lock")
+    deadline = time.perf_counter() + max(0.0, lock_timeout)
+    acquired = False
+    while not acquired:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            acquired = True
+        except FileExistsError:
+            if time.perf_counter() >= deadline:
+                return False
+            time.sleep(0.05)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        payload: Dict[str, Any] = {}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                payload[str(key)] = float(value)
+            else:
+                payload[str(key)] = value
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(payload, handle, sort_keys=True)
+        os.replace(tmp_path, output_path)
+        return True
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     
 # ----------------------- train loop -----------------------
 
@@ -742,14 +930,60 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: Mapping[str, 
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
     
-def evaluate_one_epoch(model, loader, cfg):
+def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: int = 15):
     summary = _targets_summary(loader)
     if summary:
         logger.info(summary)
+
+    dataset = getattr(loader, "dataset", None)
+    try:
+        total_clips = len(loader.dataset) if dataset is not None else len(loader)
+    except Exception:
+        total_clips = 0
+    if not isinstance(total_clips, int):
+        total_clips = 0
+
+    print(f"[train:eval] start (clips={total_clips})", flush=True)
+
+    eval_start = perf_counter()
+    stop_event = threading.Event()
+    progress = {"count": 0, "total": total_clips}
+    heartbeat_thread = _spawn_eval_heartbeat(progress, eval_start, 10.0, stop_event)
+    watchdog_thread = _spawn_eval_watchdog(eval_start, 15.0, stop_event)
+
+    timeout_seconds = float(timeout_minutes) * 60.0 if timeout_minutes and timeout_minutes > 0 else 0.0
+    skip_empty_logged = False
+    timed_out = False
+
+    lag_ms_values: list[float] = []
+    lag_low_corr = 0
+    lag_timeouts = 0
+
+    prev_training = model.training
+    original_device = _first_parameter_device(model)
+    cpu_device = torch.device("cpu")
+    moved_to_cpu = original_device.type != "cpu"
+    if moved_to_cpu:
+        model.to(cpu_device)
+        _move_optimizer_state(optimizer, cpu_device)
+
+    num_threads_prev = torch.get_num_threads()
+    interop_prev = None
+    if hasattr(torch, "get_num_interop_threads"):
+        try:
+            interop_prev = torch.get_num_interop_threads()
+        except RuntimeError:
+            interop_prev = None
+    torch.set_num_threads(min(8, os.cpu_count() or 8))
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(2)
+        except RuntimeError:
+            interop_prev = None
+
     model.eval()
     crit = make_criterions()
-    w = cfg["training"]["loss_weights"]   
-    #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
+    w = cfg["training"]["loss_weights"]
     metrics_cfg = cfg.get("training", {}).get("metrics", {})
     thr_pitch = float(metrics_cfg.get("prob_threshold", 0.5))
     onoff_cal = _get_onoff_calibration(cfg)
@@ -806,9 +1040,56 @@ def evaluate_one_epoch(model, loader, cfg):
     metric_n = 0
 
     want = ("pitch", "onset", "offset", "hand", "clef")
-    with torch.no_grad():
-        for batch in loader:
-            x = batch["video"]
+    try:
+        with torch.inference_mode():
+            for batch in loader:
+                if batch is None:
+                    if not skip_empty_logged:
+                        print("[train:eval] skip empty batch", flush=True)
+                        skip_empty_logged = True
+                    continue
+
+                elapsed = perf_counter() - eval_start
+                if timeout_seconds > 0 and elapsed > timeout_seconds:
+                    timed_out = True
+                    break
+
+                if "video" not in batch:
+                    raise KeyError("Eval batch missing 'video' tensor.")
+
+                x = batch["video"]
+                if torch.is_tensor(x):
+                    batch_size = int(x.shape[0])
+                else:
+                    batch_size = len(batch.get("path", []))
+                progress["count"] += int(batch_size)
+                if total_clips > 0:
+                    progress["count"] = min(progress["count"], total_clips)
+
+                lag_ms_batch = batch.get("lag_ms")
+                if lag_ms_batch is not None:
+                    if torch.is_tensor(lag_ms_batch):
+                        lag_iter = lag_ms_batch.detach().cpu().reshape(-1).tolist()
+                    else:
+                        lag_iter = list(lag_ms_batch)
+                    for lag_val in lag_iter:
+                        if lag_val is None:
+                            continue
+                        try:
+                            lag_ms_values.append(float(lag_val))
+                        except (TypeError, ValueError):
+                            continue
+
+                lag_flags_batch = batch.get("lag_flags") or []
+                for flags in lag_flags_batch:
+                    if not flags:
+                        continue
+                    if any(flag == "low_corr_zero" for flag in flags):
+                        lag_low_corr += 1
+                    if any(flag == "lag_timeout" for flag in flags):
+                        lag_timeouts += 1
+
+                have_all = all(k in batch for k in want)
             have_all = all(k in batch for k in want)
             use_dummy = bool(cfg["training"].get("debug_dummy_labels", False))
             if have_all and not use_dummy:
@@ -1048,6 +1329,49 @@ def evaluate_one_epoch(model, loader, cfg):
                 metric_counts["onset_pos_rate"]  += onset_gt_bin.mean().item()
                 metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
                 metric_n += 1
+    finally:
+        stop_event.set()
+        _join_thread(heartbeat_thread)
+        _join_thread(watchdog_thread)
+        torch.set_num_threads(num_threads_prev)
+        if interop_prev is not None and hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(int(interop_prev))
+            except RuntimeError:
+                pass
+        if moved_to_cpu:
+            model.to(original_device)
+            _move_optimizer_state(optimizer, original_device)
+        if prev_training:
+            model.train()
+        else:
+            model.eval()
+
+    elapsed_total = perf_counter() - eval_start
+    print(f"[train:eval] done dt={elapsed_total:.1f}s", flush=True)
+
+    sorted_lag = sorted(lag_ms_values)
+    lag_mean = (sum(sorted_lag) / len(sorted_lag)) if sorted_lag else 0.0
+    lag_median = _compute_percentile(sorted_lag, 50.0)
+    lag_p95 = _compute_percentile(sorted_lag, 95.0)
+    print(
+        f"[train:eval] A/V lag ms: mean={lag_mean:.1f}, median={lag_median:.1f}, p95={lag_p95:.1f}, low_corr={lag_low_corr}, timeouts={lag_timeouts}",
+        flush=True,
+    )
+    logger.info(
+        "[train:eval] A/V lag ms: mean=%.1f median=%.1f p95=%.1f low_corr=%d timeouts=%d",
+        lag_mean,
+        lag_median,
+        lag_p95,
+        lag_low_corr,
+        lag_timeouts,
+    )
+
+    if timed_out:
+        timeout_label = timeout_minutes if timeout_minutes else 0
+        print(f"[train:eval] timeout after {timeout_label}m; skipping metrics", flush=True)
+        logger.warning("[train:eval] timeout after %sm; skipping metrics", timeout_label)
+        return None
 
     # averages
     losses = {k: sums[k] / max(1, n_batches) for k in sums}
@@ -1128,6 +1452,12 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="Run a quick synthetic pass")
     args = ap.parse_args()
 
+    faulthandler.enable()
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except (AttributeError, RuntimeError, ValueError, OSError):
+        pass
+
     setup_logging(args.debug)
     set_seed(42)
     cfg = load_config(args.config)
@@ -1173,6 +1503,9 @@ def main():
                 val_loader = make_dataloader(cfg, split=test_split)
             except Exception:
                 val_loader = None
+
+    if val_loader is not None:
+        val_loader = _prepare_inner_eval_loader(cfg, val_loader)
     
     # Model & optimizer
     model = build_model(cfg)
@@ -1523,18 +1856,35 @@ def main():
         # --- evaluation & best checkpoint ---
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
-            val_metrics = evaluate_one_epoch(model, val_loader, cfg)
-            print("Val:", " ".join([f"{k}={v:.3f}\t" for k, v in val_metrics.items()]))
-            logger.info("Val: %s", " ".join(f"{k}={v:.3f}" for k, v in val_metrics.items()))
-            if writer is not None:
-                for k, v in val_metrics.items():
-                    writer.add_scalar(f"val/{k}", v, epoch)
-            val_total = val_metrics["total"]
-            if val_total < best_val:
-                best_val = val_total
-                save_checkpoint(best_path, model, optimizer, epoch, cfg, best_val)
-                print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
-                logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
+            val_metrics = evaluate_one_epoch(model, val_loader, cfg, optimizer=optimizer)
+            if val_metrics is None:
+                logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
+            else:
+                print("Val:", " ".join([f"{k}={v:.3f}\t" for k, v in val_metrics.items()]))
+                logger.info("Val: %s", " ".join(f"{k}={v:.3f}" for k, v in val_metrics.items()))
+                if writer is not None:
+                    for k, v in val_metrics.items():
+                        writer.add_scalar(f"val/{k}", v, epoch)
+
+                metrics_payload: Dict[str, Any] = {
+                    "epoch": float(epoch),
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+                metrics_payload.update({k: float(v) for k, v in val_metrics.items()})
+                metrics_path = log_dir / "inner_eval_metrics.yaml"
+                if _atomic_write_metrics(metrics_payload, metrics_path):
+                    print(f"[train:eval] metrics saved (atomic) path={metrics_path}", flush=True)
+                    logger.info("[train:eval] metrics saved (atomic) path=%s", metrics_path)
+                else:
+                    print("[train:eval] skip write (lock timeout)", flush=True)
+                    logger.warning("[train:eval] skip write (lock timeout)")
+
+                val_total = val_metrics.get("total")
+                if val_total is not None and val_total < best_val:
+                    best_val = val_total
+                    save_checkpoint(best_path, model, optimizer, epoch, cfg, best_val)
+                    print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
+                    logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
 
         # --- always save LAST ---
         save_checkpoint(last_path, model, optimizer, epoch, cfg, best_val)
@@ -1549,4 +1899,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

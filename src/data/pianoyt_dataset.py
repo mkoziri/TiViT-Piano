@@ -26,7 +26,7 @@ import os
 import time
 import warnings
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 try:
     from typing import TypedDict
@@ -88,6 +88,8 @@ class SampleBuildResult:
     has_events: bool
     start_idx: int
     video_id: str
+    lag_flags: Set[str] = field(default_factory=set)
+    lag_corr: Optional[float] = None
 
 
 def _safe_expanduser(path: Union[str, Path]) -> Path:
@@ -527,6 +529,7 @@ class PianoYTDataset(Dataset):
         self._eval_snapshot_by_video: Dict[int, List[int]] = {}
         self._eval_candidates_by_video: Dict[int, List[int]] = {}
         self._eval_materialize_stats: Dict[str, Any] = {}
+        self._eval_skip_logged: Set[str] = set()
         self._audit_ok_records: Set[int] = set()
         self._audit_entry_starts: Dict[int, List[int]] = {}
         self._label_warned: Set[str] = set()
@@ -728,25 +731,19 @@ class PianoYTDataset(Dataset):
                 raise RuntimeError(
                     "PianoYTDataset: eval snapshot empty; rerun audit or refresh dataset."
                 )
-            idx = idx % max(total, 1)
-            sample, failure_reason = self._fetch_eval_sample(idx)
-            if sample is not None:
-                return sample
-            reason = failure_reason or "unknown"
-            for step in range(1, total):
-                fallback_idx = (idx - step) % total
-                sample, fallback_reason = self._fetch_eval_sample(fallback_idx)
-                if sample is not None:
-                    print(
-                        f"[dataset] fallback idx={idx} -> idx={fallback_idx} reason={reason}",
-                        flush=True,
-                    )
-                    if fallback_reason and fallback_reason != reason:
-                        reason = fallback_reason
-                    return sample
-            raise RuntimeError(
-                "PianoYTDataset: exhausted eval fallbacks; no valid samples available."
-            )
+            if idx < 0 or idx >= total:
+                raise IndexError(idx)
+            result = self._fetch_eval_result(idx)
+            if result.sample is None and result.status and result.status not in self._eval_skip_logged:
+                LOGGER.warning(
+                    "[PianoYT] eval skip idx=%d start=%d video=%s reason=%s",
+                    idx,
+                    result.start_idx,
+                    result.video_id,
+                    result.status,
+                )
+                self._eval_skip_logged.add(result.status)
+            return result.sample
 
         if not self._valid_entries:
             if self.split == "val":
@@ -781,30 +778,39 @@ class PianoYTDataset(Dataset):
     def _uses_eval_snapshot(self) -> bool:
         return self.split != "train"
 
-    def _fetch_eval_sample(self, snapshot_idx: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    def _fetch_eval_result(self, snapshot_idx: int) -> SampleBuildResult:
         if snapshot_idx < 0 or snapshot_idx >= len(self.eval_indices_snapshot):
-            return None, "snapshot_oob"
+            return SampleBuildResult(
+                None,
+                "snapshot_oob",
+                None,
+                "",
+                0,
+                0,
+                False,
+                0,
+                "",
+            )
 
         record_idx, start_idx = self.eval_indices_snapshot[snapshot_idx]
-        result = self._build_sample(
+        initial_result = self._build_sample(
             record_idx,
             dataset_index=snapshot_idx,
             preferred_start_idx=start_idx,
             audit=False,
         )
-        if result.sample is not None:
-            return result.sample, None
+        if initial_result.sample is not None:
+            return initial_result
 
-        failure_reason = result.status or "unknown"
-        alt_sample, alt_reason = self._try_alternative_windows(
+        failure_reason = initial_result.status or "unknown"
+        fallback_result = self._try_alternative_windows(
             record_idx,
             snapshot_idx=snapshot_idx,
             failure_reason=failure_reason,
             original_start=start_idx,
+            initial_result=initial_result,
         )
-        if alt_sample is not None:
-            return alt_sample, alt_reason
-        return None, alt_reason or failure_reason
+        return fallback_result
 
     def _try_alternative_windows(
         self,
@@ -813,14 +819,28 @@ class PianoYTDataset(Dataset):
         failure_reason: str,
         original_start: int,
         snapshot_idx: int,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        initial_result: SampleBuildResult,
+    ) -> SampleBuildResult:
         candidates = self._eval_candidates_by_video.get(record_idx)
         if not candidates:
-            return None, failure_reason
+            return SampleBuildResult(
+                None,
+                failure_reason,
+                initial_result.lag_ms,
+                initial_result.lag_source,
+                initial_result.events_on,
+                initial_result.events_off,
+                initial_result.has_events,
+                initial_result.start_idx,
+                initial_result.video_id,
+                lag_flags=initial_result.lag_flags,
+                lag_corr=initial_result.lag_corr,
+            )
 
         attempts = 0
         last_reason: Optional[str] = None
         ordered = sorted(candidates, key=lambda start: (abs(start - original_start), start))
+        last_result = initial_result
         for start_idx in ordered:
             if attempts >= _EVAL_ALT_WINDOW_ATTEMPTS:
                 break
@@ -834,9 +854,25 @@ class PianoYTDataset(Dataset):
                 audit=False,
             )
             if result.sample is not None:
-                return result.sample, None
+                return result
             last_reason = result.status or failure_reason
-        return None, last_reason or failure_reason
+            last_result = result
+        if last_result.sample is not None:
+            return last_result
+        final_reason = last_reason or failure_reason
+        return SampleBuildResult(
+            None,
+            final_reason,
+            last_result.lag_ms,
+            last_result.lag_source,
+            last_result.events_on,
+            last_result.events_off,
+            last_result.has_events,
+            last_result.start_idx,
+            last_result.video_id,
+            lag_flags=last_result.lag_flags,
+            lag_corr=last_result.lag_corr,
+        )
 
     def _build_sample(
         self,
@@ -936,6 +972,8 @@ class PianoYTDataset(Dataset):
         lag_ms_int: Optional[int] = None
         lag_source = "guardrail"
         shifted_labels = labels_tensor
+        lag_flags: Set[str] = set()
+        lag_corr_val: Optional[float] = None
 
         if labels_tensor.numel() > 0:
             if self._av_sync_disabled:
@@ -1005,6 +1043,17 @@ class PianoYTDataset(Dataset):
                     shifted_labels = labels_tensor.reshape(0, 3)
         else:
             shifted_labels = labels_tensor.reshape(0, 3)
+
+        if lag_result is not None and getattr(lag_result, "flags", None) is not None:
+            lag_flags = set(lag_result.flags or set())
+            try:
+                corr_val = float(lag_result.corr)
+            except (TypeError, ValueError):
+                corr_val = float("nan")
+            lag_corr_val = corr_val if math.isfinite(corr_val) else None
+        else:
+            lag_flags = set()
+            lag_corr_val = None
 
         has_events = shifted_labels.numel() > 0
         sample["labels"] = shifted_labels
@@ -1096,7 +1145,19 @@ class PianoYTDataset(Dataset):
                     if not audit:
                         self._log_frame_target_status(video_id, "failed", "-", lag_frames=None)
                         self._mark_frame_target_failure(record_idx, video_id)
-                    return SampleBuildResult(None, "build_failed", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
+                    return SampleBuildResult(
+                        None,
+                        "build_failed",
+                        lag_ms_int,
+                        lag_source,
+                        0,
+                        0,
+                        has_events,
+                        start_idx,
+                        video_id,
+                        lag_flags=lag_flags,
+                        lag_corr=lag_corr_val,
+                    )
 
                 if ft_result.cache_key is not None and not audit:
                     self._log_frame_target_status(
@@ -1116,7 +1177,19 @@ class PianoYTDataset(Dataset):
                         elif self.require_labels:
                             self._log_missing_labels_once(video_path)
                             self._mark_bad_clip(record_idx, video_id, "no_labels")
-                    return SampleBuildResult(None, "build_failed", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
+                    return SampleBuildResult(
+                        None,
+                        "build_failed",
+                        ft_result.lag_ms,
+                        ft_result.lag_source,
+                        0,
+                        0,
+                        has_events,
+                        start_idx,
+                        video_id,
+                        lag_flags=lag_flags,
+                        lag_corr=lag_corr_val,
+                    )
 
                 lag_ms_int = ft_result.lag_ms
                 lag_source = ft_result.lag_source
@@ -1125,8 +1198,23 @@ class PianoYTDataset(Dataset):
         events_off = int(((shifted_labels[:, 1] > t0) & (shifted_labels[:, 1] <= t1)).sum().item()) if has_events else 0
         sample["lag_ms"] = lag_ms_int
         sample["lag_source"] = lag_source
+        if self.split != "train":
+            sample["lag_flags"] = tuple(sorted(lag_flags)) if lag_flags else tuple()
+            sample["lag_corr"] = lag_corr_val if lag_corr_val is not None else float("nan")
 
-        return SampleBuildResult(sample, "ok", lag_ms_int, lag_source, events_on, events_off, has_events, start_idx, video_id)
+        return SampleBuildResult(
+            sample,
+            "ok",
+            lag_ms_int,
+            lag_source,
+            events_on,
+            events_off,
+            has_events,
+            start_idx,
+            video_id,
+            lag_flags=lag_flags,
+            lag_corr=lag_corr_val,
+        )
 
     def _load_sample_for_index(
         self,
@@ -1256,6 +1344,7 @@ class PianoYTDataset(Dataset):
         self._eval_snapshot_by_video = {}
         self._eval_candidates_by_video = {}
         self._eval_materialize_stats = {}
+        self._eval_skip_logged.clear()
 
         if not self._uses_eval_snapshot():
             self._last_materialize_duration = time.perf_counter() - t_start
