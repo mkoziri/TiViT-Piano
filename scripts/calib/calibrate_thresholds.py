@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
+from filelock import FileLock, Timeout as FileLockTimeout
 
 # -----------------------------------------------------------------------------
 # Repo setup so we can import from src/
@@ -49,7 +50,7 @@ from models import build_model
 # Helper utilities
 # -----------------------------------------------------------------------------
 
-PARTIAL_WRITE_INTERVAL = 32
+HEARTBEAT_SECONDS = 10.0
 
 DEFAULT_LOGIT_GRID = torch.arange(-4.0, 2.0 + 1e-9, 0.05)
 DEFAULT_PROB_GRID = torch.arange(0.01, 0.99 + 1e-9, 0.01)
@@ -67,91 +68,76 @@ def _print_progress(processed: int, total: Optional[int]) -> None:
     print(msg, flush=True)
 
 
-def _write_partial_calibration(
-    onset_logits_list,
-    offset_logits_list,
-    onset_probs_list,
-    offset_probs_list,
-    onset_tgts_list,
-    offset_tgts_list,
-) -> None:
-    if not onset_logits_list:
-        return
-    onset_logits = torch.cat(onset_logits_list, dim=0)
-    offset_logits = torch.cat(offset_logits_list, dim=0)
-    onset_probs = torch.cat(onset_probs_list, dim=0)
-    offset_probs = torch.cat(offset_probs_list, dim=0)
-    onset_tgts = torch.cat(onset_tgts_list, dim=0)
-    offset_tgts = torch.cat(offset_tgts_list, dim=0)
-    onset_stats = _compute_metrics(
-        onset_logits,
-        onset_probs,
-        onset_tgts,
-        "onset",
-        prob_grid=DEFAULT_PROB_GRID,
-        logit_grid=DEFAULT_LOGIT_GRID,
-    )
-    offset_stats = _compute_metrics(
-        offset_logits,
-        offset_probs,
-        offset_tgts,
-        "offset",
-        prob_grid=OFFSET_PROB_GRID,
-        logit_grid=DEFAULT_LOGIT_GRID,
-    )
-    with torch.enable_grad():
-        onset_cal = _fit_platt_scaling(onset_logits, onset_tgts)
-        offset_cal = _fit_platt_scaling(offset_logits, offset_tgts)
-    onset_stats.update(onset_cal)
-    offset_stats.update(offset_cal)
-    with open("calibration.json", "w") as f:
-        json.dump(
-            {
-                "onset": {
-                    "best_logit": onset_stats["best_logit"],
-                    "best_prob": onset_stats["best_prob"],
-                    "temperature": onset_stats["temperature"],
-                    "logit_bias": onset_stats["logit_bias"],
-                    "platt_scale": onset_stats["platt_scale"],
-                    "platt_bias": onset_stats["platt_bias"],
-                    "scale": onset_stats["scale"],
-                    "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
-                    "pos_rate": onset_stats["pos_rate"],
-                },
-                "offset": {
-                    "best_logit": offset_stats["best_logit"],
-                    "best_prob": offset_stats["best_prob"],
-                    "temperature": offset_stats["temperature"],
-                    "logit_bias": offset_stats["logit_bias"],
-                    "platt_scale": offset_stats["platt_scale"],
-                    "platt_bias": offset_stats["platt_bias"],
-                    "scale": offset_stats["scale"],
-                    "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
-                    "pos_rate": offset_stats["pos_rate"],
-                },
-                "platt_onset_scale": onset_stats["platt_scale"],
-                "platt_onset_bias": onset_stats["platt_bias"],
-                "temperature_onset": onset_stats["temperature"],
-                "platt_offset_scale": offset_stats["platt_scale"],
-                "platt_offset_bias": offset_stats["platt_bias"],
-                "temperature_offset": offset_stats["temperature"],
-            },
-            f,
-            indent=2,
-        )
+def _write_calibration_file(onset_stats: dict, offset_stats: dict, path: Path = Path("calibration.json")) -> None:
+    payload = {
+        "onset": {
+            "best_logit": onset_stats["best_logit"],
+            "best_prob": onset_stats["best_prob"],
+            "temperature": onset_stats["temperature"],
+            "logit_bias": onset_stats["logit_bias"],
+            "platt_scale": onset_stats["platt_scale"],
+            "platt_bias": onset_stats["platt_bias"],
+            "scale": onset_stats["scale"],
+            "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
+            "pos_rate": onset_stats["pos_rate"],
+        },
+        "offset": {
+            "best_logit": offset_stats["best_logit"],
+            "best_prob": offset_stats["best_prob"],
+            "temperature": offset_stats["temperature"],
+            "logit_bias": offset_stats["logit_bias"],
+            "platt_scale": offset_stats["platt_scale"],
+            "platt_bias": offset_stats["platt_bias"],
+            "scale": offset_stats["scale"],
+            "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
+            "pos_rate": offset_stats["pos_rate"],
+        },
+        "platt_onset_scale": onset_stats["platt_scale"],
+        "platt_onset_bias": onset_stats["platt_bias"],
+        "temperature_onset": onset_stats["temperature"],
+        "platt_offset_scale": offset_stats["platt_scale"],
+        "platt_offset_bias": offset_stats["platt_bias"],
+        "temperature_offset": offset_stats["temperature"],
+    }
+
+    out_path = Path(path)
+    tmp_path = out_path.with_name(f"{out_path.name}.tmp")
+    lock_path = out_path.with_name(f"{out_path.name}.lock")
+    try:
+        with FileLock(str(lock_path), timeout=1.0):
+            with open(tmp_path, "w") as tmp_file:
+                json.dump(payload, tmp_file, indent=2)
+                tmp_file.flush()
+                try:
+                    os.fsync(tmp_file.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path, out_path)
+    except FileLockTimeout:
+        print("[calib] skip write (lock timeout)", flush=True)
+    except Exception as exc:
+        print(f"[calib] failed to write calibration: {exc}", flush=True)
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def _fit_platt_scaling(
     logits: torch.Tensor,
     targets: torch.Tensor,
     *,
+    head: str,
     max_iter: int = 300,
     lr: float = 0.05,
     l2_lambda: float = 1e-4,
 ) -> dict:
     """Fit Platt scaling (temperature + bias) via logistic regression."""
 
+    prev_grad_mode = torch.is_grad_enabled()
     torch.set_grad_enabled(True)
+    t_start = time.monotonic()
 
     logits = logits.detach()
     targets = targets.detach().float()
@@ -162,10 +148,31 @@ def _fit_platt_scaling(
     flat_logits = logits.reshape(-1)
     flat_targets = targets.reshape(-1)
 
-    total = flat_targets.numel()
-    pos = flat_targets.sum().item()
+    total = int(flat_targets.numel())
+    pos = int(flat_targets.sum().item())
+
+    def _finalize(result_dict: dict, steps: int, loss_val: Optional[float]) -> dict:
+        torch.set_grad_enabled(prev_grad_mode)
+        elapsed = time.monotonic() - t_start
+        loss_str = "nan"
+        if loss_val is not None and math.isfinite(loss_val):
+            loss_str = f"{loss_val:.6f}"
+        print(
+            "[platt] {head}: steps={steps} loss={loss} scale={scale:.6f} bias={bias:.6f} temp={temp:.6f} dt={dt:.3f}s".format(
+                head=head,
+                steps=steps,
+                loss=loss_str,
+                scale=result_dict.get("platt_scale", 1.0),
+                bias=result_dict.get("platt_bias", 0.0),
+                temp=result_dict.get("temperature", 1.0),
+                dt=elapsed,
+            ),
+            flush=True,
+        )
+        return result_dict
+
     if total == 0:
-        return {
+        result = {
             "temperature": 1.0,
             "logit_bias": 0.0,
             "calibrated_pred_rate": 0.0,
@@ -173,10 +180,11 @@ def _fit_platt_scaling(
             "platt_bias": 0.0,
             "platt_scale": 1.0,
         }
+        return _finalize(result, steps=0, loss_val=None)
     if pos <= 0 or pos >= total:
-        print(f"[platt] skipped (degenerate labels): pos={int(pos)} total={int(total)}", flush=True)
+        print(f"[platt] skipped (degenerate labels): pos={pos} total={total}", flush=True)
         pred_rate_default = float(flat_targets.mean().detach().cpu()) if total > 0 else 0.0
-        return {
+        result = {
             "temperature": 1.0,
             "logit_bias": 0.0,
             "calibrated_pred_rate": pred_rate_default,
@@ -184,6 +192,37 @@ def _fit_platt_scaling(
             "platt_bias": 0.0,
             "platt_scale": 1.0,
         }
+        return _finalize(result, steps=0, loss_val=None)
+
+    if total > 500_000:
+        positives = torch.nonzero(flat_targets > 0.5, as_tuple=False).reshape(-1)
+        negatives = torch.nonzero(flat_targets < 0.5, as_tuple=False).reshape(-1)
+        target_count = min(pos, 50_000, positives.numel(), negatives.numel())
+        if target_count > 0:
+            orig_total = total
+            positives_cpu = positives.cpu()
+            negatives_cpu = negatives.cpu()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(0)
+            if positives_cpu.numel() > target_count:
+                pos_perm = torch.randperm(positives_cpu.numel(), generator=generator)[:target_count]
+                positives_cpu = positives_cpu.index_select(0, pos_perm)
+            else:
+                positives_cpu = positives_cpu[:target_count]
+            if negatives_cpu.numel() > target_count:
+                neg_perm = torch.randperm(negatives_cpu.numel(), generator=generator)[:target_count]
+                negatives_cpu = negatives_cpu.index_select(0, neg_perm)
+            else:
+                negatives_cpu = negatives_cpu[:target_count]
+            selected = torch.cat([positives_cpu, negatives_cpu], dim=0).to(flat_logits.device)
+            flat_logits = flat_logits.index_select(0, selected)
+            flat_targets = flat_targets.index_select(0, selected)
+            flat_logits = flat_logits.clone()
+            flat_targets = flat_targets.clone()
+            total = int(flat_targets.numel())
+            pos = int((flat_targets > 0.5).sum().item())
+            neg = total - pos
+            print(f"[platt] downsampled N={orig_total} -> N_sub={total} (pos={pos}, neg={neg})", flush=True)
 
     scale = torch.nn.Parameter(torch.ones((), device=device))
     bias = torch.nn.Parameter(torch.zeros((), device=device))
@@ -191,8 +230,12 @@ def _fit_platt_scaling(
 
     best_loss = float("inf")
     best_state = (scale.detach().clone(), bias.detach().clone())
+    stagnation = 0
+    prev_loss = None
+    loss_history = []
+    steps_run = 0
 
-    for _ in range(max_iter):
+    for step in range(max_iter):
         opt.zero_grad()
         logits_adj = scale * flat_logits + bias
         loss = F.binary_cross_entropy_with_logits(logits_adj, flat_targets)
@@ -205,6 +248,26 @@ def _fit_platt_scaling(
         if loss_val < best_loss - 1e-7:
             best_loss = loss_val
             best_state = (scale.detach().clone(), bias.detach().clone())
+            stagnation = 0
+        else:
+            stagnation += 1
+
+        if prev_loss is not None and abs(prev_loss - loss_val) < 5e-7:
+            stagnation += 1
+        prev_loss = loss_val
+        loss_history.append(loss_val)
+        steps_run = step + 1
+
+        elapsed = time.monotonic() - t_start
+        if elapsed > 5.0:
+            break
+        if step >= 20:
+            ref_loss = loss_history[-21]
+            rel_delta = abs(loss_val - ref_loss) / max(ref_loss, 1e-6)
+            if rel_delta < 1e-3:
+                break
+        if stagnation >= 25:
+            break
 
     final_scale, final_bias = best_state
     logits_adj = final_scale * flat_logits + final_bias
@@ -215,7 +278,7 @@ def _fit_platt_scaling(
     pred_rate = float(probs.mean().detach().cpu())
     temperature = float(1.0 / max(scale_val, 1e-6))
 
-    return {
+    result = {
         "temperature": temperature,
         "logit_bias": bias_val,
         "calibrated_pred_rate": pred_rate,
@@ -223,6 +286,8 @@ def _fit_platt_scaling(
         "platt_bias": bias_val,
         "platt_scale": scale_val,
     }
+
+    return _finalize(result, steps=steps_run, loss_val=best_loss if math.isfinite(best_loss) else None)
 
 
 def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
@@ -345,6 +410,7 @@ def _collect(model, loader, target_clips: Optional[int], timeout_secs: float):
     timeout_hit = False
     target_total = None if target_clips is None else max(0, int(target_clips))
     start_time = time.monotonic()
+    last_heartbeat = start_time
 
     if target_total is not None and target_total == 0:
         raise RuntimeError("target_clips resolved to 0; no clips available for calibration")
@@ -417,41 +483,22 @@ def _collect(model, loader, target_clips: Optional[int], timeout_secs: float):
             processed += take
             _print_progress(processed, target_total)
 
-            if processed % PARTIAL_WRITE_INTERVAL == 0 or (
-                target_total is not None and processed >= target_total
-            ):
-                _write_partial_calibration(
-                    onset_logits_list,
-                    offset_logits_list,
-                    onset_probs_list,
-                    offset_probs_list,
-                    onset_tgts_list,
-                    offset_tgts_list,
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                elapsed_str = _format_seconds(now - start_time)
+                total_display = target_total if target_total is not None else "?"
+                print(
+                    f"[calib] collect heartbeat: processed={processed}/{total_display} elapsed={elapsed_str}",
+                    flush=True,
                 )
+                last_heartbeat = now
 
-            if timeout_secs and time.monotonic() - start_time >= timeout_secs:
+            if timeout_secs and now - start_time >= timeout_secs:
                 timeout_hit = True
-                _write_partial_calibration(
-                    onset_logits_list,
-                    offset_logits_list,
-                    onset_probs_list,
-                    offset_probs_list,
-                    onset_tgts_list,
-                    offset_tgts_list,
-                )
                 break
 
     if not onset_logits_list:
         raise RuntimeError("No clips processed during calibration")
-
-    _write_partial_calibration(
-        onset_logits_list,
-        offset_logits_list,
-        onset_probs_list,
-        offset_probs_list,
-        onset_tgts_list,
-        offset_tgts_list,
-    )
 
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
@@ -459,6 +506,23 @@ def _collect(model, loader, target_clips: Optional[int], timeout_secs: float):
     offset_probs = torch.cat(offset_probs_list, dim=0)
     onset_tgts = torch.cat(onset_tgts_list, dim=0)
     offset_tgts = torch.cat(offset_tgts_list, dim=0)
+    elapsed_total = time.monotonic() - start_time
+    logits_shape_display = {
+        "onset": tuple(onset_logits.shape),
+        "offset": tuple(offset_logits.shape),
+    }
+    targets_shape_display = {
+        "onset": tuple(onset_tgts.shape),
+        "offset": tuple(offset_tgts.shape),
+    }
+    print(
+        "[calib] collect done: logits_shape={} targets_shape={} elapsed={}".format(
+            logits_shape_display,
+            targets_shape_display,
+            _format_seconds(elapsed_total),
+        ),
+        flush=True,
+    )
 
     return (
         onset_logits,
@@ -571,7 +635,10 @@ def main():
         dataset_cfg["num_workers"] = 0
         dataset_cfg["persistent_workers"] = False
         dataset_cfg["pin_memory"] = False
-        print("[debug] num_workers=0, persistent_workers=False, pin_memory=False", flush=True)
+        print(
+            "[progress] debug mode: forcing num_workers=0, persistent_workers=False, pin_memory=False.",
+            flush=True,
+        )
 
     split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
     frames_display = dataset_cfg.get("frames")
@@ -698,11 +765,12 @@ def main():
             flush=True,
         )
 
+    target_clips: Optional[int]
     if ds_len is not None:
-        if cap_candidate is None:
-            target_clips = int(ds_len)
-        else:
-            target_clips = int(min(ds_len, cap_candidate))
+        resolved_cap = ds_len
+        if cap_candidate is not None:
+            resolved_cap = min(resolved_cap, cap_candidate)
+        target_clips = int(resolved_cap)
     else:
         target_clips = int(cap_candidate) if cap_candidate is not None else None
 
@@ -814,65 +882,12 @@ def main():
         prob_grid=OFFSET_PROB_GRID,
         logit_grid=DEFAULT_LOGIT_GRID,
     )
-    onset_platt = _fit_platt_scaling(onset_logits, onset_tgts)
-    offset_platt = _fit_platt_scaling(offset_logits, offset_tgts)
+    onset_platt = _fit_platt_scaling(onset_logits, onset_tgts, head="onset")
+    offset_platt = _fit_platt_scaling(offset_logits, offset_tgts, head="offset")
     onset_stats.update(onset_platt)
     offset_stats.update(offset_platt)
 
-    print(
-        "[platt] onset: scale={:.3f} bias={:.3f} temp={:.3f} pos_rate={:.4f}".format(
-            onset_stats["platt_scale"],
-            onset_stats["platt_bias"],
-            onset_stats["temperature"],
-            onset_stats["pos_rate"],
-        ),
-        flush=True,
-    )
-    print(
-        "[platt] offset: scale={:.3f} bias={:.3f} temp={:.3f} pos_rate={:.4f}".format(
-            offset_stats["platt_scale"],
-            offset_stats["platt_bias"],
-            offset_stats["temperature"],
-            offset_stats["pos_rate"],
-        ),
-        flush=True,
-    )
-
-    with open("calibration.json", "w") as f:
-        json.dump(
-            {
-                "onset": {
-                    "best_logit": onset_stats["best_logit"],
-                    "best_prob": onset_stats["best_prob"],
-                    "temperature": onset_stats["temperature"],
-                    "logit_bias": onset_stats["logit_bias"],
-                    "platt_scale": onset_stats["platt_scale"],
-                    "platt_bias": onset_stats["platt_bias"],
-                    "scale": onset_stats["scale"],
-                    "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
-                    "pos_rate": onset_stats["pos_rate"],
-                },
-                "offset": {
-                    "best_logit": offset_stats["best_logit"],
-                    "best_prob": offset_stats["best_prob"],
-                    "temperature": offset_stats["temperature"],
-                    "logit_bias": offset_stats["logit_bias"],
-                    "platt_scale": offset_stats["platt_scale"],
-                    "platt_bias": offset_stats["platt_bias"],
-                    "scale": offset_stats["scale"],
-                    "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
-                    "pos_rate": offset_stats["pos_rate"],
-                },
-                "platt_onset_scale": onset_stats["platt_scale"],
-                "platt_onset_bias": onset_stats["platt_bias"],
-                "temperature_onset": onset_stats["temperature"],
-                "platt_offset_scale": offset_stats["platt_scale"],
-                "platt_offset_bias": offset_stats["platt_bias"],
-                "temperature_offset": offset_stats["temperature"],
-            },
-            f,
-            indent=2,
-        )
+    _write_calibration_file(onset_stats, offset_stats)
 
     total_elapsed = time.time() - t_main_start
     stage_order = [
