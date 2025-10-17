@@ -548,11 +548,14 @@ def main():
     dataset_elapsed = time.time() - t_dataset_build0
     stage_durations["dataset_init"] = dataset_elapsed
     dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
+    dataset_len = None
     dataset_count = "?"
     if dataset is not None:
         try:
-            dataset_count = str(len(dataset))
+            dataset_len = len(dataset)
+            dataset_count = str(dataset_len)
         except TypeError:
+            dataset_len = None
             dataset_count = "?"
     batch_size_val = getattr(val_loader, "batch_size", None)
     batch_display = str(batch_size_val) if batch_size_val is not None else "?"
@@ -570,14 +573,21 @@ def main():
     )
     frame_summary = getattr(dataset, "frame_target_summary", None)
     if frame_summary:
-        _log_progress(f"[progress] {frame_summary}", force=True)
+        frame_summary_display = frame_summary
+        if avlag_disabled and "lag_source=" in frame_summary_display:
+            prefix, suffix = frame_summary_display.split("lag_source=", 1)
+            if "," in suffix:
+                _, tail = suffix.split(",", 1)
+                frame_summary_display = f"{prefix}lag_source=no_avlag,{tail}"
+            else:
+                frame_summary_display = f"{prefix}lag_source=no_avlag"
+        _log_progress(f"[progress] {frame_summary_display}", force=True)
 
-    num_clips_est = args.max_clips
-    if num_clips_est is None and dataset is not None:
-        try:
-            num_clips_est = len(dataset)
-        except TypeError:
-            num_clips_est = None
+    if dataset_len is not None:
+        max_cap = args.max_clips if args.max_clips is not None else dataset_len
+        target_clips = min(dataset_len, max_cap)
+    else:
+        target_clips = args.max_clips
 
     per_head_sweep_vals = None
     per_head_use_logits = False
@@ -649,9 +659,9 @@ def main():
         thr_desc = str(sweep_len)
         k_sweep_state = "off"
 
-    clips_est_str = str(num_clips_est) if num_clips_est is not None else "?"
+    target_display = str(target_clips) if target_clips is not None else "?"
     _log_progress(
-        f"[progress] starting: clips≈{clips_est_str} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})",
+        f"[progress] starting: clips={target_display} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})",
         force=True,
     )
 
@@ -674,7 +684,9 @@ def main():
     last_clip_name = "-"
     first_batch_time = None
     with torch.no_grad():
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
+            if target_clips is not None and clips_done >= target_clips:
+                break
             raw_paths = batch.get("path")
             if isinstance(raw_paths, (list, tuple)):
                 paths = [str(p) for p in raw_paths]
@@ -740,9 +752,10 @@ def main():
                 lag_vals = _extract_lag_values(batch.get("lag_ms"))
                 if lag_vals:
                     lag_ms_samples.extend(lag_vals)
-                lag_sources = _extract_lag_sources(batch.get("lag_source"))
-                if lag_sources:
-                    lag_source_counter.update(lag_sources)
+                if not avlag_disabled:
+                    lag_sources = _extract_lag_sources(batch.get("lag_source"))
+                    if lag_sources:
+                        lag_source_counter.update(lag_sources)
 
                 if args.debug and len(onset_logits_list) == 1:
                     print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
@@ -767,26 +780,34 @@ def main():
                     )
                     last_heartbeat = now
                 if args.progress:
-                    progress_force = clips_done == batch_size or (
-                        num_clips_est is not None and clips_done >= num_clips_est
-                    )
+                    progress_force = i == 0 or (target_clips is not None and clips_done >= target_clips)
                     if progress_force or now - last_clip_print >= args.progress_interval:
                         elapsed = now - t_data0
-                        if num_clips_est:
-                            pct = min(clips_done, num_clips_est) / max(num_clips_est, 1) * 100.0
+                        if target_clips is not None and target_clips > 0:
+                            pct = min(100.0, 100.0 * clips_done / float(target_clips))
                             pct_display = f"{pct:5.1f}"
-                            remaining = max(num_clips_est - clips_done, 0)
-                            eta_seconds = (elapsed / max(clips_done, 1)) * remaining
-                            eta_display = _format_seconds(eta_seconds)
                         else:
                             pct_display = "?"
-                            eta_display = "??:??"
-                        clips_total_display = num_clips_est if num_clips_est is not None else "?"
+                        if clips_done == 0:
+                            eta_display = "--:--"
+                        elif target_clips is None or target_clips <= 0:
+                            eta_display = "--:--"
+                        else:
+                            remaining = max(target_clips - clips_done, 0)
+                            if remaining == 0:
+                                eta_display = "00:00"
+                            else:
+                                eta_seconds = (elapsed / clips_done) * remaining
+                                eta_display = _format_seconds(eta_seconds)
+                        processed_display = clips_done if target_clips is None else min(clips_done, target_clips)
+                        clips_total_display = target_display
                         _log_progress(
-                            f"[progress] clips {clips_done}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
+                            f"[progress] clips {processed_display}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
                             force=progress_force,
                         )
                         last_clip_print = now
+                if target_clips is not None and clips_done >= target_clips:
+                    break
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -796,11 +817,21 @@ def main():
     elapsed_data = time.time() - t_data0
     stage_durations["data_pass"] = elapsed_data
     throughput = clips_done / elapsed_data if elapsed_data > 0 else 0.0
+    processed_display = clips_done if target_clips is None else min(clips_done, target_clips)
+    skipped_display = len(skip_paths)
+    elapsed_display = _format_seconds(elapsed_data)
+    expected_display = target_clips if target_clips is not None else "?"
     _log_progress(
-        f"[progress] data pass done: clips={clips_done}, elapsed={_format_seconds(elapsed_data)} ({elapsed_data:.2f}s), throughput={throughput:.2f} clips/s",
+        f"[progress] data pass done: clips={processed_display}, expected={expected_display}, skipped={skipped_display}, elapsed={elapsed_display}",
         force=True,
     )
-    if lag_ms_samples:
+    _log_progress(
+        f"[progress] throughput: {throughput:.2f} clips/s ({elapsed_data:.2f}s)",
+        force=True,
+    )
+    if avlag_disabled:
+        _log_progress("[progress] A/V lag ms stats: disabled (all zero).", force=True)
+    elif lag_ms_samples:
         lag_arr = np.asarray(lag_ms_samples, dtype=np.float32)
         lag_mean = float(lag_arr.mean())
         lag_median = float(np.median(lag_arr))
@@ -814,7 +845,7 @@ def main():
             ),
             force=True,
         )
-    if lag_source_counter:
+    if lag_source_counter and not avlag_disabled:
         top_sources = ", ".join(f"{src}:{cnt}" for src, cnt in lag_source_counter.most_common(3))
         _log_progress(f"[progress] lag sources top: {top_sources}", force=True)
     if skipped_batches:
