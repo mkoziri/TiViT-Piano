@@ -1,4 +1,15 @@
-"""Utilities for consistent frame-target configuration and caching."""
+"""Purpose:
+    Build and cache frame-level piano targets aligned to sampled video clips,
+    including configuration helpers shared by PianoYT and OMAPS datasets.
+
+Key Functions/Classes:
+    - FrameTargetSpec: Immutable configuration describing target generation.
+    - prepare_frame_targets(): Loads cached targets or builds them on demand.
+    - FRAME_TARGET_KEYS: Canonical set of tensors expected by downstream code.
+
+CLI:
+    Not a standalone CLI; utilities are imported by dataset loaders.
+"""
 
 from __future__ import annotations
 

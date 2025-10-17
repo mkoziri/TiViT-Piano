@@ -1,3 +1,16 @@
+"""Purpose:
+    Estimate and cache audio/video alignment offsets used across TiViT
+    datasets.  Provides guarded correlation search plus disk-backed lag cache.
+
+Key Functions/Classes:
+    - AVLagResult: Dataclass capturing lag, correlation, and guardrail flags.
+    - AVLagCache: Thread-safe JSON cache storing per-video lag estimates.
+    - compute_av_lag(): Main entry point that measures lag with guardrails.
+
+CLI:
+    Not a standalone CLI; imported by dataset loaders and calibration scripts.
+"""
+
 from __future__ import annotations
 
 import json

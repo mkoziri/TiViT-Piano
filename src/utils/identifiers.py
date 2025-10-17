@@ -1,4 +1,15 @@
-"""Identifier normalisation helpers for dataset assets and caches."""
+"""Purpose:
+    Normalise dataset-specific identifiers so caches, metadata, and file paths
+    share a consistent `video_###` naming scheme.
+
+Key Functions/Classes:
+    - canonical_video_id(): Converts arbitrary strings/paths to canonical IDs.
+    - id_aliases(): Produces canonical plus legacy alias variations.
+    - log_legacy_id_hit(): Emits one-time compat logs when legacy IDs resolve.
+
+CLI:
+    Not a standalone CLI; imported by caching and dataset utilities.
+"""
 
 from __future__ import annotations
 

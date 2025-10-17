@@ -1,23 +1,14 @@
-"""Utilities for persisting per-clip frame target tensors.
+"""Purpose:
+    Persist frame-target tensors for specific video/lag configurations so
+    datasets only rebuild targets when inputs change.
 
-Purpose:
-    Provide a lightweight disk cache keyed by dataset/video properties so the
-    expensive per-frame target construction only runs when required.  The cache
-    mirrors the behaviour of :class:`utils.av_sync.AVLagCache` but stores torch
-    tensors representing pianoroll labels for a particular combination of
-    split, video, temporal alignment, and frame-target configuration.
+Key Functions/Classes:
+    - FrameTargetCache: Disk-backed helper with load/save primitives.
+    - make_target_cache_key(): Generates stable SHA1 keys and metadata blobs.
+    - FrameTargetMeta: TypedDict describing stored cache metadata.
 
-Usage:
-    >>> cache = FrameTargetCache()
-    >>> key_hash, meta = make_target_cache_key(...)
-    >>> tensors, hit = cache.load(key_hash)
-    >>> if tensors is None:
-    ...     tensors = build_targets_somehow()
-    ...     cache.save(key_hash, meta, tensors)
-
-The helper intentionally keeps the interface tiny so dataset loaders can call
-``load`` and ``save`` without worrying about the on-disk format.  All tensors
-are stored in CPU memory for portability.
+CLI:
+    Not a standalone CLI; used by dataset loaders when preparing targets.
 """
 
 from __future__ import annotations

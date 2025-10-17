@@ -123,6 +123,15 @@ script saves NPZ files containing flattened logits for each requested head; the
 NPZ artefacts can be rescored or re-evaluated without rerunning the forward
 pass.
 
+### Debugging mode
+
+Pass `--debug` to any calibration or evaluation entry point (for example
+`eval_thresholds.py`) to favour deterministic, single-process data loading when
+investigating individual clips. Debugging mode forces
+`num_workers=0`, disables `persistent_workers`, turns off pinned memory, and
+prints an acknowledgement before dataset construction so you can confirm the
+runtime surface has been adjusted.
+
 To recompute the default operating points from scratch, run the streaming
 calibration helper which emits running summaries to `calibration.json` and logs
 reliability diagrams:
