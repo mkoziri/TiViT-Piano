@@ -99,8 +99,9 @@ def _write_partial_calibration(
         prob_grid=OFFSET_PROB_GRID,
         logit_grid=DEFAULT_LOGIT_GRID,
     )
-    onset_cal = _fit_platt_scaling(onset_logits, onset_tgts)
-    offset_cal = _fit_platt_scaling(offset_logits, offset_tgts)
+    with torch.enable_grad():
+        onset_cal = _fit_platt_scaling(onset_logits, onset_tgts)
+        offset_cal = _fit_platt_scaling(offset_logits, offset_tgts)
     onset_stats.update(onset_cal)
     offset_stats.update(offset_cal)
     with open("calibration.json", "w") as f:
@@ -111,6 +112,9 @@ def _write_partial_calibration(
                     "best_prob": onset_stats["best_prob"],
                     "temperature": onset_stats["temperature"],
                     "logit_bias": onset_stats["logit_bias"],
+                    "platt_scale": onset_stats["platt_scale"],
+                    "platt_bias": onset_stats["platt_bias"],
+                    "scale": onset_stats["scale"],
                     "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
                     "pos_rate": onset_stats["pos_rate"],
                 },
@@ -119,9 +123,18 @@ def _write_partial_calibration(
                     "best_prob": offset_stats["best_prob"],
                     "temperature": offset_stats["temperature"],
                     "logit_bias": offset_stats["logit_bias"],
+                    "platt_scale": offset_stats["platt_scale"],
+                    "platt_bias": offset_stats["platt_bias"],
+                    "scale": offset_stats["scale"],
                     "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
                     "pos_rate": offset_stats["pos_rate"],
                 },
+                "platt_onset_scale": onset_stats["platt_scale"],
+                "platt_onset_bias": onset_stats["platt_bias"],
+                "temperature_onset": onset_stats["temperature"],
+                "platt_offset_scale": offset_stats["platt_scale"],
+                "platt_offset_bias": offset_stats["platt_bias"],
+                "temperature_offset": offset_stats["temperature"],
             },
             f,
             indent=2,
@@ -132,44 +145,73 @@ def _fit_platt_scaling(
     logits: torch.Tensor,
     targets: torch.Tensor,
     *,
-    max_iter: int = 250,
+    max_iter: int = 300,
     lr: float = 0.05,
+    l2_lambda: float = 1e-4,
 ) -> dict:
     """Fit Platt scaling (temperature + bias) via logistic regression."""
 
+    torch.set_grad_enabled(True)
+
+    logits = logits.detach()
+    targets = targets.detach().float()
     device = logits.device
-    x = logits.reshape(-1, 1)
-    y = targets.reshape(-1, 1).float()
+    logits = logits.to(device)
+    targets = targets.to(device)
 
-    log_scale = torch.zeros(1, device=device, requires_grad=True)
-    bias = torch.zeros(1, device=device, requires_grad=True)
-    opt = torch.optim.Adam([log_scale, bias], lr=lr)
+    flat_logits = logits.reshape(-1)
+    flat_targets = targets.reshape(-1)
 
-    best_state = None
+    total = flat_targets.numel()
+    pos = flat_targets.sum().item()
+    if total == 0:
+        return {
+            "temperature": 1.0,
+            "logit_bias": 0.0,
+            "calibrated_pred_rate": 0.0,
+            "scale": 1.0,
+            "platt_bias": 0.0,
+            "platt_scale": 1.0,
+        }
+    if pos <= 0 or pos >= total:
+        print(f"[platt] skipped (degenerate labels): pos={int(pos)} total={int(total)}", flush=True)
+        pred_rate_default = float(flat_targets.mean().detach().cpu()) if total > 0 else 0.0
+        return {
+            "temperature": 1.0,
+            "logit_bias": 0.0,
+            "calibrated_pred_rate": pred_rate_default,
+            "scale": 1.0,
+            "platt_bias": 0.0,
+            "platt_scale": 1.0,
+        }
+
+    scale = torch.nn.Parameter(torch.ones((), device=device))
+    bias = torch.nn.Parameter(torch.zeros((), device=device))
+    opt = torch.optim.Adam([scale, bias], lr=lr)
+
     best_loss = float("inf")
+    best_state = (scale.detach().clone(), bias.detach().clone())
+
     for _ in range(max_iter):
         opt.zero_grad()
-        scale = torch.exp(log_scale)
-        logits_adj = x * scale + bias
-        loss = F.binary_cross_entropy_with_logits(logits_adj, y)
+        logits_adj = scale * flat_logits + bias
+        loss = F.binary_cross_entropy_with_logits(logits_adj, flat_targets)
+        if l2_lambda > 0.0:
+            loss = loss + l2_lambda * ((scale - 1.0) ** 2 + bias**2)
         loss.backward()
         opt.step()
 
         loss_val = float(loss.detach().cpu())
         if loss_val < best_loss - 1e-7:
             best_loss = loss_val
-            best_state = (log_scale.detach().clone(), bias.detach().clone())
+            best_state = (scale.detach().clone(), bias.detach().clone())
 
-    if best_state is None:
-        best_state = (log_scale.detach().clone(), bias.detach().clone())
-
-    log_scale_best, bias_best = best_state
-    scale = torch.exp(log_scale_best)
-    logits_adj = x * scale + bias_best
+    final_scale, final_bias = best_state
+    logits_adj = final_scale * flat_logits + final_bias
     probs = torch.sigmoid(logits_adj)
 
-    scale_val = float(scale.detach().cpu())
-    bias_val = float(bias_best.detach().cpu())
+    scale_val = float(final_scale.detach().cpu())
+    bias_val = float(final_bias.detach().cpu())
     pred_rate = float(probs.mean().detach().cpu())
     temperature = float(1.0 / max(scale_val, 1e-6))
 
@@ -178,6 +220,8 @@ def _fit_platt_scaling(
         "logit_bias": bias_val,
         "calibrated_pred_rate": pred_rate,
         "scale": scale_val,
+        "platt_bias": bias_val,
+        "platt_scale": scale_val,
     }
 
 
@@ -770,8 +814,29 @@ def main():
         prob_grid=OFFSET_PROB_GRID,
         logit_grid=DEFAULT_LOGIT_GRID,
     )
-    onset_stats.update(_fit_platt_scaling(onset_logits, onset_tgts))
-    offset_stats.update(_fit_platt_scaling(offset_logits, offset_tgts))
+    onset_platt = _fit_platt_scaling(onset_logits, onset_tgts)
+    offset_platt = _fit_platt_scaling(offset_logits, offset_tgts)
+    onset_stats.update(onset_platt)
+    offset_stats.update(offset_platt)
+
+    print(
+        "[platt] onset: scale={:.3f} bias={:.3f} temp={:.3f} pos_rate={:.4f}".format(
+            onset_stats["platt_scale"],
+            onset_stats["platt_bias"],
+            onset_stats["temperature"],
+            onset_stats["pos_rate"],
+        ),
+        flush=True,
+    )
+    print(
+        "[platt] offset: scale={:.3f} bias={:.3f} temp={:.3f} pos_rate={:.4f}".format(
+            offset_stats["platt_scale"],
+            offset_stats["platt_bias"],
+            offset_stats["temperature"],
+            offset_stats["pos_rate"],
+        ),
+        flush=True,
+    )
 
     with open("calibration.json", "w") as f:
         json.dump(
@@ -781,6 +846,9 @@ def main():
                     "best_prob": onset_stats["best_prob"],
                     "temperature": onset_stats["temperature"],
                     "logit_bias": onset_stats["logit_bias"],
+                    "platt_scale": onset_stats["platt_scale"],
+                    "platt_bias": onset_stats["platt_bias"],
+                    "scale": onset_stats["scale"],
                     "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
                     "pos_rate": onset_stats["pos_rate"],
                 },
@@ -789,9 +857,18 @@ def main():
                     "best_prob": offset_stats["best_prob"],
                     "temperature": offset_stats["temperature"],
                     "logit_bias": offset_stats["logit_bias"],
+                    "platt_scale": offset_stats["platt_scale"],
+                    "platt_bias": offset_stats["platt_bias"],
+                    "scale": offset_stats["scale"],
                     "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
                     "pos_rate": offset_stats["pos_rate"],
                 },
+                "platt_onset_scale": onset_stats["platt_scale"],
+                "platt_onset_bias": onset_stats["platt_bias"],
+                "temperature_onset": onset_stats["temperature"],
+                "platt_offset_scale": offset_stats["platt_scale"],
+                "platt_offset_bias": offset_stats["platt_bias"],
+                "temperature_offset": offset_stats["temperature"],
             },
             f,
             indent=2,
