@@ -726,53 +726,77 @@ class PianoYTDataset(Dataset):
         t0: float = float(frame_to_sec(start_idx, 1.0 / fps))
         t1: float = float(frame_to_sec(start_idx + ((T - 1) * self.stride + 1), 1.0 / fps))
 
-        sample: Dict[str, Any] = {"video": clip, "path": str(video_path)}
+        if audit:
+            sample: Dict[str, Any] = {"path": str(video_path)}
+        else:
+            sample = {"video": clip, "path": str(video_path)}
 
         lag_result = None
-        if labels_tensor.numel() > 0:
-            lag_result = compute_av_lag(
-                video_id=video_id,
-                frames=clip,
-                events=labels_tensor,
-                hop_seconds=hop_seconds,
-                clip_start=t0,
-                clip_end=t1,
-                cache=self._av_sync_cache,
-            )
-
+        lag_ms_int: Optional[int] = None
+        lag_source = "guardrail"
         shifted_labels = labels_tensor
 
-        if lag_result is not None:
-            if not lag_result.success and not self._av_sync_warned:
-                LOGGER.warning(
-                    "Unable to compute A/V lag for clip %s; using lag=0",
-                    video_id,
+        if labels_tensor.numel() > 0:
+            if audit:
+                cached_lag_ms = self._av_sync_cache.get(video_id)
+                if cached_lag_ms is not None and math.isfinite(float(cached_lag_ms)):
+                    lag_seconds = float(cached_lag_ms) / 1000.0
+                    shifted_labels = shift_label_events(
+                        labels_tensor,
+                        lag_seconds,
+                        clip_start=t0,
+                        clip_end=t1,
+                    )
+                    lag_ms_int = int(round(float(cached_lag_ms)))
+                    lag_source = "cache"
+                else:
+                    shifted_labels = labels_tensor
+                    lag_source = "audit_skip"
+            else:
+                lag_result = compute_av_lag(
+                    video_id=video_id,
+                    frames=clip,
+                    events=labels_tensor,
+                    hop_seconds=hop_seconds,
+                    clip_start=t0,
+                    clip_end=t1,
+                    cache=self._av_sync_cache,
                 )
-                self._av_sync_warned = True
-            lag_seconds = (lag_result.lag_frames * hop_seconds) if lag_result.success else 0.0
-            shifted_labels = shift_label_events(
-                labels_tensor,
-                lag_seconds,
-                clip_start=t0,
-                clip_end=t1,
-            )
-            lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
-            corr_val = float(lag_result.corr)
-            corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
-            flags_set: Set[str] = set(lag_result.flags or set())
-            flags_str = ",".join(sorted(flags_set)) if flags_set else "-"
-            if not audit and video_id not in self._lag_log_once:
-                LOGGER.info(
-                    "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
-                    video_id,
-                    int(round(lag_ms_display)),
-                    corr_str,
-                    T,
-                    flags_str,
-                )
-                self._lag_log_once.add(video_id)
+                if lag_result is not None:
+                    if not lag_result.success and not self._av_sync_warned:
+                        LOGGER.warning(
+                            "Unable to compute A/V lag for clip %s; using lag=0",
+                            video_id,
+                        )
+                        self._av_sync_warned = True
+                    lag_seconds = (
+                        lag_result.lag_frames * hop_seconds
+                    ) if lag_result.success else 0.0
+                    shifted_labels = shift_label_events(
+                        labels_tensor,
+                        lag_seconds,
+                        clip_start=t0,
+                        clip_end=t1,
+                    )
+                    lag_ms_display = lag_result.lag_ms if lag_result.success else 0.0
+                    corr_val = float(lag_result.corr)
+                    corr_str = f"{corr_val:.2f}" if math.isfinite(corr_val) else "nan"
+                    flags_set: Set[str] = set(lag_result.flags or set())
+                    flags_str = ",".join(sorted(flags_set)) if flags_set else "-"
+                    if not audit and video_id not in self._lag_log_once:
+                        LOGGER.info(
+                            "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
+                            video_id,
+                            int(round(lag_ms_display)),
+                            corr_str,
+                            T,
+                            flags_str,
+                        )
+                        self._lag_log_once.add(video_id)
+                else:
+                    shifted_labels = labels_tensor.reshape(0, 3)
         else:
-            shifted_labels = shifted_labels.reshape(0, 3)
+            shifted_labels = labels_tensor.reshape(0, 3)
 
         has_events = shifted_labels.numel() > 0
         sample["labels"] = shifted_labels
@@ -834,49 +858,50 @@ class PianoYTDataset(Dataset):
             self._invalidate_sample_index(record_idx)
             return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
 
-        lag_ms_value, lag_source = resolve_lag_ms(lag_result)
-        lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
+        if not audit:
+            lag_ms_value, lag_source = resolve_lag_ms(lag_result)
+            lag_ms_int = int(round(lag_ms_value)) if math.isfinite(lag_ms_value) else None
 
-        spec = getattr(self, "frame_target_spec", None)
-        if spec is not None:
-            try:
-                ft_result: FrameTargetResult = prepare_frame_targets(
-                    labels=shifted_labels,
-                    lag_result=lag_result,
-                    spec=spec,
-                    cache=self._frame_target_cache,
-                    split=self.split,
-                    video_id=video_id,
-                    clip_start=t0,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning(
-                    "Failed to build frame targets for %s: %s",
-                    video_id,
-                    exc,
-                )
-                if not audit:
-                    self._log_frame_target_status(video_id, "failed", "-", 0)
+            spec = getattr(self, "frame_target_spec", None)
+            if spec is not None:
+                try:
+                    ft_result: FrameTargetResult = prepare_frame_targets(
+                        labels=shifted_labels,
+                        lag_result=lag_result,
+                        spec=spec,
+                        cache=self._frame_target_cache,
+                        split=self.split,
+                        video_id=video_id,
+                        clip_start=t0,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning(
+                        "Failed to build frame targets for %s: %s",
+                        video_id,
+                        exc,
+                    )
+                    if not audit:
+                        self._log_frame_target_status(video_id, "failed", "-", 0)
+                        self._mark_frame_target_failure(record_idx, video_id)
+                    return SampleBuildResult(None, "build_fail", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
+
+                if ft_result.cache_key is not None and not audit:
+                    self._log_frame_target_status(
+                        video_id,
+                        ft_result.status,
+                        ft_result.cache_key,
+                        ft_result.lag_ms,
+                    )
+
+                if ft_result.payload is not None:
+                    sample.update(ft_result.payload)
+                elif self.require_labels and self.split == "train" and not audit:
+                    self._log_missing_labels_once(video_path)
                     self._mark_frame_target_failure(record_idx, video_id)
-                return SampleBuildResult(None, "build_fail", lag_ms_int, lag_source, 0, 0, has_events, start_idx, video_id)
+                    return SampleBuildResult(None, "build_fail", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
 
-            if ft_result.cache_key is not None and not audit:
-                self._log_frame_target_status(
-                    video_id,
-                    ft_result.status,
-                    ft_result.cache_key,
-                    ft_result.lag_ms,
-                )
-
-            if ft_result.payload is not None:
-                sample.update(ft_result.payload)
-            elif self.require_labels and self.split == "train" and not audit:
-                self._log_missing_labels_once(video_path)
-                self._mark_frame_target_failure(record_idx, video_id)
-                return SampleBuildResult(None, "build_fail", ft_result.lag_ms, ft_result.lag_source, 0, 0, has_events, start_idx, video_id)
-
-            lag_ms_int = ft_result.lag_ms
-            lag_source = ft_result.lag_source
+                lag_ms_int = ft_result.lag_ms
+                lag_source = ft_result.lag_source
 
         events_on = int(((shifted_labels[:, 0] >= t0) & (shifted_labels[:, 0] < t1)).sum().item()) if has_events else 0
         events_off = int(((shifted_labels[:, 1] > t0) & (shifted_labels[:, 1] <= t1)).sum().item()) if has_events else 0
