@@ -27,7 +27,7 @@ import time
 import warnings
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 try:
     from typing import TypedDict
 except ImportError:  # Python <3.8 fallback (not expected in TiViT)
@@ -522,7 +522,13 @@ class PianoYTDataset(Dataset):
         self._av_sync_warned = False
         self._lag_log_once: Set[str] = set()
         self._valid_entries: List[WindowEntry] = []
-        self.eval_indices_snapshot: List[int] = []
+        self.eval_indices_snapshot: List[Tuple[int, int]] = []
+        self._eval_snapshot_flags: List[bool] = []
+        self._eval_snapshot_by_video: Dict[int, List[int]] = {}
+        self._eval_candidates_by_video: Dict[int, List[int]] = {}
+        self._eval_materialize_stats: Dict[str, Any] = {}
+        self._audit_ok_records: Set[int] = set()
+        self._audit_entry_starts: Dict[int, List[int]] = {}
         self._label_warned: Set[str] = set()
         self._num_windows: int = 0
         self._frame_target_cache = FrameTargetCache()
@@ -531,6 +537,8 @@ class PianoYTDataset(Dataset):
         self._bad_clips: Set[str] = set()
         self._only_filter_applied: bool = False
         self._only_video_target: Optional[str] = None
+        self.args_max_clips_or_None: Optional[int] = None
+        self._last_materialize_duration: float = 0.0
         self._log_av_disabled_once()
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
@@ -677,6 +685,7 @@ class PianoYTDataset(Dataset):
         self._rebuild_valid_index_cache(log_summary=False)
 
     def limit_max_clips(self, max_clips: Optional[int]):
+        self.args_max_clips_or_None = max_clips if isinstance(max_clips, int) else None
         if max_clips is None:
             return
         if max_clips < len(self.samples):
@@ -713,13 +722,6 @@ class PianoYTDataset(Dataset):
         return len(self._valid_entries)
 
     def __getitem__(self, idx: int):
-        if not self._valid_entries:
-            if self.split == "val":
-                raise RuntimeError(
-                    "Val split has 0 valid videos after audit; check labels/lag or widen search."
-                )
-            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
-
         if self._uses_eval_snapshot():
             total = len(self.eval_indices_snapshot)
             if total == 0:
@@ -733,16 +735,25 @@ class PianoYTDataset(Dataset):
             reason = failure_reason or "unknown"
             for step in range(1, total):
                 fallback_idx = (idx - step) % total
-                sample, _ = self._fetch_eval_sample(fallback_idx)
+                sample, fallback_reason = self._fetch_eval_sample(fallback_idx)
                 if sample is not None:
                     print(
                         f"[dataset] fallback idx={idx} -> idx={fallback_idx} reason={reason}",
                         flush=True,
                     )
+                    if fallback_reason and fallback_reason != reason:
+                        reason = fallback_reason
                     return sample
             raise RuntimeError(
                 "PianoYTDataset: exhausted eval fallbacks; no valid samples available."
             )
+
+        if not self._valid_entries:
+            if self.split == "val":
+                raise RuntimeError(
+                    "Val split has 0 valid videos after audit; check labels/lag or widen search."
+                )
+            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
 
         if idx < 0 or idx >= len(self._valid_entries):
             raise IndexError(idx)
@@ -774,67 +785,51 @@ class PianoYTDataset(Dataset):
         if snapshot_idx < 0 or snapshot_idx >= len(self.eval_indices_snapshot):
             return None, "snapshot_oob"
 
-        base_idx = self.eval_indices_snapshot[snapshot_idx]
-        if base_idx < 0 or base_idx >= len(self._valid_entries):
-            return None, "invalid_base_index"
-
-        entry = self._valid_entries[base_idx]
+        record_idx, start_idx = self.eval_indices_snapshot[snapshot_idx]
         result = self._build_sample(
-            entry.record_idx,
-            dataset_index=base_idx,
-            preferred_start_idx=entry.start_idx,
+            record_idx,
+            dataset_index=snapshot_idx,
+            preferred_start_idx=start_idx,
             audit=False,
         )
         if result.sample is not None:
             return result.sample, None
 
         failure_reason = result.status or "unknown"
-        if failure_reason in {"no_labels", "build_failed"}:
-            alt_sample, alt_reason = self._try_alternative_windows(
-                entry,
-                base_idx,
-                failure_reason=failure_reason,
-                original_start=result.start_idx,
-            )
-            if alt_sample is not None:
-                return alt_sample, None
-            if alt_reason:
-                failure_reason = alt_reason
-        return None, failure_reason
+        alt_sample, alt_reason = self._try_alternative_windows(
+            record_idx,
+            snapshot_idx=snapshot_idx,
+            failure_reason=failure_reason,
+            original_start=start_idx,
+        )
+        if alt_sample is not None:
+            return alt_sample, alt_reason
+        return None, alt_reason or failure_reason
 
     def _try_alternative_windows(
         self,
-        entry: WindowEntry,
-        dataset_index: int,
+        record_idx: int,
         *,
         failure_reason: str,
         original_start: int,
+        snapshot_idx: int,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        record_idx = entry.record_idx
-        if record_idx >= len(self.samples):
-            return None, "record_oob"
-
-        record = self.samples[record_idx]
-        midi_path = record.get("midi")
-        if midi_path is None or not midi_path.exists():
+        candidates = self._eval_candidates_by_video.get(record_idx)
+        if not candidates:
             return None, failure_reason
 
-        labels_tensor = _read_midi_events(midi_path)
-        if labels_tensor is None or labels_tensor.numel() == 0:
-            return None, "no_labels"
-
-        candidates = self._candidate_start_indices(labels_tensor)
         attempts = 0
         last_reason: Optional[str] = None
-        for start_idx in candidates:
+        ordered = sorted(candidates, key=lambda start: (abs(start - original_start), start))
+        for start_idx in ordered:
             if attempts >= _EVAL_ALT_WINDOW_ATTEMPTS:
                 break
-            if start_idx == original_start or (entry.start_idx is not None and start_idx == entry.start_idx):
+            if start_idx == original_start:
                 continue
             attempts += 1
             result = self._build_sample(
                 record_idx,
-                dataset_index=dataset_index,
+                dataset_index=snapshot_idx,
                 preferred_start_idx=start_idx,
                 audit=False,
             )
@@ -1212,10 +1207,7 @@ class PianoYTDataset(Dataset):
             entry for entry in self._valid_entries if entry.record_idx != record_idx
         ]
         self._num_windows = len(self._valid_entries)
-        if self._uses_eval_snapshot():
-            self.eval_indices_snapshot = list(range(len(self._valid_entries)))
-        else:
-            self.eval_indices_snapshot = []
+        self.eval_indices_snapshot = []
 
     def _candidate_start_indices(self, labels_tensor: Optional[torch.Tensor]) -> List[int]:
         if labels_tensor is None or labels_tensor.numel() == 0:
@@ -1238,6 +1230,357 @@ class PianoYTDataset(Dataset):
         ordered = sorted(starts)
         max_candidates = 8
         return ordered[:max_candidates]
+
+    def _materialize_eval_entries_from_labels(
+        self,
+        max_total: Optional[int] = None,
+        target_T: Optional[int] = 96,
+        *,
+        fps: Optional[float] = None,
+        stride: Optional[int] = None,
+        tol_s: Optional[float] = None,
+        dilate: Optional[int] = None,
+    ) -> List[Tuple[int, int]]:
+        """
+        Build a list of (video_idx, start_frame) entries for eval ONLY from labels,
+        without decoding frames. Use:
+          - onset times -> center windows on events (positive-centric)
+          - plus a few uniform negatives per video
+        Respect clip bounds and T. Return a list and store in self.eval_indices_snapshot.
+        If max_total is given, cap the total entries globally (round-robin per video).
+        """
+
+        t_start = time.perf_counter()
+        self.eval_indices_snapshot = []
+        self._eval_snapshot_flags = []
+        self._eval_snapshot_by_video = {}
+        self._eval_candidates_by_video = {}
+        self._eval_materialize_stats = {}
+
+        if not self._uses_eval_snapshot():
+            self._last_materialize_duration = time.perf_counter() - t_start
+            return []
+
+        fps_val = float(fps) if fps is not None else float(self.decode_fps)
+        if not math.isfinite(fps_val) or fps_val <= 0:
+            fps_val = max(self.decode_fps, 1.0)
+        stride_val = int(stride) if stride is not None else int(self.stride)
+        stride_val = max(1, stride_val)
+        target_t_val = int(target_T) if target_T is not None else int(self.frames)
+        target_t_val = max(1, target_t_val)
+        tol_sec = float(tol_s) if tol_s is not None else float(self.frame_targets_cfg.get("tolerance", 0.03) or 0.0)
+        tol_sec = max(0.0, tol_sec)
+        dilate_frames = int(dilate) if dilate is not None else int(self.frame_targets_cfg.get("dilate_active_frames", 0) or 0)
+        dilate_frames = max(0, dilate_frames)
+
+        hop_seconds = stride_val / max(fps_val, 1e-6)
+        tol_frames = int(round(tol_sec * fps_val)) if fps_val > 0 else 0
+        dilate_frames_abs = dilate_frames * stride_val
+        clip_span_frames = max(0, (target_t_val - 1) * stride_val)
+        buffer_per_video = 2
+
+        ok_records = sorted(self._audit_ok_records)
+        if not ok_records:
+            ok_records = [
+                idx
+                for idx, record in enumerate(self.samples)
+                if canonical_video_id(record.get("id", "")) not in self._bad_clips
+            ]
+        ok_records = [idx for idx in ok_records if 0 <= idx < len(self.samples)]
+        ok_records = sorted(
+            ok_records,
+            key=lambda idx: canonical_video_id(self.samples[idx].get("id", "")),
+        )
+        if not ok_records:
+            self._last_materialize_duration = time.perf_counter() - t_start
+            return []
+
+        def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+            if not intervals:
+                return []
+            intervals = sorted(intervals, key=lambda it: it[0])
+            merged: List[Tuple[int, int]] = [intervals[0]]
+            for start, end in intervals[1:]:
+                last_start, last_end = merged[-1]
+                if start <= last_end:
+                    merged[-1] = (last_start, max(last_end, end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        per_video_data: Dict[int, Dict[str, Any]] = {}
+        total_pos_candidates = 0
+        total_neg_candidates = 0
+
+        for record_idx in ok_records:
+            record = self.samples[record_idx]
+            midi_path = record.get("midi")
+            if midi_path is None or not midi_path.exists():
+                continue
+            labels_tensor = _read_midi_events(midi_path)
+            if labels_tensor is None:
+                labels_tensor = torch.zeros((0, 3), dtype=torch.float32)
+            labels_list = labels_tensor.tolist()
+            if isinstance(labels_list, float):
+                labels_list = [[float(labels_tensor)]]  # defensive; should not occur
+
+            raw_existing = self._audit_entry_starts.get(record_idx, [])
+            existing_starts = [int(start) for start in raw_existing]
+            existing_max = max(existing_starts) if existing_starts else 0
+            event_times: List[float] = []
+            for row in labels_list:
+                if not isinstance(row, (list, tuple)) or len(row) < 1:
+                    continue
+                for val in row[:2]:
+                    try:
+                        fval = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(fval):
+                        event_times.append(max(0.0, fval))
+            max_event_sec = max(event_times) if event_times else 0.0
+            max_from_labels = 0
+            if fps_val > 0:
+                max_frame_est = int(sec_to_frame(max_event_sec, 1.0 / fps_val))
+                max_from_labels = max(0, max_frame_est - clip_span_frames)
+            max_start_idx = max(existing_max, max_from_labels)
+            max_start_idx = max(0, max_start_idx - (max_start_idx % stride_val))
+
+            pos_starts: List[int] = []
+            neg_starts: List[int] = []
+            seen_starts: Set[int] = set()
+
+            onset_values: Set[float] = set()
+            for row in labels_list:
+                if not isinstance(row, (list, tuple)) or len(row) < 1:
+                    continue
+                try:
+                    onset_val = float(row[0])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(onset_val):
+                    continue
+                onset_values.add(max(0.0, onset_val))
+            onset_seconds = sorted(onset_values)
+            third_offset = int(round(target_t_val / 3.0))
+            third_offset = max(0, min(target_t_val - 1, third_offset))
+            third_offset_sec = third_offset * hop_seconds
+
+            for onset_sec in onset_seconds:
+                start_sec = max(0.0, onset_sec - third_offset_sec)
+                start_idx = int(sec_to_frame(start_sec, 1.0 / fps_val)) if fps_val > 0 else 0
+                if stride_val > 1:
+                    start_idx -= start_idx % stride_val
+                start_idx = max(0, start_idx)
+                if max_start_idx > 0 and start_idx > max_start_idx:
+                    start_idx = max_start_idx
+                if stride_val > 1 and start_idx % stride_val != 0:
+                    start_idx -= start_idx % stride_val
+                start_idx = max(0, start_idx)
+                if start_idx not in seen_starts:
+                    seen_starts.add(start_idx)
+                    pos_starts.append(start_idx)
+
+            active_intervals: List[Tuple[int, int]] = []
+            if labels_list:
+                for row in labels_list:
+                    if not isinstance(row, (list, tuple)) or len(row) < 1:
+                        continue
+                    onset_val = float(row[0])
+                    offset_val = float(row[1]) if len(row) > 1 else onset_val
+                    if not math.isfinite(onset_val):
+                        continue
+                    if not math.isfinite(offset_val):
+                        offset_val = onset_val
+                    onset_val = max(0.0, onset_val)
+                    offset_val = max(onset_val, offset_val)
+                    start_frame = int(sec_to_frame(onset_val, 1.0 / fps_val)) if fps_val > 0 else 0
+                    end_frame = int(sec_to_frame(offset_val, 1.0 / fps_val)) if fps_val > 0 else start_frame
+                    start_frame = max(0, start_frame - tol_frames - dilate_frames_abs)
+                    end_frame = end_frame + tol_frames + dilate_frames_abs
+                    if end_frame <= start_frame:
+                        end_frame = start_frame + stride_val
+                    active_intervals.append((start_frame, end_frame))
+            merged_intervals = _merge_intervals(active_intervals)
+
+            def _window_overlaps_active(start_idx: int) -> bool:
+                if not merged_intervals:
+                    return False
+                win_start = max(0, start_idx)
+                win_end = win_start + clip_span_frames
+                for a_start, a_end in merged_intervals:
+                    if win_start <= a_end and win_end >= a_start:
+                        return True
+                return False
+
+            if pos_starts:
+                if len(pos_starts) <= 3:
+                    neg_slots = 2
+                else:
+                    neg_slots = 3
+            else:
+                neg_slots = 1 if max_start_idx == 0 else 2
+            neg_slots = max(1, min(3, neg_slots))
+
+            if max_start_idx <= 0:
+                candidate_positions = [0]
+            else:
+                if neg_slots == 1:
+                    fractions = [0.5]
+                else:
+                    fractions = [i / max(neg_slots - 1, 1) for i in range(neg_slots)]
+                candidate_positions = [
+                    int(round(frac * max_start_idx)) for frac in fractions
+                ]
+
+            neighbor_offsets = [0, -stride_val, stride_val, -2 * stride_val, 2 * stride_val]
+            for base_idx in candidate_positions:
+                base_idx = max(0, min(base_idx, max_start_idx))
+                for offset in neighbor_offsets:
+                    candidate = base_idx + offset
+                    if candidate < 0 or candidate > max_start_idx:
+                        continue
+                    if stride_val > 1 and candidate % stride_val != 0:
+                        candidate -= candidate % stride_val
+                    candidate = max(0, candidate)
+                    if candidate > max_start_idx:
+                        continue
+                    if candidate in seen_starts:
+                        continue
+                    if _window_overlaps_active(candidate):
+                        continue
+                    seen_starts.add(candidate)
+                    neg_starts.append(candidate)
+                    break
+
+            if not pos_starts and not neg_starts:
+                fallback_start = max_start_idx
+                if stride_val > 1 and fallback_start % stride_val != 0:
+                    fallback_start -= fallback_start % stride_val
+                fallback_start = max(0, fallback_start)
+                neg_starts.append(fallback_start)
+                seen_starts.add(fallback_start)
+
+            pos_starts = sorted(set(pos_starts))
+            neg_starts = sorted(set(neg_starts))
+
+            total_pos_candidates += len(pos_starts)
+            total_neg_candidates += len(neg_starts)
+
+            candidate_pool: Set[int] = set(pos_starts) | set(neg_starts) | set(existing_starts)
+            per_video_data[record_idx] = {
+                "positives": pos_starts,
+                "negatives": neg_starts,
+                "candidates": sorted(candidate_pool),
+                "canonical_id": canonical_video_id(record.get("id", "")),
+            }
+
+        materialized_videos: List[int] = []
+        for record_idx in ok_records:
+            data = per_video_data.get(record_idx)
+            if not data:
+                continue
+            if not data["positives"] and not data["negatives"]:
+                continue
+            materialized_videos.append(record_idx)
+
+        ok_video_count = len(materialized_videos)
+        if ok_video_count == 0:
+            self._last_materialize_duration = time.perf_counter() - t_start
+            return []
+
+        per_video_cap: Optional[int] = None
+        if max_total is not None and max_total > 0:
+            per_video_cap = int(math.ceil(max_total / max(1, ok_video_count))) + buffer_per_video
+            per_video_cap = max(1, per_video_cap)
+
+        for record_idx in materialized_videos:
+            data = per_video_data[record_idx]
+            positives_sorted = data["positives"]
+            negatives_sorted = data["negatives"]
+            ordered_pairs: List[Tuple[int, bool]] = []
+            if per_video_cap is not None:
+                for start_idx in positives_sorted:
+                    if len(ordered_pairs) >= per_video_cap:
+                        break
+                    ordered_pairs.append((start_idx, True))
+                if len(ordered_pairs) < per_video_cap:
+                    for start_idx in negatives_sorted:
+                        if len(ordered_pairs) >= per_video_cap:
+                            break
+                        ordered_pairs.append((start_idx, False))
+            else:
+                ordered_pairs = [(start_idx, True) for start_idx in positives_sorted] + [
+                    (start_idx, False) for start_idx in negatives_sorted
+                ]
+            ordered_pairs.sort(key=lambda item: item[0])
+            data["ordered"] = ordered_pairs
+
+        final_entries: List[Tuple[int, int]] = []
+        final_flags: List[bool] = []
+        snapshot_by_video: Dict[int, List[int]] = {vid: [] for vid in materialized_videos}
+
+        if max_total is not None and max_total > 0:
+            iterator_map: Dict[int, Iterator[Tuple[int, bool]]] = {}
+            for record_idx in materialized_videos:
+                ordered = per_video_data[record_idx].get("ordered", [])
+                if ordered:
+                    iterator_map[record_idx] = iter(ordered)
+            while iterator_map and len(final_entries) < max_total:
+                for record_idx in list(iterator_map.keys()):
+                    if len(final_entries) >= max_total:
+                        break
+                    iterator = iterator_map[record_idx]
+                    try:
+                        start_idx, is_positive = next(iterator)
+                    except StopIteration:
+                        del iterator_map[record_idx]
+                        continue
+                    final_entries.append((record_idx, start_idx))
+                    final_flags.append(is_positive)
+                    snapshot_by_video.setdefault(record_idx, []).append(start_idx)
+        else:
+            for record_idx in materialized_videos:
+                for start_idx, is_positive in per_video_data[record_idx].get("ordered", []):
+                    final_entries.append((record_idx, start_idx))
+                    final_flags.append(is_positive)
+                    snapshot_by_video.setdefault(record_idx, []).append(start_idx)
+
+        if not final_entries:
+            self._last_materialize_duration = time.perf_counter() - t_start
+            return []
+
+        pos_total = sum(1 for flag in final_flags if flag)
+        neg_total = len(final_flags) - pos_total
+        used_video_count = sum(1 for starts in snapshot_by_video.values() if starts)
+        avg_per_video = (len(final_entries) / used_video_count) if used_video_count else 0.0
+
+        self.eval_indices_snapshot = final_entries
+        self._eval_snapshot_flags = final_flags
+        self._eval_snapshot_by_video = {
+            vid: starts for vid, starts in snapshot_by_video.items() if starts
+        }
+        self._eval_candidates_by_video = {
+            vid: per_video_data.get(vid, {}).get("candidates", [])
+            for vid in self._eval_snapshot_by_video.keys()
+        }
+        self._eval_materialize_stats = {
+            "positives": pos_total,
+            "negatives": neg_total,
+            "videos": used_video_count,
+            "avg_per_video": avg_per_video,
+            "pos_candidates": total_pos_candidates,
+            "neg_candidates": total_neg_candidates,
+            "duration": self._last_materialize_duration,
+        }
+
+        self._last_materialize_duration = time.perf_counter() - t_start
+
+        print(
+            f"[dataset] entries built: total={len(final_entries)} (avg per video ≈ {avg_per_video:.1f}, pos≈{pos_total}, neg≈{neg_total})",
+            flush=True,
+        )
+        return final_entries
 
     def _record_has_valid_window(self, record_idx: int) -> bool:
         record = self.samples[record_idx]
@@ -1373,6 +1716,8 @@ class PianoYTDataset(Dataset):
 
     def _rebuild_valid_index_cache(self, *, log_summary: bool) -> None:
         self._valid_entries = []
+        self._audit_ok_records.clear()
+        self._audit_entry_starts = {}
         total = len(self.samples)
         skipped = 0
         ok_videos = 0
@@ -1403,6 +1748,8 @@ class PianoYTDataset(Dataset):
                 if has_window:
                     self._valid_entries.append(WindowEntry(idx, None, True))
                     ok_videos += 1
+                    if self._uses_eval_snapshot():
+                        self._audit_ok_records.add(idx)
                 else:
                     skipped += 1
                     bad_videos += 1
@@ -1441,9 +1788,20 @@ class PianoYTDataset(Dataset):
                 if status == "ok" and entries:
                     self._valid_entries.extend(entries)
                     ok_videos += 1
+                    self._audit_ok_records.add(idx)
                 else:
                     skipped += 1
                     bad_videos += 1
+
+        starts_map: Dict[int, List[int]] = {}
+        for entry in self._valid_entries:
+            if entry.start_idx is None:
+                continue
+            starts_map.setdefault(entry.record_idx, []).append(int(entry.start_idx))
+        self._audit_entry_starts = {
+            rec_idx: sorted({int(start) for start in starts})
+            for rec_idx, starts in starts_map.items()
+        }
 
         self._num_windows = len(self._valid_entries)
         if log_summary:
@@ -1462,6 +1820,18 @@ class PianoYTDataset(Dataset):
             LOGGER.warning(
                 "[PianoYT] No valid labeled samples remain for split %s.", self.split
             )
+        if self._uses_eval_snapshot():
+            try:
+                self._materialize_eval_entries_from_labels(
+                    max_total=self.args_max_clips_or_None,
+                    target_T=self.frames,
+                    fps=self.decode_fps,
+                    stride=self.stride,
+                    tol_s=self.frame_targets_cfg.get("tolerance"),
+                    dilate=self.frame_targets_cfg.get("dilate_active_frames"),
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to materialize eval entries from labels: %s", exc)
 
 
 def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
@@ -1512,6 +1882,7 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     max_clips = dcfg.get("max_clips")
     dataset.limit_max_clips(max_clips if isinstance(max_clips, int) else None)
     dataset.max_clips = max_clips
+    dataset.args_max_clips_or_None = max_clips if isinstance(max_clips, int) else None
 
     dataset.annotations_root = dcfg.get("annotations_root")
     dataset.label_format = dcfg.get("label_format", "midi")

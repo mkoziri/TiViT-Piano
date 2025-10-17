@@ -22,6 +22,7 @@ from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
+from typing import Optional
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -547,15 +548,35 @@ def main():
 
     dataset = getattr(val_loader, "dataset", None)
     dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
-    dataset_len = None
+    ds_len: Optional[int] = None
     dataset_count = "?"
+    ok_videos = 0
+    materialize_duration = 0.0
     if dataset is not None:
+        materialize_stats = getattr(dataset, "_eval_materialize_stats", {}) or {}
+        if isinstance(materialize_stats, dict):
+            try:
+                ok_videos = int(materialize_stats.get("videos") or 0)
+            except (TypeError, ValueError):
+                ok_videos = 0
+            try:
+                materialize_duration = float(materialize_stats.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                materialize_duration = 0.0
+        if materialize_duration == 0.0:
+            try:
+                materialize_duration = float(getattr(dataset, "_last_materialize_duration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                materialize_duration = 0.0
         try:
-            dataset_len = len(dataset)
-            dataset_count = str(dataset_len)
+            ds_len = len(dataset)
+            dataset_count = str(ds_len)
         except TypeError:
-            dataset_len = None
+            ds_len = None
             dataset_count = "?"
+    if ds_len == 0 and ok_videos > 0:
+        print("[error] dataset len is 0 after audit ok>0 – eval entries were not materialized", flush=True)
+        sys.exit(1)
     dataset_elapsed = time.time() - t_dataset_build0
     stage_durations["dataset_init"] = dataset_elapsed
     batch_size_val = getattr(val_loader, "batch_size", None)
@@ -584,11 +605,11 @@ def main():
                 frame_summary_display = f"{prefix}lag_source=no_avlag"
         _log_progress(f"[progress] {frame_summary_display}", force=True)
 
-    if dataset_len is not None:
-        max_cap = args.max_clips if args.max_clips is not None else dataset_len
-        target_clips = min(dataset_len, max_cap)
+    if ds_len is not None:
+        resolved_cap = args.max_clips if args.max_clips is not None else ds_len
+        target_clips = int(min(ds_len, int(resolved_cap)))
     else:
-        target_clips = args.max_clips
+        target_clips = int(args.max_clips) if args.max_clips is not None else None
 
     if dataset is not None and target_clips is not None:
         try:
@@ -630,11 +651,14 @@ def main():
                 loader_kwargs["multiprocessing_context"] = multiprocessing_context
             val_loader = DataLoader(dataset, **loader_kwargs)
             dataset = getattr(val_loader, "dataset", dataset)
-            dataset_len = len(dataset)
-            dataset_count = str(dataset_len)
-            target_clips = dataset_len
+            ds_len = len(dataset)
+            dataset_count = str(ds_len)
+            target_clips = ds_len
             dataset_elapsed = time.time() - t_dataset_build0
             stage_durations["dataset_init"] = dataset_elapsed
+
+    if materialize_duration > 0:
+        stage_durations["materialize"] = materialize_duration
 
     if target_clips == 0:
         _log_progress("[progress] target_clips resolved to 0; exiting early.", force=True)
@@ -1239,6 +1263,7 @@ def main():
     total_elapsed = time.time() - t_main_start
     stage_order = [
         ("dataset_init", "dataset"),
+        ("materialize", "materialize"),
         ("first_batch", "first_batch"),
         ("data_pass", "data_pass"),
         ("grid_pass", "grid_sweep"),
