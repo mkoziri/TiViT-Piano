@@ -42,6 +42,7 @@ from utils.frame_targets import (
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
+from utils.registration_refinement import RegistrationRefiner
 
 LOGGER = logging.getLogger(__name__)
 
@@ -664,6 +665,12 @@ class OMAPSDataset(Dataset):
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
+        self.registration_refiner = RegistrationRefiner(
+            self.canonical_hw,
+            cache_path=Path("runs/reg_refined.json"),
+            sample_frames=32,
+            logger=LOGGER,
+        )
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
         if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
@@ -778,13 +785,19 @@ class OMAPSDataset(Dataset):
             decode_fps=self.decode_fps,
         )
         
+        meta = self.registration_cfg.get("crop") if self.registration_enabled else None
         if self.registration_enabled and self.apply_crop:
-            meta = self.registration_cfg.get("crop")
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
         elif not self.registration_enabled and not self._registration_off_logged:
             self._registration_off_logged = True
 
-        clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+        clip = self.registration_refiner.transform_clip(
+            clip,
+            video_id=video_id,
+            video_path=path,
+            crop_meta=meta if (self.registration_enabled and self.apply_crop) else None,
+            interp=self.registration_interp,
+        )
 
         if self.global_aug_enabled and is_train:
             clip = apply_global_augment(

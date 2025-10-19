@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import argparse
 import faulthandler
+import json
 import os
 import signal
 import threading
@@ -44,8 +45,19 @@ from tqdm import tqdm
 from data import make_dataloader
 from models import build_model
 from utils import load_config, configure_verbosity, get_logger
+from utils.logging_utils import QUIET_INFO_FLAG
 
 logger = get_logger(__name__)
+
+INNER_EVAL_WARMUP_WINDOWS = 120
+INNER_EVAL_CACHE_PATH = Path("runs/cache/inner_eval_stats.json")
+INNER_EVAL_CACHE_TOLERANCE = 0.20
+INNER_EVAL_N_POS_MIN = 2000
+INNER_EVAL_MIN_CAP = 300
+INNER_EVAL_MAX_CAP = 5000
+INNER_EVAL_SAFETY = 1.10
+INNER_EVAL_BUDGET_DEFAULT = 900  # seconds
+INNER_EVAL_BUDGET_MAX = 2700  # seconds
 
 # ----------------------- helpers -----------------------
 def set_seed(seed: int = 42):
@@ -655,6 +667,163 @@ def _unwrap_dataset(dataset):
     return current
 
 
+def _resolved_verbosity() -> str:
+    return os.environ.get("TIVIT_VERBOSE", "quiet").strip().lower() or "quiet"
+
+
+def _load_inner_eval_cache(path: Path = INNER_EVAL_CACHE_PATH) -> Optional[Dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError):  # pragma: no cover - defensive
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _store_inner_eval_cache(stats: Mapping[str, Any], path: Path = INNER_EVAL_CACHE_PATH) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = dict(stats)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    except OSError:  # pragma: no cover - best effort persistence
+        logger.debug("[train:eval] failed to persist eval cache", exc_info=True)
+
+
+def _materialized_eval_density(base_dataset) -> Tuple[int, int]:
+    snapshot_flags = getattr(base_dataset, "_eval_snapshot_flags", None)
+    total_pos = 0
+    total_windows = 0
+    if isinstance(snapshot_flags, list) and snapshot_flags:
+        total_pos = sum(1 for flag in snapshot_flags if flag)
+        total_windows = len(snapshot_flags)
+    else:
+        stats = getattr(base_dataset, "_eval_materialize_stats", {}) or {}
+        try:
+            total_pos = int(stats.get("positives") or 0)
+        except (TypeError, ValueError):
+            total_pos = 0
+        try:
+            total_neg = int(stats.get("negatives") or 0)
+        except (TypeError, ValueError):
+            total_neg = 0
+        total_windows = total_pos + total_neg
+    snapshot_entries = getattr(base_dataset, "eval_indices_snapshot", None)
+    if isinstance(snapshot_entries, list) and snapshot_entries:
+        total_windows = max(total_windows, len(snapshot_entries))
+    return total_pos, total_windows
+
+
+def _build_stratified_selection(base_dataset, cap: int, min_per_video: int) -> Tuple[List[int], Dict[int, int]]:
+    cap = max(0, cap)
+    snapshot = getattr(base_dataset, "eval_indices_snapshot", None)
+    if not isinstance(snapshot, list) or not snapshot:
+        return list(range(cap)), {}
+
+    cap = min(cap, len(snapshot))
+    video_map: Dict[int, List[int]] = {}
+    for idx, (record_idx, _) in enumerate(snapshot):
+        video_map.setdefault(record_idx, []).append(idx)
+    if not video_map:
+        return list(range(cap)), {}
+
+    per_video_seed: Dict[int, int] = {}
+    for vid, indices in video_map.items():
+        per_video_seed[vid] = min(len(indices), min_per_video)
+
+    alloc_total = sum(per_video_seed.values())
+    if alloc_total > cap:
+        # Scale down fairly when cap is smaller than requested base allocation.
+        vids_desc = sorted(per_video_seed, key=lambda vid: per_video_seed[vid], reverse=True)
+        while alloc_total > cap and vids_desc:
+            for vid in vids_desc:
+                if alloc_total <= cap:
+                    break
+                if per_video_seed[vid] <= 0:
+                    continue
+                per_video_seed[vid] -= 1
+                alloc_total -= 1
+
+    remaining = cap - alloc_total
+    available_map: Dict[int, int] = {
+        vid: max(0, len(indices) - per_video_seed.get(vid, 0))
+        for vid, indices in video_map.items()
+    }
+    total_available = sum(available_map.values())
+    extras: Dict[int, int] = {vid: 0 for vid in video_map}
+    fractions: List[Tuple[float, int]] = []
+    if remaining > 0 and total_available > 0:
+        for vid, available in available_map.items():
+            if available <= 0:
+                continue
+            share = (available / total_available) * remaining
+            extra = int(math.floor(share))
+            extras[vid] = extra
+            fractions.append((share - extra, vid))
+        distributed = sum(extras.values())
+        leftover = remaining - distributed
+        if leftover > 0:
+            for _, vid in sorted(fractions, key=lambda item: item[0], reverse=True):
+                if leftover <= 0:
+                    break
+                if available_map[vid] <= extras[vid]:
+                    continue
+                extras[vid] += 1
+                leftover -= 1
+
+    per_video_total: Dict[int, int] = {}
+    for vid, base_alloc in per_video_seed.items():
+        total = base_alloc + extras.get(vid, 0)
+        total = min(total, len(video_map[vid]))
+        per_video_total[vid] = total
+
+    selected: List[int] = []
+    for vid, count in per_video_total.items():
+        if count <= 0:
+            continue
+        selected.extend(video_map[vid][:count])
+
+    selected = sorted(set(selected))[:cap]
+    return selected, per_video_total
+
+
+def _compute_eval_cap(total_windows: int, pos_per_window: float, throughput: Optional[float]) -> Dict[str, Any]:
+    pos_rate = max(pos_per_window, 1e-6)
+    cap_pos = int(math.ceil(INNER_EVAL_N_POS_MIN / pos_rate))
+
+    cap_time_value: Optional[int] = None
+    if throughput is not None and throughput > 0:
+        cap_time_value = int(math.floor(throughput * INNER_EVAL_BUDGET_DEFAULT * 0.90))
+        cap_time_value = max(cap_time_value, 0)
+
+    effective_time_cap = cap_time_value if cap_time_value is not None else float("inf")
+    raw_cap = min(cap_pos, effective_time_cap)
+    bounded_cap = int(
+        min(
+            total_windows,
+            max(
+                INNER_EVAL_MIN_CAP,
+                min(INNER_EVAL_MAX_CAP, raw_cap),
+            ),
+        )
+    )
+
+    driver = "pos" if cap_pos <= effective_time_cap else "time"
+    if cap_time_value is None:
+        driver = "pos"
+
+    return {
+        "cap": max(0, bounded_cap),
+        "cap_time": cap_time_value,
+        "cap_pos": cap_pos,
+        "driver": driver,
+    }
+
+
 def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoader]) -> Optional[DataLoader]:
     if loader is None:
         return None
@@ -720,12 +889,11 @@ def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoad
     else:
         target = max(cap, 0)
 
-    if base_len > 0 and target < base_len:
-        eval_dataset = Subset(base_dataset, list(range(target)))
-    else:
-        eval_dataset = base_dataset
-        if base_len > 0:
-            target = base_len
+    subset_len = base_len if base_len > 0 else target
+    subset_len = min(subset_len, target)
+    subset_len = max(subset_len, 0)
+    subset_indices = list(range(subset_len))
+    eval_dataset = Subset(base_dataset, subset_indices)
 
     safe_collate = SafeEvalCollate(getattr(loader, "collate_fn", None))
     batch_size = getattr(loader, "batch_size", 1)
@@ -743,8 +911,23 @@ def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoad
         prefetch_factor=2,
     )
     setattr(eval_loader, "_base_dataset", base_dataset)
-    setattr(eval_loader, "_target_total", int(target))
+    setattr(eval_loader, "_target_total", int(subset_len))
     setattr(eval_loader, "_target_cap", cap)
+
+    snapshot_flags = getattr(base_dataset, "_eval_snapshot_flags", None)
+    if isinstance(snapshot_flags, list) and snapshot_flags:
+        total_pos = sum(1 for flag in snapshot_flags if flag)
+        total_windows = len(snapshot_flags)
+    else:
+        stats = getattr(base_dataset, "_eval_materialize_stats", {}) or {}
+        total_pos = int(stats.get("positives") or 0)
+        total_windows = int(stats.get("positives") or 0) + int(stats.get("negatives") or 0)
+    snapshot_entries = getattr(base_dataset, "eval_indices_snapshot", None)
+    if isinstance(snapshot_entries, list) and snapshot_entries:
+        total_windows = max(total_windows, len(snapshot_entries))
+
+    setattr(eval_loader, "_materialized_total_pos", int(total_pos))
+    setattr(eval_loader, "_materialized_total_windows", int(total_windows))
     return eval_loader
 
 
@@ -755,9 +938,11 @@ def _spawn_eval_heartbeat(progress: Dict[str, int], start_time: float, interval:
             processed = progress.get("count", 0)
             total = progress.get("total")
             total_repr = total if isinstance(total, int) and total >= 0 else "?"
-            print(
-                f"[train:eval] heartbeat processed={processed}/{total_repr} elapsed={_format_mmss(elapsed)}",
-                flush=True,
+            logger.info(
+                "[train:eval] heartbeat processed=%s/%s elapsed=%s",
+                processed,
+                total_repr,
+                _format_mmss(elapsed),
             )
 
     thread = threading.Thread(target=_runner, name="eval-heartbeat", daemon=True)
@@ -769,9 +954,9 @@ def _spawn_eval_watchdog(start_time: float, interval: float, stop_event: threadi
     def _runner():
         while not stop_event.wait(interval):
             elapsed = time.perf_counter() - start_time
-            print(
-                f"[train:eval] watchdog alive elapsed={_format_mmss(elapsed)}",
-                flush=True,
+            logger.info(
+                "[train:eval] watchdog alive elapsed=%s",
+                _format_mmss(elapsed),
             )
 
     thread = threading.Thread(target=_runner, name="eval-watchdog", daemon=True)
@@ -987,24 +1172,106 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     if summary:
         logger.info(summary)
 
+    verbosity = _resolved_verbosity()
     dataset = getattr(loader, "dataset", None)
+    base_dataset = getattr(loader, "_base_dataset", _unwrap_dataset(dataset))
     try:
-        raw_total = len(loader.dataset) if dataset is not None else len(loader)
+        raw_total = len(dataset) if dataset is not None else len(loader)
     except Exception:
         raw_total = 0
     if not isinstance(raw_total, int):
         raw_total = 0
     raw_total = max(0, raw_total)
 
-    total_clips = raw_total
-    target_total_attr = getattr(loader, "_target_total", None)
-    if target_total_attr is not None:
+    total_pos = 0
+    total_windows = raw_total
+    if base_dataset is not None:
+        total_pos, total_windows = _materialized_eval_density(base_dataset)
+    materialized_total = getattr(loader, "_materialized_total_windows", 0)
+    if materialized_total:
         try:
-            coerced_total = int(target_total_attr)
+            total_windows = max(total_windows, int(materialized_total))
         except (TypeError, ValueError):
-            coerced_total = None
-        if coerced_total is not None and coerced_total >= 0:
-            total_clips = coerced_total
+            pass
+    if total_windows <= 0:
+        total_windows = raw_total
+
+    pos_per_window = (total_pos / total_windows) if total_windows > 0 else 0.0
+    pos_per_window = float(pos_per_window)
+
+    if verbosity != "quiet":
+        logger.info(
+            "[train:eval] pos_per_window=%.2f (total_pos=%d over %d windows)",
+            pos_per_window,
+            total_pos,
+            total_windows,
+        )
+
+    cache_data = _load_inner_eval_cache()
+    cached_throughput: Optional[float] = None
+    if cache_data:
+        try:
+            cached_throughput = float(cache_data.get("throughput_win_per_s"))
+        except (TypeError, ValueError):
+            cached_throughput = None
+        if cached_throughput is not None and (not math.isfinite(cached_throughput) or cached_throughput <= 0):
+            cached_throughput = None
+
+    cap_components = _compute_eval_cap(total_windows, pos_per_window, cached_throughput)
+    planned_cap = cap_components["cap"]
+    cap_time_est = cap_components["cap_time"]
+    cap_pos = cap_components["cap_pos"]
+    cap_driver = cap_components["driver"]
+
+    stratified_indices: List[int]
+    per_video_alloc: Dict[int, int] = {}
+    if isinstance(dataset, Subset) and base_dataset is not None:
+        stratified_indices, per_video_alloc = _build_stratified_selection(base_dataset, planned_cap, 10)
+        dataset.indices = stratified_indices
+        setattr(loader, "_target_total", len(stratified_indices))
+        if verbosity != "quiet":
+            logger.info(
+                "[train:eval] stratified sampling: videos=%d  min_per_video=%d",
+                len(per_video_alloc),
+                10,
+            )
+        if verbosity == "debug" and per_video_alloc:
+            logger.debug("[train:eval] per-video allocations: %s", per_video_alloc)
+    else:
+        stratified_indices = list(range(planned_cap))
+
+    total_clips = len(stratified_indices)
+    if total_clips <= 0:
+        total_clips = planned_cap if planned_cap > 0 else raw_total
+
+    cap_active = min(cap_components["cap"], total_clips)
+    cap_driver_active = cap_driver
+    cap_time_active = cap_time_est
+    throughput_used = cached_throughput
+    throughput_live: Optional[float] = None
+    cap_logged = False
+    total_clips = cap_active
+
+    eval_wall_budget = INNER_EVAL_BUDGET_DEFAULT
+    if cached_throughput is not None and cap_time_est is not None and cap_pos > cap_time_est:
+        budget_needed = int(math.ceil(cap_pos / max(cached_throughput, 1e-6) * INNER_EVAL_SAFETY))
+        if budget_needed > INNER_EVAL_BUDGET_DEFAULT:
+            if budget_needed > INNER_EVAL_BUDGET_MAX:
+                logger.warning(
+                    "[train:eval] requested budget %ds exceeds cap %ds; clamped. F1 variance may be high.",
+                    budget_needed,
+                    INNER_EVAL_BUDGET_MAX,
+                )
+                budget_needed = INNER_EVAL_BUDGET_MAX
+            logger.warning(
+                "[train:eval] increasing timeout to %ds (was %ds) to satisfy N_POS_MIN=%d; pos_per_window=%.2f, throughput=%.2f win/s",
+                budget_needed,
+                eval_wall_budget,
+                INNER_EVAL_N_POS_MIN,
+                pos_per_window,
+                cached_throughput,
+            )
+            eval_wall_budget = budget_needed
 
     print(f"[train:eval] start (clips={total_clips})", flush=True)
 
@@ -1014,7 +1281,12 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     heartbeat_thread = _spawn_eval_heartbeat(progress, eval_start, 10.0, stop_event)
     watchdog_thread = _spawn_eval_watchdog(eval_start, 15.0, stop_event)
 
-    timeout_seconds = float(timeout_minutes) * 60.0 if timeout_minutes and timeout_minutes > 0 else 0.0
+    timeout_seconds = float(eval_wall_budget)
+    warmup_target = INNER_EVAL_WARMUP_WINDOWS
+    warmup_processed = 0
+    warmup_start_time: Optional[float] = None
+    warmup_elapsed: Optional[float] = None
+    warmup_logged = False
     skip_empty_logged = False
     timed_out = False
 
@@ -1127,11 +1399,111 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     batch_size = int(x.shape[0])
                 else:
                     batch_size = len(batch.get("path", []))
+
+                if warmup_start_time is None:
+                    warmup_start_time = perf_counter()
+                warmup_processed += int(batch_size)
+
                 progress["count"] += int(batch_size)
-                if total_clips > 0:
-                    progress["count"] = min(progress["count"], total_clips)
-                    if progress["count"] >= total_clips:
+                if cap_active > 0:
+                    progress["count"] = min(progress["count"], cap_active)
+                    if progress["count"] >= cap_active:
+                        if warmup_elapsed is None and warmup_start_time is not None:
+                            warmup_elapsed = perf_counter() - warmup_start_time
                         raise _StopEvalLoop()
+
+                if (
+                    warmup_elapsed is None
+                    and warmup_target > 0
+                    and warmup_processed >= warmup_target
+                ):
+                    warmup_elapsed = max(
+                        (perf_counter() - warmup_start_time) if warmup_start_time is not None else 0.0,
+                        1e-6,
+                    )
+                    throughput_live = warmup_processed / warmup_elapsed
+                    if verbosity != "quiet":
+                        logger.info(
+                            "[train:eval] warmup throughput=%.2f win/s (%d in %.1fs)",
+                            throughput_live,
+                            warmup_processed,
+                            warmup_elapsed,
+                        )
+                    warmup_logged = True
+
+                    cap_payload = _compute_eval_cap(total_windows, pos_per_window, throughput_live)
+                    new_cap = min(cap_payload["cap"], len(stratified_indices))
+                    old_cap = cap_active
+                    cap_driver_active = cap_payload["driver"]
+                    cap_time_active = cap_payload["cap_time"]
+
+                    if throughput_used is None:
+                        cap_active = new_cap
+                    else:
+                        if throughput_used > 0:
+                            delta_pct = (throughput_live - throughput_used) / throughput_used * 100.0
+                        else:
+                            delta_pct = None
+                        if delta_pct is not None and abs(delta_pct) > INNER_EVAL_CACHE_TOLERANCE * 100:
+                            cap_active = min(new_cap, cap_active)
+                            if verbosity != "quiet" and cap_active != old_cap:
+                                logger.info(
+                                    "[train:eval] adjusted cap from %d→%d (live throughput %+d%%)",
+                                    old_cap,
+                                    cap_active,
+                                    int(round(delta_pct)),
+                                )
+                        # retain original cap when difference within tolerance
+
+                    throughput_used = throughput_live
+
+                    cap_active = max(0, min(cap_active, len(stratified_indices)))
+                    total_clips = cap_active
+                    progress["total"] = cap_active
+                    progress["count"] = min(progress["count"], cap_active)
+
+                    if (
+                        throughput_used
+                        and throughput_used > 0
+                        and cap_time_active is not None
+                        and cap_pos > cap_time_active
+                    ):
+                        orig_budget = eval_wall_budget
+                        budget_needed_live = int(
+                            math.ceil(cap_pos / max(throughput_used, 1e-6) * INNER_EVAL_SAFETY)
+                        )
+                        if budget_needed_live > orig_budget:
+                            if budget_needed_live > INNER_EVAL_BUDGET_MAX:
+                                logger.warning(
+                                    "[train:eval] requested budget %ds exceeds cap %ds; clamped. F1 variance may be high.",
+                                    budget_needed_live,
+                                    INNER_EVAL_BUDGET_MAX,
+                                )
+                                budget_needed_live = INNER_EVAL_BUDGET_MAX
+                            logger.warning(
+                                "[train:eval] increasing timeout to %ds (was %ds) to satisfy N_POS_MIN=%d; pos_per_window=%.2f, throughput=%.2f win/s",
+                                budget_needed_live,
+                                orig_budget,
+                                INNER_EVAL_N_POS_MIN,
+                                pos_per_window,
+                                throughput_used,
+                            )
+                            eval_wall_budget = budget_needed_live
+                            timeout_seconds = float(eval_wall_budget)
+
+                    if not cap_logged:
+                        cap_time_repr = (
+                            str(cap_time_active) if cap_time_active is not None else "inf"
+                        )
+                        logger.info(
+                            "[train:eval] cap=%d/%d (driver=%s)  cap_time=%s  cap_pos=%d",
+                            cap_active,
+                            total_windows,
+                            cap_driver_active,
+                            cap_time_repr,
+                            cap_pos,
+                        )
+                        cap_logged = True
 
                 lag_ms_batch = batch.get("lag_ms")
                 if lag_ms_batch is not None:
@@ -1396,6 +1768,39 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                 metric_counts["onset_pos_rate"]  += onset_gt_bin.mean().item()
                 metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
                 metric_n += 1
+        if warmup_elapsed is not None and not warmup_logged:
+            throughput_live_fallback = warmup_processed / max(warmup_elapsed, 1e-6)
+            if verbosity != "quiet":
+                logger.info(
+                    "[train:eval] warmup throughput=%.2f win/s (%d in %.1fs)",
+                    throughput_live_fallback,
+                    warmup_processed,
+                    warmup_elapsed,
+                )
+            warmup_logged = True
+            throughput_used = throughput_live_fallback
+            cap_payload = _compute_eval_cap(
+                total_windows,
+                pos_per_window,
+                throughput_live_fallback if throughput_live_fallback > 0 else None,
+            )
+            cap_driver_active = cap_payload["driver"]
+            cap_time_active = cap_payload["cap_time"]
+            cap_active = min(cap_active, cap_payload["cap"])
+            total_clips = cap_active
+            progress["total"] = cap_active
+            progress["count"] = min(progress["count"], cap_active)
+        if not cap_logged:
+            cap_time_repr = str(cap_time_active) if cap_time_active is not None else "inf"
+            logger.info(
+                "[train:eval] cap=%d/%d (driver=%s)  cap_time=%s  cap_pos=%d",
+                cap_active,
+                total_windows,
+                cap_driver_active,
+                cap_time_repr,
+                cap_pos,
+            )
+            cap_logged = True
     except _StopEvalLoop:
         pass
     finally:
@@ -1437,7 +1842,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     )
 
     if timed_out:
-        timeout_label = timeout_minutes if timeout_minutes else 0
+        timeout_label = int(round(timeout_seconds / 60.0)) if timeout_seconds > 0 else 0
         print(f"[train:eval] timeout after {timeout_label}m; skipping metrics", flush=True)
         logger.warning("[train:eval] timeout after %sm; skipping metrics", timeout_label)
         return None
@@ -1505,8 +1910,20 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     legacy_line = _fmt_metrics_line(legacy_metrics)
     print(f"[{agg_label}] {selected_line}\n")
     print(f"[any] {legacy_line}\n")
-    logger.info("[%s] %s", agg_label, selected_line)
-    logger.info("[any] %s", legacy_line)
+    quiet_extra = {QUIET_INFO_FLAG: True}
+    logger.info("[%s] %s", agg_label, selected_line, extra=quiet_extra)
+    logger.info("[any] %s", legacy_line, extra=quiet_extra)
+
+    processed_total = progress.get("count", 0)
+    throughput_for_cache = throughput_used if throughput_used and throughput_used > 0 else processed_total / max(elapsed_total, 1e-6)
+    if not math.isfinite(throughput_for_cache):
+        throughput_for_cache = 0.0
+    cache_payload = {
+        "throughput_win_per_s": float(throughput_for_cache),
+        "pos_per_window": float(pos_per_window),
+        "updated": datetime.utcnow().isoformat(timespec="seconds"),
+    }
+    _store_inner_eval_cache(cache_payload)
 
     return val_metrics
 

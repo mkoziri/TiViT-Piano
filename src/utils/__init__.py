@@ -18,6 +18,7 @@ from .pitch import align_pitch_dim
 from .logging import setup_logging, get_logger
 from .logging_utils import configure_verbosity
 from .time_grid import sec_to_frame, frame_to_sec
+from .registration_refinement import RegistrationRefiner, RegistrationResult
 
 __all__ = [
     "load_config",
@@ -28,4 +29,6 @@ __all__ = [
     "get_logger",
     "sec_to_frame",
     "frame_to_sec",
+    "RegistrationRefiner",
+    "RegistrationResult",
 ]

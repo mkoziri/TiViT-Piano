@@ -50,13 +50,13 @@ from utils.frame_targets import (
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
+from utils.registration_refinement import RegistrationRefiner
 
 from .omaps_dataset import (  # reuse established helpers for identical behaviour
     _load_clip_with_random_start,
     _read_manifest,
     apply_global_augment,
     apply_registration_crop,
-    resize_to_canonical,
 )
 LOGGER = logging.getLogger(__name__)
 
@@ -577,6 +577,12 @@ class PianoYTDataset(Dataset):
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", False))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
+        self.registration_refiner = RegistrationRefiner(
+            self.canonical_hw,
+            cache_path=Path("runs/reg_refined.json"),
+            sample_frames=32,
+            logger=LOGGER,
+        )
 
         global_aug_cfg = self.dataset_cfg.get("global_aug")
         if not isinstance(global_aug_cfg, dict):
@@ -1107,7 +1113,13 @@ class PianoYTDataset(Dataset):
                 clip = apply_registration_crop(clip, meta, self.registration_cfg)
             elif not self.registration_enabled and not self._registration_off_logged:
                 self._registration_off_logged = True
-            clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
+            clip = self.registration_refiner.transform_clip(
+                clip,
+                video_id=video_id,
+                video_path=video_path,
+                crop_meta=meta if (self.registration_enabled and self.apply_crop) else None,
+                interp=self.registration_interp,
+            )
 
             if self.global_aug_enabled and is_train:
                 clip = apply_global_augment(

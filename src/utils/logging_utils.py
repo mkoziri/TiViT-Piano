@@ -28,8 +28,19 @@ VERBOSITY_LEVELS = {
     "debug": logging.DEBUG,
 }
 
+QUIET_INFO_FLAG = "tivit_force_info"
+
 _DEFAULT_FORMAT = "%(asctime)s %(levelname).1s %(name)s: %(message)s"
 _DEFAULT_DATEFMT = "%H:%M:%S"
+
+
+class _QuietInfoFilter(logging.Filter):
+    """Allow INFO logs through in quiet mode only when explicitly flagged."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - simple predicate
+        if record.levelno >= logging.WARNING:
+            return True
+        return bool(getattr(record, QUIET_INFO_FLAG, False))
 
 
 def _coerce_level_name(level: Optional[str], env_var: str) -> str:
@@ -68,11 +79,18 @@ def configure_verbosity(level: Optional[str], env_var: str = "TIVIT_VERBOSE") ->
         root.removeHandler(handler)
 
     handler = TqdmLoggingHandler()
-    handler.setLevel(numeric_level)
+    handler_level = logging.INFO if resolved == "quiet" else numeric_level
+    handler.setLevel(handler_level)
     handler.setFormatter(logging.Formatter(_DEFAULT_FORMAT, datefmt=_DEFAULT_DATEFMT))
+
+    if resolved == "quiet":
+        handler.addFilter(_QuietInfoFilter())
+        root.setLevel(logging.INFO)
+    else:
+        root.setLevel(numeric_level)
+
     root.addHandler(handler)
 
-    root.setLevel(numeric_level)
     logging.captureWarnings(True)
 
     os.environ[env_var] = resolved
@@ -80,4 +98,4 @@ def configure_verbosity(level: Optional[str], env_var: str = "TIVIT_VERBOSE") ->
     return resolved
 
 
-__all__ = ["configure_verbosity", "VERBOSITY_LEVELS"]
+__all__ = ["configure_verbosity", "VERBOSITY_LEVELS", "QUIET_INFO_FLAG"]
