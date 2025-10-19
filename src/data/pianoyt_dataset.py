@@ -23,6 +23,7 @@ import csv
 import logging
 import math
 import os
+import random
 import time
 import warnings
 from pathlib import Path
@@ -57,11 +58,11 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
     apply_registration_crop,
     resize_to_canonical,
 )
-
 LOGGER = logging.getLogger(__name__)
 
 
 _EVAL_ALT_WINDOW_ATTEMPTS = 3
+_TRAIN_ALT_WINDOW_ATTEMPTS = 3
 
 
 class SampleRecord(TypedDict):
@@ -524,6 +525,7 @@ class PianoYTDataset(Dataset):
         self._av_sync_warned = False
         self._lag_log_once: Set[str] = set()
         self._valid_entries: List[WindowEntry] = []
+        self.train_indices_snapshot: List[WindowEntry] = []
         self.eval_indices_snapshot: List[Tuple[int, int]] = []
         self._eval_snapshot_flags: List[bool] = []
         self._eval_snapshot_by_video: Dict[int, List[int]] = {}
@@ -541,6 +543,11 @@ class PianoYTDataset(Dataset):
         self._only_filter_applied: bool = False
         self._only_video_target: Optional[str] = None
         self.args_max_clips_or_None: Optional[int] = None
+        self._train_fallback_once: Set[str] = set()
+        self._eval_fallback_once: Set[str] = set()
+        self._train_candidates_by_video: Dict[int, List[int]] = {}
+        self._train_epoch_active: bool = False
+        self._last_good_sample: Optional[Dict[str, Any]] = None
         self._last_materialize_duration: float = 0.0
         self._log_av_disabled_once()
 
@@ -719,61 +726,235 @@ class PianoYTDataset(Dataset):
         self._rebuild_valid_index_cache(log_summary=False)
         return True
 
+    def prepare_epoch_snapshot(self, *, shuffle: bool = True, audit: bool = True) -> None:
+        """Rebuild the train snapshot once per epoch to avoid mid-epoch shrink."""
+
+        if self.split != "train":
+            return
+        if audit:
+            self._rebuild_valid_index_cache(log_summary=False)
+        if shuffle and self._valid_entries:
+            random.shuffle(self._valid_entries)
+        self.train_indices_snapshot = [
+            WindowEntry(entry.record_idx, entry.start_idx, entry.has_events)
+            for entry in self._valid_entries
+        ]
+        self._train_epoch_active = True
+        self._train_fallback_once.clear()
+
+    def finish_epoch_snapshot(self) -> None:
+        if self.split == "train":
+            self._train_epoch_active = False
+
+    def _ensure_train_snapshot(self) -> List[WindowEntry]:
+        if self.split != "train":
+            return []
+        if not self.train_indices_snapshot:
+            self.train_indices_snapshot = [
+                WindowEntry(entry.record_idx, entry.start_idx, entry.has_events)
+                for entry in self._valid_entries
+            ]
+        return self.train_indices_snapshot
+
     def __len__(self) -> int:
         if self._uses_eval_snapshot():
-            return len(self.eval_indices_snapshot)
+            if self.eval_indices_snapshot:
+                return len(self.eval_indices_snapshot)
+            return len(self._valid_entries)
+        snapshot = self._ensure_train_snapshot()
+        if snapshot:
+            return len(snapshot)
         return len(self._valid_entries)
 
-    def __getitem__(self, idx: int):
-        if self._uses_eval_snapshot():
-            total = len(self.eval_indices_snapshot)
-            if total == 0:
-                raise RuntimeError(
-                    "PianoYTDataset: eval snapshot empty; rerun audit or refresh dataset."
-                )
-            if idx < 0 or idx >= total:
-                raise IndexError(idx)
-            result = self._fetch_eval_result(idx)
-            if result.sample is None and result.status and result.status not in self._eval_skip_logged:
-                LOGGER.warning(
-                    "[PianoYT] eval skip idx=%d start=%d video=%s reason=%s",
-                    idx,
-                    result.start_idx,
-                    result.video_id,
-                    result.status,
-                )
-                self._eval_skip_logged.add(result.status)
-            return result.sample
+    def _log_snapshot_fallback(
+        self,
+        origin_idx: int,
+        fallback_idx: int,
+        reason: str,
+        *,
+        mode: str,
+    ) -> None:
+        if fallback_idx < 0:
+            return
+        reason_text = reason or "unknown"
+        cache = self._train_fallback_once if mode == "train" else self._eval_fallback_once
+        key = f"{mode}:{origin_idx}->{fallback_idx}:{reason_text}"
+        if key in cache:
+            return
+        cache.add(key)
+        print(
+            f"[dataset] fallback idx={origin_idx} -> {fallback_idx} reason={reason_text} ({mode})",
+            flush=True,
+        )
 
-        if not self._valid_entries:
-            if self.split == "val":
-                raise RuntimeError(
-                    "Val split has 0 valid videos after audit; check labels/lag or widen search."
-                )
-            raise RuntimeError("PianoYTDataset has no valid labeled windows to sample.")
+    def _clone_sample(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
+        cloned: Dict[str, Any] = {}
+        for key, value in sample.items():
+            if torch.is_tensor(value):
+                cloned[key] = value.clone()
+            else:
+                cloned[key] = value
+        return cloned
 
-        if idx < 0 or idx >= len(self._valid_entries):
-            raise IndexError(idx)
+    def _store_last_good_sample(self, sample: Mapping[str, Any]) -> None:
+        try:
+            self._last_good_sample = self._clone_sample(sample)
+        except Exception:
+            self._last_good_sample = None
 
+    def _log_eval_skip(self, idx: int, result: SampleBuildResult) -> None:
+        status = result.status or "unknown"
+        if status in self._eval_skip_logged:
+            return
+        LOGGER.warning(
+            "[PianoYT] eval skip idx=%d start=%d video=%s reason=%s",
+            idx,
+            result.start_idx,
+            result.video_id,
+            status,
+        )
+        self._eval_skip_logged.add(status)
+
+    def _get_eval_item(self, idx: int):
+        if not self.eval_indices_snapshot:
+            return None
+        total = len(self.eval_indices_snapshot)
+        if total <= 0:
+            return None
+        origin_idx = idx % total if total else 0
+        current_idx = origin_idx
+        visited: Set[int] = set()
+        while len(visited) < total:
+            if current_idx < 0 or current_idx >= total:
+                current_idx = current_idx % total
+            if current_idx in visited:
+                break
+            visited.add(current_idx)
+            result = self._fetch_eval_result(current_idx)
+            if result.sample is not None:
+                return result.sample
+            self._log_eval_skip(current_idx, result)
+            if total == 1:
+                break
+            fallback_idx = (current_idx - 1) % total
+            if fallback_idx in visited:
+                fallback_idx = (current_idx + 1) % total
+                if fallback_idx in visited:
+                    break
+            self._log_snapshot_fallback(
+                origin_idx,
+                fallback_idx,
+                result.status or "unknown",
+                mode="eval",
+            )
+            current_idx = fallback_idx
+        return None
+
+    def _try_train_alternative_windows(
+        self,
+        record_idx: int,
+        *,
+        failure_reason: str,
+        original_start: int,
+        snapshot_idx: int,
+        initial_result: SampleBuildResult,
+    ) -> SampleBuildResult:
+        candidates = self._train_candidates_by_video.get(record_idx)
+        if not candidates:
+            return initial_result
+        base_start = int(original_start or 0)
+        ordered = sorted(candidates, key=lambda start: (abs(start - base_start), start))
         attempts = 0
-        while self._valid_entries:
-            if idx < 0 or idx >= len(self._valid_entries):
-                idx = idx % len(self._valid_entries)
-            entry = self._valid_entries[idx]
+        last_result = initial_result
+        for start_idx in ordered:
+            if start_idx == original_start:
+                continue
+            result = self._build_sample(
+                record_idx,
+                dataset_index=snapshot_idx,
+                preferred_start_idx=start_idx,
+                audit=False,
+            )
+            attempts += 1
+            if result.sample is not None:
+                return result
+            last_result = result
+            if attempts >= _TRAIN_ALT_WINDOW_ATTEMPTS:
+                break
+        if last_result.sample is not None:
+            return last_result
+        return SampleBuildResult(
+            last_result.sample,
+            failure_reason,
+            last_result.lag_ms,
+            last_result.lag_source,
+            last_result.events_on,
+            last_result.events_off,
+            last_result.has_events,
+            last_result.start_idx,
+            last_result.video_id,
+            lag_flags=last_result.lag_flags,
+            lag_corr=last_result.lag_corr,
+        )
+
+    def _get_train_item(self, idx: int):
+        snapshot = self._ensure_train_snapshot()
+        total = len(snapshot)
+        if total <= 0:
+            return None
+        self._train_epoch_active = True
+        origin_idx = idx % total if total else 0
+        current_idx = origin_idx
+        visited: Set[int] = set()
+        while len(visited) < total:
+            if current_idx < 0 or current_idx >= total:
+                current_idx = current_idx % total
+            if current_idx in visited:
+                break
+            visited.add(current_idx)
+            entry = snapshot[current_idx]
             result = self._build_sample(
                 entry.record_idx,
-                dataset_index=idx,
+                dataset_index=current_idx,
                 preferred_start_idx=entry.start_idx,
                 audit=False,
             )
             if result.sample is not None:
+                self._store_last_good_sample(result.sample)
                 return result.sample
-            attempts += 1
-            if attempts >= max(len(self._valid_entries), 1):
+            failure_reason = result.status or "unknown"
+            retry_result = self._try_train_alternative_windows(
+                entry.record_idx,
+                failure_reason=failure_reason,
+                original_start=result.start_idx,
+                snapshot_idx=current_idx,
+                initial_result=result,
+            )
+            if retry_result.sample is not None:
+                self._store_last_good_sample(retry_result.sample)
+                return retry_result.sample
+            if total == 1:
                 break
-        raise RuntimeError(
-            "PianoYTDataset: unable to fetch a valid sample after filtering bad clips."
-        )
+            fallback_idx = (current_idx - 1) % total
+            if fallback_idx in visited:
+                fallback_idx = (current_idx + 1) % total
+                if fallback_idx in visited:
+                    break
+            self._log_snapshot_fallback(
+                origin_idx,
+                fallback_idx,
+                retry_result.status or failure_reason,
+                mode="train",
+            )
+            current_idx = fallback_idx
+        if self._last_good_sample is not None:
+            return self._clone_sample(self._last_good_sample)
+        return None
+
+    def __getitem__(self, idx: int):
+        if self._uses_eval_snapshot():
+            return self._get_eval_item(idx)
+        return self._get_train_item(idx)
 
     def _uses_eval_snapshot(self) -> bool:
         return self.split != "train"
@@ -890,7 +1071,7 @@ class PianoYTDataset(Dataset):
 
         if video_path is None or not video_path.exists():
             if not audit:
-                self._invalidate_sample_index(record_idx)
+                self._mark_bad_clip(record_idx, video_id, "no_file")
             return SampleBuildResult(None, "no_file", None, "", 0, 0, False, start_hint, video_id)
 
         if midi_path is None or not midi_path.exists():
@@ -918,12 +1099,11 @@ class PianoYTDataset(Dataset):
                 preferred_start_idx=preferred_start_idx,
             )
 
+            meta = self.metadata.get(video_id)
             if self.registration_enabled and self.apply_crop:
-                meta = self.metadata.get(video_id)
                 clip = apply_registration_crop(clip, meta, self.registration_cfg)
             elif not self.registration_enabled and not self._registration_off_logged:
                 self._registration_off_logged = True
-
             clip = resize_to_canonical(clip, self.canonical_hw, self.registration_interp)
 
             if self.global_aug_enabled and is_train:
@@ -1112,7 +1292,7 @@ class PianoYTDataset(Dataset):
             sample.update(clip_targets)
         elif self.require_labels and self.split == "train" and not audit:
             self._log_missing_labels_once(video_path)
-            self._invalidate_sample_index(record_idx)
+            self._mark_bad_clip(record_idx, video_id, "no_labels")
             return SampleBuildResult(None, "no_labels", None, "", 0, 0, False, start_idx, video_id)
 
         if not audit:
@@ -1277,6 +1457,8 @@ class PianoYTDataset(Dataset):
         self._bad_clips.add(canon)
         print(f"[data_pass] mark_bad id={canon} reason={reason}", flush=True)
         if record_idx is not None and not self._uses_eval_snapshot():
+            if self.split == "train" and self._train_epoch_active:
+                return
             self._invalidate_sample_index(record_idx)
 
     def _mark_frame_target_failure(self, record_idx: int, video_id: str) -> None:
@@ -1345,6 +1527,7 @@ class PianoYTDataset(Dataset):
         self._eval_candidates_by_video = {}
         self._eval_materialize_stats = {}
         self._eval_skip_logged.clear()
+        self._eval_fallback_once.clear()
 
         if not self._uses_eval_snapshot():
             self._last_materialize_duration = time.perf_counter() - t_start
@@ -1702,25 +1885,31 @@ class PianoYTDataset(Dataset):
             dilate=dilate_val,
         )
 
-    def _record_has_valid_window(self, record_idx: int) -> bool:
+    def _record_has_valid_window(self, record_idx: int) -> Tuple[bool, List[int]]:
         record = self.samples[record_idx]
         video_id = canonical_video_id(record.get("id", ""))
         if video_id in self._bad_clips:
-            return False
+            self._train_candidates_by_video.pop(record_idx, None)
+            return False, []
         midi_path = record.get("midi")
         video_path = record.get("video")
         if midi_path is None or not midi_path.exists():
             if video_path is not None:
                 self._log_missing_labels_once(video_path)
-            return False
+            self._train_candidates_by_video.pop(record_idx, None)
+            return False, []
 
         labels_tensor = _read_midi_events(midi_path)
         if labels_tensor is None or labels_tensor.numel() == 0:
             if video_path is not None:
                 self._log_missing_labels_once(video_path)
-            return False
+            self._train_candidates_by_video.pop(record_idx, None)
+            return False, []
 
-        start_indices = self._candidate_start_indices(labels_tensor)
+        start_indices = list(self._candidate_start_indices(labels_tensor))
+        if not start_indices:
+            start_indices = [0]
+        self._train_candidates_by_video[record_idx] = list(start_indices)
         for start_idx in start_indices:
             try:
                 result = self._build_sample(
@@ -1736,13 +1925,24 @@ class PianoYTDataset(Dataset):
                     start_idx,
                     exc,
                 )
-                result = SampleBuildResult(None, "error", None, "", 0, 0, False, start_idx, record.get("id", ""))
+                result = SampleBuildResult(
+                    None,
+                    "error",
+                    None,
+                    "",
+                    0,
+                    0,
+                    False,
+                    start_idx,
+                    record.get("id", ""),
+                )
             if result.sample is not None and result.has_events:
-                return True
+                return True, list(start_indices)
 
         if video_path is not None:
             self._log_missing_labels_once(video_path)
-        return False
+        self._train_candidates_by_video.pop(record_idx, None)
+        return False, list(start_indices)
     
     def _plan_eval_entries(
         self, record_idx: int
@@ -1838,6 +2038,8 @@ class PianoYTDataset(Dataset):
         self._valid_entries = []
         self._audit_ok_records.clear()
         self._audit_entry_starts = {}
+        if self.split == "train":
+            self._train_candidates_by_video.clear()
         total = len(self.samples)
         skipped = 0
         ok_videos = 0
@@ -1846,11 +2048,16 @@ class PianoYTDataset(Dataset):
         if log_summary:
             print(f"[dataset] audit start (videos={total})", flush=True)
         if self.split == "train":
+            self._train_fallback_once.clear()
             for idx in range(total):
                 record = self.samples[idx]
                 vid_id = canonical_video_id(record.get("id", ""))
+                if vid_id in self._bad_clips:
+                    skipped += 1
+                    bad_videos += 1
+                    continue
                 per_start = time.perf_counter()
-                has_window = self._record_has_valid_window(idx)
+                has_window, start_candidates = self._record_has_valid_window(idx)
                 elapsed = time.perf_counter() - per_start
                 status_label = "ok" if has_window else "no_window"
                 if log_summary:
@@ -1867,10 +2074,13 @@ class PianoYTDataset(Dataset):
                     continue
                 if has_window:
                     self._valid_entries.append(WindowEntry(idx, None, True))
+                    if start_candidates:
+                        self._train_candidates_by_video[idx] = list(start_candidates)
                     ok_videos += 1
                     if self._uses_eval_snapshot():
                         self._audit_ok_records.add(idx)
                 else:
+                    self._train_candidates_by_video.pop(idx, None)
                     skipped += 1
                     bad_videos += 1
         else:
@@ -1940,6 +2150,8 @@ class PianoYTDataset(Dataset):
             LOGGER.warning(
                 "[PianoYT] No valid labeled samples remain for split %s.", self.split
             )
+        if self.split == "train":
+            self.train_indices_snapshot = []
         if self._uses_eval_snapshot():
             try:
                 self._materialize_eval_entries_from_labels(

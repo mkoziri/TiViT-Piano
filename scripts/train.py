@@ -16,7 +16,7 @@ CLI:
     configuration file.
 """
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 import argparse
@@ -665,17 +665,67 @@ def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoad
     base_dataset = _unwrap_dataset(dataset)
     materialize_fn = getattr(base_dataset, "materialize_eval_entries_from_labels", None)
     snapshot = getattr(base_dataset, "eval_indices_snapshot", None)
-    if callable(materialize_fn) and (not snapshot):
+    if callable(materialize_fn) and not snapshot:
         try:
             materialize_fn()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("[train:eval] failed to materialize eval entries: %s", exc)
 
-    eval_dataset = base_dataset
-    cap_value = cfg.get("training", {}).get("inner_eval_cap")
-    if isinstance(cap_value, int) and cap_value > 0:
-        capped = min(len(base_dataset), cap_value)
-        eval_dataset = Subset(base_dataset, range(capped))
+    def _coerce_positive_int(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    cap_candidates: List[Any] = []
+    for env_key in ("AUTOPILOT_CALIB_MAX_CLIPS", "CALIB_MAX_CLIPS"):
+        env_val = os.environ.get(env_key)
+        if env_val is not None and str(env_val).strip():
+            cap_candidates.append(env_val)
+
+    autopilot_cfg = cfg.get("autopilot")
+    if isinstance(autopilot_cfg, Mapping):
+        cap_candidates.append(autopilot_cfg.get("calib_max_clips"))
+
+    calibration_cfg = cfg.get("calibration")
+    if isinstance(calibration_cfg, Mapping):
+        cap_candidates.append(calibration_cfg.get("max_clips"))
+
+    dataset_cfg = cfg.get("dataset")
+    if isinstance(dataset_cfg, Mapping):
+        cap_candidates.append(dataset_cfg.get("max_clips"))
+
+    dataset_attr = getattr(base_dataset, "args_max_clips_or_None", None)
+    cap_candidates.append(dataset_attr)
+
+    autopilot_cap = next(
+        (
+            value
+            for value in (_coerce_positive_int(candidate) for candidate in cap_candidates)
+            if value is not None
+        ),
+        None,
+    )
+    default_cap = 2000
+    cap = autopilot_cap if autopilot_cap is not None else default_cap
+
+    try:
+        base_len = int(len(base_dataset))
+    except Exception:
+        base_len = 0
+
+    if base_len > 0:
+        target = min(base_len, max(cap, 0))
+    else:
+        target = max(cap, 0)
+
+    if base_len > 0 and target < base_len:
+        eval_dataset = Subset(base_dataset, list(range(target)))
+    else:
+        eval_dataset = base_dataset
+        if base_len > 0:
+            target = base_len
 
     safe_collate = SafeEvalCollate(getattr(loader, "collate_fn", None))
     batch_size = getattr(loader, "batch_size", 1)
@@ -693,6 +743,8 @@ def _prepare_inner_eval_loader(cfg: Mapping[str, Any], loader: Optional[DataLoad
         prefetch_factor=2,
     )
     setattr(eval_loader, "_base_dataset", base_dataset)
+    setattr(eval_loader, "_target_total", int(target))
+    setattr(eval_loader, "_target_cap", cap)
     return eval_loader
 
 
@@ -937,11 +989,22 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
 
     dataset = getattr(loader, "dataset", None)
     try:
-        total_clips = len(loader.dataset) if dataset is not None else len(loader)
+        raw_total = len(loader.dataset) if dataset is not None else len(loader)
     except Exception:
-        total_clips = 0
-    if not isinstance(total_clips, int):
-        total_clips = 0
+        raw_total = 0
+    if not isinstance(raw_total, int):
+        raw_total = 0
+    raw_total = max(0, raw_total)
+
+    total_clips = raw_total
+    target_total_attr = getattr(loader, "_target_total", None)
+    if target_total_attr is not None:
+        try:
+            coerced_total = int(target_total_attr)
+        except (TypeError, ValueError):
+            coerced_total = None
+        if coerced_total is not None and coerced_total >= 0:
+            total_clips = coerced_total
 
     print(f"[train:eval] start (clips={total_clips})", flush=True)
 
@@ -1040,12 +1103,14 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     metric_n = 0
 
     want = ("pitch", "onset", "offset", "hand", "clef")
+    class _StopEvalLoop(Exception):
+        pass
     try:
         with torch.inference_mode():
             for batch in loader:
                 if batch is None:
                     if not skip_empty_logged:
-                        print("[train:eval] skip empty batch", flush=True)
+                        print("[train:eval] skip empty batch (all invalid)", flush=True)
                         skip_empty_logged = True
                     continue
 
@@ -1065,6 +1130,8 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                 progress["count"] += int(batch_size)
                 if total_clips > 0:
                     progress["count"] = min(progress["count"], total_clips)
+                    if progress["count"] >= total_clips:
+                        raise _StopEvalLoop()
 
                 lag_ms_batch = batch.get("lag_ms")
                 if lag_ms_batch is not None:
@@ -1329,6 +1396,8 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                 metric_counts["onset_pos_rate"]  += onset_gt_bin.mean().item()
                 metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
                 metric_n += 1
+    except _StopEvalLoop:
+        pass
     finally:
         stop_event.set()
         _join_thread(heartbeat_thread)
@@ -1490,6 +1559,7 @@ def main():
     train_split = args.train_split or cfg["dataset"].get("split_train") or cfg["dataset"].get("split") or "train"
     val_split = args.val_split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
     train_loader = make_dataloader(cfg, split=train_split)
+    train_base_dataset = _unwrap_dataset(getattr(train_loader, "dataset", train_loader))
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.
     val_loader = None
@@ -1673,6 +1743,12 @@ def main():
             n_trainable = sum(p.requires_grad for p in model.parameters())
             print(f"[warmup] trainable params: {n_trainable}")    
         t0 = perf_counter()
+        epoch_prepare = getattr(train_base_dataset, "prepare_epoch_snapshot", None)
+        if callable(epoch_prepare):
+            try:
+                epoch_prepare(shuffle=True, audit=True)
+            except Exception as exc:
+                logger.warning("[train] failed to prepare epoch snapshot: %s", exc)
         # --- train one epoch ---
         model.train()
         crit = make_criterions()
@@ -1885,6 +1961,13 @@ def main():
                     save_checkpoint(best_path, model, optimizer, epoch, cfg, best_val)
                     print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
                     logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
+
+        epoch_finish = getattr(train_base_dataset, "finish_epoch_snapshot", None)
+        if callable(epoch_finish):
+            try:
+                epoch_finish()
+            except Exception as exc:
+                logger.warning("[train] failed to finalize epoch snapshot: %s", exc)
 
         # --- always save LAST ---
         save_checkpoint(last_path, model, optimizer, epoch, cfg, best_val)
