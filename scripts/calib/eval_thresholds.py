@@ -17,7 +17,7 @@ CLI:
     dataset split, and ``--dump_logits`` to save logits to NPZ.
 """
 
-import sys, json, time, math, os, torch
+import sys, json, time, math, os, torch, logging
 from collections import Counter
 import numpy as np
 import torch.nn.functional as F
@@ -28,11 +28,15 @@ repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
 from utils import load_config, align_pitch_dim, configure_verbosity
+from utils.logging_utils import QUIET_INFO_FLAG
 from utils.identifiers import canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from torch.utils.data import DataLoader, Subset
+
+LOGGER = logging.getLogger("eval_thresholds")
+QUIET_EXTRA = {QUIET_INFO_FLAG: True}
 
 
 # Default probability grid used when sweeping thresholds without an explicit
@@ -344,6 +348,23 @@ def main():
                 file=sys.stderr,
             )
             return
+
+    onset_probs_final = list(args.prob_thresholds) if args.prob_thresholds is not None else []
+    offset_probs_final = list(args.offset_prob_thresholds) if args.offset_prob_thresholds is not None else []
+    if args.grid_prob_thresholds:
+        combos = len(onset_probs_final) * len(offset_probs_final)
+    else:
+        combos = max(len(onset_probs_final), len(offset_probs_final))
+    onset_display = "[" + ",".join(f"{p:.4f}" for p in onset_probs_final) + "]"
+    offset_display = "[" + ",".join(f"{p:.4f}" for p in offset_probs_final) + "]"
+    LOGGER.info(
+        "[grid] onset_probs=%s offset_probs=%s (final) combos=%d",
+        onset_display,
+        offset_display,
+        combos,
+        extra=QUIET_EXTRA,
+    )
+
     log_handle = None
 
     if args.head is None and args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):

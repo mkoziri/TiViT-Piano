@@ -72,7 +72,7 @@ def _write_calibration_file(onset_stats: dict, offset_stats: dict, path: Path = 
     payload = {
         "onset": {
             "best_logit": onset_stats["best_logit"],
-            "best_prob": onset_stats["best_prob"],
+            "best_prob": float(onset_stats["best_prob"]),
             "temperature": onset_stats["temperature"],
             "logit_bias": onset_stats["logit_bias"],
             "platt_scale": onset_stats["platt_scale"],
@@ -80,10 +80,11 @@ def _write_calibration_file(onset_stats: dict, offset_stats: dict, path: Path = 
             "scale": onset_stats["scale"],
             "calibrated_pred_rate": onset_stats["calibrated_pred_rate"],
             "pos_rate": onset_stats["pos_rate"],
+            "provenance": "thorough",
         },
         "offset": {
             "best_logit": offset_stats["best_logit"],
-            "best_prob": offset_stats["best_prob"],
+            "best_prob": float(offset_stats["best_prob"]),
             "temperature": offset_stats["temperature"],
             "logit_bias": offset_stats["logit_bias"],
             "platt_scale": offset_stats["platt_scale"],
@@ -91,6 +92,7 @@ def _write_calibration_file(onset_stats: dict, offset_stats: dict, path: Path = 
             "scale": offset_stats["scale"],
             "calibrated_pred_rate": offset_stats["calibrated_pred_rate"],
             "pos_rate": offset_stats["pos_rate"],
+            "provenance": "thorough",
         },
         "platt_onset_scale": onset_stats["platt_scale"],
         "platt_onset_bias": onset_stats["platt_bias"],

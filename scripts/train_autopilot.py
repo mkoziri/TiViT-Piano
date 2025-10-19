@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import logging
 import math
 import os
 import re
@@ -67,7 +68,10 @@ TARGET_METRIC_FIELDS = {
 }
 
 sys.path.insert(0, str(REPO / "src"))
-from utils.logging_utils import configure_verbosity
+from utils.logging_utils import QUIET_INFO_FLAG, configure_verbosity
+
+LOGGER = logging.getLogger("autopilot")
+QUIET_EXTRA = {QUIET_INFO_FLAG: True}
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +416,10 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
 
 FAST_GRID_THRESHOLDS = [0.40, 0.44, 0.48, 0.52, 0.56, 0.60]
 
-FAST_SWEEP_MIN = 0.40
-FAST_SWEEP_MAX = 0.60
-FAST_RESULT_MIN = 0.30
-FAST_RESULT_MAX = 0.80
+FAST_SWEEP_CLIP_MIN = 0.02
+FAST_SWEEP_CLIP_MAX = 0.98
+FAST_RESULT_MIN = 0.02
+FAST_RESULT_MAX = 0.98
 
 
 
@@ -508,20 +512,20 @@ def _clamp_range(prob: float, lower: float, upper: float) -> float:
 
 
 def _bounded_fast_sweep_candidates(center: float, delta: float) -> Tuple[float, ...]:
-    center = _clamp_range(center, FAST_SWEEP_MIN, FAST_SWEEP_MAX)
     raw_candidates = (
-        _clamp_range(center - delta, FAST_SWEEP_MIN, FAST_SWEEP_MAX),
+        center - delta,
         center,
-        _clamp_range(center + delta, FAST_SWEEP_MIN, FAST_SWEEP_MAX),
+        center + delta,
     )
     seen = set()
     ordered: List[float] = []
     for value in raw_candidates:
-        key = round(value, 6)
+        clipped = _clamp_range(value, FAST_SWEEP_CLIP_MIN, FAST_SWEEP_CLIP_MAX)
+        key = int(round(clipped * 1000))
         if key in seen:
             continue
         seen.add(key)
-        ordered.append(value)
+        ordered.append(clipped)
     return tuple(ordered)
 
 
@@ -551,7 +555,7 @@ def _extract_best_probability(
             prob_val = fallback_val
         else:
             prob_val = _logit_to_probability(fallback_val)
-    return _clamp_fast_result(_clamp_probability(prob_val))
+    return _clamp_probability(prob_val)
 
 
 def _blend_and_clip_platt(
@@ -790,38 +794,73 @@ def perform_calibration(
     prefer_fast_grid = first_calibration and args.fast_first_calib
     desired_kind = args.first_calib if first_calibration else "fast"
 
-    def _parse_prob_from_calib(entry: dict, default: float) -> Tuple[float, Optional[float]]:
+    cfg_snapshot = load_cfg()
+    prev_metrics = (cfg_snapshot.get("training", {}) or {}).get("metrics", {}) or {}
+    prev_onset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_onset"))
+    prev_offset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_offset"))
+
+    def _resolve_anchor(
+        calib_entry: Optional[dict],
+        *,
+        previous: Optional[float],
+        fallback: float,
+    ) -> Tuple[float, Optional[float], str]:
         prob_val: Optional[float] = None
         logit_val: Optional[float] = None
-        if isinstance(entry, dict):
-            if "best_prob" in entry:
-                raw_prob = entry.get("best_prob")
-                prob_val = _coerce_optional_float(raw_prob)
-                if prob_val is not None:
-                    prob_val = _clamp_probability(prob_val)
-            if "best_logit" in entry:
-                raw_logit = entry.get("best_logit")
-                logit_val = _coerce_optional_float(raw_logit)
-                if logit_val is not None and prob_val is None:
-                    prob_val = _logit_to_probability(logit_val)
-        if prob_val is None:
-            prob_val = default
-        prob_val = _clamp_fast_result(_clamp_probability(prob_val))
-        return prob_val, logit_val
-    
+        if isinstance(calib_entry, dict):
+            cal_prob = _coerce_optional_float(calib_entry.get("best_prob"))
+            if cal_prob is not None:
+                prob_val = _clamp_probability(cal_prob)
+            else:
+                cal_logit = _coerce_optional_float(calib_entry.get("best_logit"))
+                if cal_logit is not None:
+                    logit_val = cal_logit
+                    prob_val = _clamp_probability(_logit_to_probability(cal_logit))
+        if prob_val is not None:
+            return float(prob_val), logit_val, "calibration"
+        if previous is not None:
+            return float(_clamp_probability(previous)), None, "best"
+        return float(_clamp_probability(fallback)), None, "fallback"
+
     def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
         onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
         offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
-        onset_prob, onset_logit = _parse_prob_from_calib(onset_entry, 0.3)
-        offset_prob, offset_logit = _parse_prob_from_calib(offset_entry, 0.3)
+        onset_prob, onset_logit, onset_src = _resolve_anchor(
+            onset_entry,
+            previous=prev_onset_best,
+            fallback=0.3,
+        )
+        offset_prob, offset_logit, offset_src = _resolve_anchor(
+            offset_entry,
+            previous=prev_offset_best,
+            fallback=0.3,
+        )
         onset_prob = _clamp_fast_result(onset_prob)
         offset_prob = _clamp_fast_result(offset_prob)
         prob_delta = 0.05
         onset_probs = _bounded_fast_sweep_candidates(onset_prob, prob_delta)
         offset_probs = _bounded_fast_sweep_candidates(offset_prob, prob_delta)
-        print("[autopilot] fast eval sweep thresholds:", f"onset={','.join(f'{p:.2f}' for p in onset_probs)} offset={','.join(f'{p:.2f}' for p in offset_probs)}")
+        if onset_src == offset_src:
+            anchor_source = onset_src
+        else:
+            anchor_source = f"onset:{onset_src},offset:{offset_src}"
+        LOGGER.info(
+            "[autopilot:grid] anchors onset=%.4f offset=%.4f (source=%s)",
+            onset_prob,
+            offset_prob,
+            anchor_source,
+            extra=QUIET_EXTRA,
+        )
+        combos = len(onset_probs) * len(offset_probs)
+        LOGGER.info(
+            "[autopilot:grid] onset_probs=%s offset_probs=%s combos=%d",
+            "[" + ",".join(f"{p:.4f}" for p in onset_probs) + "]",
+            "[" + ",".join(f"{p:.4f}" for p in offset_probs) + "]",
+            combos,
+            extra=QUIET_EXTRA,
+        )
         eval_ret, lines = run_fast_eval(
             ckpt,
             stdout_dir,
