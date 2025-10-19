@@ -160,6 +160,7 @@ def _gaussian_smooth_1d(data: np.ndarray, kernel: int = 9) -> np.ndarray:
 
 
 def _find_peak(profile: np.ndarray, center: float, window: int) -> float:
+    """Return the index of the strongest response around ``center``."""
     length = profile.shape[0]
     if length == 0:
         return float(center)
@@ -174,11 +175,59 @@ def _find_peak(profile: np.ndarray, center: float, window: int) -> float:
     return float(left + idx)
 
 
+def _snap_edges_ransac(edges: np.ndarray, expected_spacing: float) -> np.ndarray:
+    """Project detected edges onto a regular grid while limiting local drift."""
+    if edges.size < 4:
+        return edges
+    indices = np.arange(edges.size, dtype=np.float32)
+    spacing = max(float(expected_spacing), 1.0)
+    inlier_thresh = max(spacing * 0.35, 1.5)
+    rng = np.random.default_rng(12345)
+
+    best_inliers: Optional[np.ndarray] = None
+    best_count = -1
+    best_error = float("inf")
+
+    for _ in range(120):
+        sample = rng.choice(edges.size, size=2, replace=False)
+        i0, i1 = int(sample[0]), int(sample[1])
+        denom = float(indices[i1] - indices[i0])
+        if abs(denom) < 1e-6:
+            continue
+        slope = float((edges[i1] - edges[i0]) / denom)
+        intercept = float(edges[i0] - slope * indices[i0])
+        fitted = slope * indices + intercept
+        residuals = np.abs(fitted - edges)
+        inliers = residuals <= inlier_thresh
+        count = int(np.count_nonzero(inliers))
+        if count < 4:
+            continue
+        error = float(residuals[inliers].mean()) if count > 0 else float("inf")
+        if count > best_count or (count == best_count and error < best_error):
+            best_inliers = inliers
+            best_count = count
+            best_error = error
+
+    if best_inliers is None:
+        slope, intercept = np.polyfit(indices, edges, deg=1)
+    else:
+        slope, intercept = np.polyfit(indices[best_inliers], edges[best_inliers], deg=1)
+
+    fitted = slope * indices + intercept
+    residuals = edges - fitted
+    clip_val = max(spacing * 0.6, 3.0)
+    residuals = np.clip(residuals, -clip_val, clip_val)
+    refined = fitted + residuals
+    refined = np.maximum.accumulate(refined)
+    return refined.astype(np.float32)
+
+
 def _compute_keyboard_edges(
     grad_profile: np.ndarray,
     width: int,
     num_white_keys: int = 52,
 ) -> Tuple[np.ndarray, float, float]:
+    """Estimate white-key edge locations across the keyboard span."""
     if grad_profile.size == 0:
         indices = np.linspace(0.0, float(width - 1), num_white_keys + 1, dtype=np.float32)
         return indices, float(indices[0]), float(indices[-1])
@@ -208,7 +257,11 @@ def _compute_keyboard_edges(
         center = x_left + step * idx
         peak = _find_peak(profile, center, int(round(window)))
         edges.append(peak)
-    return np.array(edges, dtype=np.float32), x_left, x_right
+    edge_arr = np.array(edges, dtype=np.float32)
+    edge_arr = np.clip(edge_arr, 0.0, float(width - 1))
+    edge_arr = _snap_edges_ransac(edge_arr, step)
+    edge_arr = np.clip(edge_arr, 0.0, float(width - 1))
+    return edge_arr, float(edge_arr[0]), float(edge_arr[-1])
 
 
 def _aggregate_gradients(frames: Sequence[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -286,6 +339,80 @@ def _homography_to_grid(
         axis=-1,
     )
     return torch.from_numpy(grid.astype(np.float32))
+
+
+def _homography_to_vector(matrix: np.ndarray) -> np.ndarray:
+    """Flatten a homography into an 8D vector with bottom-right entry normalised."""
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.shape != (3, 3):
+        raise ValueError(f"expected homography shape (3, 3); got {arr.shape}")
+    scale = float(arr[2, 2]) if abs(float(arr[2, 2])) > 1e-6 else 1.0
+    arr = arr / scale
+    return np.array(
+        [
+            float(arr[0, 0]),
+            float(arr[0, 1]),
+            float(arr[0, 2]),
+            float(arr[1, 0]),
+            float(arr[1, 1]),
+            float(arr[1, 2]),
+            float(arr[2, 0]),
+            float(arr[2, 1]),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _solve_regularized_homography(
+    src_pts: np.ndarray,
+    dst_pts: np.ndarray,
+    base_h: np.ndarray,
+    *,
+    reg_lambda: float = 0.05,
+) -> Optional[np.ndarray]:
+    """Solve a least-squares homography with Tikhonov regularisation."""
+    if src_pts.shape[0] < 4:
+        return None
+
+    src = np.asarray(src_pts, dtype=np.float32)
+    dst = np.asarray(dst_pts, dtype=np.float32)
+    n = src.shape[0]
+    A = np.zeros((2 * n, 8), dtype=np.float32)
+    b = np.zeros((2 * n,), dtype=np.float32)
+
+    for i in range(n):
+        x, y = float(src[i, 0]), float(src[i, 1])
+        u, v = float(dst[i, 0]), float(dst[i, 1])
+        row = 2 * i
+        A[row, 0:3] = [x, y, 1.0]
+        A[row, 6:8] = [-u * x, -u * y]
+        b[row] = u
+        A[row + 1, 3:6] = [x, y, 1.0]
+        A[row + 1, 6:8] = [-v * x, -v * y]
+        b[row + 1] = v
+
+    if reg_lambda > 0.0:
+        lam = float(reg_lambda)
+        sqrt_lam = math.sqrt(lam)
+        A_reg = sqrt_lam * np.eye(8, dtype=np.float32)
+        b_reg = sqrt_lam * _homography_to_vector(base_h)
+        A = np.vstack([A, A_reg])
+        b = np.concatenate([b, b_reg])
+
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    H = np.array(
+        [
+            [sol[0], sol[1], sol[2]],
+            [sol[3], sol[4], sol[5]],
+            [sol[6], sol[7], 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return H
 
 
 def _invert_homography(matrix: Any) -> np.ndarray:
@@ -387,7 +514,7 @@ class RegistrationRefiner:
             raise ValueError("canonical_hw must provide (H, W)")
         self.canonical_hw: Tuple[int, int] = (int(canonical_hw[0]), int(canonical_hw[1]))
         self.sample_frames = int(max(sample_frames, 8))
-        self.cache_path = cache_path or Path("runs/reg_refined.json")
+        self.cache_path = cache_path or Path("reg_refined.json")
         self.logger = logger or LOGGER
         self._cache: Dict[str, RegistrationResult] = {}
         self._load_cache()
@@ -630,52 +757,83 @@ class RegistrationRefiner:
 
         src_arr = np.asarray(src_pts, dtype=np.float32)
         dst_arr = np.asarray(dst_pts, dtype=np.float32)
+        base_h = np.array(
+            [
+                [scale_x, 0.0, 0.0],
+                [0.0, scale_y, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
 
-        if cv2 is not None and src_arr.shape[0] >= 4:
-            H, mask = cv2.findHomography(
-                src_arr,
-                dst_arr,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=2.5,
-                maxIters=2500,
-                confidence=0.997,
-            )
-            if H is None or not np.all(np.isfinite(H)):
-                H = None
-        else:
-            H = None
+        status = "ok"
+        err_after = err_before
+        H: Optional[np.ndarray]
 
-        if H is None:
-            H = np.array(
-                [
-                    [scale_x, 0.0, 0.0],
-                    [0.0, scale_y, 0.0],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=np.float32,
-            )
-            status = "fallback_homography"
-            err_after = err_before
+        if src_arr.shape[0] < 4:
+            H = base_h
+            status = "fallback_points"
         else:
-            status = "ok"
-            pts_h = np.stack([xs, ys, np.ones_like(xs)], axis=0)
-            proj = H @ pts_h
-            proj /= np.maximum(proj[2], 1e-6)
-            x_proj = proj[0]
-            err_after = float(np.mean(np.abs(x_proj - canon_edges)))
-            if not math.isfinite(err_after):
-                status = "fallback_invalid"
-                H = np.array(
-                    [
-                        [scale_x, 0.0, 0.0],
-                        [0.0, scale_y, 0.0],
-                        [0.0, 0.0, 1.0],
-                    ],
-                    dtype=np.float32,
+            inlier_mask: Optional[np.ndarray] = None
+            if cv2 is not None:
+                _, mask = cv2.findHomography(
+                    src_arr,
+                    dst_arr,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=2.5,
+                    maxIters=2500,
+                    confidence=0.997,
                 )
-                err_after = err_before
+                if mask is not None and mask.size == src_arr.shape[0]:
+                    mask = mask.ravel().astype(bool)
+                    if int(mask.sum()) >= 4:
+                        inlier_mask = mask
+
+            src_fit = src_arr[inlier_mask] if inlier_mask is not None else src_arr
+            dst_fit = dst_arr[inlier_mask] if inlier_mask is not None else dst_arr
+
+            H_candidate = _solve_regularized_homography(src_fit, dst_fit, base_h, reg_lambda=0.05)
+            if H_candidate is None or not np.all(np.isfinite(H_candidate)):
+                H = base_h
+                status = "fallback_homography"
+            else:
+                base_norm = float(np.linalg.norm(base_h))
+                delta_norm = float(np.linalg.norm(H_candidate - base_h))
+                if base_norm > 0.0 and delta_norm > 0.75 * base_norm:
+                    blend = min(1.0, (0.75 * base_norm) / (delta_norm + 1e-6))
+                    H_candidate = base_h + blend * (H_candidate - base_h)
+                pts_h = np.stack([xs, ys, np.ones_like(xs)], axis=0)
+                proj = H_candidate @ pts_h
+                proj /= np.maximum(proj[2], 1e-6)
+                x_proj = proj[0]
+                err_after = float(np.mean(np.abs(x_proj - canon_edges)))
+                if not math.isfinite(err_after):
+                    H = base_h
+                    status = "fallback_invalid"
+                    err_after = err_before
+                else:
+                    H = H_candidate
+
+        if status != "ok":
+            err_after = err_before
+            H = base_h if H is None else H
+        else:
+            err_after = float(err_after)
 
         H_arr = np.asarray(H, dtype=np.float32)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            delta_norm = float(np.linalg.norm(H_arr - base_h))
+            err_delta = float(err_before - err_after)
+            self.logger.debug(
+                "reg_refined.debug: %s status=%s err_before=%.2fpx err_after=%.2fpx Δerr=%.2fpx ||ΔH||=%.3f frames=%d",
+                video_id,
+                status,
+                err_before,
+                err_after,
+                err_delta,
+                delta_norm,
+                len(frames),
+            )
         H_inv = _invert_homography(H_arr)
         grid = _homography_to_grid(H_inv, (height, width), canonical)
         return RegistrationResult(

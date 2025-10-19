@@ -104,6 +104,26 @@ Checkpoints and TensorBoard summaries are emitted according to the `logging`
 section of the configuration (for example `logging.checkpoint_dir` and
 `logging.log_dir`).
 
+### Registration QA
+
+Use the refinement smoke test to verify cached homographies before extended
+training or calibration runs:
+
+```bash
+python scripts/check/test_refinement.py \
+  --split val \
+  --clips 2 \
+  --inspect 5 \
+  --log-level debug
+```
+
+The helper streams the usual `reg_refined:` log lines while it samples clips and
+then summarises the most recent cache entries, reporting the pre/post edge
+alignment error and the deviation from the baseline scale transform. Adjust
+`--clips`, `--frames`, or `--batch-size` to keep the probe lightweight. Results
+are cached in `reg_refined.json` at the repository root so repeated runs can
+reuse prior estimates.
+
 ## Evaluation
 
 The calibration utilities sweep decision thresholds and can optionally dump raw

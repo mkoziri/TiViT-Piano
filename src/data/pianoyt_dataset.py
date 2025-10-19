@@ -579,7 +579,7 @@ class PianoYTDataset(Dataset):
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
-            cache_path=Path("runs/reg_refined.json"),
+            cache_path=Path("reg_refined.json"),
             sample_frames=32,
             logger=LOGGER,
         )
