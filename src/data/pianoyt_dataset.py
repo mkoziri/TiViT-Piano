@@ -575,7 +575,7 @@ class PianoYTDataset(Dataset):
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
-        self.registration_enabled = bool(reg_cfg.get("enabled", False))
+        self.registration_enabled = bool(reg_cfg.get("enabled", True))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,

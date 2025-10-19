@@ -661,9 +661,15 @@ class OMAPSDataset(Dataset):
         self.frame_target_spec: Optional[FrameTargetSpec] = None
         self.frame_target_summary: Optional[str] = None
 
+        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
+        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
+            self.canonical_hw = (int(round(float(canonical_cfg[0]))), int(round(float(canonical_cfg[1]))))
+        else:
+            self.canonical_hw = tuple(self.resize)
+
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
-        self.registration_enabled = bool(reg_cfg.get("enabled", False))
+        self.registration_enabled = bool(reg_cfg.get("enabled", True))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
@@ -671,12 +677,6 @@ class OMAPSDataset(Dataset):
             sample_frames=32,
             logger=LOGGER,
         )
-
-        canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
-        if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
-            self.canonical_hw = (int(round(float(canonical_cfg[0]))), int(round(float(canonical_cfg[1]))))
-        else:
-            self.canonical_hw = tuple(self.resize)
 
         global_aug_cfg = self.dataset_cfg.get("global_aug")
         if not isinstance(global_aug_cfg, dict):

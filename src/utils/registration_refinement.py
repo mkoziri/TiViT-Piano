@@ -67,7 +67,13 @@ def _extract_crop_values(
         return None
 
     try:
-        return tuple(float(v) for v in vals[:4])
+        min_y, max_y, min_x, max_x = vals[:4]
+        return (
+            float(min_y),
+            float(max_y),
+            float(min_x),
+            float(max_x),
+        )
     except (TypeError, ValueError):
         return None
 
@@ -282,6 +288,14 @@ def _homography_to_grid(
     return torch.from_numpy(grid.astype(np.float32))
 
 
+def _invert_homography(matrix: Any) -> np.ndarray:
+    """Return the inverse of a 3x3 homography as float32 array."""
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.shape != (3, 3):
+        raise ValueError(f"expected homography shape (3, 3); got {arr.shape}")
+    return np.linalg.inv(arr)
+
+
 @dataclass
 class RegistrationResult:
     homography: np.ndarray
@@ -435,6 +449,7 @@ class RegistrationRefiner:
         frames: List[np.ndarray] = []
 
         if _HAVE_DECORD:
+            assert decord is not None
             try:
                 vr = decord.VideoReader(str(video_path))
                 total = len(vr)
@@ -536,7 +551,10 @@ class RegistrationRefiner:
             if frame.shape[0] != height or frame.shape[1] != width:
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA) if cv2 is not None else frame
             if frame.ndim == 3:
-                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if cv2 is not None else np.mean(frame, axis=-1)
+                if cv2 is not None:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = np.mean(np.asarray(frame, dtype=np.float32), axis=-1)
             else:
                 gray = frame
             gray = gray.astype(np.uint8)
@@ -657,10 +675,11 @@ class RegistrationRefiner:
                 )
                 err_after = err_before
 
-        H_inv = np.linalg.inv(H)
+        H_arr = np.asarray(H, dtype=np.float32)
+        H_inv = _invert_homography(H_arr)
         grid = _homography_to_grid(H_inv, (height, width), canonical)
         return RegistrationResult(
-            homography=H.astype(np.float32),
+            homography=H_arr,
             source_hw=(height, width),
             target_hw=canonical,
             err_before=err_before,
@@ -688,7 +707,7 @@ class RegistrationRefiner:
         if cached is not None:
             if cached.grid is None:
                 try:
-                    H_inv = np.linalg.inv(cached.homography)
+                    H_inv = _invert_homography(cached.homography)
                     cached.grid = _homography_to_grid(H_inv, cached.source_hw, cached.target_hw)
                 except Exception:
                     cached.grid = None
@@ -697,7 +716,7 @@ class RegistrationRefiner:
         result = self._compute_refinement(canon_id, video_path, crop_meta)
         if result.grid is None:
             try:
-                H_inv = np.linalg.inv(result.homography)
+                H_inv = _invert_homography(result.homography)
                 result.grid = _homography_to_grid(H_inv, result.source_hw, result.target_hw)
             except Exception:
                 result.grid = None
