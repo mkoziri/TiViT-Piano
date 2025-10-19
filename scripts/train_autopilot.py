@@ -66,6 +66,9 @@ TARGET_METRIC_FIELDS = {
     "offset_ev_f1": "offset_event_f1",
 }
 
+sys.path.insert(0, str(REPO / "src"))
+from utils.logging_utils import configure_verbosity
+
 
 # ---------------------------------------------------------------------------
 # YAML helpers
@@ -131,6 +134,16 @@ def log_banner(results_path: Path, message: str) -> None:
         f.write(f"# {message}\n")
 
 
+def _with_verbose(cmd: Iterable[str], verbose: Optional[str]) -> List[str]:
+    result = list(cmd)
+    if not verbose:
+        return result
+    if "--verbose" in result:
+        return result
+    result.extend(["--verbose", verbose])
+    return result
+
+
 def run_command(
     cmd: List[str],
     log_file: Path,
@@ -139,14 +152,20 @@ def run_command(
     extra_env: Optional[Dict[str, str]] = None,
     unset_env: Optional[Iterable[str]] = None,
     echo_cmd: bool = True,
+    verbose: Optional[str] = None,
 ) -> Tuple[int, Optional[str], List[str]]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    if verbose:
+        env["TIVIT_VERBOSE"] = verbose
     if unset_env:
         for key in unset_env:
             env.pop(key, None)
     if extra_env:
         env.update(extra_env)
+    if verbose:
+        cmd_display = " ".join(cmd)
+        print(f"[autopilot] verbose={verbose} → passing to child {cmd_display}")
     log_file.parent.mkdir(parents=True, exist_ok=True)
     if echo_cmd:
         print(">>>", " ".join(cmd))
@@ -215,11 +234,21 @@ def _build_dataset_cli(split: Optional[str], frames: Optional[int], max_clips: O
     return args
 
 
-def run_calibration(kind: str, ckpt: Path, log_dir: Path, split: str, max_clips: Optional[int], frames: Optional[int]) -> int:
+def run_calibration(
+    kind: str,
+    ckpt: Path,
+    log_dir: Path,
+    split: str,
+    max_clips: Optional[int],
+    frames: Optional[int],
+    *,
+    verbose: Optional[str] = None,
+) -> int:
     log_name = f"calibration_{kind}.txt"
     log_path = log_dir / log_name
     dataset_cli = _build_dataset_cli(split, frames, max_clips)
     cmd = [sys.executable, "-u", str(CALIBRATE_THRESH), *dataset_cli, "--ckpt", str(ckpt)]
+    cmd = _with_verbose(cmd, verbose)
     if kind == "thorough":
         env_to_unset = ["AVSYNC_DISABLE", "DEBUG"]
         cmd_display = [Path(cmd[0]).name] + cmd[1:]
@@ -232,13 +261,14 @@ def run_calibration(kind: str, ckpt: Path, log_dir: Path, split: str, max_clips:
             capture_last_val=False,
             unset_env=env_to_unset,
             echo_cmd=False,
+            verbose=verbose,
         )
         bad_markers = ("[debug] AV-lag disabled", "lag_source=no_avlag")
         if any(marker in line for line in lines for marker in bad_markers):
             print("[autopilot] ERROR: thorough calibration disabled A/V lag; aborting.", flush=True)
             return 1
         return ret
-    ret, _, _ = run_command(cmd, log_path, capture_last_val=False)
+    ret, _, _ = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
     return ret
 
 
@@ -287,6 +317,7 @@ def run_fast_eval(
     offset_probs: Optional[Iterable[float]] = None,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
+    verbose: Optional[str] = None,
 ) -> Tuple[int, List[str]]:
     log_path = log_dir / "eval_fast.txt"
     cmd = [
@@ -311,8 +342,9 @@ def run_fast_eval(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
-    ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
+    ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
     return ret, lines
 
 
@@ -393,6 +425,8 @@ def run_fast_grid_calibration(
     split: str,
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
+    *,
+    verbose: Optional[str] = None,
 ) -> Tuple[int, Optional[Dict[str, float]], List[str]]:
     log_path = log_dir / "calibration_fast_grid.txt"
     cmd = [
@@ -410,8 +444,9 @@ def run_fast_grid_calibration(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
-    ret, _, lines = run_command(cmd, log_path, capture_last_val=False)
+    ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
     if ret != 0:
         return ret, None, lines
     metrics = parse_eval_table(lines)
@@ -798,6 +833,7 @@ def perform_calibration(
             offset_probs=offset_probs,
             temperature=args.temperature,
             bias=args.bias,
+            verbose=args.verbose,
         )
         if eval_ret != 0:
             return None, eval_ret
@@ -835,6 +871,7 @@ def perform_calibration(
             split,
             temperature=args.temperature,
             bias=args.bias,
+            verbose=args.verbose,
         )
         if ret != 0 or metrics is None:
             return None, ret or 1
@@ -854,6 +891,7 @@ def perform_calibration(
             split,
             args.calib_max_clips,
             args.calib_frames,
+            verbose=args.verbose,
         )
         if ret != 0:
             return _run_fast_grid("thorough calibration failed")
@@ -1027,7 +1065,13 @@ def main() -> int:
     ap.add_argument("--stdout_dir", type=Path, default=DEFAULT_STDOUT_DIR)
     ap.add_argument("--dataset_max_clips", type=int)
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument(
+        "--verbose",
+        choices=["quiet", "info", "debug"],
+        help="Logging verbosity for autopilot and child runs (default: quiet or $TIVIT_VERBOSE)",
+    )
     args = ap.parse_args()
+    args.verbose = configure_verbosity(args.verbose)
     patience_budget = max(args.patience, 0)
 
     target_metric_field = TARGET_METRIC_FIELDS[args.target_metric]
@@ -1170,10 +1214,15 @@ def main() -> int:
             banner = "NOTICE: Training burst — this may take a while"
             log_banner(results_path, banner)
             log_path = stdout_dir / f"stdout_round{round_idx:02d}_train.txt"
-            train_ret, last_val, _ = run_command(
+            train_cmd = _with_verbose(
                 [sys.executable, str(TRAIN), "--config", str(CONFIG)],
+                args.verbose,
+            )
+            train_ret, last_val, _ = run_command(
+                train_cmd,
                 log_path,
                 capture_last_val=True,
+                verbose=args.verbose,
             )
             training_executed = True
 

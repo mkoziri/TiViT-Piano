@@ -96,8 +96,9 @@ split directories. Configure `dataset.manifest.*` or `split_*` keys in
    ```
 
    Common overrides include `--train-split`, `--val-split`, `--max-clips`, and
-   `--frames` for rapid experiments. Use `--debug` for verbose logging and
-   `--smoke` to run a synthetic dry run without touching the datasets.
+   `--frames` for rapid experiments. Use `--verbose info` (or `--verbose debug`)
+   to surface additional logging and `--smoke` to run a synthetic dry run
+   without touching the datasets.
 
 Checkpoints and TensorBoard summaries are emitted according to the `logging`
 section of the configuration (for example `logging.checkpoint_dir` and
@@ -125,9 +126,10 @@ pass.
 
 ### Debugging mode
 
-Pass `--debug` to any calibration or evaluation entry point (for example
-`eval_thresholds.py`) to favour deterministic, single-process data loading when
-investigating individual clips. Debugging mode forces
+Pass `--verbose debug` to calibration or evaluation entry points (for example
+`eval_thresholds.py`) to surface detailed per-clip diagnostics. The calibration
+helper also retains a `--debug` switch that favours deterministic,
+single-process data loading when investigating individual clips: it forces
 `num_workers=0`, disables `persistent_workers`, turns off pinned memory, and
 prints an acknowledgement before dataset construction so you can confirm the
 runtime surface has been adjusted.
@@ -208,7 +210,7 @@ plumbing:
 
 Refer to `docs/REPO_TREE.md` for an index of additional utilities, including
 profilers, visualization scripts, and document generators. Combine these tools
-with the `--debug`/`--smoke` flags when iterating on configuration changes.
+with `--verbose debug` and `--smoke` when iterating on configuration changes.
 
 ## Documentation & references
 

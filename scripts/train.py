@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 from data import make_dataloader
 from models import build_model
-from utils import load_config, setup_logging, get_logger
+from utils import load_config, configure_verbosity, get_logger
 
 logger = get_logger(__name__)
 
@@ -1517,17 +1517,21 @@ def main():
     ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
-    ap.add_argument("--debug", action="store_true", help="Enable verbose logging")
+    ap.add_argument(
+        "--verbose",
+        choices=["quiet", "info", "debug"],
+        help="Logging verbosity (default: quiet or $TIVIT_VERBOSE)",
+    )
     ap.add_argument("--smoke", action="store_true", help="Run a quick synthetic pass")
     args = ap.parse_args()
+
+    args.verbose = configure_verbosity(args.verbose)
 
     faulthandler.enable()
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     except (AttributeError, RuntimeError, ValueError, OSError):
         pass
-
-    setup_logging(args.debug)
     set_seed(42)
     cfg = load_config(args.config)
     if args.max_clips is not None:

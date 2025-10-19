@@ -107,7 +107,7 @@ def log_legacy_id_hit(legacy_id: str, canon_id: str, *, logger: Optional[logging
         return
     _LEGACY_HITS.add(key)
     target_logger = logger if logger is not None else LOGGER
-    target_logger.info("[compat] legacy_id_hit id=%s → canon=%s", legacy, canon)
+    target_logger.debug("[compat] legacy_id_hit id=%s → canon=%s", legacy, canon)
 
 
 __all__ = ["canonical_video_id", "id_aliases", "log_legacy_id_hit"]

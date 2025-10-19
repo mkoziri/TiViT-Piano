@@ -630,7 +630,7 @@ class PianoYTDataset(Dataset):
                     split,
                 )
         total_videos = len(ids)
-        print(f"[dataset] enter PianoYT(split={split}) total_videos={total_videos}", flush=True)
+        LOGGER.info("dataset.enter split=%s total_videos=%d", split, total_videos)
         if self._only_video_target:
             ids = [
                 vid
@@ -671,7 +671,7 @@ class PianoYTDataset(Dataset):
         self.crop_rescale = "auto"
         self.include_low_res = True
         self.excluded_ids: set = set()
-        print(f"[dataset] after filter videos={len(self.samples)}", flush=True)
+        LOGGER.info("dataset.after_filter videos=%d", len(self.samples))
 
         if len(self.samples) == 0:
             raise FileNotFoundError(
@@ -782,9 +782,12 @@ class PianoYTDataset(Dataset):
         if key in cache:
             return
         cache.add(key)
-        print(
-            f"[dataset] fallback idx={origin_idx} -> {fallback_idx} reason={reason_text} ({mode})",
-            flush=True,
+        LOGGER.debug(
+            "fallback idx=%d -> %d reason=%s mode=%s",
+            origin_idx,
+            fallback_idx,
+            reason_text,
+            mode,
         )
 
     def _clone_sample(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1128,10 +1131,13 @@ class PianoYTDataset(Dataset):
                 clip = clip[..., :aligned_w]
             if not self._tiling_log_once:
                 width_sum = sum(widths_px)
-                print(
-                    f"tiles(tokens)={tokens_per_tile} widths_px={widths_px} "
-                    f"sum={width_sum} orig_W={original_w} overlap_tokens={self.tiling_overlap_tokens}",
-                    flush=True,
+                LOGGER.debug(
+                    "tiles tokens=%s widths_px=%s sum=%s orig_W=%s overlap_tokens=%s",
+                    tokens_per_tile,
+                    widths_px,
+                    width_sum,
+                    original_w,
+                    self.tiling_overlap_tokens,
                 )
                 self._tiling_log_once = True
 
@@ -1210,7 +1216,7 @@ class PianoYTDataset(Dataset):
                     flags_set: Set[str] = set(lag_result.flags or set())
                     flags_str = ",".join(sorted(flags_set)) if flags_set else "-"
                     if not audit and video_id not in self._lag_log_once:
-                        LOGGER.info(
+                        LOGGER.debug(
                             "clip=%s av_lag_ms=%+d corr=%s frames=%d flags=%s",
                             video_id,
                             int(round(lag_ms_display)),
@@ -1413,7 +1419,7 @@ class PianoYTDataset(Dataset):
 
     def _log_av_disabled_once(self) -> None:
         if self._av_sync_disabled and not self._av_sync_disabled_logged:
-            print("[debug] AV-lag disabled (lag_ms=0 for all clips)", flush=True)
+            LOGGER.debug("AV-lag disabled (lag_ms=0 for all clips)")
             self._av_sync_disabled_logged = True
 
     def _log_missing_labels_once(self, video_ref: Union[str, Path]) -> None:
@@ -1441,7 +1447,7 @@ class PianoYTDataset(Dataset):
             return
         tickets.add(ticket)
         frames_display = lag_frames if lag_frames is not None else "?"
-        LOGGER.info(
+        LOGGER.debug(
             "targets: %s split=%s id=%s key=%s lag_frames=%s",
             status,
             self.split,
@@ -1455,7 +1461,7 @@ class PianoYTDataset(Dataset):
         if canon in self._bad_clips:
             return
         self._bad_clips.add(canon)
-        print(f"[data_pass] mark_bad id={canon} reason={reason}", flush=True)
+        LOGGER.debug("mark_bad id=%s reason=%s", canon, reason)
         if record_idx is not None and not self._uses_eval_snapshot():
             if self.split == "train" and self._train_epoch_active:
                 return
@@ -1848,9 +1854,12 @@ class PianoYTDataset(Dataset):
 
         self._last_materialize_duration = time.perf_counter() - t_start
 
-        print(
-            f"[dataset] entries built: total={len(final_entries)} (avg per video ≈ {avg_per_video:.1f}, pos≈{pos_total}, neg≈{neg_total})",
-            flush=True,
+        LOGGER.info(
+            "dataset.entries_built total=%d avg_per_video=%.1f pos=%d neg=%d",
+            len(final_entries),
+            avg_per_video,
+            pos_total,
+            neg_total,
         )
         return final_entries
 
@@ -2046,7 +2055,7 @@ class PianoYTDataset(Dataset):
         bad_videos = 0
         audit_start = time.perf_counter()
         if log_summary:
-            print(f"[dataset] audit start (videos={total})", flush=True)
+            LOGGER.info("dataset.audit_start videos=%d", total)
         if self.split == "train":
             self._train_fallback_once.clear()
             for idx in range(total):
@@ -2061,13 +2070,19 @@ class PianoYTDataset(Dataset):
                 elapsed = time.perf_counter() - per_start
                 status_label = "ok" if has_window else "no_window"
                 if log_summary:
-                    print(
-                        f"[dataset] audit clip={vid_id} elapsed={elapsed:.2f}s status={status_label}",
-                        flush=True,
+                    LOGGER.debug(
+                        "audit clip=%s elapsed=%.2fs status=%s",
+                        vid_id,
+                        elapsed,
+                        status_label,
                     )
                 if elapsed > self._audit_timeout_sec:
-                    if log_summary:
-                        print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
+                    LOGGER.warning(
+                        "audit timeout id=%s elapsed=%.2fs threshold=%.2fs",
+                        vid_id,
+                        elapsed,
+                        self._audit_timeout_sec,
+                    )
                     self._mark_bad_clip(idx, vid_id, "audit_timeout")
                     skipped += 1
                     bad_videos += 1
@@ -2094,20 +2109,26 @@ class PianoYTDataset(Dataset):
                 entries, status, events_on, events_off, lag_ms = self._plan_eval_entries(idx)
                 elapsed = time.perf_counter() - per_start
                 if log_summary:
-                    print(
-                        f"[dataset] audit clip={vid_id} elapsed={elapsed:.2f}s status={status}",
-                        flush=True,
+                    LOGGER.debug(
+                        "audit clip=%s elapsed=%.2fs status=%s",
+                        vid_id,
+                        elapsed,
+                        status,
                     )
                 if elapsed > self._audit_timeout_sec:
-                    if log_summary:
-                        print(f"[dataset] audit timeout id={vid_id}; mark_bad", flush=True)
+                    LOGGER.warning(
+                        "audit timeout id=%s elapsed=%.2fs threshold=%.2fs",
+                        vid_id,
+                        elapsed,
+                        self._audit_timeout_sec,
+                    )
                     self._mark_bad_clip(idx, vid_id, "audit_timeout")
                     skipped += 1
                     bad_videos += 1
                     continue
                 if self.split == "val":
                     lag_display = lag_ms if lag_ms is not None else "?"
-                    LOGGER.info(
+                    LOGGER.debug(
                         "val_audit | vid=%s lag_ms=%s events_on=%d events_off=%d status=%s",
                         record.get("id", ""),
                         lag_display,
@@ -2136,9 +2157,11 @@ class PianoYTDataset(Dataset):
         self._num_windows = len(self._valid_entries)
         if log_summary:
             elapsed_total = time.perf_counter() - audit_start
-            print(
-                f"[dataset] audit done ok={ok_videos} bad={bad_videos} elapsed={elapsed_total:.2f}s",
-                flush=True,
+            LOGGER.info(
+                "dataset.audit_done ok=%d bad=%d elapsed=%.2fs",
+                ok_videos,
+                bad_videos,
+                elapsed_total,
             )
             LOGGER.info(
                 "videos: %d, N_skipped_no_labels: %d, windows: %d",

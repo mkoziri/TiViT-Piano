@@ -12,17 +12,14 @@ CLI:
 import logging
 from typing import Optional
 
+from .logging_utils import configure_verbosity
+
 
 def setup_logging(debug: bool = False) -> logging.Logger:
-    """Configure and return a root logger.
+    """Configure logging using the legacy debug toggle."""
 
-    Parameters
-    ----------
-    debug: bool, optional
-        If True, set the log level to ``DEBUG``. Otherwise ``INFO``.
-    """
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+    level = "debug" if debug else "info"
+    configure_verbosity(level)
     return logging.getLogger("tivit")
 
 

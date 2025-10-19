@@ -118,7 +118,7 @@ class AVLagCache:
             acquired = self._acquire_file_lock(lock_timeout)
             if not acquired:
                 if warn_on_timeout and not self._lock_timeout_logged:
-                    print("[lag_cache] preload timeout; continuing", flush=True)
+                    LOGGER.debug("lag_cache preload timeout; continuing without preload")
                     self._lock_timeout_logged = True
                 return False
         try:
@@ -158,7 +158,7 @@ class AVLagCache:
             return
         if elapsed > 2.0:
             if not self._preload_slow_logged:
-                print("[lag_cache] preload exceeded 2s; skipping preload this run", flush=True)
+                LOGGER.debug("lag_cache preload exceeded threshold; skipping preload this run")
                 self._preload_slow_logged = True
             with _CACHE_LOCK:
                 self._cache = None

@@ -41,7 +41,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-from utils import load_config, align_pitch_dim
+from utils import load_config, align_pitch_dim, configure_verbosity
 from data import make_dataloader
 from models import build_model
 
@@ -611,11 +611,17 @@ def main():
         help="Disable audio/video lag estimation when preparing frame targets",
     )
     ap.add_argument(
+        "--verbose",
+        choices=["quiet", "info", "debug"],
+        help="Logging verbosity (default: quiet or $TIVIT_VERBOSE)",
+    )
+    ap.add_argument(
         "--debug",
         action="store_true",
         help="Force single-process dataloading like fast eval (num_workers=0, no pinning)",
     )
     args = ap.parse_args()
+    args.verbose = configure_verbosity(args.verbose)
 
     avlag_enabled = not args.no_avlag
     env_disable = str(os.environ.get("AVSYNC_DISABLE", "")).strip().lower()

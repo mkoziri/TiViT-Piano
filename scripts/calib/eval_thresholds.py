@@ -27,7 +27,7 @@ from typing import Optional
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
 
-from utils import load_config, align_pitch_dim
+from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.identifiers import canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
@@ -251,7 +251,11 @@ def main():
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
-    ap.add_argument("--debug", action="store_true", help="Log extra diagnostics for first batch")
+    ap.add_argument(
+        "--verbose",
+        choices=["quiet", "info", "debug"],
+        help="Logging verbosity (default: quiet or $TIVIT_VERBOSE)",
+    )
     ap.add_argument("--no-avlag", action="store_true", help="Disable audio/video lag estimation for isolation")
     ap.add_argument(
         "--dump_logits",
@@ -286,6 +290,8 @@ def main():
         help="Optional file path to tee progress logs",
     )
     args = ap.parse_args(argv)
+    args.verbose = configure_verbosity(args.verbose)
+    debug_mode = args.verbose == "debug"
     args.thresholds = logit_thrs
     args.prob_thresholds = prob_thrs
     args.offset_thresholds = offset_logit_thrs
@@ -499,7 +505,7 @@ def main():
     avlag_disabled = bool(args.no_avlag) or env_disable in {"1", "true", "yes", "on"}
     if avlag_disabled:
         dataset_cfg["avlag_disabled"] = True
-    if args.debug:
+    if debug_mode:
         dataset_cfg["num_workers"] = 0
         dataset_cfg["persistent_workers"] = False
         dataset_cfg["pin_memory"] = False
@@ -833,7 +839,7 @@ def main():
                     if lag_sources:
                         lag_source_counter.update(lag_sources)
 
-                if args.debug and len(onset_logits_list) == 1:
+                if debug_mode and len(onset_logits_list) == 1:
                     print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
                     print(
                         "[DEBUG] onset_roll nonzero=",
@@ -953,7 +959,7 @@ def main():
     onset_tgts = align_pitch_dim(onset_probs, onset_tgts, "onset")
     offset_tgts = align_pitch_dim(offset_probs, offset_tgts, "offset")
     
-    if args.debug:
+    if debug_mode:
         print(
             "[DEBUG] aligned shapes logits=",
             onset_logits.shape,
