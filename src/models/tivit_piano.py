@@ -16,13 +16,18 @@ CLI:
     factories for training or evaluation scripts.
 """
 
+import logging
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from einops import rearrange
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 from utils.tiling import tile_vertical_token_aligned
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 # -------- Tubelet embedding (3D patchify) ----------
@@ -169,6 +174,149 @@ class MultiLayerHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class KeyAwareWidthPool(nn.Module):
+    """
+    Learnable soft assignment from spatial width bins to piano keys.
+
+    Maintains a bank of key-by-width logits initialised from canonical keyboard
+    geometry, row-wise softmaxed at runtime to yield per-key distributions.
+    """
+
+    def __init__(
+        self,
+        num_keys: int = 88,
+        canonical_width: float = 800.0,
+        smoothness_lambda: float = 5e-5,
+    ) -> None:
+        super().__init__()
+        self.num_keys = int(num_keys)
+        self.canonical_width = float(canonical_width)
+        self.white_key_width = float(self.canonical_width / 52.0)
+        self.sigma = max(self.white_key_width * 0.7, 1.0)
+        self.smoothness_lambda = max(float(smoothness_lambda), 0.0)
+
+        self.register_parameter("weight", None)
+        self.register_buffer("key_centers", self._compute_key_centers(), persistent=False)
+        self.register_buffer("width_coords_ref", None, persistent=False)
+
+        self._logged = False
+
+    def _compute_key_centers(self) -> torch.Tensor:
+        """Return canonical x-centres (px) for MIDI 21..108."""
+
+        black_mods = {1, 3, 6, 8, 10}
+        centers: List[float] = []
+        white_positions: Dict[int, float] = {}
+        white_idx = -1
+
+        for midi in range(21, 109):
+            note_mod = midi % 12
+            if note_mod in black_mods:
+                prev_midi = midi - 1
+                while prev_midi >= 21 and (prev_midi % 12) in black_mods:
+                    prev_midi -= 1
+                next_midi = midi + 1
+                while next_midi <= 108 and (next_midi % 12) in black_mods:
+                    next_midi += 1
+                prev_center = white_positions.get(prev_midi)
+                next_center = white_positions.get(next_midi)
+                if prev_center is not None and next_center is not None:
+                    center = 0.5 * (prev_center + next_center)
+                elif prev_center is not None:
+                    center = prev_center
+                elif next_center is not None:
+                    center = next_center
+                else:
+                    center = 0.0
+                centers.append(float(center))
+            else:
+                white_idx += 1
+                center = (white_idx + 0.5) * self.white_key_width
+                white_positions[midi] = center
+                centers.append(float(center))
+
+        return torch.tensor(centers, dtype=torch.float32)
+
+    def _init_weight(self, width_coords: torch.Tensor, device: torch.device) -> None:
+        coords = width_coords.to(device=device, dtype=torch.float32)
+        centers = self.key_centers.to(device=device, dtype=torch.float32)
+
+        diff = coords.unsqueeze(0) - centers.unsqueeze(1)
+        gauss = torch.exp(-0.5 * (diff / self.sigma) ** 2)
+        gauss = gauss / gauss.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        logits = torch.log(gauss.clamp_min(1e-6))
+
+        self.weight = nn.Parameter(logits)
+        self.width_coords_ref = coords.detach().clone()
+        self._logged = False
+
+    def _ensure_weight(self, width_coords: torch.Tensor) -> None:
+        if width_coords.ndim != 1:
+            raise ValueError(f"width_coords must be 1D (got shape {tuple(width_coords.shape)})")
+
+        P = int(width_coords.numel())
+        device = width_coords.device
+
+        if self.weight is None or self.weight.shape[1] != P:
+            self._init_weight(width_coords, device)
+            LOGGER.info("keypool: P=%d init=geometry learnable=True", P)
+            self._logged = True
+        elif self.width_coords_ref is None or self.width_coords_ref.shape[0] != P:
+            self.width_coords_ref = width_coords.detach().clone()
+        elif not self._logged:
+            LOGGER.info("keypool: P=%d init=geometry learnable=True", P)
+            self._logged = True
+
+    def forward(
+        self,
+        feat: torch.Tensor,
+        width_coords: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            feat: (B, T, P, D) tensor of features across width bins.
+            width_coords: (P,) canonical x coordinate per width bin.
+            valid_mask: Optional (P,) bool mask flagging valid width bins.
+
+        Returns:
+            key_features: (B, T, K, D)
+            smooth_loss: Optional scalar regulariser.
+        """
+
+        if feat.ndim != 4:
+            raise ValueError(f"Expected feat with rank 4 (B,T,P,D), got shape {tuple(feat.shape)}")
+
+        width_coords = width_coords.to(device=feat.device, dtype=torch.float32)
+        self._ensure_weight(width_coords)
+
+        logits = self.weight.to(device=feat.device)
+        if logits.shape[1] != feat.shape[2]:
+            raise RuntimeError(
+                f"Key pool width mismatch: logits has {logits.shape[1]} bins but features have {feat.shape[2]}"
+            )
+
+        if valid_mask is not None:
+            mask = valid_mask.to(device=feat.device, dtype=torch.bool).unsqueeze(0)
+            masked_logits = logits.masked_fill(~mask, float("-inf"))
+            attn = torch.softmax(masked_logits, dim=1)
+            attn = attn * mask.float()
+            denom = attn.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            attn = attn / denom
+        else:
+            attn = torch.softmax(logits, dim=1)
+
+        attn = attn.to(dtype=feat.dtype)
+        key_feat = torch.einsum("btpd,kp->btkd", feat, attn)
+
+        smooth_loss: Optional[torch.Tensor] = None
+        if self.smoothness_lambda > 0.0 and attn.shape[1] > 1:
+            diff = attn[:, 1:] - attn[:, :-1]
+            smooth_loss = self.smoothness_lambda * diff.pow(2).mean()
+
+        return key_feat, smooth_loss
     
 # -------- TiViT-Piano: tiling wrapper + ViViT backbone + multi-task head ----------
 class TiViTPiano(nn.Module):
@@ -260,6 +408,8 @@ class TiViTPiano(nn.Module):
         self.head_hand = MultiLayerHead(d_model, 2, hidden_dims=(base_hidden//2,), dropout=dropout)
         self.head_clef = MultiLayerHead(d_model, clef_classes, hidden_dims=(base_hidden//2,), dropout=dropout)
 
+        self.key_pool = KeyAwareWidthPool(num_keys=88, canonical_width=800.0, smoothness_lambda=5e-5)
+
         # Cache Tubelet conv sizes for token shape inference
         self._tube_k   = self.embed.proj.kernel_size[0]
         self._tube_s   = self.embed.proj.stride[0]
@@ -267,6 +417,8 @@ class TiViTPiano(nn.Module):
         self._patch_kw = self.embed.proj.kernel_size[2]
         self._patch_sh = self.embed.proj.stride[1]
         self._patch_sw = self.embed.proj.stride[2]
+        self._spatial_hw: Optional[Tuple[int, int]] = None
+        self._keypool_warned = False
 
     def _init_encoder_if_needed(self, t_tokens, s_tokens):
         if self.encoder is None:
@@ -379,7 +531,64 @@ class TiViTPiano(nn.Module):
                 f"kernel={(kt,kh,kw)}, stride={(st,sh,sw)}, padding={(pt,ph,pw)}."
             )
 
+        self._spatial_hw = (int(Hprime), int(Wprime))
         return int(Tprime), int(Hprime * Wprime)
+
+    def _compute_width_coords(self, w_tokens: int) -> Optional[torch.Tensor]:
+        bounds = self._tile_bounds
+        if not bounds or w_tokens <= 0:
+            return None
+        patch_w = max(int(self.tiling_patch_w), 1)
+        coords: List[float] = []
+        for left, right in bounds:
+            width_px = max(int(right - left), 0)
+            tokens_est = int(round(width_px / patch_w))
+            tokens_est = max(1, min(tokens_est, w_tokens))
+            for idx in range(w_tokens):
+                if idx < tokens_est:
+                    center = left + (idx + 0.5) * patch_w
+                else:
+                    last_center = left + (tokens_est - 0.5) * patch_w
+                    center = last_center if tokens_est > 0 else left + 0.5 * patch_w
+                coords.append(float(center))
+        if not coords:
+            return None
+        return torch.tensor(coords, dtype=torch.float32)
+
+    def _compute_width_valid_mask(self, w_tokens: int) -> Optional[torch.Tensor]:
+        bounds = self._tile_bounds
+        if not bounds or w_tokens <= 0:
+            return None
+        patch_w = max(int(self.tiling_patch_w), 1)
+        mask_vals: List[bool] = []
+        for left, right in bounds:
+            width_px = max(int(right - left), 0)
+            tokens_est = int(round(width_px / patch_w))
+            tokens_est = max(1, min(tokens_est, w_tokens))
+            mask_vals.extend([True] * tokens_est)
+            mask_vals.extend([False] * max(0, w_tokens - tokens_est))
+        if not mask_vals:
+            return None
+        return torch.tensor(mask_vals, dtype=torch.bool)
+
+    def _prepare_width_features(
+        self, enc_5d: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        spatial_hw = self._spatial_hw
+        if spatial_hw is None:
+            return None, None, None
+        h_tokens, w_tokens = spatial_hw
+        if h_tokens <= 0 or w_tokens <= 0:
+            return None, None, None
+        try:
+            enc_hw = rearrange(enc_5d, "b m t (h w) d -> b m t h w d", h=h_tokens, w=w_tokens)
+        except RuntimeError:
+            return None, None, None
+        enc_height_avg = enc_hw.mean(dim=3)  # avg over height bins
+        width_feat = rearrange(enc_height_avg, "b m t w d -> b t (m w) d")
+        width_coords = self._compute_width_coords(w_tokens)
+        valid_mask = self._compute_width_valid_mask(w_tokens)
+        return width_feat, width_coords, valid_mask
 
 
     def forward(self, x):
@@ -421,35 +630,83 @@ class TiViTPiano(nn.Module):
         enc_tiles = rearrange(enc, 'b (m n) d -> b m n d', m=self.tiles)          # (B, tiles, T'*S', D)
         enc_5d    = rearrange(enc_tiles, 'b m (t s) d -> b m t s d', t=t_tokens)  # (B, tiles, T', S', D)
 
+        width_feat, width_coords_cpu, valid_mask_cpu = self._prepare_width_features(enc_5d)
+
         # ----- Frame mode: per-time features and time-distributed heads -----
         if getattr(self, "head_mode", "clip") == "frame":
-            # Avg over tiles and spatial positions -> (B, T', D)
-            g_t = enc_5d.mean(dim=(1, 3))  # mean over tiles (m) and spatial (s)
+            keypool_reg: Optional[torch.Tensor] = None
+            if width_feat is not None:
+                g_t = width_feat.mean(dim=2)
+            else:
+                g_t = enc_5d.mean(dim=(1, 3))
 
-            # Heads accept (B,T,D) thanks to LayerNorm -> Linear on last dim
-            pitch_logits  = self.head_pitch(g_t)              # (B, T', 88)
-            onset_logits  = self.head_onset(g_t)             # (B, T', 88)
-            offset_logits = self.head_offset(g_t)            # (B, T', 88)
-            hand_logits   = self.head_hand(g_t)              # (B, T', 2)
-            clef_logits   = self.head_clef(g_t)              # (B, T', 3)
+            key_features: Optional[torch.Tensor] = None
+            if width_feat is not None and width_coords_cpu is not None:
+                width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
+                valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
+                key_features, keypool_reg = self.key_pool(width_feat, width_coords, valid_mask=valid_mask)
+            else:
+                if not self._keypool_warned:
+                    LOGGER.warning("keypool: width grid unavailable; using global width average.")
+                    self._keypool_warned = True
 
-            return {
-                "pitch_logits":  pitch_logits,
-                "onset_logits":  onset_logits,
+            if key_features is not None:
+                pitch_logits = torch.diagonal(self.head_pitch(key_features), dim1=-2, dim2=-1)
+                onset_logits = torch.diagonal(self.head_onset(key_features), dim1=-2, dim2=-1)
+                offset_logits = torch.diagonal(self.head_offset(key_features), dim1=-2, dim2=-1)
+            else:
+                pitch_logits = self.head_pitch(g_t)
+                onset_logits = self.head_onset(g_t)
+                offset_logits = self.head_offset(g_t)
+
+            hand_logits = self.head_hand(g_t)
+            clef_logits = self.head_clef(g_t)
+
+            out = {
+                "pitch_logits": pitch_logits,
+                "onset_logits": onset_logits,
                 "offset_logits": offset_logits,
-                "hand_logits":   hand_logits,
-                "clef_logits":   clef_logits,
+                "hand_logits": hand_logits,
+                "clef_logits": clef_logits,
             }
+            if keypool_reg is not None:
+                out["keypool_reg"] = keypool_reg
+            return out
 
         # ----- Clip mode: global mean-pool over all tokens -----
-        g = enc.mean(dim=1)  # (B, D)
+        keypool_reg: Optional[torch.Tensor] = None
+        if width_feat is not None:
+            g = width_feat.mean(dim=(1, 2))
+        else:
+            g = enc.mean(dim=1)
+
+        key_features_clip: Optional[torch.Tensor] = None
+        if width_feat is not None and width_coords_cpu is not None:
+            width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
+            valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
+            pooled_clip, keypool_reg = self.key_pool(width_feat.mean(dim=1, keepdim=True), width_coords, valid_mask=valid_mask)
+            key_features_clip = pooled_clip
+        else:
+            if not self._keypool_warned:
+                LOGGER.warning("keypool: width grid unavailable; using global width average.")
+                self._keypool_warned = True
+
+        if key_features_clip is not None:
+            pitch_logits = torch.diagonal(self.head_pitch(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
+            onset_logits = torch.diagonal(self.head_onset(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
+            offset_logits = torch.diagonal(self.head_offset(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
+        else:
+            pitch_logits = self.head_pitch(g)
+            onset_logits = self.head_onset(g)
+            offset_logits = self.head_offset(g)
+
         out = {
-            "pitch_logits":  self.head_pitch(g),                 # (B, 88)
-            "onset_logits":  self.head_onset(g),                 # (B, 88)
-            "offset_logits": self.head_offset(g),                # (B, 88)
-            "hand_logits":   self.head_hand(g),                  # (B, 2)
-            "clef_logits":   self.head_clef(g),                  # (B, 3)
+            "pitch_logits": pitch_logits,
+            "onset_logits": onset_logits,
+            "offset_logits": offset_logits,
+            "hand_logits":   self.head_hand(g),
+            "clef_logits":   self.head_clef(g),
         }
+        if keypool_reg is not None:
+            out["keypool_reg"] = keypool_reg
         return out
-
-
