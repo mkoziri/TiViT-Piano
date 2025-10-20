@@ -671,7 +671,7 @@ class OMAPSDataset(Dataset):
         self.registration_cfg = reg_cfg
         self.registration_enabled = bool(reg_cfg.get("enabled", True))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
-        reg_sample_frames = int(reg_cfg.get("sample_frames", 80))
+        reg_sample_frames = int(reg_cfg.get("sample_frames", 96))
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
             cache_path=Path("reg_refined.json"),

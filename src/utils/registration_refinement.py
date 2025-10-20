@@ -273,6 +273,9 @@ def _compute_keyboard_edges(
 
 
 _BLACK_KEY_INTERVAL_PATTERN: Tuple[int, ...] = (1, 0, 1, 1, 0, 1, 1)
+WHITE_ANCHOR_PRIORITY: float = 0.7
+BLACK_ANCHOR_PRIORITY: float = 0.3
+X_WARP_ERR_THRESHOLD: float = 2.5
 
 
 def _compute_black_key_gaps(
@@ -404,13 +407,27 @@ def _build_x_warp_controls(anchor_src: np.ndarray, anchor_dst: np.ndarray, width
     order = np.argsort(ctrl_src)
     ctrl_src = ctrl_src[order]
     ctrl_dst = ctrl_dst[order]
-    ctrl_dst = np.maximum.accumulate(ctrl_dst)
+    ctrl_dst = np.clip(ctrl_dst, 0.0, width_f)
+    for _ in range(2):
+        if ctrl_dst.size <= 4:
+            break
+        smooth = 0.25 * ctrl_dst[:-2] + 0.5 * ctrl_dst[1:-1] + 0.25 * ctrl_dst[2:]
+        ctrl_dst[1:-1] = smooth
+        ctrl_dst = np.clip(ctrl_dst, 0.0, width_f)
+        ctrl_dst = np.maximum.accumulate(ctrl_dst)
+    ctrl_dst = np.clip(ctrl_dst, 0.0, width_f)
+    ctrl_dst[0] = 0.0
+    ctrl_dst[-1] = width_f
     key_width = width_f / 52.0
     max_delta = key_width * 0.5
     deltas = np.clip(ctrl_dst - ctrl_src, -max_delta, max_delta)
     deltas[0] = 0.0
     deltas[-1] = 0.0
     ctrl = np.stack([ctrl_src, ctrl_src + deltas], axis=-1)
+    ctrl[:, 1] = np.clip(ctrl[:, 1], 0.0, width_f)
+    ctrl[:, 1] = np.maximum.accumulate(ctrl[:, 1])
+    ctrl[0, 1] = 0.0
+    ctrl[-1, 1] = width_f
     return ctrl.astype(np.float32)
 
 
@@ -714,7 +731,7 @@ class RegistrationRefiner:
         canonical_hw: Sequence[int],
         *,
         cache_path: Optional[Path] = None,
-        sample_frames: int = 80,
+        sample_frames: int = 96,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         if len(canonical_hw) < 2:
@@ -777,6 +794,7 @@ class RegistrationRefiner:
         max_frames: Optional[int] = None,
     ) -> List[np.ndarray]:
         target_frames = int(max_frames or self.sample_frames)
+        target_frames = int(np.clip(target_frames, 60, 100))
         if target_frames <= 0:
             return []
 
@@ -884,7 +902,6 @@ class RegistrationRefiner:
             )
 
         grayscale_frames: List[np.ndarray] = []
-        sum_frame: Optional[np.ndarray] = None
         slopes: List[float] = []
         intercepts: List[float] = []
 
@@ -906,11 +923,6 @@ class RegistrationRefiner:
                 slopes.append(baseline[0])
                 intercepts.append(baseline[1])
             grayscale_frames.append(gray)
-            gray_f32 = gray.astype(np.float32)
-            if sum_frame is None:
-                sum_frame = gray_f32
-            else:
-                sum_frame += gray_f32
 
         slope = _median_or_none(slopes)
         intercept = _median_or_none(intercepts)
@@ -932,10 +944,12 @@ class RegistrationRefiner:
                 x_warp_ctrl=None,
             )
 
-        if sum_frame is None:
-            avg_frame = np.zeros((height, width), dtype=np.float32)
+        if grayscale_frames:
+            stack = np.stack(grayscale_frames, axis=0)
+            avg_frame = np.median(stack, axis=0).astype(np.float32)
+            del stack
         else:
-            avg_frame = sum_frame / max(len(grayscale_frames), 1)
+            avg_frame = np.zeros((height, width), dtype=np.float32)
         grad_x_profile, grad_y_profile = _aggregate_gradients(grayscale_frames)
 
         edges, edge_strengths, x_left, x_right = _compute_keyboard_edges(grad_x_profile, width)
@@ -959,7 +973,7 @@ class RegistrationRefiner:
         edge_strengths = np.abs(edge_strengths.astype(np.float32)) + 1e-6
         edge_weight_scale = float(np.max(edge_strengths))
         edge_weights = edge_strengths / max(edge_weight_scale, 1e-6)
-        edge_weights = np.clip(edge_weights, 0.05, 1.0)
+        edge_weights = np.clip(edge_weights, 0.05, 1.0) * WHITE_ANCHOR_PRIORITY
 
         black_positions, black_strengths, black_boundaries = _compute_black_key_gaps(
             avg_frame,
@@ -987,7 +1001,7 @@ class RegistrationRefiner:
         if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
             black_strengths = np.abs(black_strengths.astype(np.float32)) + 1e-6
             black_weight_scale = float(np.max(black_strengths))
-            black_weights = np.clip(black_strengths / max(black_weight_scale, 1e-6), 0.05, 1.0)
+            black_weights = np.clip(black_strengths / max(black_weight_scale, 1e-6), 0.05, 1.0) * BLACK_ANCHOR_PRIORITY
         else:
             canon_black_positions = np.zeros((0,), dtype=np.float32)
             black_weights = np.zeros((0,), dtype=np.float32)
@@ -1091,7 +1105,7 @@ class RegistrationRefiner:
                 status = "fallback_points"
                 err_black_gaps = err_before if black_positions.size > 0 else 0.0
             else:
-                weights_iter = weights_fit.copy()
+                weights_iter = weights_fit.astype(np.float32, copy=True)
                 H_candidate: Optional[np.ndarray] = None
                 for _ in range(6):
                     H_try = _solve_regularized_homography(
@@ -1118,7 +1132,7 @@ class RegistrationRefiner:
                     high_resid = residuals > (huber_delta * 2.5)
                     if np.any(high_resid):
                         weights_new[high_resid] = 0.0
-                    weights_new = np.clip(weights_new, 0.0, 1.0)
+                    weights_new = np.clip(weights_new, 0.0, 1.0).astype(np.float32, copy=False)
                     if np.linalg.norm(weights_new - weights_iter) <= 1e-3:
                         H_candidate = H_try
                         weights_iter = weights_new
@@ -1159,38 +1173,62 @@ class RegistrationRefiner:
                         black_proj_x = black_proj[:, 0]
                         err_black_gaps = float(np.mean(np.abs(black_proj_x - canon_black_positions)))
 
-                    anchor_src: List[np.ndarray] = []
-                    anchor_dst: List[np.ndarray] = []
-                    anchor_src.append(white_proj_x.astype(np.float32))
-                    anchor_dst.append(canon_edges.astype(np.float32))
-                    if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
-                        anchor_src.append(black_proj_x.astype(np.float32))
-                        anchor_dst.append(canon_black_positions.astype(np.float32))
-                    warp_ctrl = _build_x_warp_controls(
-                        np.concatenate(anchor_src) if anchor_src else np.zeros((0,), dtype=np.float32),
-                        np.concatenate(anchor_dst) if anchor_dst else np.zeros((0,), dtype=np.float32),
-                        canonical[1],
-                    )
-                    if warp_ctrl.size >= 4:
-                        ctrl_order = np.argsort(warp_ctrl[:, 0])
-                        pre = warp_ctrl[ctrl_order, 0]
-                        post = warp_ctrl[ctrl_order, 1]
-                        white_after = np.interp(white_proj_x, pre, post, left=post[0], right=post[-1])
-                        white_after = np.clip(white_after, 0.0, float(canonical[1] - 1))
-                        err_white_edges = float(np.mean(np.abs(white_after - canon_edges)))
-                        if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
-                            black_after = np.interp(black_proj_x, pre, post, left=post[0], right=post[-1])
-                            black_after = np.clip(black_after, 0.0, float(canonical[1] - 1))
-                            err_black_gaps = float(np.mean(np.abs(black_after - canon_black_positions)))
-
-                    if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
-                        total = len(canon_edges) + len(canon_black_positions)
+                    if (
+                        black_positions.size > 0
+                        and canon_black_positions.size == black_positions.size
+                        and math.isfinite(err_black_gaps)
+                    ):
+                        weight_total = WHITE_ANCHOR_PRIORITY + BLACK_ANCHOR_PRIORITY
                         err_after = float(
-                            (err_white_edges * len(canon_edges) + err_black_gaps * len(canon_black_positions))
-                            / max(total, 1)
+                            (
+                                err_white_edges * WHITE_ANCHOR_PRIORITY
+                                + err_black_gaps * BLACK_ANCHOR_PRIORITY
+                            )
+                            / max(weight_total, 1e-6)
                         )
                     else:
                         err_after = err_white_edges
+
+                    warp_ctrl = np.zeros((0, 2), dtype=np.float32)
+                    apply_x_warp = err_after > X_WARP_ERR_THRESHOLD
+                    if apply_x_warp:
+                        anchor_src: List[np.ndarray] = [white_proj_x.astype(np.float32)]
+                        anchor_dst: List[np.ndarray] = [canon_edges.astype(np.float32)]
+                        if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
+                            anchor_src.append(black_proj_x.astype(np.float32))
+                            anchor_dst.append(canon_black_positions.astype(np.float32))
+                        warp_candidate = _build_x_warp_controls(
+                            np.concatenate(anchor_src) if anchor_src else np.zeros((0,), dtype=np.float32),
+                            np.concatenate(anchor_dst) if anchor_dst else np.zeros((0,), dtype=np.float32),
+                            canonical[1],
+                        )
+                        if warp_candidate.size >= 4:
+                            warp_ctrl = warp_candidate
+                            ctrl_order = np.argsort(warp_ctrl[:, 0])
+                            pre = warp_ctrl[ctrl_order, 0]
+                            post = warp_ctrl[ctrl_order, 1]
+                            white_after = np.interp(white_proj_x, pre, post, left=post[0], right=post[-1])
+                            white_after = np.clip(white_after, 0.0, float(canonical[1] - 1))
+                            err_white_edges = float(np.mean(np.abs(white_after - canon_edges)))
+                            if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
+                                black_after = np.interp(black_proj_x, pre, post, left=post[0], right=post[-1])
+                                black_after = np.clip(black_after, 0.0, float(canonical[1] - 1))
+                                err_black_gaps = float(np.mean(np.abs(black_after - canon_black_positions)))
+                            if (
+                                black_positions.size > 0
+                                and canon_black_positions.size == black_positions.size
+                                and math.isfinite(err_black_gaps)
+                            ):
+                                weight_total = WHITE_ANCHOR_PRIORITY + BLACK_ANCHOR_PRIORITY
+                                err_after = float(
+                                    (
+                                        err_white_edges * WHITE_ANCHOR_PRIORITY
+                                        + err_black_gaps * BLACK_ANCHOR_PRIORITY
+                                    )
+                                    / max(weight_total, 1e-6)
+                                )
+                            else:
+                                err_after = err_white_edges
 
                     if not math.isfinite(err_after):
                         H = base_h
