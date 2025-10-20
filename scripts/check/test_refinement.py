@@ -24,7 +24,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple, cast
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -158,6 +158,15 @@ def inspect_cache(cache_path: Path, limit: int) -> None:
         status = str(data.get("status", "unknown"))
         err_before = float(data.get("err_before", math.nan))
         err_after = float(data.get("err_after", math.nan))
+        err_white = float(data.get("err_white_edges", err_after))
+        err_black = float(data.get("err_black_gaps", math.nan))
+        warp_ctrl = data.get("x_warp_ctrl")
+        if isinstance(warp_ctrl, Sequence):
+            ctrl_points = len(warp_ctrl)
+        elif isinstance(warp_ctrl, Iterable):
+            ctrl_points = sum(1 for _ in warp_ctrl)
+        else:
+            ctrl_points = 0
         frames = int(data.get("frames", 0))
         if not isinstance(H_vals, Iterable) or src_hw is None or dst_hw is None:
             logging.info("%s: status=%s frames=%d (missing homography)", video_id, status, frames)
@@ -168,14 +177,20 @@ def inspect_cache(cache_path: Path, limit: int) -> None:
         delta_norm = float(np.linalg.norm(H - baseline))
         improvement = err_before - err_after
         logging.info(
-            "%s: status=%s frames=%d err_before=%.2fpx err_after=%.2fpx Δerr=%.2fpx ||ΔH||=%.3f",
+            (
+                "%s: status=%s frames=%d err_before=%.2fpx err_after=%.2fpx "
+                "err_white=%.2fpx err_black=%.2fpx Δerr=%.2fpx ||ΔH||=%.3f warp_pts=%d"
+            ),
             video_id,
             status,
             frames,
             err_before,
             err_after,
+            err_white,
+            err_black,
             improvement,
             delta_norm,
+            ctrl_points,
         )
 
 

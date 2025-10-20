@@ -226,16 +226,18 @@ def _compute_keyboard_edges(
     grad_profile: np.ndarray,
     width: int,
     num_white_keys: int = 52,
-) -> Tuple[np.ndarray, float, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """Estimate white-key edge locations across the keyboard span."""
     if grad_profile.size == 0:
         indices = np.linspace(0.0, float(width - 1), num_white_keys + 1, dtype=np.float32)
-        return indices, float(indices[0]), float(indices[-1])
+        strengths = np.ones_like(indices, dtype=np.float32)
+        return indices, strengths, float(indices[0]), float(indices[-1])
 
     profile = _gaussian_smooth_1d(grad_profile.astype(np.float32), kernel=9)
     if profile.max(initial=0.0) <= 1e-6:
         indices = np.linspace(0.0, float(width - 1), num_white_keys + 1, dtype=np.float32)
-        return indices, float(indices[0]), float(indices[-1])
+        strengths = np.ones_like(indices, dtype=np.float32)
+        return indices, strengths, float(indices[0]), float(indices[-1])
 
     threshold = float(profile.max() * 0.2)
     active = np.where(profile >= threshold)[0]
@@ -253,15 +255,163 @@ def _compute_keyboard_edges(
     step = span / float(num_white_keys)
     window = max(5.0, step * 0.35)
     edges = []
+    strengths = []
     for idx in range(num_white_keys + 1):
         center = x_left + step * idx
         peak = _find_peak(profile, center, int(round(window)))
+        peak_clamped = int(np.clip(round(peak), 0, profile.shape[0] - 1))
         edges.append(peak)
+        strengths.append(float(profile[peak_clamped]))
     edge_arr = np.array(edges, dtype=np.float32)
     edge_arr = np.clip(edge_arr, 0.0, float(width - 1))
     edge_arr = _snap_edges_ransac(edge_arr, step)
     edge_arr = np.clip(edge_arr, 0.0, float(width - 1))
-    return edge_arr, float(edge_arr[0]), float(edge_arr[-1])
+    strength_arr = np.array(strengths, dtype=np.float32)
+    if strength_arr.size != edge_arr.size:
+        strength_arr = np.ones_like(edge_arr, dtype=np.float32)
+    return edge_arr, strength_arr, float(edge_arr[0]), float(edge_arr[-1])
+
+
+_BLACK_KEY_INTERVAL_PATTERN: Tuple[int, ...] = (1, 0, 1, 1, 0, 1, 1)
+
+
+def _compute_black_key_gaps(
+    avg_frame: np.ndarray,
+    baseline_row: int,
+    keyboard_height: float,
+    edges: np.ndarray,
+    *,
+    min_margin: float = 0.15,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Detect black-key gap anchors using intensity minima."""
+    if avg_frame.ndim == 3:
+        avg_frame = np.mean(avg_frame, axis=-1)
+    avg_frame = np.asarray(avg_frame, dtype=np.float32)
+    if avg_frame.ndim != 2 or avg_frame.size == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    height, width = avg_frame.shape
+    if width <= 1 or height <= 1:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    if keyboard_height <= 1.0:
+        keyboard_height = float(height) * 0.65
+    baseline_row = int(np.clip(baseline_row, 0, height - 1))
+
+    top = int(max(0, baseline_row - int(round(keyboard_height * 0.95))))
+    mid = int(max(top + 1, baseline_row - int(round(keyboard_height * 0.4))))
+    if mid <= top:
+        mid = min(height, top + max(1, int(round(keyboard_height * 0.3))))
+    roi = avg_frame[top:mid, :]
+    if roi.size == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    profile = roi.mean(axis=0)
+    response = profile.max(initial=0.0) - profile
+    if response.size == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+    response = _gaussian_smooth_1d(response.astype(np.float32), kernel=11)
+
+    positions: List[float] = []
+    strengths: List[float] = []
+    boundaries: List[int] = []
+
+    num_edges = int(edges.shape[0])
+    if num_edges < 3:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    pattern = _BLACK_KEY_INTERVAL_PATTERN
+    pattern_len = len(pattern)
+
+    for boundary in range(1, num_edges - 1):
+        if not pattern[(boundary - 1) % pattern_len]:
+            continue
+        left_span = float(edges[boundary] - edges[boundary - 1])
+        right_span = float(edges[boundary + 1] - edges[boundary])
+        span_left = max(left_span * (1.0 - min_margin), left_span * 0.35)
+        span_right = max(right_span * (1.0 - min_margin), right_span * 0.35)
+        search_left = int(max(0.0, math.floor(edges[boundary] - span_left)))
+        search_right = int(min(width - 1.0, math.ceil(edges[boundary] + span_right)))
+        if search_right <= search_left:
+            continue
+        window = response[search_left:search_right]
+        if window.size == 0:
+            continue
+        idx_rel = int(np.argmax(window))
+        peak_col = float(search_left + idx_rel)
+        strength = float(window[idx_rel])
+        positions.append(peak_col)
+        strengths.append(strength)
+        boundaries.append(boundary)
+
+    if not positions:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+
+    return (
+        np.array(positions, dtype=np.float32),
+        np.array(strengths, dtype=np.float32),
+        np.array(boundaries, dtype=np.int32),
+    )
+
+
+def _canonical_black_key_positions(
+    canon_edges: np.ndarray, boundary_indices: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    if canon_edges.ndim != 1 or canon_edges.size < 3 or boundary_indices.size == 0:
+        empty = np.zeros((0,), dtype=np.float32)
+        mask = np.zeros((0,), dtype=bool)
+        return empty, mask
+    canon = np.asarray(canon_edges, dtype=np.float32)
+    boundary_indices = np.asarray(boundary_indices, dtype=np.int32)
+    mask = (boundary_indices > 0) & (boundary_indices < canon.shape[0] - 1)
+    if not np.any(mask):
+        empty = np.zeros((0,), dtype=np.float32)
+        return empty, mask
+    valid_indices = boundary_indices[mask]
+    centers = 0.5 * (canon[valid_indices - 1] + canon[valid_indices + 1])
+    return centers.astype(np.float32), mask
+
+
+def _apply_homography_to_points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError("points must have shape (N, 2)")
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    homog = np.hstack([pts, ones]).T
+    mapped = matrix @ homog
+    denom = np.maximum(mapped[2], 1e-6)
+    x = mapped[0] / denom
+    y = mapped[1] / denom
+    return np.stack([x, y], axis=1)
+
+
+def _build_x_warp_controls(anchor_src: np.ndarray, anchor_dst: np.ndarray, width: int) -> np.ndarray:
+    if anchor_src.size == 0 or anchor_dst.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    src = np.asarray(anchor_src, dtype=np.float32).ravel()
+    dst = np.asarray(anchor_dst, dtype=np.float32).ravel()
+    valid = np.isfinite(src) & np.isfinite(dst)
+    if not np.any(valid):
+        return np.zeros((0, 2), dtype=np.float32)
+    src = src[valid]
+    dst = dst[valid]
+    width_f = float(max(width - 1, 1))
+    src = np.clip(src, 0.0, width_f)
+    dst = np.clip(dst, 0.0, width_f)
+
+    ctrl_src = np.concatenate(([0.0], src, [width_f]))
+    ctrl_dst = np.concatenate(([0.0], dst, [width_f]))
+    order = np.argsort(ctrl_src)
+    ctrl_src = ctrl_src[order]
+    ctrl_dst = ctrl_dst[order]
+    ctrl_dst = np.maximum.accumulate(ctrl_dst)
+    key_width = width_f / 52.0
+    max_delta = key_width * 0.5
+    deltas = np.clip(ctrl_dst - ctrl_src, -max_delta, max_delta)
+    deltas[0] = 0.0
+    deltas[-1] = 0.0
+    ctrl = np.stack([ctrl_src, ctrl_src + deltas], axis=-1)
+    return ctrl.astype(np.float32)
 
 
 def _aggregate_gradients(frames: Sequence[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
@@ -315,12 +465,23 @@ def _homography_to_grid(
     homography: np.ndarray,
     source_hw: Tuple[int, int],
     target_hw: Tuple[int, int],
+    warp_ctrl: Optional[np.ndarray] = None,
 ) -> torch.Tensor:
     h_dst, w_dst = target_hw
     h_src, w_src = source_hw
     ys = np.linspace(0.0, float(h_dst - 1), h_dst, dtype=np.float32)
     xs = np.linspace(0.0, float(w_dst - 1), w_dst, dtype=np.float32)
-    xv, yv = np.meshgrid(xs, ys)
+    xs_pre = xs
+    if warp_ctrl is not None and warp_ctrl.size >= 4:
+        ctrl = np.asarray(warp_ctrl, dtype=np.float32)
+        pre = ctrl[:, 0]
+        post = ctrl[:, 1]
+        order = np.argsort(post)
+        post_sorted = post[order]
+        pre_sorted = np.clip(pre[order], 0.0, float(w_dst - 1))
+        xs_pre = np.interp(xs, post_sorted, pre_sorted, left=pre_sorted[0], right=pre_sorted[-1])
+        xs_pre = np.clip(xs_pre, 0.0, float(w_dst - 1))
+    xv, yv = np.meshgrid(xs_pre, ys)
     ones = np.ones_like(xv)
     coords = np.stack([xv, yv, ones], axis=-1).reshape(-1, 3).T
     mapped = homography @ coords
@@ -369,6 +530,7 @@ def _solve_regularized_homography(
     base_h: np.ndarray,
     *,
     reg_lambda: float = 0.05,
+    weights: Optional[Sequence[float]] = None,
 ) -> Optional[np.ndarray]:
     """Solve a least-squares homography with Tikhonov regularisation."""
     if src_pts.shape[0] < 4:
@@ -379,6 +541,13 @@ def _solve_regularized_homography(
     n = src.shape[0]
     A = np.zeros((2 * n, 8), dtype=np.float32)
     b = np.zeros((2 * n,), dtype=np.float32)
+    weight_arr: Optional[np.ndarray] = None
+    if weights is not None:
+        weight_arr = np.asarray(list(weights), dtype=np.float32).reshape(-1)
+        if weight_arr.shape[0] != n:
+            raise ValueError("weights must match number of points")
+        min_w = float(np.max(weight_arr)) * 1e-3 if np.max(weight_arr, initial=0.0) > 0 else 0.0
+        weight_arr = np.clip(weight_arr, min_w, None)
 
     for i in range(n):
         x, y = float(src[i, 0]), float(src[i, 1])
@@ -390,6 +559,10 @@ def _solve_regularized_homography(
         A[row + 1, 3:6] = [x, y, 1.0]
         A[row + 1, 6:8] = [-v * x, -v * y]
         b[row + 1] = v
+        if weight_arr is not None:
+            w = math.sqrt(float(weight_arr[i]))
+            A[row : row + 2] *= w
+            b[row : row + 2] *= w
 
     if reg_lambda > 0.0:
         lam = float(reg_lambda)
@@ -423,6 +596,24 @@ def _invert_homography(matrix: Any) -> np.ndarray:
     return np.linalg.inv(arr)
 
 
+def _load_warp_ctrl(raw: Any) -> Optional[np.ndarray]:
+    if raw is None:
+        return None
+    try:
+        arr = np.asarray(raw, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 1:
+        if arr.size % 2 != 0:
+            return None
+        arr = arr.reshape(-1, 2)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        return None
+    return arr
+
+
 @dataclass
 class RegistrationResult:
     homography: np.ndarray
@@ -430,27 +621,40 @@ class RegistrationResult:
     target_hw: Tuple[int, int]
     err_before: float
     err_after: float
+    err_white_edges: float
+    err_black_gaps: float
     frames: int
     status: str
     baseline_slope: float
     baseline_intercept: float
     keyboard_height: float
     timestamp: float
+    x_warp_ctrl: Optional[np.ndarray] = None
     grid: Optional[torch.Tensor] = None
 
     def to_json(self) -> Dict[str, Any]:
+        warp_payload: Optional[List[List[float]]]
+        if self.x_warp_ctrl is None:
+            warp_payload = None
+        else:
+            warp_payload = [
+                [float(row[0]), float(row[1])] for row in np.asarray(self.x_warp_ctrl, dtype=np.float32)
+            ]
         return {
             "homography": [float(x) for x in self.homography.reshape(-1)],
             "source_hw": list(self.source_hw),
             "target_hw": list(self.target_hw),
             "err_before": float(self.err_before),
             "err_after": float(self.err_after),
+            "err_white_edges": float(self.err_white_edges),
+            "err_black_gaps": float(self.err_black_gaps),
             "frames": int(self.frames),
             "status": str(self.status),
             "baseline_slope": float(self.baseline_slope),
             "baseline_intercept": float(self.baseline_intercept),
             "keyboard_height": float(self.keyboard_height),
             "timestamp": float(self.timestamp),
+            "x_warp_ctrl": warp_payload,
         }
 
     @classmethod
@@ -464,12 +668,15 @@ class RegistrationResult:
             target_hw=target_hw,  # type: ignore[arg-type]
             err_before=float(payload.get("err_before", 0.0)),
             err_after=float(payload.get("err_after", 0.0)),
+            err_white_edges=float(payload.get("err_white_edges", float(payload.get("err_after", 0.0)))),
+            err_black_gaps=float(payload.get("err_black_gaps", 0.0)),
             frames=int(payload.get("frames", 0)),
             status=str(payload.get("status", "unknown")),
             baseline_slope=float(payload.get("baseline_slope", 0.0)),
             baseline_intercept=float(payload.get("baseline_intercept", 0.0)),
             keyboard_height=float(payload.get("keyboard_height", 0.0)),
             timestamp=float(payload.get("timestamp", time.time())),
+            x_warp_ctrl=_load_warp_ctrl(payload.get("x_warp_ctrl")),
             grid=None,
         )
 
@@ -507,7 +714,7 @@ class RegistrationRefiner:
         canonical_hw: Sequence[int],
         *,
         cache_path: Optional[Path] = None,
-        sample_frames: int = 30,
+        sample_frames: int = 80,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         if len(canonical_hw) < 2:
@@ -643,12 +850,15 @@ class RegistrationRefiner:
                 target_hw=canonical,
                 err_before=0.0,
                 err_after=0.0,
+                err_white_edges=0.0,
+                err_black_gaps=0.0,
                 frames=0,
                 status="fallback_no_frames",
                 baseline_slope=0.0,
                 baseline_intercept=0.0,
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
+                x_warp_ctrl=None,
             )
 
         heights = [frame.shape[0] for frame in frames]
@@ -662,12 +872,15 @@ class RegistrationRefiner:
                 target_hw=canonical,
                 err_before=0.0,
                 err_after=0.0,
+                err_white_edges=0.0,
+                err_black_gaps=0.0,
                 frames=len(frames),
                 status="fallback_bad_dims",
                 baseline_slope=0.0,
                 baseline_intercept=0.0,
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
+                x_warp_ctrl=None,
             )
 
         grayscale_frames: List[np.ndarray] = []
@@ -702,17 +915,21 @@ class RegistrationRefiner:
                 target_hw=canonical,
                 err_before=0.0,
                 err_after=0.0,
+                err_white_edges=0.0,
+                err_black_gaps=0.0,
                 frames=len(frames),
                 status="fallback_no_baseline",
                 baseline_slope=0.0,
                 baseline_intercept=0.0,
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
+                x_warp_ctrl=None,
             )
 
+        avg_frame = np.mean(np.stack(grayscale_frames, axis=0).astype(np.float32), axis=0)
         grad_x_profile, grad_y_profile = _aggregate_gradients(grayscale_frames)
 
-        edges, x_left, x_right = _compute_keyboard_edges(grad_x_profile, width)
+        edges, edge_strengths, x_left, x_right = _compute_keyboard_edges(grad_x_profile, width)
         canon_edges = np.linspace(0.0, float(canonical[1] - 1), edges.shape[0], dtype=np.float32)
 
         scale_x = (canonical[1] - 1) / max(width - 1, 1)
@@ -730,33 +947,94 @@ class RegistrationRefiner:
         target_top_y = max(0.0, target_baseline_y - canonical_keyboard_height)
         source_top = np.clip(ys - keyboard_height, 0.0, height - 1.0)
 
+        edge_strengths = np.abs(edge_strengths.astype(np.float32)) + 1e-6
+        edge_weight_scale = float(np.max(edge_strengths))
+        edge_weights = edge_strengths / max(edge_weight_scale, 1e-6)
+        edge_weights = np.clip(edge_weights, 0.05, 1.0)
+
+        black_positions, black_strengths, black_boundaries = _compute_black_key_gaps(
+            avg_frame,
+            baseline_row,
+            keyboard_height,
+            xs,
+        )
+        canon_black_positions = np.zeros((0,), dtype=np.float32)
+        black_weights = np.zeros((0,), dtype=np.float32)
+        if black_positions.size > 0 and black_boundaries.size == black_positions.size:
+            canon_pos, valid_mask = _canonical_black_key_positions(canon_edges, black_boundaries)
+            if valid_mask.size == black_positions.size and np.any(valid_mask):
+                black_positions = black_positions[valid_mask]
+                black_strengths = black_strengths[valid_mask]
+                black_boundaries = black_boundaries[valid_mask]
+                canon_black_positions = canon_pos
+            else:
+                black_positions = np.zeros((0,), dtype=np.float32)
+                black_strengths = np.zeros((0,), dtype=np.float32)
+                black_boundaries = np.zeros((0,), dtype=np.int32)
+        else:
+            black_positions = np.zeros((0,), dtype=np.float32)
+            black_strengths = np.zeros((0,), dtype=np.float32)
+            black_boundaries = np.zeros((0,), dtype=np.int32)
+        if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
+            black_strengths = np.abs(black_strengths.astype(np.float32)) + 1e-6
+            black_weight_scale = float(np.max(black_strengths))
+            black_weights = np.clip(black_strengths / max(black_weight_scale, 1e-6), 0.05, 1.0)
+        else:
+            canon_black_positions = np.zeros((0,), dtype=np.float32)
+            black_weights = np.zeros((0,), dtype=np.float32)
+            black_positions = np.zeros((0,), dtype=np.float32)
+            black_boundaries = np.zeros((0,), dtype=np.int32)
+
         src_pts: List[List[float]] = []
         dst_pts: List[List[float]] = []
-        for x_val, y_base, y_top, canon_x in zip(xs, ys, source_top, canon_edges):
+        point_weights: List[float] = []
+
+        for x_val, y_base, y_top, canon_x, weight in zip(xs, ys, source_top, canon_edges, edge_weights):
             src_pts.append([float(x_val), float(y_top)])
             dst_pts.append([float(canon_x), float(target_top_y)])
+            point_weights.append(float(weight))
             src_pts.append([float(x_val), float(y_base)])
             dst_pts.append([float(canon_x), float(target_baseline_y)])
+            point_weights.append(float(weight))
 
-        src_pts.extend(
-            [
-                [0.0, 0.0],
-                [float(width - 1), 0.0],
-                [0.0, float(height - 1)],
-                [float(width - 1), float(height - 1)],
-            ]
-        )
-        dst_pts.extend(
-            [
-                [0.0, 0.0],
-                [float(canonical[1] - 1), 0.0],
-                [0.0, float(canonical[0] - 1)],
-                [float(canonical[1] - 1), float(canonical[0] - 1)],
-            ]
-        )
+        if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
+            black_y_base = np.clip(slope * black_positions + intercept, 0.0, height - 1.0)
+            black_y_top = np.clip(black_y_base - keyboard_height, 0.0, height - 1.0)
+            for x_gap, y_base, y_top, canon_x, weight in zip(
+                black_positions, black_y_base, black_y_top, canon_black_positions, black_weights
+            ):
+                src_pts.append([float(x_gap), float(y_top)])
+                dst_pts.append([float(canon_x), float(target_top_y)])
+                point_weights.append(float(weight))
+                src_pts.append([float(x_gap), float(y_base)])
+                dst_pts.append([float(canon_x), float(target_baseline_y)])
+                point_weights.append(float(weight))
+
+        corner_weight = 0.15
+        corners_src = [
+            [0.0, 0.0],
+            [float(width - 1), 0.0],
+            [0.0, float(height - 1)],
+            [float(width - 1), float(height - 1)],
+        ]
+        corners_dst = [
+            [0.0, 0.0],
+            [float(canonical[1] - 1), 0.0],
+            [0.0, float(canonical[0] - 1)],
+            [float(canonical[1] - 1), float(canonical[0] - 1)],
+        ]
+        src_pts.extend(corners_src)
+        dst_pts.extend(corners_dst)
+        point_weights.extend([corner_weight] * len(corners_src))
 
         src_arr = np.asarray(src_pts, dtype=np.float32)
         dst_arr = np.asarray(dst_pts, dtype=np.float32)
+        weights_arr = np.asarray(point_weights, dtype=np.float32)
+        valid_mask = weights_arr > 1e-3
+        if not np.all(valid_mask):
+            src_arr = src_arr[valid_mask]
+            dst_arr = dst_arr[valid_mask]
+            weights_arr = weights_arr[valid_mask]
         base_h = np.array(
             [
                 [scale_x, 0.0, 0.0],
@@ -768,12 +1046,18 @@ class RegistrationRefiner:
 
         status = "ok"
         err_after = err_before
+        err_white_edges = err_before
+        err_black_gaps = err_before if black_positions.size > 0 else 0.0
+        warp_ctrl = np.zeros((0, 2), dtype=np.float32)
         H: Optional[np.ndarray]
 
-        if src_arr.shape[0] < 4:
+        if src_arr.shape[0] < 4 or np.count_nonzero(weights_arr > 0.05) < 4:
             H = base_h
             status = "fallback_points"
+            err_black_gaps = err_before if black_positions.size > 0 else 0.0
         else:
+            weights_norm = weights_arr / max(float(np.max(weights_arr)), 1e-6)
+            weights_norm = np.clip(weights_norm, 0.05, 1.0)
             inlier_mask: Optional[np.ndarray] = None
             if cv2 is not None:
                 _, mask = cv2.findHomography(
@@ -791,31 +1075,129 @@ class RegistrationRefiner:
 
             src_fit = src_arr[inlier_mask] if inlier_mask is not None else src_arr
             dst_fit = dst_arr[inlier_mask] if inlier_mask is not None else dst_arr
+            weights_fit = weights_norm[inlier_mask] if inlier_mask is not None else weights_norm
 
-            H_candidate = _solve_regularized_homography(src_fit, dst_fit, base_h, reg_lambda=0.05)
-            if H_candidate is None or not np.all(np.isfinite(H_candidate)):
+            if src_fit.shape[0] < 4 or np.count_nonzero(weights_fit > 0.05) < 4:
                 H = base_h
-                status = "fallback_homography"
+                status = "fallback_points"
+                err_black_gaps = err_before if black_positions.size > 0 else 0.0
             else:
-                base_norm = float(np.linalg.norm(base_h))
-                delta_norm = float(np.linalg.norm(H_candidate - base_h))
-                if base_norm > 0.0 and delta_norm > 0.75 * base_norm:
-                    blend = min(1.0, (0.75 * base_norm) / (delta_norm + 1e-6))
-                    H_candidate = base_h + blend * (H_candidate - base_h)
-                pts_h = np.stack([xs, ys, np.ones_like(xs)], axis=0)
-                proj = H_candidate @ pts_h
-                proj /= np.maximum(proj[2], 1e-6)
-                x_proj = proj[0]
-                err_after = float(np.mean(np.abs(x_proj - canon_edges)))
-                if not math.isfinite(err_after):
+                weights_iter = weights_fit.copy()
+                H_candidate: Optional[np.ndarray] = None
+                for _ in range(6):
+                    H_try = _solve_regularized_homography(
+                        src_fit,
+                        dst_fit,
+                        base_h,
+                        reg_lambda=0.05,
+                        weights=weights_iter.tolist(),
+                    )
+                    if H_try is None or not np.all(np.isfinite(H_try)):
+                        H_candidate = None
+                        break
+                    proj_pts = _apply_homography_to_points(H_try, src_fit)
+                    residuals = np.linalg.norm(proj_pts - dst_fit, axis=1)
+                    if residuals.size == 0:
+                        H_candidate = H_try
+                        break
+                    median_resid = float(np.median(residuals))
+                    if not math.isfinite(median_resid) or median_resid <= 1e-6:
+                        median_resid = float(np.mean(residuals)) if residuals.size > 0 else 1.0
+                    huber_delta = max(2.0, median_resid * 2.5)
+                    huber_weights = np.where(residuals <= huber_delta, 1.0, huber_delta / (residuals + 1e-6))
+                    weights_new = weights_fit * huber_weights
+                    high_resid = residuals > (huber_delta * 2.5)
+                    if np.any(high_resid):
+                        weights_new[high_resid] = 0.0
+                    weights_new = np.clip(weights_new, 0.0, 1.0)
+                    if np.linalg.norm(weights_new - weights_iter) <= 1e-3:
+                        H_candidate = H_try
+                        weights_iter = weights_new
+                        break
+                    weights_iter = weights_new
+                    H_candidate = H_try
+                    if np.count_nonzero(weights_iter > 0.05) < 4:
+                        break
+
+                if H_candidate is None:
                     H = base_h
-                    status = "fallback_invalid"
-                    err_after = err_before
+                    status = "fallback_homography"
+                    err_black_gaps = err_before if black_positions.size > 0 else 0.0
                 else:
-                    H = H_candidate
+                    base_norm = float(np.linalg.norm(base_h))
+                    delta_norm = float(np.linalg.norm(H_candidate - base_h))
+                    if base_norm > 0.0 and delta_norm > 0.75 * base_norm:
+                        blend = min(1.0, (0.75 * base_norm) / (delta_norm + 1e-6))
+                        H_candidate = base_h + blend * (H_candidate - base_h)
+
+                    white_points = np.stack([xs, ys], axis=1)
+                    white_proj = _apply_homography_to_points(H_candidate, white_points)
+                    white_proj_x = white_proj[:, 0]
+                    white_err = np.abs(white_proj_x - canon_edges)
+                    err_white_edges = float(np.mean(white_err))
+
+                    black_proj_x = np.zeros((0,), dtype=np.float32)
+                    err_black_gaps = 0.0
+                    if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
+                        black_points = np.stack(
+                            [
+                                black_positions,
+                                np.clip(slope * black_positions + intercept, 0.0, height - 1.0),
+                            ],
+                            axis=1,
+                        )
+                        black_proj = _apply_homography_to_points(H_candidate, black_points)
+                        black_proj_x = black_proj[:, 0]
+                        err_black_gaps = float(np.mean(np.abs(black_proj_x - canon_black_positions)))
+
+                    anchor_src: List[np.ndarray] = []
+                    anchor_dst: List[np.ndarray] = []
+                    anchor_src.append(white_proj_x.astype(np.float32))
+                    anchor_dst.append(canon_edges.astype(np.float32))
+                    if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
+                        anchor_src.append(black_proj_x.astype(np.float32))
+                        anchor_dst.append(canon_black_positions.astype(np.float32))
+                    warp_ctrl = _build_x_warp_controls(
+                        np.concatenate(anchor_src) if anchor_src else np.zeros((0,), dtype=np.float32),
+                        np.concatenate(anchor_dst) if anchor_dst else np.zeros((0,), dtype=np.float32),
+                        canonical[1],
+                    )
+                    if warp_ctrl.size >= 4:
+                        ctrl_order = np.argsort(warp_ctrl[:, 0])
+                        pre = warp_ctrl[ctrl_order, 0]
+                        post = warp_ctrl[ctrl_order, 1]
+                        white_after = np.interp(white_proj_x, pre, post, left=post[0], right=post[-1])
+                        white_after = np.clip(white_after, 0.0, float(canonical[1] - 1))
+                        err_white_edges = float(np.mean(np.abs(white_after - canon_edges)))
+                        if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
+                            black_after = np.interp(black_proj_x, pre, post, left=post[0], right=post[-1])
+                            black_after = np.clip(black_after, 0.0, float(canonical[1] - 1))
+                            err_black_gaps = float(np.mean(np.abs(black_after - canon_black_positions)))
+
+                    if black_positions.size > 0 and canon_black_positions.size == black_positions.size:
+                        total = len(canon_edges) + len(canon_black_positions)
+                        err_after = float(
+                            (err_white_edges * len(canon_edges) + err_black_gaps * len(canon_black_positions))
+                            / max(total, 1)
+                        )
+                    else:
+                        err_after = err_white_edges
+
+                    if not math.isfinite(err_after):
+                        H = base_h
+                        status = "fallback_invalid"
+                        err_after = err_before
+                        err_white_edges = err_before
+                        err_black_gaps = err_before if black_positions.size > 0 else 0.0
+                        warp_ctrl = np.zeros((0, 2), dtype=np.float32)
+                    else:
+                        H = H_candidate
 
         if status != "ok":
             err_after = err_before
+            err_white_edges = err_before
+            err_black_gaps = err_before if black_positions.size > 0 else 0.0
+            warp_ctrl = np.zeros((0, 2), dtype=np.float32)
             H = base_h if H is None else H
         else:
             err_after = float(err_after)
@@ -825,29 +1207,38 @@ class RegistrationRefiner:
             delta_norm = float(np.linalg.norm(H_arr - base_h))
             err_delta = float(err_before - err_after)
             self.logger.debug(
-                "reg_refined.debug: %s status=%s err_before=%.2fpx err_after=%.2fpx Δerr=%.2fpx ||ΔH||=%.3f frames=%d",
+                (
+                    "reg_refined.debug: %s status=%s err_before=%.2fpx err_after=%.2fpx "
+                    "Δerr=%.2fpx err_white=%.2fpx err_black=%.2fpx ||ΔH||=%.3f frames=%d"
+                ),
                 video_id,
                 status,
                 err_before,
                 err_after,
                 err_delta,
+                err_white_edges,
+                err_black_gaps,
                 delta_norm,
                 len(frames),
             )
         H_inv = _invert_homography(H_arr)
-        grid = _homography_to_grid(H_inv, (height, width), canonical)
+        warp_for_grid: Optional[np.ndarray] = warp_ctrl if warp_ctrl.size >= 4 else None
+        grid = _homography_to_grid(H_inv, (height, width), canonical, warp_ctrl=warp_for_grid)
         return RegistrationResult(
             homography=H_arr,
             source_hw=(height, width),
             target_hw=canonical,
             err_before=err_before,
             err_after=err_after,
+            err_white_edges=err_white_edges,
+            err_black_gaps=err_black_gaps,
             frames=len(frames),
             status=status,
             baseline_slope=float(slope),
             baseline_intercept=float(intercept),
             keyboard_height=float(keyboard_height),
             timestamp=time.time(),
+            x_warp_ctrl=warp_for_grid.copy() if warp_for_grid is not None else None,
             grid=grid,
         )
 
@@ -866,7 +1257,12 @@ class RegistrationRefiner:
             if cached.grid is None:
                 try:
                     H_inv = _invert_homography(cached.homography)
-                    cached.grid = _homography_to_grid(H_inv, cached.source_hw, cached.target_hw)
+                    cached.grid = _homography_to_grid(
+                        H_inv,
+                        cached.source_hw,
+                        cached.target_hw,
+                        warp_ctrl=cached.x_warp_ctrl,
+                    )
                 except Exception:
                     cached.grid = None
             return cached
@@ -875,25 +1271,37 @@ class RegistrationRefiner:
         if result.grid is None:
             try:
                 H_inv = _invert_homography(result.homography)
-                result.grid = _homography_to_grid(H_inv, result.source_hw, result.target_hw)
+                result.grid = _homography_to_grid(
+                    H_inv,
+                    result.source_hw,
+                    result.target_hw,
+                    warp_ctrl=result.x_warp_ctrl,
+                )
             except Exception:
                 result.grid = None
         self._cache[canon_id] = result
         if result.status.startswith("fallback"):
             self.logger.warning(
-                "reg_refined: %s status=%s err_before=%.2fpx err_after=%.2fpx frames=%d",
+                (
+                    "reg_refined: %s status=%s err_before=%.2fpx err_after=%.2fpx "
+                    "err_white=%.2fpx err_black=%.2fpx frames=%d"
+                ),
                 canon_id,
                 result.status,
                 result.err_before,
                 result.err_after,
+                result.err_white_edges,
+                result.err_black_gaps,
                 result.frames,
             )
         else:
             self.logger.info(
-                "reg_refined: %s err_before=%.2fpx err_after=%.2fpx frames=%d",
+                "reg_refined: %s err_before=%.2fpx err_after=%.2fpx err_white=%.2fpx err_black=%.2fpx frames=%d",
                 canon_id,
                 result.err_before,
                 result.err_after,
+                result.err_white_edges,
+                result.err_black_gaps,
                 result.frames,
             )
         self._persist_cache()
