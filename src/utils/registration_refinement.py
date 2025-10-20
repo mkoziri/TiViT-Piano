@@ -884,6 +884,7 @@ class RegistrationRefiner:
             )
 
         grayscale_frames: List[np.ndarray] = []
+        sum_frame: Optional[np.ndarray] = None
         slopes: List[float] = []
         intercepts: List[float] = []
 
@@ -905,6 +906,11 @@ class RegistrationRefiner:
                 slopes.append(baseline[0])
                 intercepts.append(baseline[1])
             grayscale_frames.append(gray)
+            gray_f32 = gray.astype(np.float32)
+            if sum_frame is None:
+                sum_frame = gray_f32
+            else:
+                sum_frame += gray_f32
 
         slope = _median_or_none(slopes)
         intercept = _median_or_none(intercepts)
@@ -926,7 +932,10 @@ class RegistrationRefiner:
                 x_warp_ctrl=None,
             )
 
-        avg_frame = np.mean(np.stack(grayscale_frames, axis=0).astype(np.float32), axis=0)
+        if sum_frame is None:
+            avg_frame = np.zeros((height, width), dtype=np.float32)
+        else:
+            avg_frame = sum_frame / max(len(grayscale_frames), 1)
         grad_x_profile, grad_y_profile = _aggregate_gradients(grayscale_frames)
 
         edges, edge_strengths, x_left, x_right = _compute_keyboard_edges(grad_x_profile, width)
