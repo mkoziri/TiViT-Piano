@@ -402,13 +402,15 @@ class TiViTPiano(nn.Module):
         # Heads. These work with (B, D) and (B, T, D).
         base_hidden = max(d_model // 2, 128)
 
-        self.head_pitch = MultiLayerHead(d_model, pitch_classes, hidden_dims=(base_hidden,), dropout=dropout)
-        self.head_onset = MultiLayerHead(d_model, 88, hidden_dims=(base_hidden, base_hidden), dropout=dropout)  
-        self.head_offset = MultiLayerHead(d_model, 88, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
+        self.num_keys = int(pitch_classes)
+
+        self.head_pitch = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden,), dropout=dropout)
+        self.head_onset = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
+        self.head_offset = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
         self.head_hand = MultiLayerHead(d_model, 2, hidden_dims=(base_hidden//2,), dropout=dropout)
         self.head_clef = MultiLayerHead(d_model, clef_classes, hidden_dims=(base_hidden//2,), dropout=dropout)
 
-        self.key_pool = KeyAwareWidthPool(num_keys=88, canonical_width=800.0, smoothness_lambda=5e-5)
+        self.key_pool = KeyAwareWidthPool(num_keys=self.num_keys, canonical_width=800.0, smoothness_lambda=5e-5)
 
         # Cache Tubelet conv sizes for token shape inference
         self._tube_k   = self.embed.proj.kernel_size[0]
@@ -590,6 +592,25 @@ class TiViTPiano(nn.Module):
         valid_mask = self._compute_width_valid_mask(w_tokens)
         return width_feat, width_coords, valid_mask
 
+    def _apply_key_head(self, head: nn.Module, key_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Apply a shared head independently to each key feature vector.
+
+        Args:
+            head: module mapping from D -> 1.
+            key_feat: (B, T, K, D) tensor.
+
+        Returns:
+            (B, T, K) logits tensor.
+        """
+        if key_feat.ndim != 4:
+            raise ValueError(f"Expected key features with rank 4 (B,T,K,D), got {tuple(key_feat.shape)}")
+
+        key_feat_flat = key_feat.reshape(-1, key_feat.shape[-1])
+        logits = head(key_feat_flat)
+        logits = logits.reshape(*key_feat.shape[:-1], -1)
+        return logits.squeeze(-1)
+
 
     def forward(self, x):
         """
@@ -651,13 +672,13 @@ class TiViTPiano(nn.Module):
                     self._keypool_warned = True
 
             if key_features is not None:
-                pitch_logits = torch.diagonal(self.head_pitch(key_features), dim1=-2, dim2=-1)
-                onset_logits = torch.diagonal(self.head_onset(key_features), dim1=-2, dim2=-1)
-                offset_logits = torch.diagonal(self.head_offset(key_features), dim1=-2, dim2=-1)
+                frame_key_features = key_features
             else:
-                pitch_logits = self.head_pitch(g_t)
-                onset_logits = self.head_onset(g_t)
-                offset_logits = self.head_offset(g_t)
+                frame_key_features = g_t.unsqueeze(2).expand(-1, -1, self.num_keys, -1).contiguous()
+
+            pitch_logits = self._apply_key_head(self.head_pitch, frame_key_features)
+            onset_logits = self._apply_key_head(self.head_onset, frame_key_features)
+            offset_logits = self._apply_key_head(self.head_offset, frame_key_features)
 
             hand_logits = self.head_hand(g_t)
             clef_logits = self.head_clef(g_t)
@@ -692,13 +713,13 @@ class TiViTPiano(nn.Module):
                 self._keypool_warned = True
 
         if key_features_clip is not None:
-            pitch_logits = torch.diagonal(self.head_pitch(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
-            onset_logits = torch.diagonal(self.head_onset(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
-            offset_logits = torch.diagonal(self.head_offset(key_features_clip), dim1=-2, dim2=-1).squeeze(1)
+            clip_key_features = key_features_clip
         else:
-            pitch_logits = self.head_pitch(g)
-            onset_logits = self.head_onset(g)
-            offset_logits = self.head_offset(g)
+            clip_key_features = g.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.num_keys, -1).contiguous()
+
+        pitch_logits = self._apply_key_head(self.head_pitch, clip_key_features).squeeze(1)
+        onset_logits = self._apply_key_head(self.head_onset, clip_key_features).squeeze(1)
+        offset_logits = self._apply_key_head(self.head_offset, clip_key_features).squeeze(1)
 
         out = {
             "pitch_logits": pitch_logits,

@@ -2047,7 +2047,7 @@ def main():
             lname = name.lower()
             if "offset" in lname:
                 offset_params.append(p)
-            elif "onset" in lname:
+            elif "onset" in lname or "key_pool" in lname:
                 onset_params.append(p)
             else:
                 base_params.append(p)
@@ -2145,6 +2145,10 @@ def main():
             if "head" in name.lower():
                 for p in module.parameters():
                     p.requires_grad = True
+        # Keep KeyPool trainable during warmup so it updates with the heads.
+        for name, p in model.named_parameters():
+            if "key_pool" in name.lower():
+                p.requires_grad = True
 
     def _unfreeze_backbone(model):
         for _, p in model.named_parameters():
