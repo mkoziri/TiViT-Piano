@@ -16,6 +16,7 @@ CLI:
     configuration file.
 """
 
+from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
@@ -2113,7 +2114,43 @@ def main():
         print(f"[resume] Loading from {resume_path}")
         logger.info("[resume] Loading from %s", resume_path)
         ckpt = torch.load(resume_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"], strict=False)
+        ckpt_model = ckpt.get("model", {})
+        model_state = model.state_dict()
+        filtered_state = OrderedDict()
+        mismatched = []
+        if not isinstance(ckpt_model, Mapping):
+            ckpt_model = {}
+        for key, tensor in ckpt_model.items():
+            target = model_state.get(key)
+            if target is None:
+                continue
+            if tensor.shape != target.shape:
+                mismatched.append((key, tuple(tensor.shape), tuple(target.shape)))
+                continue
+            filtered_state[key] = tensor
+        if mismatched:
+            mismatch_desc = ", ".join(
+                f"{k}: {src}->{dst}" for k, src, dst in mismatched[:5]
+            )
+            if len(mismatched) > 5:
+                mismatch_desc += ", ..."
+            msg = (
+                f"[resume] Skipping {len(mismatched)} key(s) with shape mismatch "
+                f"({mismatch_desc})"
+            )
+            print(msg)
+            logger.warning(msg)
+        incompat = model.load_state_dict(filtered_state, strict=False)
+        if getattr(incompat, "missing_keys", None):
+            logger.info(
+                "[resume] Missing keys after load (OK with strict=False): %s",
+                incompat.missing_keys,
+            )
+        if getattr(incompat, "unexpected_keys", None):
+            logger.info(
+                "[resume] Unexpected keys in checkpoint skipped: %s",
+                incompat.unexpected_keys,
+            )
         best_val = ckpt.get("best_val", math.inf)
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
