@@ -365,11 +365,13 @@ class TiViTPiano(nn.Module):
         pitch_classes=88,
         clef_classes=3,
         head_mode: str = "clip",   # "clip" or "frame"
+        per_key_head: bool = False,
         tiling_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.tiles = tiles
         self.head_mode = head_mode  # runtime switch for clip vs frame heads
+        self.per_key_head = bool(per_key_head)
 
         tiling_cfg = dict(tiling_cfg or {})
         tokens_split_cfg = tiling_cfg.get("tokens_split", "auto")
@@ -404,13 +406,19 @@ class TiViTPiano(nn.Module):
 
         self.num_keys = int(pitch_classes)
 
-        self.head_pitch = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden,), dropout=dropout)
-        self.head_onset = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
-        self.head_offset = MultiLayerHead(d_model, 1, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
+        head_out_dim = 1 if self.per_key_head else self.num_keys
+
+        self.head_pitch = MultiLayerHead(d_model, head_out_dim, hidden_dims=(base_hidden,), dropout=dropout)
+        self.head_onset = MultiLayerHead(d_model, head_out_dim, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
+        self.head_offset = MultiLayerHead(d_model, head_out_dim, hidden_dims=(base_hidden, base_hidden), dropout=dropout)
         self.head_hand = MultiLayerHead(d_model, 2, hidden_dims=(base_hidden//2,), dropout=dropout)
         self.head_clef = MultiLayerHead(d_model, clef_classes, hidden_dims=(base_hidden//2,), dropout=dropout)
 
-        self.key_pool = KeyAwareWidthPool(num_keys=self.num_keys, canonical_width=800.0, smoothness_lambda=5e-5)
+        self.key_pool = (
+            KeyAwareWidthPool(num_keys=self.num_keys, canonical_width=800.0, smoothness_lambda=5e-5)
+            if self.per_key_head
+            else None
+        )
 
         # Cache Tubelet conv sizes for token shape inference
         self._tube_k   = self.embed.proj.kernel_size[0]
@@ -651,83 +659,121 @@ class TiViTPiano(nn.Module):
         enc_tiles = rearrange(enc, 'b (m n) d -> b m n d', m=self.tiles)          # (B, tiles, T'*S', D)
         enc_5d    = rearrange(enc_tiles, 'b m (t s) d -> b m t s d', t=t_tokens)  # (B, tiles, T', S', D)
 
-        width_feat, width_coords_cpu, valid_mask_cpu = self._prepare_width_features(enc_5d)
+        width_feat: Optional[torch.Tensor] = None
+        width_coords_cpu: Optional[torch.Tensor] = None
+        valid_mask_cpu: Optional[torch.Tensor] = None
+        if self.per_key_head:
+            width_feat, width_coords_cpu, valid_mask_cpu = self._prepare_width_features(enc_5d)
 
         # ----- Frame mode: per-time features and time-distributed heads -----
         if getattr(self, "head_mode", "clip") == "frame":
-            keypool_reg: Optional[torch.Tensor] = None
             if width_feat is not None:
                 g_t = width_feat.mean(dim=2)
             else:
                 g_t = enc_5d.mean(dim=(1, 3))
 
-            key_features: Optional[torch.Tensor] = None
-            if width_feat is not None and width_coords_cpu is not None:
-                width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
-                valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
-                key_features, keypool_reg = self.key_pool(width_feat, width_coords, valid_mask=valid_mask)
-            else:
-                if not self._keypool_warned:
-                    LOGGER.warning("keypool: width grid unavailable; using global width average.")
-                    self._keypool_warned = True
+            if self.per_key_head:
+                keypool_reg: Optional[torch.Tensor] = None
+                key_features: Optional[torch.Tensor] = None
+                if (
+                    self.key_pool is not None
+                    and width_feat is not None
+                    and width_coords_cpu is not None
+                ):
+                    width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
+                    valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
+                    key_features, keypool_reg = self.key_pool(width_feat, width_coords, valid_mask=valid_mask)
+                else:
+                    if not self._keypool_warned:
+                        LOGGER.warning("keypool: width grid unavailable; using global width average.")
+                        self._keypool_warned = True
 
-            if key_features is not None:
-                frame_key_features = key_features
-            else:
-                frame_key_features = g_t.unsqueeze(2).expand(-1, -1, self.num_keys, -1).contiguous()
+                if key_features is not None:
+                    frame_key_features = key_features
+                else:
+                    frame_key_features = g_t.unsqueeze(2).expand(-1, -1, self.num_keys, -1).contiguous()
 
-            pitch_logits = self._apply_key_head(self.head_pitch, frame_key_features)
-            onset_logits = self._apply_key_head(self.head_onset, frame_key_features)
-            offset_logits = self._apply_key_head(self.head_offset, frame_key_features)
+                pitch_logits = self._apply_key_head(self.head_pitch, frame_key_features)
+                onset_logits = self._apply_key_head(self.head_onset, frame_key_features)
+                offset_logits = self._apply_key_head(self.head_offset, frame_key_features)
 
+                hand_logits = self.head_hand(g_t)
+                clef_logits = self.head_clef(g_t)
+
+                out = {
+                    "pitch_logits": pitch_logits,
+                    "onset_logits": onset_logits,
+                    "offset_logits": offset_logits,
+                    "hand_logits": hand_logits,
+                    "clef_logits": clef_logits,
+                }
+                if keypool_reg is not None:
+                    out["keypool_reg"] = keypool_reg
+                return out
+
+            pitch_logits = self.head_pitch(g_t)
+            onset_logits = self.head_onset(g_t)
+            offset_logits = self.head_offset(g_t)
             hand_logits = self.head_hand(g_t)
             clef_logits = self.head_clef(g_t)
-
-            out = {
+            return {
                 "pitch_logits": pitch_logits,
                 "onset_logits": onset_logits,
                 "offset_logits": offset_logits,
                 "hand_logits": hand_logits,
                 "clef_logits": clef_logits,
             }
-            if keypool_reg is not None:
-                out["keypool_reg"] = keypool_reg
-            return out
 
         # ----- Clip mode: global mean-pool over all tokens -----
-        keypool_reg: Optional[torch.Tensor] = None
         if width_feat is not None:
             g = width_feat.mean(dim=(1, 2))
         else:
             g = enc.mean(dim=1)
 
-        key_features_clip: Optional[torch.Tensor] = None
-        if width_feat is not None and width_coords_cpu is not None:
-            width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
-            valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
-            pooled_clip, keypool_reg = self.key_pool(width_feat.mean(dim=1, keepdim=True), width_coords, valid_mask=valid_mask)
-            key_features_clip = pooled_clip
-        else:
-            if not self._keypool_warned:
-                LOGGER.warning("keypool: width grid unavailable; using global width average.")
-                self._keypool_warned = True
+        if self.per_key_head:
+            keypool_reg: Optional[torch.Tensor] = None
+            key_features_clip: Optional[torch.Tensor] = None
+            if (
+                self.key_pool is not None
+                and width_feat is not None
+                and width_coords_cpu is not None
+            ):
+                width_coords = width_coords_cpu.to(device=width_feat.device, dtype=width_feat.dtype)
+                valid_mask = valid_mask_cpu.to(device=width_feat.device) if valid_mask_cpu is not None else None
+                pooled_clip, keypool_reg = self.key_pool(width_feat.mean(dim=1, keepdim=True), width_coords, valid_mask=valid_mask)
+                key_features_clip = pooled_clip
+            else:
+                if not self._keypool_warned:
+                    LOGGER.warning("keypool: width grid unavailable; using global width average.")
+                    self._keypool_warned = True
 
-        if key_features_clip is not None:
-            clip_key_features = key_features_clip
-        else:
-            clip_key_features = g.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.num_keys, -1).contiguous()
+            if key_features_clip is not None:
+                clip_key_features = key_features_clip
+            else:
+                clip_key_features = g.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.num_keys, -1).contiguous()
 
-        pitch_logits = self._apply_key_head(self.head_pitch, clip_key_features).squeeze(1)
-        onset_logits = self._apply_key_head(self.head_onset, clip_key_features).squeeze(1)
-        offset_logits = self._apply_key_head(self.head_offset, clip_key_features).squeeze(1)
+            pitch_logits = self._apply_key_head(self.head_pitch, clip_key_features).squeeze(1)
+            onset_logits = self._apply_key_head(self.head_onset, clip_key_features).squeeze(1)
+            offset_logits = self._apply_key_head(self.head_offset, clip_key_features).squeeze(1)
 
-        out = {
+            out = {
+                "pitch_logits": pitch_logits,
+                "onset_logits": onset_logits,
+                "offset_logits": offset_logits,
+                "hand_logits":   self.head_hand(g),
+                "clef_logits":   self.head_clef(g),
+            }
+            if keypool_reg is not None:
+                out["keypool_reg"] = keypool_reg
+            return out
+
+        pitch_logits = self.head_pitch(g)
+        onset_logits = self.head_onset(g)
+        offset_logits = self.head_offset(g)
+        return {
             "pitch_logits": pitch_logits,
             "onset_logits": onset_logits,
             "offset_logits": offset_logits,
             "hand_logits":   self.head_hand(g),
             "clef_logits":   self.head_clef(g),
         }
-        if keypool_reg is not None:
-            out["keypool_reg"] = keypool_reg
-        return out
