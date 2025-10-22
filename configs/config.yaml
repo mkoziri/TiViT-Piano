@@ -71,6 +71,7 @@ model:
   head_mode: frame
   tiles: 3
   input_channels: 3
+  per_key_head: true
   transformer:
     type: ViViT
     input_patch_size: 16
