@@ -76,8 +76,14 @@ class AVLagCache:
 
     def __init__(self, cache_path: Optional[Path] = None) -> None:
         project_root = Path(__file__).resolve().parents[2]
-        default_path = project_root / "runs" / "av_lags.json"
-        self.cache_path = Path(cache_path) if cache_path else default_path
+        default_path = project_root / "av_lags.json"
+        if cache_path is None:
+            resolved = default_path
+        else:
+            resolved = Path(cache_path)
+            if not resolved.is_absolute():
+                resolved = project_root / resolved
+        self.cache_path = resolved
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self._cache: Optional[Dict[str, float]] = None
         self._loaded = False

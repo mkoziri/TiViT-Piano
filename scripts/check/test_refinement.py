@@ -195,6 +195,7 @@ def inspect_cache(cache_path: Path, limit: int) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    project_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(
         description="Probe registration refinement and inspect cached homographies.",
     )
@@ -235,7 +236,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cache",
-        default="reg_refined.json",
+        default=str(project_root / "reg_refined.json"),
         help="Path to the registration refinement cache.",
     )
     parser.add_argument(
@@ -273,7 +274,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     else:
         logging.info("Probe complete: processed=%d clips in %.2fs", processed, elapsed)
 
-    inspect_cache(Path(args.cache), args.inspect)
+    project_root = Path(__file__).resolve().parents[2]
+    cache_path = Path(args.cache)
+    if not cache_path.is_absolute():
+        cache_path = project_root / cache_path
+    inspect_cache(cache_path, args.inspect)
     return 0
 
 

@@ -738,7 +738,14 @@ class RegistrationRefiner:
             raise ValueError("canonical_hw must provide (H, W)")
         self.canonical_hw: Tuple[int, int] = (int(canonical_hw[0]), int(canonical_hw[1]))
         self.sample_frames = int(max(sample_frames, 8))
-        self.cache_path = cache_path or Path("reg_refined.json")
+        project_root = Path(__file__).resolve().parents[2]
+        if cache_path is None:
+            resolved = project_root / "reg_refined.json"
+        else:
+            resolved = Path(cache_path)
+            if not resolved.is_absolute():
+                resolved = project_root / resolved
+        self.cache_path = resolved
         self.logger = logger or LOGGER
         self._cache: Dict[str, RegistrationResult] = {}
         self._load_cache()
