@@ -32,6 +32,8 @@ import torch
 from data import make_dataloader
 from utils import load_config
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _resolve_split(cfg: Mapping[str, Any], override: Optional[str]) -> str:
     if override:
@@ -235,7 +237,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cache",
-        default="reg_refined.json",
+        default=str(PROJECT_ROOT / "reg_refined.json"),
         help="Path to the registration refinement cache.",
     )
     parser.add_argument(

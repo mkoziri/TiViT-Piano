@@ -115,8 +115,8 @@ training:
     hand: 0.3
     clef: 0.3
   metrics:
-    prob_threshold: 0.45
-    prob_threshold_onset: 0.45
+    prob_threshold: 0.40
+    prob_threshold_onset: 0.40
     prob_threshold_offset: 0.40
     prob_temperature: 1.0
     prob_temperature_onset: 1.0

@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from .identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 try:
     import cv2  # type: ignore
@@ -738,7 +739,10 @@ class RegistrationRefiner:
             raise ValueError("canonical_hw must provide (H, W)")
         self.canonical_hw: Tuple[int, int] = (int(canonical_hw[0]), int(canonical_hw[1]))
         self.sample_frames = int(max(sample_frames, 8))
-        self.cache_path = cache_path or Path("reg_refined.json")
+        cache_candidate = Path(cache_path) if cache_path is not None else Path("reg_refined.json")
+        if not cache_candidate.is_absolute():
+            cache_candidate = PROJECT_ROOT / cache_candidate
+        self.cache_path = cache_candidate
         self.logger = logger or LOGGER
         self._cache: Dict[str, RegistrationResult] = {}
         self._load_cache()
