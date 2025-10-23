@@ -1193,11 +1193,16 @@ def main() -> int:
         if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
             k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
-        resuming = round_idx > 1 or args.mode == "resume"
+        ckpt = find_ckpt(ckpt_dir)
+        resume_requested = round_idx > 1 or args.mode == "resume"
+        resuming = bool(resume_requested and ckpt is not None)
         train_cfg["resume"] = resuming
+        current_epoch = 0
         if resuming:
             train_cfg["reset_head_bias"] = False
-            current_epoch = infer_current_epoch(ckpt_dir) if resuming else 0
+            current_epoch = infer_current_epoch(ckpt_dir)
+        elif resume_requested and ckpt is None:
+            print("[autopilot] resume requested but no checkpoint found; starting fresh")
         epochs_target = args.burst_epochs
         if resuming and current_epoch > 0:
             epochs_target = current_epoch + args.burst_epochs

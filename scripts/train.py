@@ -2109,7 +2109,7 @@ def main():
     # Try to resume from checkpoint
     resume_path = ckpt_dir / "tivit_best.pt"
     want_resume = bool(cfg.get("training", {}).get("resume", False))
-    if resume_path.exists():
+    if resume_path.exists() and want_resume:
         print(f"[resume] Loading from {resume_path}")
         logger.info("[resume] Loading from %s", resume_path)
         ckpt = torch.load(resume_path, map_location="cpu")
@@ -2123,6 +2123,12 @@ def main():
             # scheduler will be re-created fresh below
         start_epoch = int(ckpt.get("epoch", 0)) + 1
     else:
+        if resume_path.exists() and not want_resume:
+            print(f"[resume] Found checkpoint at {resume_path} but resume disabled; starting fresh")
+            logger.info("[resume] Found checkpoint at %s but resume disabled; starting fresh", resume_path)
+        if not resume_path.exists() and want_resume:
+            print(f"[resume] Requested resume but checkpoint missing at {resume_path}; starting fresh")
+            logger.info("[resume] Requested resume but checkpoint missing at %s; starting fresh", resume_path)
         # Fresh init → apply onset/offset bias if requested
         if cfg.get("training", {}).get("reset_head_bias", True):
             training_cfg = cfg.get("training", {})
