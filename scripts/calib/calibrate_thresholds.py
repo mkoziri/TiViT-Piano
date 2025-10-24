@@ -1,21 +1,38 @@
 #!/usr/bin/env python3
-"""Purpose:
-    Evaluate onset and offset predictions to determine calibrated logit or
-    probability thresholds, emit reliability diagnostics, and continuously write
-    partial results to ``calibration.json`` during long sweeps.
+"""Calibrate onset/offset thresholds for TiViT-Piano checkpoints.
+
+Purpose:
+    Evaluate model predictions to derive calibrated logits/probabilities,
+    compute reliability diagnostics, and persist partial results to
+    ``calibration.json`` so long sweeps can resume safely.
 
 Key Functions/Classes:
-    - _collect(): Runs the model across a dataloader to gather logits,
-      probabilities, and aligned targets while checkpointing partial metrics.
-    - _compute_metrics(): Sweeps thresholds to compute F1 scores, prediction
-      rates, expected calibration error, and Brier scores.
-    - main(): Command-line entry point that loads checkpoints, runs evaluation,
-      and writes calibration summaries.
+    - _collect: Run a model over a dataloader while checkpointing partial stats.
+    - _compute_metrics: Sweep thresholds to compute F1, prediction rates, ECE,
+      and Brier scores for onset/offset heads.
+    - main: CLI entry point handling checkpoint loading, evaluation, and report
+      emission.
 
-CLI:
-    Invoke ``python scripts/calib/calibrate_thresholds.py --ckpt <path> --split val``
-    with optional ``--max-clips``/``--frames`` overrides or ``--timeout-mins`` to
-    stop early while preserving partial statistics.
+CLI Arguments:
+    --ckpt PATH (default: checkpoints/tivit_best.pt)
+        Checkpoint file evaluated to produce calibration statistics.
+    --split {train,val,test} (default: config split)
+        Dataset split evaluated; falls back to dataset config when omitted.
+    --max-clips INT (default: None)
+        Override max clips evaluated; defaults to YAML configuration.
+    --frames INT (default: None)
+        Override frames per clip; defaults to YAML configuration.
+    --timeout-mins FLOAT (default: None)
+        Stop evaluation after the given minutes while keeping partial results.
+    --no-avlag (default: False)
+        Disable audio/video lag estimation before building frame targets.
+    --verbose {quiet,info,debug} (default: env or quiet)
+        Logging verbosity for the script and dependent modules.
+    --debug (default: False)
+        Run with single-process dataloading (num_workers=0) for quick iteration.
+
+Usage:
+    python scripts/calib/calibrate_thresholds.py --ckpt checkpoints/latest.pt --split val
 """
 
 import argparse

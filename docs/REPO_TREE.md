@@ -16,6 +16,8 @@ tivit/
 │  ├─ pianoyt_test.json
 │  ├─ pianoyt_train.json
 │  └─ pianoyt_val.json
+├─ runs
+│  └─ frame_targets
 ├─ scripts
 │  ├─ calib
 │  │  ├─ calibrate.py
@@ -38,6 +40,7 @@ tivit/
 │  │  ├─ test_key_prior.py
 │  │  ├─ test_labels.py
 │  │  ├─ test_loader.py
+│  │  ├─ test_refinement.py
 │  │  └─ test_synthetic_forward.py
 │  ├─ dev
 │  │  ├─ gen_file_index.py
@@ -69,7 +72,9 @@ tivit/
 │     ├─ frame_targets.py
 │     ├─ identifiers.py
 │     ├─ logging.py
+│     ├─ logging_utils.py
 │     ├─ pitch.py
+│     ├─ registration_refinement.py
 │     ├─ tiling.py
 │     └─ time_grid.py
 ├─ theory

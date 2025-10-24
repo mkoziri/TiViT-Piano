@@ -11,8 +11,8 @@ Key Functions/Classes:
       perform decoding, tiling, and pianoroll construction.
 
 CLI:
-    Not a standalone CLI.  The dataset is consumed by scripts like
-    :mod:`scripts.train`, :mod:`scripts.eval_thresholds`, and diagnostic tools.
+    Not a standalone CLI; consume via :mod:`scripts.train`, evaluation helpers,
+    or diagnostic notebooks.
 """
 
 import os

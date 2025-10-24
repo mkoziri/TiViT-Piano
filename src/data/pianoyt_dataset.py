@@ -13,8 +13,8 @@ Key Functions/Classes:
       event tensor used by downstream code (onset, offset, pitch).
 
 CLI:
-    Not a standalone CLI.  Use the loader via :mod:`scripts.train` or diagnostic
-    scripts that already depend on :func:`data.make_dataloader`.
+    Not a standalone CLI; access through :mod:`scripts.train` or diagnostic
+    scripts that rely on :func:`data.make_dataloader`.
 """
 
 from __future__ import annotations

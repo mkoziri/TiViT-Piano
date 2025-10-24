@@ -1,27 +1,71 @@
 #!/usr/bin/env python3
-"""Automated training/calibration driver for TiViT-Piano.
-""Purpose:
-    Cycle through repeated "train → calibrate → evaluate" rounds until the
-    event-level F1 target is met or patience runs out. The driver keeps
-    ``configs/config.yaml`` aligned with calibration outputs, mirrors helper
-    stdout to log files, and appends a tab-separated ledger of every round. It
-    can jump directly to calibration, skip the opening training burst, and fall
-    back to fast grid searches when thorough sweeps fail.
+"""Automated training and calibration driver for TiViT-Piano.
+
+Purpose:
+    Orchestrate repeated "train → calibrate → evaluate" rounds until the target
+    event-level F1 is achieved or patience expires. The script keeps
+    ``configs/config.yaml`` synchronized with calibration results, mirrors
+    helper stdout/stderr to logs, and records each round in a TSV ledger. It
+    can resume from an existing experiment, jump straight to calibration, or
+    fall back to coarse sweeps when thorough passes fail.
 
 Key Functions/Classes:
     - run_command: Execute helper scripts while teeing stdout/stderr to disk.
-    - run_calibration / run_fast_eval: Invoke calibration/eval helpers and
-      return parsed metrics.
-    - run_fast_grid_calibration: Perform a coarse sweep used for fast fallback
+    - run_calibration / run_fast_eval: Invoke calibration/evaluation helpers and
+      parse their metrics.
+    - run_fast_grid_calibration: Perform a coarse sweep for fallback
       calibration.
     - append_results: Persist round metadata to ``runs/auto/results.txt``.
-    - main: CLI entry point implementing the training/autocalibration loop.
+    - main: CLI entry point that drives the automation loop.
 
-CLI:
-    python scripts/train_autopilot.py --mode fresh --first_step train \
-        --burst_epochs 3 --first_calib thorough --fast_first_calib \
-        --results runs/auto/results.txt --ckpt_dir checkpoints \
-        --target_ev_f1 0.20
+CLI Arguments:
+    --mode {fresh,resume} (default: fresh)
+        Reset experiment naming and ledgers or resume existing state.
+    --burst_epochs INT (default: 4)
+        Training epochs per burst before running calibration.
+    --first_calib {thorough,fast} (default: thorough)
+        Calibration mode used for the first round.
+    --first_step {train,calib} (default: train)
+        Initial action when starting the automation loop.
+    --skip_train_round1 (default: False)
+        Skip the first training burst and start with calibration.
+    --fast_first_calib (default: False)
+        Force the first calibration to use the fast sweep parameters.
+    --target_ev_f1 FLOAT (default: 0.65)
+        Target event-level F1 score that terminates the loop when reached.
+    --target_metric {ev_f1_mean,onset_ev_f1,offset_ev_f1} (default: ev_f1_mean)
+        Metric field evaluated against ``--target_ev_f1``.
+    --max_rounds INT (default: 12)
+        Maximum number of train/calibrate rounds to execute.
+    --patience INT (default: 3)
+        Allowed number of non-improving rounds before aborting.
+    --results PATH (default: logs/auto/results.txt)
+        Ledger file that stores per-round results.
+    --ckpt_dir PATH (default: checkpoints)
+        Directory containing training checkpoints for calibration/eval.
+    --split_eval STR (default: val)
+        Dataset split evaluated during fast metrics checks.
+    --calib_max_clips INT (default: None)
+        Override the maximum clips seen during calibration (falls back to config).
+    --calib_frames INT (default: None)
+        Override the number of frames per clip when calibrating (falls back to config).
+    --temperature FLOAT (default: None)
+        Manually set calibration temperature instead of discovering it.
+    --bias FLOAT (default: None)
+        Manually set calibration bias instead of discovering it.
+    --stdout_dir PATH (default: logs/auto)
+        Directory where captured stdout/stderr transcripts are written.
+    --dataset_max_clips INT (default: None)
+        Override dataset max clips for both training and calibration runs.
+    --dry_run (default: False)
+        Print the planned actions but skip execution.
+    --verbose {quiet,info,debug} (default: env or quiet)
+        Logging verbosity for the autopilot and child processes.
+    --eval_extras STR (default: "")
+        Additional CLI tokens appended to ``eval_thresholds.py`` during fast evaluation.
+
+Usage:
+    python scripts/train_autopilot.py --mode fresh --first_step train --burst_epochs 3
 """
 
 from __future__ import annotations
