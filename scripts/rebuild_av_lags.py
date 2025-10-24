@@ -9,6 +9,7 @@ Purpose:
 Key Functions/Classes:
     - probe_video: Gather fps, frame count, and dimensions for a video path.
     - resolve_keyboard_bbox: Determine the keyboard ROI or fall back to full frame.
+    - compute_visual_curve_model: Derive a visual envelope from model onset logits.
     - main: CLI entry point orchestrating PianoYT iteration and cache updates.
 
 CLI Arguments:
@@ -30,17 +31,27 @@ CLI Arguments:
         Keyboard ROI mode: registration-aware boxes or full frame.
     --debug-bbox INT (default: 0)
         Print the resolved keyboard ROI for the first N videos when > 0.
+    --visual-source {motion,model} (default: motion)
+        Visual envelope source: motion energy or model onset logits.
+    --ckpt PATH (required when --visual-source=model)
+        Model checkpoint used to derive onset logits for the visual envelope.
+    --config PATH (default: configs/config.yaml)
+        Model configuration file used when loading checkpoints for envelopes.
     --refresh (default: False)
         Recompute and overwrite existing cache entries when set.
     --min-onsets INT (default: 1)
         Minimum note onsets required within a sampled window.
     --min-corr FLOAT (default: 0.25)
         Minimum correlation required before accepting the estimated lag.
+    --no-abs-corr (default: not set)
+        Use signed correlation for guardrails instead of absolute correlation.
     --max-runtime-s FLOAT (default: 3.0)
         Maximum runtime in seconds allocated to lag estimation per video.
+    --debug-curves INT (default: 0)
+        Print correlation diagnostics for the first N videos when > 0.
 
 Usage:
-    python scripts/rebuild_av_lags.py --split train --refresh --min-corr 0.3
+    python scripts/rebuild_av_lags.py --split train --visual-source model --ckpt checkpoints/tivit.pt
 """
 
 from __future__ import annotations
@@ -68,6 +79,8 @@ from data.pianoyt_dataset import (  # noqa: E402
     _read_split_ids,
     _resolve_media_paths,
 )
+from models import build_model  # noqa: E402
+from utils import load_config  # noqa: E402
 from utils.av_sync import AVLagCache, AVLagResult, compute_av_lag  # noqa: E402
 from utils.identifiers import canonical_video_id  # noqa: E402
 from utils.registration_refinement import RegistrationRefiner  # noqa: E402
@@ -298,6 +311,63 @@ def resolve_keyboard_bbox(
     return (x0, y0, x1, y1)
 
 
+def _resample_curve_np(curve: np.ndarray, target_len: int) -> np.ndarray:
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if curve.size == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if curve.size == target_len:
+        return curve.astype(np.float32, copy=False)
+    if curve.size == 1:
+        return np.full(target_len, float(curve[0]), dtype=np.float32)
+    src_idx = np.linspace(0.0, curve.size - 1, num=curve.size, dtype=np.float32)
+    dst_idx = np.linspace(0.0, curve.size - 1, num=target_len, dtype=np.float32)
+    resampled = np.interp(dst_idx, src_idx, curve.astype(np.float32, copy=False))
+    return resampled.astype(np.float32, copy=False)
+
+
+def compute_visual_curve_model(
+    clip: torch.Tensor,
+    model: torch.nn.Module,
+    device: torch.device,
+    *,
+    smooth_sigma: float = 1.5,
+) -> np.ndarray:
+    if clip.ndim != 4:
+        raise ValueError("Expected clip tensor with shape (T,C,H,W)")
+    clip_input = clip.unsqueeze(0).to(device)
+    with torch.no_grad():
+        outputs = model(clip_input)
+    onset_logits = None
+    if isinstance(outputs, dict):
+        if "onset_logits" in outputs:
+            onset_logits = outputs["onset_logits"]
+        elif "onset" in outputs:
+            onset_logits = outputs["onset"]
+    if onset_logits is None:
+        raise KeyError("Model output missing onset logits (keys: onset_logits/onset)")
+    logits = onset_logits.detach().to(torch.float32).cpu()
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    elif logits.dim() == 2:
+        pass
+    else:
+        raise ValueError(f"Unexpected onset logits shape: {tuple(logits.shape)}")
+    if logits.dim() != 2:
+        raise ValueError(f"Unable to reduce logits with shape {tuple(logits.shape)}")
+    positive = torch.relu(logits)
+    envelope = positive.sum(dim=-1).numpy()
+    if smooth_sigma and smooth_sigma > 0:
+        radius = max(1, int(round(3.0 * smooth_sigma)))
+        grid = np.arange(-radius, radius + 1, dtype=np.float32)
+        kernel = np.exp(-0.5 * (grid / float(smooth_sigma)) ** 2)
+        kernel_sum = float(kernel.sum())
+        if kernel_sum > 0:
+            kernel /= kernel_sum
+            envelope = np.convolve(envelope, kernel, mode="same")
+    return envelope.astype(np.float32, copy=False)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rebuild PianoYT per-video A/V lag cache.")
     parser.add_argument("--split", required=True, choices=("train", "val", "test"), help="Dataset split to process.")
@@ -318,6 +388,35 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Print the resolved keyboard ROI for the first N videos when > 0 (default: 0).",
+    )
+    parser.add_argument(
+        "--visual-source",
+        choices=("motion", "model"),
+        default="motion",
+        help="Visual envelope source: 'motion' uses motion energy (default), 'model' uses onset logits.",
+    )
+    parser.add_argument(
+        "--ckpt",
+        default=None,
+        help="Model checkpoint path (required when --visual-source=model).",
+    )
+    parser.add_argument(
+        "--config",
+        default="configs/config.yaml",
+        help="Model configuration YAML used when --visual-source=model (default: configs/config.yaml).",
+    )
+    parser.add_argument(
+        "--no-abs-corr",
+        dest="use_abs_corr",
+        action="store_false",
+        help="Use signed correlation for guardrails instead of absolute correlation.",
+    )
+    parser.set_defaults(use_abs_corr=True)
+    parser.add_argument(
+        "--debug-curves",
+        type=int,
+        default=0,
+        help="Print correlation diagnostics for the first N videos when > 0 (default: 0).",
     )
     parser.add_argument("--refresh", action="store_true", help="Overwrite existing cache entries.")
     parser.add_argument("--min-onsets", type=int, default=1, help="Minimum onsets per window (default: 1).")
@@ -363,9 +462,32 @@ def main() -> None:
     tries = max(1, int(args.tries_per_video))
     search_ms = max(1, int(args.search_ms))
     max_runtime_s = float(args.max_runtime_s) if args.max_runtime_s is not None else 3.0
+    debug_curves_limit = max(0, int(getattr(args, "debug_curves", 0) or 0))
+    debug_curves_count = 0
 
     cache_path = Path("av_lags.json")
     reg_cache_path = Path("reg_refined.json")
+
+    if args.visual_source == "model" and not args.ckpt:
+        raise SystemExit("--ckpt is required when --visual-source=model")
+
+    model_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    visual_model: Optional[torch.nn.Module]
+    if args.visual_source == "model":
+        config_path = Path(args.config).expanduser()
+        if not config_path.exists():
+            raise SystemExit(f"Model config not found: {config_path}")
+        cfg = load_config(config_path)
+        visual_model = build_model(cfg).to(model_device)
+        ckpt_path = Path(args.ckpt).expanduser()
+        if not ckpt_path.exists():
+            raise SystemExit(f"Checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(str(ckpt_path), map_location=model_device)
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        visual_model.load_state_dict(state_dict, strict=False)
+        visual_model.eval()
+    else:
+        visual_model = None
 
     print(f"[setup] split={split} cache={cache_path} refresh={args.refresh}")
 
@@ -442,11 +564,6 @@ def main() -> None:
             min_onsets=min_onsets,
         )
         start_sec = max(0.0, min(start_sec, max(0.0, info.duration - clip_duration)))
-        clip_start = start_sec
-        clip_end = clip_start + clip_duration
-        if info.duration > 0:
-            clip_end = min(info.duration, clip_end)
-
         preferred_start_idx = int(round(start_sec * fps_eff))
         try:
             clip, start_idx = _load_clip_with_random_start(
@@ -480,13 +597,29 @@ def main() -> None:
         except Exception as exc:
             print(f"[warn] registration failed for {canon_id}: {exc}")
 
-        clip = clip.contiguous()
+        clip = clip.contiguous().cpu()
 
         start_idx = int(start_idx)
         clip_start = float(frame_to_sec(start_idx, 1.0 / fps_eff))
         clip_end = float(frame_to_sec(start_idx + clip_span_frames, 1.0 / fps_eff))
         if info.duration > 0:
             clip_end = min(info.duration, clip_end)
+
+        visual_curve: Optional[np.ndarray] = None
+        if args.visual_source == "model" and visual_model is not None:
+            try:
+                raw_curve = compute_visual_curve_model(clip, visual_model, model_device)
+                visual_curve = _resample_curve_np(raw_curve, clip.shape[0])
+            except Exception as exc:
+                print(f"[warn] model envelope failed for {canon_id}: {exc}; falling back to motion envelope")
+                visual_curve = None
+
+        if labels.numel() > 0:
+            mask = (labels[:, 1] > clip_start) & (labels[:, 0] >= clip_start) & (labels[:, 0] < clip_end)
+            window_labels = labels[mask].clone()
+        else:
+            window_labels = torch.zeros((0, 3), dtype=labels.dtype if torch.is_tensor(labels) else torch.float32)
+        num_events_window = int(window_labels.shape[0])
 
         bbox_arg: Optional[Sequence[int]] = None
         if args.keyboard_bbox == "reg":
@@ -511,7 +644,8 @@ def main() -> None:
                 video_id=canon_id,
                 frames=clip,
                 fps=fps_eff,
-                events=labels,
+                hop_seconds=hop_seconds,
+                events=window_labels,
                 clip_start=clip_start,
                 clip_end=clip_end,
                 cache=cache,
@@ -519,6 +653,8 @@ def main() -> None:
                 keyboard_bbox=bbox_arg,
                 max_runtime_s=max_runtime_s,
                 min_corr=float(args.min_corr),
+                visual_curve=visual_curve,
+                use_abs_corr=bool(args.use_abs_corr),
             )
         except Exception as exc:
             print(f"[warn] estimator raised for {canon_id}: {exc}")
@@ -546,6 +682,15 @@ def main() -> None:
             bbox_text = f"x0={x0} y0={y0} x1={x1} y1={y1}"
         else:
             bbox_text = "full"
+        if debug_curves_limit > 0 and debug_curves_count < debug_curves_limit:
+            hit_boundary = getattr(result, "hit_bound", False) if result is not None else False
+            corr_value = float(corr) if math.isfinite(corr) else float("nan")
+            print(
+                f"[curve] {canon_id} events={num_events_window} T={clip.shape[0]} "
+                f"hop={hop_seconds:.4f} corr={corr_value:+.3f} lag_ms={lag_ms:+6.1f} "
+                f"hit_boundary={hit_boundary}"
+            )
+            debug_curves_count += 1
         print(
             f"[lag] {canon_id:<20} lag_ms={lag_ms:+6.1f} corr={corr_text} "
             f"bbox={bbox_text} flags={flag_text}"

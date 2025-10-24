@@ -326,6 +326,19 @@ def _resample_to_length(values: Optional[np.ndarray], target_len: int) -> Option
     return resampled.astype(np.float32, copy=False)
 
 
+def _zscore_series(values: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    if values.size == 0:
+        return None
+    mean = float(np.mean(values))
+    std = float(np.std(values))
+    if std <= 1e-6:
+        return None
+    normalized = (values - mean) / std
+    return normalized.astype(np.float32, copy=False)
+
+
 def _corr_at_lag(video_env: np.ndarray, audio_env: np.ndarray, lag: int) -> float:
     if video_env is None or audio_env is None:
         return float("nan")
@@ -416,6 +429,7 @@ def _apply_guardrails(
     corr: float,
     hit_bound: bool,
     min_corr: float = _LOW_CORR_THRESHOLD,
+    use_abs_corr: bool = True,
 ) -> Tuple[int, float, Set[str]]:
     video_id = canonical_video_id(video_id)
     selected_ms = float(raw_lag_ms)
@@ -427,6 +441,7 @@ def _apply_guardrails(
         corr_threshold = _LOW_CORR_THRESHOLD
     corr_threshold = min(max(corr_threshold, 0.0), 1.0)
     borderline_threshold = max(corr_threshold, _BORDERLINE_CORR_THRESHOLD)
+    corr_eval = abs(corr) if use_abs_corr else corr
 
     if hit_bound:
         flags.add("hit_bound")
@@ -437,10 +452,10 @@ def _apply_guardrails(
             selected_ms = 0.0
 
     if math.isfinite(corr):
-        if corr < corr_threshold:
+        if corr_eval < corr_threshold:
             selected_ms = 0.0
             flags.add("low_corr_zero")
-        elif corr < borderline_threshold and "used_video_median" not in flags:
+        elif corr_eval < borderline_threshold and "used_video_median" not in flags:
             if video_median_ms is not None:
                 selected_ms = video_median_ms
                 flags.add("used_video_median")
@@ -451,7 +466,7 @@ def _apply_guardrails(
     if (
         math.isfinite(corr)
         and abs(selected_ms) > _CLAMP_LIMIT_MS
-        and corr < _HIGH_CONFIDENCE_CORR
+        and corr_eval < _HIGH_CONFIDENCE_CORR
     ):
         selected_ms = math.copysign(_CLAMP_LIMIT_MS, selected_ms)
         flags.add("clamped")
@@ -480,6 +495,8 @@ def compute_av_lag(
     keyboard_bbox: Optional[Sequence[int]] = None,
     max_runtime_s: float = _MAX_RUNTIME_S,
     min_corr: Optional[float] = None,
+    visual_curve: Optional[np.ndarray] = None,
+    use_abs_corr: bool = False,
 ) -> AVLagResult:
     canon_id = canonical_video_id(video_id)
     start_time = time.perf_counter()
@@ -519,9 +536,21 @@ def compute_av_lag(
         min_corr_value = _LOW_CORR_THRESHOLD
     min_corr_value = min(max(min_corr_value, 0.0), 1.0)
 
-    video_env = _motion_envelope(frames, keyboard_bbox)
+    if visual_curve is not None:
+        if isinstance(visual_curve, np.ndarray):
+            video_env = visual_curve.astype(np.float32, copy=False)
+        else:
+            video_env = np.asarray(visual_curve, dtype=np.float32)
+        video_env = video_env.reshape(-1)
+    else:
+        video_env = _motion_envelope(frames, keyboard_bbox)
+
     audio_env = _label_envelope(events, clip_start, clip_end, hop_seconds, T)
+
     video_env = _resample_to_length(video_env, T)
+    if visual_curve is not None:
+        video_env = _zscore_series(video_env)
+
     audio_env = _resample_to_length(audio_env, T)
     if video_env is None or audio_env is None:
         runtime_s = time.perf_counter() - start_time
@@ -551,6 +580,7 @@ def compute_av_lag(
                 corr=corr,
                 hit_bound=False,
                 min_corr=min_corr_value,
+                use_abs_corr=use_abs_corr,
             )
             if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
                 lag_frames = int(math.copysign(window_frames_cap, lag_frames))
@@ -587,7 +617,8 @@ def compute_av_lag(
                     corr = float("nan")
                     lag_frames_raw = 0
         else:
-            best_corr = float("-inf")
+            best_corr = float("nan")
+            best_score = float("-inf")
             best_lag = 0
             _BOUND_TRACKER["total"] += 1
             for lag in range(-max_lag_frames, max_lag_frames + 1):
@@ -597,13 +628,15 @@ def compute_av_lag(
                 candidate_corr = _corr_at_lag(video_env, audio_env, lag)
                 if not math.isfinite(candidate_corr):
                     continue
-                if candidate_corr > best_corr:
+                candidate_score = abs(candidate_corr) if use_abs_corr else candidate_corr
+                if candidate_score > best_score:
+                    best_score = candidate_score
                     best_corr = candidate_corr
                     best_lag = lag
             if timed_out:
                 corr = float("nan")
                 lag_frames_raw = 0
-            elif not math.isfinite(best_corr) or best_corr == float("-inf"):
+            elif not math.isfinite(best_corr) or best_score == float("-inf"):
                 corr = float("nan")
                 lag_frames_raw = 0
             else:
@@ -622,6 +655,7 @@ def compute_av_lag(
                 corr=corr,
                 hit_bound=hit_bound,
                 min_corr=min_corr_value,
+                use_abs_corr=use_abs_corr,
             )
             if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
                 lag_frames = int(math.copysign(window_frames_cap, lag_frames))

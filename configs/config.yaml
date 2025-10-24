@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_preT3_baseline_test3
+  name: TiViT-Piano_PianoYT_preT3_baseline_AVlag_rebuild
   seed: 1332
   output_dir: outputs
 dataset:
