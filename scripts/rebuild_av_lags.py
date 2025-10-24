@@ -110,8 +110,14 @@ def probe_video(path: Path) -> VideoInfo:
             duration = length / fps if fps > 0 else 0.0
             height = width = 0
             if length > 0:
-                sample = vr[0].asnumpy()
-                height, width = int(sample.shape[0]), int(sample.shape[1])
+                sample = vr[0]
+                if hasattr(sample, "asnumpy"):
+                    sample_arr = sample.asnumpy()
+                elif isinstance(sample, torch.Tensor):
+                    sample_arr = sample.detach().cpu().numpy()
+                else:
+                    sample_arr = np.asarray(sample)
+                height, width = int(sample_arr.shape[0]), int(sample_arr.shape[1])
             return VideoInfo(fps=fps, num_frames=length, duration=duration, height=height, width=width)
 
     cv2 = _safe_import_cv2()
@@ -148,7 +154,14 @@ def _decode_with_decord(
         for t in times
     ]
     batch = vr.get_batch(idxs)  # T,H,W,C
-    tensor = batch.to(torch.float32) / 255.0  # type: ignore[operator]
+    if isinstance(batch, torch.Tensor):
+        tensor = batch.to(dtype=torch.float32, device="cpu") / 255.0
+    else:
+        if hasattr(batch, "asnumpy"):
+            batch_np = batch.asnumpy()
+        else:
+            batch_np = np.asarray(batch)
+        tensor = torch.from_numpy(batch_np).to(torch.float32) / 255.0
     if tensor.shape[0] < frames:
         pad = tensor[-1:].repeat(frames - tensor.shape[0], 1, 1, 1)
         tensor = torch.cat([tensor, pad], dim=0)
