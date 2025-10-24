@@ -11,13 +11,13 @@ Key Functions/Classes:
     - decode_window: Decode a fixed-length frame window via decord/OpenCV.
     - main: CLI entry point orchestrating PianoYT iteration and cache updates.
 
-CLI:
+CLI Arguments:
     --split {train,val,test} (required)
-        Dataset split to process; no default.
+        Dataset split to process; no default provided.
     --root PATH (default: auto resolved by PianoYT helpers)
-        Override PianoYT root directory.
+        Override PianoYT root directory resolution.
     --max-videos INT (default: 500)
-        Limit the number of videos processed for the run.
+        Limit the number of videos processed during the run.
     --tries-per-video INT (default: 4)
         Candidate windows evaluated per video to avoid quiet spans.
     --frames INT (default: 96)
@@ -29,11 +29,16 @@ CLI:
     --keyboard-bbox {reg,full} (default: reg)
         Keyboard ROI mode: registration-aware boxes or full frame.
     --refresh (default: False)
-        Recompute and overwrite existing cache entries.
+        Recompute and overwrite existing cache entries when set.
     --min-onsets INT (default: 1)
         Minimum note onsets required within a sampled window.
+    --min-corr FLOAT (default: 0.25)
+        Minimum correlation required before accepting the estimated lag.
     --max-runtime-s FLOAT (default: 3.0)
         Maximum runtime in seconds allocated to lag estimation per video.
+
+Usage:
+    python scripts/rebuild_av_lags.py --split train --refresh --min-corr 0.3
 """
 
 from __future__ import annotations
@@ -391,6 +396,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh", action="store_true", help="Overwrite existing cache entries.")
     parser.add_argument("--min-onsets", type=int, default=1, help="Minimum onsets per window (default: 1).")
     parser.add_argument(
+        "--min-corr",
+        type=float,
+        default=0.25,
+        help="Minimum correlation required before preserving a lag estimate (default: 0.25).",
+    )
+    parser.add_argument(
         "--max-runtime-s",
         type=float,
         default=3.0,
@@ -555,6 +566,7 @@ def main() -> None:
                 window_ms=float(search_ms),
                 keyboard_bbox=bbox_arg,
                 max_runtime_s=max_runtime_s,
+                min_corr=float(args.min_corr),
             )
         except Exception as exc:
             print(f"[warn] estimator raised for {canon_id}: {exc}")

@@ -415,11 +415,18 @@ def _apply_guardrails(
     raw_lag_ms: float,
     corr: float,
     hit_bound: bool,
+    min_corr: float = _LOW_CORR_THRESHOLD,
 ) -> Tuple[int, float, Set[str]]:
     video_id = canonical_video_id(video_id)
     selected_ms = float(raw_lag_ms)
     video_median_ms = _get_video_median(video_id)
     flags: Set[str] = set()
+
+    corr_threshold = float(min_corr)
+    if not math.isfinite(corr_threshold):
+        corr_threshold = _LOW_CORR_THRESHOLD
+    corr_threshold = min(max(corr_threshold, 0.0), 1.0)
+    borderline_threshold = max(corr_threshold, _BORDERLINE_CORR_THRESHOLD)
 
     if hit_bound:
         flags.add("hit_bound")
@@ -430,10 +437,10 @@ def _apply_guardrails(
             selected_ms = 0.0
 
     if math.isfinite(corr):
-        if corr < _LOW_CORR_THRESHOLD:
+        if corr < corr_threshold:
             selected_ms = 0.0
             flags.add("low_corr_zero")
-        elif corr < _BORDERLINE_CORR_THRESHOLD and "used_video_median" not in flags:
+        elif corr < borderline_threshold and "used_video_median" not in flags:
             if video_median_ms is not None:
                 selected_ms = video_median_ms
                 flags.add("used_video_median")
@@ -472,6 +479,7 @@ def compute_av_lag(
     window_ms: float = _DEFAULT_WINDOW_MS,
     keyboard_bbox: Optional[Sequence[int]] = None,
     max_runtime_s: float = _MAX_RUNTIME_S,
+    min_corr: Optional[float] = None,
 ) -> AVLagResult:
     canon_id = canonical_video_id(video_id)
     start_time = time.perf_counter()
@@ -506,6 +514,11 @@ def compute_av_lag(
     if clip_end is None:
         clip_end = clip_start + max(T - 1, 0) * hop_seconds
 
+    min_corr_value = _LOW_CORR_THRESHOLD if min_corr is None else float(min_corr)
+    if not math.isfinite(min_corr_value):
+        min_corr_value = _LOW_CORR_THRESHOLD
+    min_corr_value = min(max(min_corr_value, 0.0), 1.0)
+
     video_env = _motion_envelope(frames, keyboard_bbox)
     audio_env = _label_envelope(events, clip_start, clip_end, hop_seconds, T)
     video_env = _resample_to_length(video_env, T)
@@ -537,6 +550,7 @@ def compute_av_lag(
                 raw_lag_ms=raw_lag_ms,
                 corr=corr,
                 hit_bound=False,
+                min_corr=min_corr_value,
             )
             if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
                 lag_frames = int(math.copysign(window_frames_cap, lag_frames))
@@ -607,6 +621,7 @@ def compute_av_lag(
                 raw_lag_ms=raw_lag_ms,
                 corr=corr,
                 hit_bound=hit_bound,
+                min_corr=min_corr_value,
             )
             if window_frames_cap > 0 and abs(lag_frames) > window_frames_cap:
                 lag_frames = int(math.copysign(window_frames_cap, lag_frames))
