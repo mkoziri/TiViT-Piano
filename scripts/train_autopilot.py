@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -322,6 +323,7 @@ def run_fast_eval(
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
     verbose: Optional[str] = None,
+    eval_extras: Optional[Iterable[str]] = None,
 ) -> Tuple[int, List[str]]:
     log_path = log_dir / "eval_fast.txt"
     cmd = [
@@ -346,6 +348,8 @@ def run_fast_eval(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    if eval_extras:
+        cmd.extend(list(eval_extras))
     cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
@@ -873,6 +877,7 @@ def perform_calibration(
             temperature=args.temperature,
             bias=args.bias,
             verbose=args.verbose,
+            eval_extras=args.eval_extras_tokens,
         )
         if eval_ret != 0:
             return None, eval_ret
@@ -1109,8 +1114,19 @@ def main() -> int:
         choices=["quiet", "info", "debug"],
         help="Logging verbosity for autopilot and child runs (default: quiet or $TIVIT_VERBOSE)",
     )
+    ap.add_argument(
+        "--eval_extras",
+        type=str,
+        default="",
+        help="Extra CLI arguments appended to eval_thresholds.py during fast evaluation",
+    )
     args = ap.parse_args()
     args.verbose = configure_verbosity(args.verbose)
+    try:
+        args.eval_extras_tokens = shlex.split(args.eval_extras) if args.eval_extras else []
+    except ValueError as exc:
+        print(f"error: could not parse --eval_extras: {exc}", file=sys.stderr)
+        return 1
     patience_budget = max(args.patience, 0)
 
     target_metric_field = TARGET_METRIC_FIELDS[args.target_metric]

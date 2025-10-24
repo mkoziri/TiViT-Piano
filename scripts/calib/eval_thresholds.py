@@ -195,6 +195,103 @@ def _pool_roll_BT(x_btP: torch.Tensor, Tprime: int) -> torch.Tensor:
     x = x_btP.permute(0, 2, 1)  # (B,P,T)
     x = F.adaptive_max_pool1d(x, Tprime)  # (B,P,T')
     return x.permute(0, 2, 1).contiguous()  # (B,T',P)
+
+
+def _median_filter_time(clip_probs: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Apply a 1D median filter along the time axis of a (T,P) pianoroll."""
+
+    if kernel_size <= 1:
+        return clip_probs
+    if clip_probs.ndim != 2:
+        raise ValueError(f"median filter expects 2D tensor, got {clip_probs.ndim}D")
+    pad = kernel_size // 2
+    # Operate in (P,T) space so padding replicates edge values per key.
+    probs_PT = clip_probs.transpose(0, 1)  # (P,T)
+    padded = F.pad(probs_PT.unsqueeze(1), (pad, pad), mode="replicate").squeeze(1)
+    windows = padded.unfold(-1, kernel_size, 1)  # (P,T,kernel)
+    filtered = windows.median(dim=-1).values  # (P,T)
+    return filtered.transpose(0, 1).contiguous()
+
+
+def decode_hysteresis(
+    probs: torch.Tensor,
+    high_thr: float,
+    low_ratio: float,
+    min_on: int,
+    min_off: int,
+    gap_merge: int,
+    median: int,
+) -> torch.Tensor:
+    """Decode per-key probabilities with hysteresis and simple duration rules."""
+
+    if probs.ndim not in (2, 3):
+        raise ValueError(f"Expected probs with 2 or 3 dims, got {probs.ndim}")
+    high_thr = float(high_thr)
+    low_thr = high_thr * float(low_ratio)
+    min_on = max(0, int(min_on))
+    min_off = max(0, int(min_off))
+    gap_merge = int(gap_merge)
+    if probs.numel() == 0:
+        return torch.zeros_like(probs, dtype=torch.bool)
+
+    def _decode_clip(clip_probs: torch.Tensor) -> torch.Tensor:
+        if median > 1:
+            processed = _median_filter_time(clip_probs, median)
+        else:
+            processed = clip_probs
+        T, P = processed.shape
+        mask = torch.zeros((T, P), dtype=torch.bool, device=clip_probs.device)
+        for pitch in range(P):
+            seq = processed[:, pitch]
+            vals = seq.tolist()
+            segments = []
+            state = False
+            start_idx = 0
+            for t, raw_val in enumerate(vals):
+                val = float(raw_val) if math.isfinite(raw_val) else 0.0
+                if not state:
+                    if val >= high_thr:
+                        state = True
+                        start_idx = t
+                else:
+                    if val < low_thr:
+                        segments.append([start_idx, t])
+                        state = False
+            if state:
+                segments.append([start_idx, T])
+            if not segments:
+                continue
+            merged = []
+            for seg_start, seg_end in segments:
+                if not merged:
+                    merged.append([seg_start, seg_end])
+                    continue
+                prev_start, prev_end = merged[-1]
+                gap = seg_start - prev_end
+                should_merge = False
+                if gap_merge >= 0 and gap <= gap_merge:
+                    should_merge = True
+                if min_off > 0 and gap < min_off:
+                    should_merge = True
+                if should_merge:
+                    merged[-1][1] = seg_end
+                else:
+                    merged.append([seg_start, seg_end])
+            for seg_start, seg_end in merged:
+                if seg_end - seg_start < min_on:
+                    continue
+                mask[seg_start:seg_end, pitch] = True
+        return mask
+
+    if probs.ndim == 2:
+        return _decode_clip(probs)
+
+    batches = []
+    for clip_probs in probs:
+        batches.append(_decode_clip(clip_probs))
+    if not batches:
+        return torch.zeros_like(probs, dtype=torch.bool)
+    return torch.stack(batches, dim=0)
     
 def main():
     import argparse
@@ -293,6 +390,42 @@ def main():
         type=str,
         help="Optional file path to tee progress logs",
     )
+    ap.add_argument(
+        "--decoder",
+        choices=["none", "hysteresis"],
+        default="none",
+        help="Temporal decoder applied during evaluation (default: none)",
+    )
+    ap.add_argument(
+        "--low_ratio",
+        type=float,
+        default=0.6,
+        help="Multiplier to derive the low hysteresis threshold (default: 0.6)",
+    )
+    ap.add_argument(
+        "--min_on",
+        type=int,
+        default=2,
+        help="Drop predicted on-segments shorter than this many frames (default: 2)",
+    )
+    ap.add_argument(
+        "--min_off",
+        type=int,
+        default=2,
+        help="Merge gaps shorter than this many frames between ons (default: 2)",
+    )
+    ap.add_argument(
+        "--gap_merge",
+        type=int,
+        default=1,
+        help="Merge on-segments separated by gaps <= this many frames (default: 1)",
+    )
+    ap.add_argument(
+        "--median",
+        type=int,
+        default=3,
+        help="Odd window size for optional time-axis median smoothing (default: 3)",
+    )
     args = ap.parse_args(argv)
     args.verbose = configure_verbosity(args.verbose)
     debug_mode = args.verbose == "debug"
@@ -348,6 +481,22 @@ def main():
                 file=sys.stderr,
             )
             return
+
+    if args.low_ratio < 0.0:
+        print("error: --low_ratio must be non-negative", file=sys.stderr)
+        return
+    if args.min_on < 0:
+        print("error: --min_on must be >= 0", file=sys.stderr)
+        return
+    if args.min_off < 0:
+        print("error: --min_off must be >= 0", file=sys.stderr)
+        return
+    if args.gap_merge < 0:
+        print("error: --gap_merge must be >= 0", file=sys.stderr)
+        return
+    if args.median < 1 or args.median % 2 == 0:
+        print("error: --median must be an odd integer >= 1", file=sys.stderr)
+        return
 
     onset_probs_final = list(args.prob_thresholds) if args.prob_thresholds is not None else []
     offset_probs_final = list(args.offset_prob_thresholds) if args.offset_prob_thresholds is not None else []
@@ -1042,11 +1191,61 @@ def main():
     # that the positive rate varies smoothly with the threshold.
     onset_true_bin = (onset_tgts > 0).float()
     offset_true_bin = (offset_tgts > 0).float()
-    
+
+    decoder_kind = args.decoder
+    decoder_params = {
+        "low_ratio": args.low_ratio,
+        "min_on": args.min_on,
+        "min_off": args.min_off,
+        "gap_merge": args.gap_merge,
+        "median": args.median,
+    }
+    decoder_notice_printed = False
+    decoder_logits_warned = False
+
     def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None):
+        nonlocal decoder_notice_printed, decoder_logits_warned
         if k_onset is None:
             k_onset = default_k_onset
-        if use_logits:
+        if decoder_kind == "hysteresis" and not use_logits:
+            if not decoder_notice_printed:
+                print(
+                    "[decoder] hysteresis "
+                    f"low_ratio={decoder_params['low_ratio']:.2f} "
+                    f"min_on={decoder_params['min_on']} "
+                    f"min_off={decoder_params['min_off']} "
+                    f"gap_merge={decoder_params['gap_merge']} "
+                    f"median={decoder_params['median']}",
+                    flush=True,
+                )
+                decoder_notice_printed = True
+            onset_pred_mask = decode_hysteresis(
+                onset_probs,
+                on_thr,
+                decoder_params["low_ratio"],
+                decoder_params["min_on"],
+                decoder_params["min_off"],
+                decoder_params["gap_merge"],
+                decoder_params["median"],
+            )
+            offset_pred_mask = decode_hysteresis(
+                offset_probs,
+                off_thr,
+                decoder_params["low_ratio"],
+                decoder_params["min_on"],
+                decoder_params["min_off"],
+                decoder_params["gap_merge"],
+                decoder_params["median"],
+            )
+            onset_pred_bin = onset_pred_mask.to(onset_probs.dtype)
+            offset_pred_bin = offset_pred_mask.to(offset_probs.dtype)
+        elif use_logits:
+            if decoder_kind == "hysteresis" and not decoder_logits_warned:
+                LOGGER.warning(
+                    "Hysteresis decoder requires probability thresholds; falling back to simple logit thresholding.",
+                    extra=QUIET_EXTRA,
+                )
+                decoder_logits_warned = True
             onset_pred_bin = (onset_logits >= on_thr).float()
             offset_pred_bin = (offset_logits >= off_thr).float()
         else:
