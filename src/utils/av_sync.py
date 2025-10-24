@@ -274,7 +274,7 @@ def _motion_envelope(
     return _normalize_series(env)
 
 
-def _label_envelope(labels: torch.Tensor,
+def _label_envelope(labels: Optional[torch.Tensor],
                     clip_start: float,
                     clip_end: float,
                     hop_seconds: float,
