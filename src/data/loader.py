@@ -11,7 +11,7 @@ Key Functions/Classes:
 
 from __future__ import annotations
 
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Mapping, MutableMapping, Optional
 
 _PIPELINE_WARNING_EMITTED = False
 _PIPELINE_KEY = "pipeline_" + "v2"
@@ -37,7 +37,13 @@ def _consume_pipeline_flag(dataset_cfg: Mapping[str, Any]) -> None:
         _PIPELINE_WARNING_EMITTED = True
 
 
-def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
+def make_dataloader(
+    cfg: Mapping[str, Any],
+    split: str,
+    drop_last: bool = False,
+    *,
+    seed: Optional[int] = None,
+):
     dataset_cfg = cfg.get("dataset", {})
     _consume_pipeline_flag(dataset_cfg)
     name = str(dataset_cfg.get("name", "OMAPS")).lower()
@@ -49,7 +55,7 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     else:
         raise ValueError(f"Unsupported dataset name: {dataset_cfg.get('name')}")
 
-    return dataset_mod.make_dataloader(cfg, split, drop_last)
+    return dataset_mod.make_dataloader(cfg, split, drop_last, seed=seed)
 
 
 __all__ = ["make_dataloader"]

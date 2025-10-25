@@ -59,6 +59,10 @@ CLI Arguments:
         Override dataset max clips for both training and calibration runs.
     --dry_run (default: False)
         Print the planned actions but skip execution.
+    --seed INT (default: config or 1337)
+        Forwarded seed for child training/calibration/eval scripts.
+    --deterministic / --no-deterministic
+        Toggle deterministic PyTorch backends for child processes.
     --verbose {quiet,info,debug} (default: env or quiet)
         Logging verbosity for the autopilot and child processes.
     --eval_extras STR (default: "")
@@ -114,6 +118,7 @@ TARGET_METRIC_FIELDS = {
 
 sys.path.insert(0, str(REPO / "src"))
 from utils.logging_utils import QUIET_INFO_FLAG, configure_verbosity
+from utils.determinism import resolve_deterministic_flag, resolve_seed
 
 LOGGER = logging.getLogger("autopilot")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
@@ -191,6 +196,21 @@ def _with_verbose(cmd: Iterable[str], verbose: Optional[str]) -> List[str]:
         return result
     result.extend(["--verbose", verbose])
     return result
+
+
+def _append_determinism_flags(
+    cmd: List[str],
+    *,
+    seed: Optional[int],
+    deterministic: Optional[bool],
+) -> List[str]:
+    if seed is not None:
+        cmd.extend(["--seed", str(int(seed))])
+    if deterministic is True:
+        cmd.append("--deterministic")
+    elif deterministic is False:
+        cmd.append("--no-deterministic")
+    return cmd
 
 
 def run_command(
@@ -292,11 +312,14 @@ def run_calibration(
     frames: Optional[int],
     *,
     verbose: Optional[str] = None,
+    seed: Optional[int] = None,
+    deterministic: Optional[bool] = None,
 ) -> int:
     log_name = f"calibration_{kind}.txt"
     log_path = log_dir / log_name
     dataset_cli = _build_dataset_cli(split, frames, max_clips)
     cmd = [sys.executable, "-u", str(CALIBRATE_THRESH), *dataset_cli, "--ckpt", str(ckpt)]
+    cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     if kind == "thorough":
         env_to_unset = ["AVSYNC_DISABLE", "DEBUG"]
@@ -368,6 +391,8 @@ def run_fast_eval(
     bias: Optional[float] = None,
     verbose: Optional[str] = None,
     eval_extras: Optional[Iterable[str]] = None,
+    seed: Optional[int] = None,
+    deterministic: Optional[bool] = None,
 ) -> Tuple[int, List[str]]:
     log_path = log_dir / "eval_fast.txt"
     cmd = [
@@ -394,6 +419,7 @@ def run_fast_eval(
         cmd.extend(["--bias", str(bias)])
     if eval_extras:
         cmd.extend(list(eval_extras))
+    cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
@@ -479,6 +505,8 @@ def run_fast_grid_calibration(
     bias: Optional[float] = None,
     *,
     verbose: Optional[str] = None,
+    seed: Optional[int] = None,
+    deterministic: Optional[bool] = None,
 ) -> Tuple[int, Optional[Dict[str, float]], List[str]]:
     log_path = log_dir / "calibration_fast_grid.txt"
     cmd = [
@@ -496,6 +524,7 @@ def run_fast_grid_calibration(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
     ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
@@ -837,6 +866,8 @@ def perform_calibration(
     stdout_dir: Path,
     split: str,
     calibration_count: int,
+    seed: int,
+    deterministic: bool,
 ) -> Tuple[Optional[Dict[str, float]], int]:
     first_calibration = calibration_count == 0
     prefer_fast_grid = first_calibration and args.fast_first_calib
@@ -922,6 +953,8 @@ def perform_calibration(
             bias=args.bias,
             verbose=args.verbose,
             eval_extras=args.eval_extras_tokens,
+            seed=seed,
+            deterministic=deterministic,
         )
         if eval_ret != 0:
             return None, eval_ret
@@ -960,6 +993,8 @@ def perform_calibration(
             temperature=args.temperature,
             bias=args.bias,
             verbose=args.verbose,
+            seed=seed,
+            deterministic=deterministic,
         )
         if ret != 0 or metrics is None:
             return None, ret or 1
@@ -980,6 +1015,8 @@ def perform_calibration(
             args.calib_max_clips,
             args.calib_frames,
             verbose=args.verbose,
+            seed=seed,
+            deterministic=deterministic,
         )
         if ret != 0:
             return _run_fast_grid("thorough calibration failed")
@@ -1153,6 +1190,13 @@ def main() -> int:
     ap.add_argument("--stdout_dir", type=Path, default=DEFAULT_STDOUT_DIR)
     ap.add_argument("--dataset_max_clips", type=int)
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--seed", type=int, help="Seed forwarded to training/calibration/eval")
+    ap.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle deterministic torch backends for child runs",
+    )
     ap.add_argument(
         "--verbose",
         choices=["quiet", "info", "debug"],
@@ -1177,6 +1221,22 @@ def main() -> int:
     
     cfg = load_cfg()
     exp_cfg = cfg.setdefault("experiment", {})
+    changed = False
+
+    seed = resolve_seed(args.seed, cfg)
+    deterministic = resolve_deterministic_flag(args.deterministic, cfg)
+    if exp_cfg.get("seed") != seed:
+        exp_cfg["seed"] = seed
+        changed = True
+    if exp_cfg.get("deterministic") != deterministic:
+        exp_cfg["deterministic"] = deterministic
+        changed = True
+    args.seed = seed
+    args.deterministic = deterministic
+    print(
+        f"[autopilot] determinism seed={seed} deterministic={'on' if deterministic else 'off'}"
+    )
+
     base_name = base_from_config_name(exp_cfg.get("name", "TiViT"))
 
     if args.mode == "fresh":
@@ -1193,7 +1253,6 @@ def main() -> int:
     dataset_cfg = cfg.setdefault("dataset", {})
     frame_cfg = dataset_cfg.setdefault("frame_targets", {})
 
-    changed = False
     if ensure_default(train_cfg, ("epochs",), args.burst_epochs):
         changed = True
     if ensure_default(train_cfg, ("eval_freq",), 1):
@@ -1210,7 +1269,7 @@ def main() -> int:
         dataset_cfg["max_clips"] = int(args.dataset_max_clips)
         changed = True
     if changed:
-        print("[autopilot] applied default knobs for training/calibration")
+        print("[autopilot] updated config defaults/determinism for training/calibration")
 
     save_cfg(cfg)
 
@@ -1293,6 +1352,8 @@ def main() -> int:
                 stdout_dir=stdout_dir,
                 split=args.split_eval,
                 calibration_count=calibration_count,
+                seed=seed,
+                deterministic=deterministic,
             )
             if metrics is None:
                 print("Calibration failed", file=sys.stderr)
@@ -1318,10 +1379,9 @@ def main() -> int:
             banner = "NOTICE: Training burst — this may take a while"
             log_banner(results_path, banner)
             log_path = stdout_dir / f"stdout_round{round_idx:02d}_train.txt"
-            train_cmd = _with_verbose(
-                [sys.executable, str(TRAIN), "--config", str(CONFIG)],
-                args.verbose,
-            )
+            train_cmd = [sys.executable, str(TRAIN), "--config", str(CONFIG)]
+            train_cmd = _append_determinism_flags(train_cmd, seed=seed, deterministic=deterministic)
+            train_cmd = _with_verbose(train_cmd, args.verbose)
             train_ret, last_val, _ = run_command(
                 train_cmd,
                 log_path,
@@ -1387,6 +1447,8 @@ def main() -> int:
                     stdout_dir=stdout_dir,
                     split=args.split_eval,
                     calibration_count=calibration_count,
+                    seed=seed,
+                    deterministic=deterministic,
                 )
                 if metrics is None:
                     print("Calibration failed", file=sys.stderr)

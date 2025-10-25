@@ -1,6 +1,7 @@
 experiment:
   name: TiViT-Piano_PianoYT_preT3_baseline_clean_start
   seed: 1332
+  deterministic: true
   output_dir: outputs
 dataset:
   name: PianoYT

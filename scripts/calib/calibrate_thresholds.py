@@ -26,6 +26,10 @@ CLI Arguments:
         Stop evaluation after the given minutes while keeping partial results.
     --no-avlag (default: False)
         Disable audio/video lag estimation before building frame targets.
+    --seed INT (default: config or 1337)
+        Seed forwarded to RNGs and dataloaders for reproducible sweeps.
+    --deterministic / --no-deterministic
+        Toggle deterministic PyTorch backend features (default: config).
     --verbose {quiet,info,debug} (default: env or quiet)
         Logging verbosity for the script and dependent modules.
     --debug (default: False)
@@ -61,6 +65,7 @@ sys.path.insert(0, str(REPO / "src"))
 from utils import load_config, align_pitch_dim, configure_verbosity
 from data import make_dataloader
 from models import build_model
+from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 
 
 # -----------------------------------------------------------------------------
@@ -639,6 +644,13 @@ def main():
         action="store_true",
         help="Force single-process dataloading like fast eval (num_workers=0, no pinning)",
     )
+    ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloaders")
+    ap.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle deterministic torch backends (default: config or enabled)",
+    )
     args = ap.parse_args()
     args.verbose = configure_verbosity(args.verbose)
 
@@ -648,6 +660,16 @@ def main():
         avlag_enabled = False
 
     cfg = dict(load_config("configs/config.yaml"))
+    seed = resolve_seed(args.seed, cfg)
+    deterministic = resolve_deterministic_flag(args.deterministic, cfg)
+    cfg.setdefault("experiment", {})
+    cfg["experiment"]["seed"] = seed
+    cfg["experiment"]["deterministic"] = deterministic
+    configure_determinism(seed, deterministic)
+    print(
+        f"[determinism] seed={seed} deterministic={'on' if deterministic else 'off'}",
+        flush=True,
+    )
     dataset_cfg = dict(cfg.get("dataset", {}) or {})
     cfg["dataset"] = dataset_cfg
     if args.max_clips is not None:
@@ -678,7 +700,7 @@ def main():
     stage_durations: dict = {}
     t_main_start = time.time()
     t_dataset0 = time.time()
-    loader = make_dataloader(cfg, split=split)
+    loader = make_dataloader(cfg, split=split, seed=seed)
     if isinstance(loader, dict):
         loader = loader.get(split) or next(iter(loader.values()))
     if isinstance(loader, (list, tuple)):

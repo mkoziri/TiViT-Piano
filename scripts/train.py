@@ -13,7 +13,8 @@ Key Functions/Classes:
 CLI:
     Run ``python scripts/train.py --config configs/config.yaml`` with optional
     overrides such as ``--epochs`` or dataset adjustments defined within the
-    configuration file.
+    configuration file. Use ``--seed``/``--deterministic`` to control global
+    reproducibility settings.
 """
 
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -45,6 +46,7 @@ from tqdm import tqdm
 from data import make_dataloader
 from models import build_model
 from utils import load_config, configure_verbosity, get_logger
+from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 from utils.logging_utils import QUIET_INFO_FLAG
 
 logger = get_logger(__name__)
@@ -58,13 +60,6 @@ INNER_EVAL_MAX_CAP = 5000
 INNER_EVAL_SAFETY = 1.10
 INNER_EVAL_BUDGET_DEFAULT = 900  # seconds
 INNER_EVAL_BUDGET_MAX = 2700  # seconds
-
-# ----------------------- helpers -----------------------
-def set_seed(seed: int = 42):
-    import random, numpy as np
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
 def ensure_dirs(cfg: Mapping[str, Any]) -> Tuple[Path, Path]:
     log_cfg = cfg.get("logging", {})
@@ -1934,6 +1929,13 @@ def main():
     ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
+    ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
+    ap.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle deterministic torch backends (default: config or enabled)",
+    )
     ap.add_argument(
         "--verbose",
         choices=["quiet", "info", "debug"],
@@ -1944,13 +1946,26 @@ def main():
 
     args.verbose = configure_verbosity(args.verbose)
 
+    cfg = dict(load_config(args.config))
+    seed = resolve_seed(args.seed, cfg)
+    deterministic = resolve_deterministic_flag(args.deterministic, cfg)
+    exp_cfg = cfg.setdefault("experiment", {})
+    exp_cfg["seed"] = seed
+    exp_cfg["deterministic"] = deterministic
+
+    configure_determinism(seed, deterministic)
+    logger.info(
+        "[determinism] seed=%d deterministic=%s",
+        seed,
+        "on" if deterministic else "off",
+        extra={QUIET_INFO_FLAG: True},
+    )
+
     faulthandler.enable()
     try:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     except (AttributeError, RuntimeError, ValueError, OSError):
         pass
-    set_seed(42)
-    cfg = load_config(args.config)
     if args.max_clips is not None:
         cfg["dataset"]["max_clips"] = args.max_clips
     if args.frames is not None:
@@ -1979,7 +1994,7 @@ def main():
     # Data
     train_split = args.train_split or cfg["dataset"].get("split_train") or cfg["dataset"].get("split") or "train"
     val_split = args.val_split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
-    train_loader = make_dataloader(cfg, split=train_split)
+    train_loader = make_dataloader(cfg, split=train_split, seed=seed)
     train_base_dataset = _unwrap_dataset(getattr(train_loader, "dataset", train_loader))
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.
@@ -1987,11 +2002,11 @@ def main():
     if cfg["training"].get("eval_freq", 0):
         # try to build test or val loader
         try:
-            val_loader = make_dataloader(cfg, split=val_split)
+            val_loader = make_dataloader(cfg, split=val_split, seed=seed)
         except Exception:
             try:
                 test_split = cfg["dataset"].get("split_test") or cfg["dataset"].get("split") or "test"
-                val_loader = make_dataloader(cfg, split=test_split)
+                val_loader = make_dataloader(cfg, split=test_split, seed=seed)
             except Exception:
                 val_loader = None
 

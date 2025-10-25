@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, compute_av_lag, shift_label_events
+from utils.determinism import DEFAULT_SEED, make_loader_components
 from utils.frame_target_cache import FrameTargetCache
 from utils.identifiers import canonical_video_id
 from utils.frame_targets import (
@@ -1063,7 +1064,13 @@ class OMAPSDataset(Dataset):
 
 
 
-def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
+def make_dataloader(
+    cfg: Mapping[str, Any],
+    split: str,
+    drop_last: bool = False,
+    *,
+    seed: Optional[int] = None,
+):
     dcfg = cfg["dataset"]
     manifest_cfg = dcfg.get("manifest", {}) or {}
     manifest_path = manifest_cfg.get(split)
@@ -1150,6 +1157,14 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     persistent_workers_cfg = bool(dcfg.get("persistent_workers", False))
     persistent_workers = persistent_workers_cfg if num_workers > 0 else False
 
+    # Seed DataLoader so shuffling/workers stay reproducible across runs.
+    base_seed = seed if seed is not None else getattr(dataset, "data_seed", None)
+    if base_seed is None:
+        base_seed = DEFAULT_SEED
+    generator, worker_init_fn = make_loader_components(
+        int(base_seed), namespace=f"{dataset.__class__.__name__}:{split}"
+    )
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
@@ -1159,5 +1174,7 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         drop_last=drop_last,
         collate_fn=_collate,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     return loader

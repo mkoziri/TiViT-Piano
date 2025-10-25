@@ -39,6 +39,8 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from utils.av_sync import AVLagCache, compute_av_lag, shift_label_events
+from utils.determinism import DEFAULT_SEED, build_snapshot_metadata, make_loader_components
+from utils.eval_window_cache import load_snapshot, save_snapshot
 from utils.identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
@@ -1898,7 +1900,42 @@ class PianoYTDataset(Dataset):
         tol_val = tol_s if tol_s is not None else self.frame_targets_cfg.get("tolerance")
         dilate_val = dilate if dilate is not None else self.frame_targets_cfg.get("dilate_active_frames")
 
-        return self._materialize_eval_entries_from_labels(
+        base_seed = self.data_seed if self.data_seed is not None else DEFAULT_SEED
+        extras = {
+            "root": str(self.root) if getattr(self, "root", None) is not None else str(self.dataset_cfg.get("root_dir")),
+            "manifest": str(self.dataset_cfg.get("manifest", {}).get(self.split)),
+            "only_video": getattr(self, "_only_video_target", None),
+            "tol_s": float(tol_val) if tol_val is not None else None,
+            "dilate": int(dilate_val) if dilate_val is not None else None,
+        }
+        metadata = build_snapshot_metadata(
+            dataset_name=self.__class__.__name__,
+            split=self.split,
+            seed=int(base_seed),
+            frames=int(target_T_val),
+            stride=int(stride_val),
+            max_clips=max_total_val,
+            extras=extras,
+        )
+
+        cached = load_snapshot(metadata)
+        if cached:
+            self.eval_indices_snapshot = list(cached.get("entries", []))
+            self._eval_snapshot_flags = list(cached.get("flags", []))
+            self._eval_snapshot_by_video = {int(k): list(v) for k, v in cached.get("by_video", {}).items()}
+            self._eval_candidates_by_video = {int(k): list(v) for k, v in cached.get("candidates", {}).items()}
+            stats_obj = cached.get("stats", {})
+            self._eval_materialize_stats = dict(stats_obj) if isinstance(stats_obj, Mapping) else {}
+            self._last_materialize_duration = float(cached.get("duration", 0.0))
+            self._num_windows = len(self.eval_indices_snapshot)
+            LOGGER.info(
+                "dataset.eval_snapshot restored entries=%d pos=%d", 
+                len(self.eval_indices_snapshot),
+                sum(1 for flag in self._eval_snapshot_flags if flag),
+            )
+            return self.eval_indices_snapshot
+
+        entries = self._materialize_eval_entries_from_labels(
             max_total=max_total_val,
             target_T=target_T_val,
             fps=fps_val,
@@ -1906,6 +1943,17 @@ class PianoYTDataset(Dataset):
             tol_s=tol_val,
             dilate=dilate_val,
         )
+        if entries:
+            payload = {
+                "entries": entries,
+                "flags": self._eval_snapshot_flags,
+                "by_video": self._eval_snapshot_by_video,
+                "candidates": self._eval_candidates_by_video,
+                "stats": self._eval_materialize_stats,
+                "duration": self._last_materialize_duration,
+            }
+            save_snapshot(metadata, payload)
+        return entries
 
     def _record_has_valid_window(self, record_idx: int) -> Tuple[bool, List[int]]:
         record = self.samples[record_idx]
@@ -2202,7 +2250,13 @@ class PianoYTDataset(Dataset):
                 LOGGER.warning("Failed to materialize eval entries from labels: %s", exc)
 
 
-def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False):
+def make_dataloader(
+    cfg: Mapping[str, Any],
+    split: str,
+    drop_last: bool = False,
+    *,
+    seed: Optional[int] = None,
+):
     dcfg = cfg["dataset"]
     manifest_cfg = dcfg.get("manifest", {}) or {}
     manifest_path = manifest_cfg.get(split)
@@ -2323,6 +2377,14 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
     persistent_workers_cfg = bool(dcfg.get("persistent_workers", False))
     persistent_workers = persistent_workers_cfg if num_workers > 0 else False
 
+    # Seed DataLoader so shuffling/workers stay reproducible across runs.
+    base_seed = seed if seed is not None else getattr(dataset, "data_seed", None)
+    if base_seed is None:
+        base_seed = DEFAULT_SEED
+    generator, worker_init_fn = make_loader_components(
+        int(base_seed), namespace=f"{dataset.__class__.__name__}:{split}"
+    )
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
@@ -2332,6 +2394,8 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False)
         drop_last=drop_last,
         collate_fn=_collate,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     return loader
 

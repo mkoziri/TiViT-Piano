@@ -14,7 +14,8 @@ Key Functions/Classes:
 CLI:
     Run ``python scripts/eval_thresholds.py --ckpt <path>`` with optional
     ``--thresholds``/``--prob_thresholds`` lists, ``--split`` to choose a
-    dataset split, and ``--dump_logits`` to save logits to NPZ.
+    dataset split, and ``--dump_logits`` to save logits to NPZ. Determinism
+    controls are available via ``--seed`` and ``--deterministic``.
 """
 
 import sys, json, time, math, os, torch, logging
@@ -34,6 +35,7 @@ from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from torch.utils.data import DataLoader, Subset
+from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 
 LOGGER = logging.getLogger("eval_thresholds")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
@@ -426,6 +428,13 @@ def main():
         default=3,
         help="Odd window size for optional time-axis median smoothing (default: 3)",
     )
+    ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
+    ap.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle deterministic torch backends (default: config or enabled)",
+    )
     args = ap.parse_args(argv)
     args.verbose = configure_verbosity(args.verbose)
     debug_mode = args.verbose == "debug"
@@ -658,6 +667,16 @@ def main():
 
 
     cfg = dict(load_config("configs/config.yaml"))
+    seed = resolve_seed(args.seed, cfg)
+    deterministic = resolve_deterministic_flag(args.deterministic, cfg)
+    cfg.setdefault("experiment", {})
+    cfg["experiment"]["seed"] = seed
+    cfg["experiment"]["deterministic"] = deterministic
+    configure_determinism(seed, deterministic)
+    print(
+        f"[determinism] seed={seed} deterministic={'on' if deterministic else 'off'}",
+        flush=True,
+    )
     dataset_raw = cfg.get("dataset")
     if isinstance(dataset_raw, dict):
         dataset_cfg = dict(dataset_raw)
@@ -716,7 +735,7 @@ def main():
 
     # build loader
     t_dataset_build0 = time.time()
-    val_loader = make_dataloader(cfg, split=split)
+    val_loader = make_dataloader(cfg, split=split, seed=seed)
     if isinstance(val_loader, dict):
         val_loader = val_loader.get(split, next(iter(val_loader.values())))
     if isinstance(val_loader, (list, tuple)):
