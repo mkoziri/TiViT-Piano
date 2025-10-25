@@ -1334,6 +1334,36 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         offset_cal["bias"],
     )
 
+    def _init_stats():
+        return {"min": math.inf, "max": -math.inf, "sum": 0.0, "count": 0}
+
+    def _update_stats(stats: dict, tensor: Optional[torch.Tensor]) -> None:
+        if tensor is None:
+            return
+        t = tensor.detach()
+        if t.numel() == 0:
+            return
+        t_min = t.min().item()
+        t_max = t.max().item()
+        stats["min"] = min(stats["min"], t_min)
+        stats["max"] = max(stats["max"], t_max)
+        stats["sum"] += t.sum().item()
+        stats["count"] += t.numel()
+
+    def _finalize_stats(stats: dict) -> Tuple[float, float, float]:
+        if stats["count"] == 0:
+            nan = float("nan")
+            return nan, nan, nan
+        mean = stats["sum"] / stats["count"]
+        return stats["min"], mean, stats["max"]
+
+    onset_logit_stats = _init_stats()
+    offset_logit_stats = _init_stats()
+    onset_prob_stats = _init_stats()
+    offset_prob_stats = _init_stats()
+    onset_k_effective: Optional[int] = None
+    offset_k_effective: Optional[int] = None
+
     sums = {"total": 0.0, "pitch": 0.0, "onset": 0.0, "offset": 0.0, "hand": 0.0, "clef": 0.0}
     n_batches = 0
 
@@ -1554,6 +1584,31 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
             #loss, parts = compute_loss(out, tgt, crit, w)
             for k in sums: sums[k] += parts[k]
             n_batches += 1
+
+            onset_logits = out.get("onset_logits")
+            offset_logits = out.get("offset_logits")
+            if onset_logits is not None:
+                _update_stats(onset_logit_stats, onset_logits)
+                onset_probs = _apply_sigmoid_calibration(
+                    onset_logits,
+                    temperature=onset_cal["temperature"],
+                    bias=onset_cal["bias"],
+                )
+                _update_stats(onset_prob_stats, onset_probs)
+                if onset_k_effective is None:
+                    onset_dim = onset_logits.shape[-1] if onset_logits.ndim > 0 else 1
+                    onset_k_effective = max(1, min(int(agg_cfg["k_onset"]), onset_dim))
+            if offset_logits is not None:
+                _update_stats(offset_logit_stats, offset_logits)
+                offset_probs = _apply_sigmoid_calibration(
+                    offset_logits,
+                    temperature=offset_cal["temperature"],
+                    bias=offset_cal["bias"],
+                )
+                _update_stats(offset_prob_stats, offset_probs)
+                if offset_k_effective is None:
+                    offset_dim = offset_logits.shape[-1] if offset_logits.ndim > 0 else 1
+                    offset_k_effective = max(1, min(int(agg_cfg["k_offset"]), offset_dim))
 
             # --- metrics ---
             if use_frame:
@@ -1841,6 +1896,28 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         print(f"[train:eval] timeout after {timeout_label}m; skipping metrics", flush=True)
         logger.warning("[train:eval] timeout after %sm; skipping metrics", timeout_label)
         return None
+
+    onset_logit_min, onset_logit_mean, onset_logit_max = _finalize_stats(onset_logit_stats)
+    offset_logit_min, offset_logit_mean, offset_logit_max = _finalize_stats(offset_logit_stats)
+    onset_prob_min, onset_prob_mean, onset_prob_max = _finalize_stats(onset_prob_stats)
+    offset_prob_min, offset_prob_mean, offset_prob_max = _finalize_stats(offset_prob_stats)
+    onset_k_report = onset_k_effective if onset_k_effective is not None else int(agg_cfg["k_onset"])
+    offset_k_report = offset_k_effective if offset_k_effective is not None else int(agg_cfg["k_offset"])
+
+    print(
+        f"[train:eval] onset logits min={onset_logit_min:.4f} mean={onset_logit_mean:.4f} max={onset_logit_max:.4f} | "
+        f"offset logits min={offset_logit_min:.4f} mean={offset_logit_mean:.4f} max={offset_logit_max:.4f}",
+        flush=True,
+    )
+    print(
+        f"[train:eval] onset probs  min={onset_prob_min:.4f} mean={onset_prob_mean:.4f} max={onset_prob_max:.4f} | "
+        f"offset probs  min={offset_prob_min:.4f} mean={offset_prob_mean:.4f} max={offset_prob_max:.4f}",
+        flush=True,
+    )
+    print(
+        f"[train:eval] thresholds onset={thr_on:.3f} (k={onset_k_report}) offset={thr_off:.3f} (k={offset_k_report})",
+        flush=True,
+    )
 
     # averages
     losses = {k: sums[k] / max(1, n_batches) for k in sums}
