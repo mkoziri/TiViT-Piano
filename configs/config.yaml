@@ -14,7 +14,7 @@ dataset:
   - offset
   - hand
   - clef
-  max_clips: null
+  max_clips: 150 #null
   manifest:
     train: null
     val: null

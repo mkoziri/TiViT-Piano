@@ -8,18 +8,30 @@ not break active progress bars.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from typing import Optional
 
 try:  # pragma: no cover - optional dependency guard
-    from tqdm.contrib.logging import TqdmLoggingHandler
+    _tqdm_logging = importlib.import_module("tqdm.contrib.logging")
 except Exception:  # pragma: no cover - fallback when tqdm.contrib is missing
 
     class TqdmLoggingHandler(logging.StreamHandler):
         """Fallback stream handler when tqdm's logging bridge is unavailable."""
 
         pass
+else:
+    _handler_cls = getattr(_tqdm_logging, "TqdmLoggingHandler", None)
+    if _handler_cls is None:
+
+        class TqdmLoggingHandler(logging.StreamHandler):
+            """Fallback stream handler when tqdm's logging bridge is unavailable."""
+
+            pass
+
+    else:
+        TqdmLoggingHandler = _handler_cls  # type: ignore[assignment]
 
 
 VERBOSITY_LEVELS = {

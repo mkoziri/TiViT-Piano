@@ -1408,6 +1408,94 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         "metric_n": 0,
     }
     metric_n = 0
+    valid_clip_counter = 0
+
+    def _resolve_clip_label(batch_dict: Mapping[str, Any], idx: int) -> str:
+        paths = batch_dict.get("path") if isinstance(batch_dict, Mapping) else None
+        if isinstance(paths, (list, tuple)) and idx < len(paths):
+            return str(paths[idx])
+        for key in ("clip_id", "clip_ids", "video_id", "video_ids"):
+            if not isinstance(batch_dict, Mapping):
+                break
+            value = batch_dict.get(key)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                if value.ndim == 0:
+                    items = [value.item()]
+                else:
+                    items = value.tolist()
+            else:
+                items = value
+            if isinstance(items, (list, tuple)) and idx < len(items):
+                return str(items[idx])
+        return f"idx={idx}"
+
+    def _reason_to_label(reasons: set[str]) -> str:
+        if any("nonfinite" in r for r in reasons):
+            return "non-finite preds"
+        if any(any(term in r for term in ("missing", "shape", "empty")) for r in reasons):
+            return "invalid preds"
+        return "invalid preds"
+
+    def _validate_onoff_outputs(
+        onset_logits: Optional[torch.Tensor],
+        offset_logits: Optional[torch.Tensor],
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, List[set[str]], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        valid_mask = torch.ones(batch_size, dtype=torch.bool)
+        invalid_reasons: List[set[str]] = [set() for _ in range(batch_size)]
+
+        def _mark_all(reason: str) -> None:
+            if batch_size == 0:
+                return
+            valid_mask[:] = False
+            for slots in invalid_reasons:
+                slots.add(reason)
+
+        def _check_tensor(name: str, tensor: Optional[torch.Tensor]) -> bool:
+            if not torch.is_tensor(tensor):
+                _mark_all(f"{name}:missing")
+                return False
+            if tensor.ndim == 0:
+                _mark_all(f"{name}:empty")
+                return False
+            if tensor.shape[0] != batch_size:
+                _mark_all(f"{name}:shape")
+                return False
+            reshaped = tensor.reshape(batch_size, -1)
+            if reshaped.shape[1] == 0:
+                _mark_all(f"{name}:empty")
+                return False
+            finite_mask = torch.isfinite(reshaped).all(dim=1)
+            finite_list = finite_mask.tolist()
+            for idx, ok in enumerate(finite_list):
+                if not ok:
+                    invalid_reasons[idx].add(f"{name}:nonfinite")
+                    valid_mask[idx] = False
+            return True
+
+        onset_probs: Optional[torch.Tensor] = None
+        offset_probs: Optional[torch.Tensor] = None
+        onset_ok = _check_tensor("onset logits", onset_logits)
+        offset_ok = _check_tensor("offset logits", offset_logits)
+
+        if onset_ok and torch.is_tensor(onset_logits):
+            onset_probs = _apply_sigmoid_calibration(
+                onset_logits.detach(),
+                temperature=onset_cal["temperature"],
+                bias=onset_cal["bias"],
+            )
+            _check_tensor("onset probs", onset_probs)
+        if offset_ok and torch.is_tensor(offset_logits):
+            offset_probs = _apply_sigmoid_calibration(
+                offset_logits.detach(),
+                temperature=offset_cal["temperature"],
+                bias=offset_cal["bias"],
+            )
+            _check_tensor("offset probs", offset_probs)
+
+        return valid_mask, invalid_reasons, onset_probs, offset_probs
 
     want = ("pitch", "onset", "offset", "hand", "clef")
     class _StopEvalLoop(Exception):
@@ -1540,12 +1628,119 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         )
                         cap_logged = True
 
-                lag_ms_batch = batch.get("lag_ms")
-                if lag_ms_batch is not None:
-                    if torch.is_tensor(lag_ms_batch):
-                        lag_iter = lag_ms_batch.detach().cpu().reshape(-1).tolist()
+                have_all = all(k in batch for k in want)
+                use_dummy = bool(cfg["training"].get("debug_dummy_labels", False))
+                raw_tgt = {k: batch[k] for k in want} if have_all and not use_dummy else None
+
+                out = model(x)
+
+                onset_logits_full = out.get("onset_logits")
+                offset_logits_full = out.get("offset_logits")
+                valid_mask, invalid_reasons, onset_probs_full, offset_probs_full = _validate_onoff_outputs(
+                    onset_logits_full,
+                    offset_logits_full,
+                    batch_size,
+                )
+
+                valid_count = int(valid_mask.sum().item())
+                if valid_count < batch_size:
+                    valid_mask_list = valid_mask.tolist()
+                    for idx, is_valid in enumerate(valid_mask_list):
+                        if is_valid:
+                            continue
+                        clip_label = _resolve_clip_label(batch, idx)
+                        reasons = invalid_reasons[idx]
+                        reason_label = _reason_to_label(reasons)
+                        detail_suffix = f" (details: {', '.join(sorted(reasons))})" if reasons else ""
+                        warn_msg = f"[eval WARNING] {reason_label} for clip {clip_label}, skipping from metrics{detail_suffix}"
+                        print(warn_msg, flush=True)
+                        logger.warning(warn_msg)
+                if valid_count == 0:
+                    continue
+
+                valid_clip_counter += valid_count
+                valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)
+                valid_indices_list = valid_indices.tolist()
+                index_cache: Dict[torch.device, torch.Tensor] = {}
+
+                def _select_valid(value: Any):
+                    if value is None:
+                        return None
+                    if torch.is_tensor(value):
+                        if value.ndim == 0:
+                            return value
+                        if value.shape[0] != batch_size or len(valid_indices_list) == batch_size:
+                            return value
+                        device = value.device
+                        if device not in index_cache:
+                            index_cache[device] = valid_indices.to(device)
+                        return value.index_select(0, index_cache[device])
+                    if isinstance(value, list):
+                        if len(value) != batch_size or len(valid_indices_list) == batch_size:
+                            return value
+                        return [value[i] for i in valid_indices_list]
+                    if isinstance(value, tuple):
+                        if len(value) != batch_size or len(valid_indices_list) == batch_size:
+                            return value
+                        return tuple(value[i] for i in valid_indices_list)
+                    return value
+
+                onset_probs_valid = _select_valid(onset_probs_full)
+                offset_probs_valid = _select_valid(offset_probs_full)
+
+                filtered_out: Dict[str, Any] = {}
+                for key, value in out.items():
+                    if torch.is_tensor(value):
+                        filtered_out[key] = _select_valid(value)
                     else:
-                        lag_iter = list(lag_ms_batch)
+                        filtered_out[key] = value
+                out = filtered_out
+
+                if have_all and not use_dummy and raw_tgt is not None:
+                    tgt = {}
+                    for key in want:
+                        val = _select_valid(raw_tgt[key])
+                        if torch.is_tensor(val):
+                            if key in ("pitch", "onset", "offset"):
+                                val = val.float()
+                            elif key in ("hand", "clef"):
+                                val = val.long()
+                        tgt[key] = val
+                else:
+                    tgt = fabricate_dummy_targets(valid_count)
+
+                use_frame = (
+                    getattr(model, "head_mode", "clip") == "frame"
+                    and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
+                )
+
+                frame_batch = None
+                if use_frame:
+                    frame_batch = {
+                        "pitch_roll": _select_valid(batch["pitch_roll"]).float(),
+                        "onset_roll": _select_valid(batch["onset_roll"]).float(),
+                        "offset_roll": _select_valid(batch["offset_roll"]).float(),
+                        "hand_frame": _select_valid(batch["hand_frame"]).long(),
+                        "clef_frame": _select_valid(batch["clef_frame"]).long(),
+                    }
+                    loss, parts = compute_loss_frame(out, frame_batch, weights=w)
+                else:
+                    if out["pitch_logits"].dim() == 3:
+                        out = _time_pool_out_to_clip(out)
+                        onset_probs_valid = None
+                        offset_probs_valid = None
+                    loss, parts = compute_loss(out, tgt, crit, w)
+
+                for k in sums:
+                    sums[k] += parts[k]
+                n_batches += 1
+
+                lag_ms_filtered = _select_valid(batch.get("lag_ms"))
+                if lag_ms_filtered is not None:
+                    if torch.is_tensor(lag_ms_filtered):
+                        lag_iter = lag_ms_filtered.detach().cpu().reshape(-1).tolist()
+                    else:
+                        lag_iter = list(lag_ms_filtered)
                     for lag_val in lag_iter:
                         if lag_val is None:
                             continue
@@ -1554,8 +1749,9 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         except (TypeError, ValueError):
                             continue
 
-                lag_flags_batch = batch.get("lag_flags") or []
-                for flags in lag_flags_batch:
+                lag_flags_raw = batch.get("lag_flags")
+                lag_flags_filtered = _select_valid(lag_flags_raw) if lag_flags_raw is not None else None
+                for flags in (lag_flags_filtered or []):
                     if not flags:
                         continue
                     if any(flag == "low_corr_zero" for flag in flags):
@@ -1563,272 +1759,236 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     if any(flag == "lag_timeout" for flag in flags):
                         lag_timeouts += 1
 
-                have_all = all(k in batch for k in want)
-            have_all = all(k in batch for k in want)
-            use_dummy = bool(cfg["training"].get("debug_dummy_labels", False))
-            if have_all and not use_dummy:
-                tgt = {k: batch[k] for k in want}
-                tgt["pitch"]  = tgt["pitch"].float()
-                tgt["hand"]   = tgt["hand"].long()
-                tgt["clef"]   = tgt["clef"].long()
-                tgt["onset"]  = tgt["onset"].float()
-                tgt["offset"] = tgt["offset"].float()
-            else:
-                tgt = fabricate_dummy_targets(x.shape[0])
+                if DEBUG_EVAL_METRICS and valid_count > 0:
+                    onset_logits = out.get("onset_logits")
+                    offset_logits = out.get("offset_logits")
+                    if onset_logits is not None and onset_logit_stats is not None and onset_prob_stats is not None:
+                        _update_stats(onset_logit_stats, onset_logits)
+                        onset_probs_stats = onset_probs_valid
+                        if onset_probs_stats is None and onset_logits is not None:
+                            onset_probs_stats = _apply_sigmoid_calibration(
+                                onset_logits,
+                                temperature=onset_cal["temperature"],
+                                bias=onset_cal["bias"],
+                            )
+                        _update_stats(onset_prob_stats, onset_probs_stats)
+                        if onset_k_effective is None:
+                            onset_dim = onset_logits.shape[-1] if onset_logits.ndim > 0 else 1
+                            onset_k_effective = max(1, min(int(agg_cfg["k_onset"]), onset_dim))
+                    if offset_logits is not None and offset_logit_stats is not None and offset_prob_stats is not None:
+                        _update_stats(offset_logit_stats, offset_logits)
+                        offset_probs_stats = offset_probs_valid
+                        if offset_probs_stats is None and offset_logits is not None:
+                            offset_probs_stats = _apply_sigmoid_calibration(
+                                offset_logits,
+                                temperature=offset_cal["temperature"],
+                                bias=offset_cal["bias"],
+                            )
+                        _update_stats(offset_prob_stats, offset_probs_stats)
+                        if offset_k_effective is None:
+                            offset_dim = offset_logits.shape[-1] if offset_logits.ndim > 0 else 1
+                            offset_k_effective = max(1, min(int(agg_cfg["k_offset"]), offset_dim))
 
-            out = model(x)
-           
-            use_frame = (
-                getattr(model, "head_mode", "clip") == "frame" and
-                all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
-            )
-            
-            if use_frame:
-                loss, parts = compute_loss_frame(out, batch, weights=w)
-            else:
-                # guard: if logits are (B,T,...) but we’re using clip loss, pool over time
-                if out["pitch_logits"].dim() == 3:
-                    out = _time_pool_out_to_clip(out)
-                loss, parts = compute_loss(out, tgt, crit, w)
+                # --- metrics ---
+                if use_frame:
+                    # --- align frame targets to logits time (T -> T_logits) ---
+                    B, T_logits, P = out["onset_logits"].shape
 
-            #loss, parts = compute_loss(out, tgt, crit, w)
-            for k in sums: sums[k] += parts[k]
-            n_batches += 1
+                    onset_roll = frame_batch["onset_roll"]
+                    offset_roll = frame_batch["offset_roll"]
+                    hand_frame = frame_batch["hand_frame"]
+                    clef_frame = frame_batch["clef_frame"]
 
-            if DEBUG_EVAL_METRICS:
-                onset_logits = out.get("onset_logits")
-                offset_logits = out.get("offset_logits")
-                if onset_logits is not None and onset_logit_stats is not None and onset_prob_stats is not None:
-                    _update_stats(onset_logit_stats, onset_logits)
-                    onset_probs = _apply_sigmoid_calibration(
-                        onset_logits,
+                    if onset_roll.shape[1] != T_logits:
+                        def _pool_bool_BT(x_btP, Tprime):
+                            # (B,T,P) -> (B,T',P), preserving "any positive in window"
+                            x = x_btP.permute(0, 2, 1)
+                            x = F.adaptive_max_pool1d(x, Tprime)
+                            return x.permute(0, 2, 1).contiguous()
+
+                        def _interp_labels_BT(x_bt, Tprime):
+                            x = x_bt.float().unsqueeze(1)
+                            x = F.interpolate(x, size=Tprime, mode="nearest")
+                            return x.squeeze(1).long()
+
+                        onset_roll = _pool_bool_BT(onset_roll, T_logits)
+                        offset_roll = _pool_bool_BT(offset_roll, T_logits)
+                        hand_frame = _interp_labels_BT(hand_frame, T_logits)
+                        clef_frame = _interp_labels_BT(clef_frame, T_logits)
+
+                    onset_any = (onset_roll > 0).any(dim=-1).float()
+                    offset_any = (offset_roll > 0).any(dim=-1).float()
+
+                    onset_pred_sel, onset_key_counts = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_onset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
                         temperature=onset_cal["temperature"],
                         bias=onset_cal["bias"],
                     )
-                    _update_stats(onset_prob_stats, onset_probs)
-                    if onset_k_effective is None:
-                        onset_dim = onset_logits.shape[-1] if onset_logits.ndim > 0 else 1
-                        onset_k_effective = max(1, min(int(agg_cfg["k_onset"]), onset_dim))
-                if offset_logits is not None and offset_logit_stats is not None and offset_prob_stats is not None:
-                    _update_stats(offset_logit_stats, offset_logits)
-                    offset_probs = _apply_sigmoid_calibration(
-                        offset_logits,
+                    offset_pred_sel, offset_key_counts = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_offset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                     )
-                    _update_stats(offset_prob_stats, offset_probs)
-                    if offset_k_effective is None:
-                        offset_dim = offset_logits.shape[-1] if offset_logits.ndim > 0 else 1
-                        offset_k_effective = max(1, min(int(agg_cfg["k_offset"]), offset_dim))
+                    onset_pred_sel = onset_pred_sel.float()
+                    offset_pred_sel = offset_pred_sel.float()
 
-            # --- metrics ---
-            if use_frame:
-                # --- align frame targets to logits time (T -> T_logits) ---
-                B, T_logits, P = out["onset_logits"].shape
+                    onset_pred_legacy, _ = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode="any",
+                        k=1,
+                        top_k=0,
+                        tau_sum=0.0,
+                        temperature=onset_cal["temperature"],
+                        bias=onset_cal["bias"],
+                    )
+                    offset_pred_legacy, _ = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode="any",
+                        k=1,
+                        top_k=0,
+                        tau_sum=0.0,
+                        temperature=offset_cal["temperature"],
+                        bias=offset_cal["bias"],
+                    )
+                    onset_pred_legacy = onset_pred_legacy.float()
+                    offset_pred_legacy = offset_pred_legacy.float()
 
-                onset_roll  = batch["onset_roll"].float()   # (B, T, P)
-                offset_roll = batch["offset_roll"].float()  # (B, T, P)
-                hand_frame  = batch["hand_frame"].long()    # (B, T)
-                clef_frame  = batch["clef_frame"].long()    # (B, T)
+                    metric_counts["onset_key_sum"] += onset_key_counts.sum().item()
+                    metric_counts["offset_key_sum"] += offset_key_counts.sum().item()
+                    metric_counts["onset_frame_count"] += onset_key_counts.numel()
+                    metric_counts["offset_frame_count"] += offset_key_counts.numel()
+                    _accumulate_pred_key_histogram(metric_counts["onset_hist"], onset_key_counts)
+                    _accumulate_pred_key_histogram(metric_counts["offset_hist"], offset_key_counts)
 
-                T_targets = onset_roll.shape[1]
+                    f1_on_sel = _binary_f1(onset_pred_sel.reshape(-1), onset_any.reshape(-1))
+                    f1_off_sel = _binary_f1(offset_pred_sel.reshape(-1), offset_any.reshape(-1))
+                    f1_on_legacy = _binary_f1(onset_pred_legacy.reshape(-1), onset_any.reshape(-1))
+                    f1_off_legacy = _binary_f1(offset_pred_legacy.reshape(-1), offset_any.reshape(-1))
+                    if f1_on_sel is not None:
+                        metric_counts["onset_f1"] += f1_on_sel
+                        metric_counts["n_on"] += 1
+                    if f1_off_sel is not None:
+                        metric_counts["offset_f1"] += f1_off_sel
+                        metric_counts["n_off"] += 1
+                    if f1_on_legacy is not None:
+                        legacy_counts["onset_f1"] += f1_on_legacy
+                        legacy_counts["n_on"] += 1
+                    if f1_off_legacy is not None:
+                        legacy_counts["offset_f1"] += f1_off_legacy
+                        legacy_counts["n_off"] += 1
 
-                #if T_targets != T_logits:
-                if onset_roll.shape[1] != T_logits:
-                    def _pool_bool_BT(x_btP, Tprime):
-                        # (B,T,P) -> (B,T',P), preserving "any positive in window"
-                        x = x_btP.permute(0, 2, 1)
-                        x = F.adaptive_max_pool1d(x, Tprime)
-                        return x.permute(0, 2, 1).contiguous()
+                    metric_counts["onset_pos_rate"] += onset_any.mean().item()
+                    metric_counts["offset_pos_rate"] += offset_any.mean().item()
+                    metric_counts["onset_pred_rate"] += onset_pred_sel.mean().item()
+                    metric_counts["offset_pred_rate"] += offset_pred_sel.mean().item()
+                    legacy_counts["onset_pred_rate"] += onset_pred_legacy.mean().item()
+                    legacy_counts["offset_pred_rate"] += offset_pred_legacy.mean().item()
+                    legacy_counts["metric_n"] += 1
 
-                    def _interp_labels_BT(x_bt, Tprime):
-                        x = x_bt.float().unsqueeze(1)
-                        x = F.interpolate(x, size=Tprime, mode="nearest")
-                        return x.squeeze(1).long()               
+                    hand_prob = F.softmax(out["hand_logits"], dim=-1)
+                    clef_prob = F.softmax(out["clef_logits"], dim=-1)
+                    hand_pred = hand_prob.argmax(dim=-1)
+                    clef_pred = clef_prob.argmax(dim=-1)
+                    Bx, Tx = hand_pred.shape
+                    metric_counts["hand_acc"] += (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
+                    metric_counts["clef_acc"] += (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
 
-                    onset_roll  = _pool_bool_BT(onset_roll,  T_logits)
-                    offset_roll = _pool_bool_BT(offset_roll, T_logits)
-                    hand_frame  = _interp_labels_BT(hand_frame, T_logits)
-                    clef_frame  = _interp_labels_BT(clef_frame, T_logits)
-                   
-                # --- derive ANY-note targets at logits time ---
-                onset_any  = (onset_roll  > 0).any(dim=-1).float()   # (B, T_logits)
-                offset_any = (offset_roll > 0).any(dim=-1).float()   # (B, T_logits)
-
-                # --- binarize predictions ---
-                onset_pred_sel, onset_key_counts = _aggregate_onoff_predictions(
-                    out["onset_logits"],
-                    thr_on,
-                    mode=agg_cfg["mode"],
-                    k=agg_cfg["k_onset"],
-                    top_k=agg_cfg["top_k"],
-                    tau_sum=agg_cfg["tau_sum"],
-                    temperature=onset_cal["temperature"],
-                    bias=onset_cal["bias"],
-                )
-                offset_pred_sel, offset_key_counts = _aggregate_onoff_predictions(
-                    out["offset_logits"],
-                    thr_off,
-                    mode=agg_cfg["mode"],
-                    k=agg_cfg["k_offset"],
-                    top_k=agg_cfg["top_k"],
-                    tau_sum=agg_cfg["tau_sum"],
-                    temperature=offset_cal["temperature"],
-                    bias=offset_cal["bias"],
-                )
-                onset_pred_sel = onset_pred_sel.float()
-                offset_pred_sel = offset_pred_sel.float()
-
-                onset_pred_legacy, _ = _aggregate_onoff_predictions(
-                    out["onset_logits"],
-                    thr_on,
-                    mode="any",
-                    k=1,
-                    top_k=0,
-                    tau_sum=0.0,
-                    temperature=onset_cal["temperature"],
-                    bias=onset_cal["bias"],
-                )
-                offset_pred_legacy, _ = _aggregate_onoff_predictions(
-                    out["offset_logits"],
-                    thr_off,
-                    mode="any",
-                    k=1,
-                    top_k=0,
-                    tau_sum=0.0,
-                    temperature=offset_cal["temperature"],
-                    bias=offset_cal["bias"],
-                )
-                onset_pred_legacy = onset_pred_legacy.float()
-                offset_pred_legacy = offset_pred_legacy.float()
-
-                metric_counts["onset_key_sum"] += onset_key_counts.sum().item()
-                metric_counts["offset_key_sum"] += offset_key_counts.sum().item()
-                metric_counts["onset_frame_count"] += onset_key_counts.numel()
-                metric_counts["offset_frame_count"] += offset_key_counts.numel()
-                _accumulate_pred_key_histogram(metric_counts["onset_hist"], onset_key_counts)
-                _accumulate_pred_key_histogram(metric_counts["offset_hist"], offset_key_counts)
-
-                # --- masked F1 and positive-rate diagnostics ---
-                f1_on_sel = _binary_f1(onset_pred_sel.reshape(-1), onset_any.reshape(-1))
-                f1_off_sel = _binary_f1(offset_pred_sel.reshape(-1), offset_any.reshape(-1))
-                f1_on_legacy = _binary_f1(onset_pred_legacy.reshape(-1), onset_any.reshape(-1))
-                f1_off_legacy = _binary_f1(offset_pred_legacy.reshape(-1), offset_any.reshape(-1))
-                if f1_on_sel is not None:
-                    metric_counts["onset_f1"] += f1_on_sel
-                    metric_counts["n_on"] += 1
-                if f1_off_sel is not None:
-                    metric_counts["offset_f1"] += f1_off_sel
-                    metric_counts["n_off"] += 1
-                if f1_on_legacy is not None:
-                    legacy_counts["onset_f1"] += f1_on_legacy
-                    legacy_counts["n_on"] += 1
-                if f1_off_legacy is not None:
-                    legacy_counts["offset_f1"] += f1_off_legacy
-                    legacy_counts["n_off"] += 1
-
-                metric_counts["onset_pos_rate"]  += onset_any.mean().item()
-                metric_counts["offset_pos_rate"] += offset_any.mean().item()
-                metric_counts["onset_pred_rate"]  += onset_pred_sel.mean().item()
-                metric_counts["offset_pred_rate"] += offset_pred_sel.mean().item()
-                legacy_counts["onset_pred_rate"]  += onset_pred_legacy.mean().item()
-                legacy_counts["offset_pred_rate"] += offset_pred_legacy.mean().item()
-                legacy_counts["metric_n"] += 1
-
-                # --- per-frame hand/clef accuracy ---
-                hand_prob = F.softmax(out["hand_logits"], dim=-1)
-                clef_prob = F.softmax(out["clef_logits"], dim=-1)
-                hand_pred = hand_prob.argmax(dim=-1)
-                clef_pred = clef_prob.argmax(dim=-1)
-                Bx, Tx = hand_pred.shape
-                metric_counts["hand_acc"] += (hand_pred.reshape(Bx*Tx) == hand_frame.reshape(Bx*Tx)).float().mean().item()
-                metric_counts["clef_acc"] += (clef_pred.reshape(Bx*Tx) == clef_frame.reshape(Bx*Tx)).float().mean().item()
-
-                metric_n += 1
+                    metric_n += 1
 
 
-            else:
-                # ---- clip-level metrics (existing path) ----
-                pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_pitch).float()
-                pitch_gt   = (tgt["pitch"] >= 0.5).float()
-                f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
-                if f1_pitch is not None:
-                    metric_counts["pitch_acc"] += f1_pitch
+                else:
+                    pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_pitch).float()
+                    pitch_gt = (tgt["pitch"] >= 0.5).float()
+                    f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
+                    if f1_pitch is not None:
+                        metric_counts["pitch_acc"] += f1_pitch
 
-                hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
-                clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
-                metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
-                metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
+                    hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
+                    clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
+                    metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
+                    metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
 
-                onset_pred_sel, _ = _aggregate_onoff_predictions(
-                    out["onset_logits"],
-                    thr_on,
-                    mode=agg_cfg["mode"],
-                    k=agg_cfg["k_onset"],
-                    top_k=agg_cfg["top_k"],
-                    tau_sum=agg_cfg["tau_sum"],
-                    temperature=onset_cal["temperature"],
-                    bias=onset_cal["bias"],
-                )
-                offset_pred_sel, _ = _aggregate_onoff_predictions(
-                    out["offset_logits"],
-                    thr_off,
-                    mode=agg_cfg["mode"],
-                    k=agg_cfg["k_offset"],
-                    top_k=agg_cfg["top_k"],
-                    tau_sum=agg_cfg["tau_sum"],
-                    temperature=offset_cal["temperature"],
-                    bias=offset_cal["bias"],
-                )
-                onset_pred_sel = onset_pred_sel.float()
-                offset_pred_sel = offset_pred_sel.float()
+                    onset_pred_sel, _ = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_onset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=onset_cal["temperature"],
+                        bias=onset_cal["bias"],
+                    )
+                    offset_pred_sel, _ = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_offset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=offset_cal["temperature"],
+                        bias=offset_cal["bias"],
+                    )
+                    onset_pred_sel = onset_pred_sel.float()
+                    offset_pred_sel = offset_pred_sel.float()
 
-                onset_pred_legacy, _ = _aggregate_onoff_predictions(
-                    out["onset_logits"],
-                    thr_on,
-                    mode="any",
-                    k=1,
-                    top_k=0,
-                    tau_sum=0.0,
-                    temperature=onset_cal["temperature"],
-                    bias=onset_cal["bias"],
-                )
-                offset_pred_legacy, _ = _aggregate_onoff_predictions(
-                    out["offset_logits"],
-                    thr_off,
-                    mode="any",
-                    k=1,
-                    top_k=0,
-                    tau_sum=0.0,
-                    temperature=offset_cal["temperature"],
-                    bias=offset_cal["bias"],
-                )
-                onset_pred_legacy = onset_pred_legacy.float()
-                offset_pred_legacy = offset_pred_legacy.float()
+                    onset_pred_legacy, _ = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode="any",
+                        k=1,
+                        top_k=0,
+                        tau_sum=0.0,
+                        temperature=onset_cal["temperature"],
+                        bias=onset_cal["bias"],
+                    )
+                    offset_pred_legacy, _ = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode="any",
+                        k=1,
+                        top_k=0,
+                        tau_sum=0.0,
+                        temperature=offset_cal["temperature"],
+                        bias=offset_cal["bias"],
+                    )
+                    onset_pred_legacy = onset_pred_legacy.float()
+                    offset_pred_legacy = offset_pred_legacy.float()
 
-                onset_gt_bin  = (tgt["onset"]  >= 0.5).float().any(dim=-1)
-                offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
+                    onset_gt_bin = (tgt["onset"] >= 0.5).float().any(dim=-1)
+                    offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
 
-                onset_f1_sel = _binary_f1(onset_pred_sel, onset_gt_bin)
-                offset_f1_sel = _binary_f1(offset_pred_sel, offset_gt_bin)
-                onset_f1_legacy = _binary_f1(onset_pred_legacy, onset_gt_bin)
-                offset_f1_legacy = _binary_f1(offset_pred_legacy, offset_gt_bin)
-                if onset_f1_sel is not None:
-                    metric_counts["onset_f1"] += onset_f1_sel
-                    metric_counts["n_on"] += 1
-                if offset_f1_sel is not None:
-                    metric_counts["offset_f1"] += offset_f1_sel
-                    metric_counts["n_off"] += 1
-                if onset_f1_legacy is not None:
-                    legacy_counts["onset_f1"] += onset_f1_legacy
-                    legacy_counts["n_on"] += 1
-                if offset_f1_legacy is not None:
-                    legacy_counts["offset_f1"] += offset_f1_legacy
-                    legacy_counts["n_off"] += 1
+                    onset_f1_sel = _binary_f1(onset_pred_sel, onset_gt_bin)
+                    offset_f1_sel = _binary_f1(offset_pred_sel, offset_gt_bin)
+                    onset_f1_legacy = _binary_f1(onset_pred_legacy, onset_gt_bin)
+                    offset_f1_legacy = _binary_f1(offset_pred_legacy, offset_gt_bin)
+                    if onset_f1_sel is not None:
+                        metric_counts["onset_f1"] += onset_f1_sel
+                        metric_counts["n_on"] += 1
+                    if offset_f1_sel is not None:
+                        metric_counts["offset_f1"] += offset_f1_sel
+                        metric_counts["n_off"] += 1
+                    if onset_f1_legacy is not None:
+                        legacy_counts["onset_f1"] += onset_f1_legacy
+                        legacy_counts["n_on"] += 1
+                    if offset_f1_legacy is not None:
+                        legacy_counts["offset_f1"] += offset_f1_legacy
+                        legacy_counts["n_off"] += 1
 
-                metric_counts["onset_pos_rate"]  += onset_gt_bin.mean().item()
-                metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
-                metric_n += 1
+                    metric_counts["onset_pos_rate"] += onset_gt_bin.mean().item()
+                    metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
+                    metric_n += 1
         if warmup_elapsed is not None and not warmup_logged:
             throughput_live_fallback = warmup_processed / max(warmup_elapsed, 1e-6)
             if verbosity != "quiet":
@@ -1907,6 +2067,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         print(f"[train:eval] timeout after {timeout_label}m; skipping metrics", flush=True)
         logger.warning("[train:eval] timeout after %sm; skipping metrics", timeout_label)
         return None
+    have_valid_metrics = valid_clip_counter > 0
 
     if DEBUG_EVAL_METRICS and onset_logit_stats is not None and offset_logit_stats is not None:
         onset_logit_min, onset_logit_mean, onset_logit_max = _finalize_stats(onset_logit_stats)
@@ -1915,6 +2076,31 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         offset_prob_min, offset_prob_mean, offset_prob_max = _finalize_stats(offset_prob_stats or _init_stats())
         onset_k_report = onset_k_effective if onset_k_effective is not None else int(agg_cfg["k_onset"])
         offset_k_report = offset_k_effective if offset_k_effective is not None else int(agg_cfg["k_offset"])
+
+        if not math.isfinite(onset_logit_min):
+            onset_logit_min = 0.0
+        if not math.isfinite(onset_logit_mean):
+            onset_logit_mean = 0.0
+        if not math.isfinite(onset_logit_max):
+            onset_logit_max = 0.0
+        if not math.isfinite(offset_logit_min):
+            offset_logit_min = 0.0
+        if not math.isfinite(offset_logit_mean):
+            offset_logit_mean = 0.0
+        if not math.isfinite(offset_logit_max):
+            offset_logit_max = 0.0
+        if not math.isfinite(onset_prob_min):
+            onset_prob_min = 0.0
+        if not math.isfinite(onset_prob_mean):
+            onset_prob_mean = 0.0
+        if not math.isfinite(onset_prob_max):
+            onset_prob_max = 0.0
+        if not math.isfinite(offset_prob_min):
+            offset_prob_min = 0.0
+        if not math.isfinite(offset_prob_mean):
+            offset_prob_mean = 0.0
+        if not math.isfinite(offset_prob_max):
+            offset_prob_max = 0.0
 
         print(
             f"[train:eval-debug] onset logits min={onset_logit_min:.4f} mean={onset_logit_mean:.4f} max={onset_logit_max:.4f} | "
@@ -1982,6 +2168,13 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     metrics_any["offset_f1"] = legacy_counts["offset_f1"] / max(1, legacy_counts.get("n_off", 0))
     metrics_any["onset_pred_rate"] = legacy_counts["onset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
     metrics_any["offset_pred_rate"] = legacy_counts["offset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
+
+    if not have_valid_metrics:
+        warn_msg = "[eval WARNING] No valid clips to score after filtering. Metrics set to 0."
+        print(warn_msg, flush=True)
+        logger.warning(warn_msg)
+        metrics = {k: 0.0 for k in metrics.keys()}
+        metrics_any = {k: 0.0 for k in metrics_any.keys()}
 
     val_metrics = {**losses, **metrics}
     legacy_metrics = {**losses, **metrics_any}
