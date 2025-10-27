@@ -586,6 +586,7 @@ def _aggregate_onoff_predictions(
     tau_sum: float,
     temperature: float = 1.0,
     bias: float = 0.0,
+    cap_count: Optional[int] = None,
 ):
     squeeze_time = logits.dim() == 2
     if squeeze_time:
@@ -602,6 +603,20 @@ def _aggregate_onoff_predictions(
             probs = torch.where(keep_mask, probs, torch.zeros_like(probs))
 
     key_mask = probs >= threshold
+
+    if cap_count is not None:
+        cap_eff = int(cap_count)
+        if cap_eff <= 0:
+            key_mask = torch.zeros_like(key_mask)
+        else:
+            P = probs.shape[-1]
+            cap_eff = min(cap_eff, P)
+            if cap_eff < P:
+                topk_idx = probs.topk(cap_eff, dim=-1).indices
+                cap_mask = torch.zeros_like(key_mask)
+                cap_mask.scatter_(-1, topk_idx, True)
+                key_mask = key_mask & cap_mask
+
     key_counts = key_mask.sum(dim=-1).float()
 
     if mode == "k_of_p":
@@ -631,6 +646,28 @@ def _accumulate_pred_key_histogram(hist_bins: list[float], counts: torch.Tensor)
     hist_bins[2] += (flat_counts == 2).sum().item()
     hist_bins[3] += (flat_counts == 3).sum().item()
     hist_bins[4] += (flat_counts >= 4).sum().item()
+
+
+def _init_eval_metric_counts() -> Dict[str, Any]:
+    return {
+        "pitch_acc": 0.0,
+        "hand_acc": 0.0,
+        "clef_acc": 0.0,
+        "onset_f1": 0.0,
+        "offset_f1": 0.0,
+        "onset_pos_rate": 0.0,
+        "offset_pos_rate": 0.0,
+        "onset_pred_rate": 0.0,
+        "offset_pred_rate": 0.0,
+        "onset_key_sum": 0.0,
+        "offset_key_sum": 0.0,
+        "onset_frame_count": 0,
+        "offset_frame_count": 0,
+        "onset_hist": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "offset_hist": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "n_on": 0,
+        "n_off": 0,
+    }
 
 
 def _format_mmss(seconds: float) -> str:
@@ -1378,26 +1415,8 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
     n_batches = 0
 
     # metric accumulators
-    metric_counts = {
-        "pitch_acc": 0.0,
-        "hand_acc":  0.0,
-        "clef_acc":  0.0,
-        "onset_f1":  0.0,
-        "offset_f1": 0.0,
-        # additions for masked F1 + imbalance diagnostics
-        "onset_pos_rate":  0.0,
-        "offset_pos_rate": 0.0,
-        "onset_pred_rate": 0.0,
-        "offset_pred_rate": 0.0,
-        "onset_key_sum": 0.0,
-        "offset_key_sum": 0.0,
-        "onset_frame_count": 0,
-        "offset_frame_count": 0,
-        "onset_hist": [0.0] * 5,
-        "offset_hist": [0.0] * 5,
-        "n_on":  0,   # batches contributing to onset_f1
-        "n_off": 0,   # batches contributing to offset_f1
-    }
+    loose_counts = _init_eval_metric_counts()
+    strict_counts = _init_eval_metric_counts()
     legacy_counts = {
         "onset_f1": 0.0,
         "offset_f1": 0.0,
@@ -1819,7 +1838,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     onset_any = (onset_roll > 0).any(dim=-1).float()
                     offset_any = (offset_roll > 0).any(dim=-1).float()
 
-                    onset_pred_sel, onset_key_counts = _aggregate_onoff_predictions(
+                    loose_onset_pred, loose_onset_counts = _aggregate_onoff_predictions(
                         out["onset_logits"],
                         thr_on,
                         mode=agg_cfg["mode"],
@@ -1829,7 +1848,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=onset_cal["temperature"],
                         bias=onset_cal["bias"],
                     )
-                    offset_pred_sel, offset_key_counts = _aggregate_onoff_predictions(
+                    loose_offset_pred, loose_offset_counts = _aggregate_onoff_predictions(
                         out["offset_logits"],
                         thr_off,
                         mode=agg_cfg["mode"],
@@ -1839,8 +1858,32 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                     )
-                    onset_pred_sel = onset_pred_sel.float()
-                    offset_pred_sel = offset_pred_sel.float()
+                    strict_onset_pred, strict_onset_counts = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_onset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=onset_cal["temperature"],
+                        bias=onset_cal["bias"],
+                        cap_count=agg_cfg["k_onset"],
+                    )
+                    strict_offset_pred, strict_offset_counts = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_offset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=offset_cal["temperature"],
+                        bias=offset_cal["bias"],
+                        cap_count=agg_cfg["k_offset"],
+                    )
+                    loose_onset_pred = loose_onset_pred.float()
+                    loose_offset_pred = loose_offset_pred.float()
+                    strict_onset_pred = strict_onset_pred.float()
+                    strict_offset_pred = strict_offset_pred.float()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
@@ -1865,23 +1908,37 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     onset_pred_legacy = onset_pred_legacy.float()
                     offset_pred_legacy = offset_pred_legacy.float()
 
-                    metric_counts["onset_key_sum"] += onset_key_counts.sum().item()
-                    metric_counts["offset_key_sum"] += offset_key_counts.sum().item()
-                    metric_counts["onset_frame_count"] += onset_key_counts.numel()
-                    metric_counts["offset_frame_count"] += offset_key_counts.numel()
-                    _accumulate_pred_key_histogram(metric_counts["onset_hist"], onset_key_counts)
-                    _accumulate_pred_key_histogram(metric_counts["offset_hist"], offset_key_counts)
+                    loose_counts["onset_key_sum"] += loose_onset_counts.sum().item()
+                    loose_counts["offset_key_sum"] += loose_offset_counts.sum().item()
+                    strict_counts["onset_key_sum"] += strict_onset_counts.sum().item()
+                    strict_counts["offset_key_sum"] += strict_offset_counts.sum().item()
+                    loose_counts["onset_frame_count"] += loose_onset_counts.numel()
+                    loose_counts["offset_frame_count"] += loose_offset_counts.numel()
+                    strict_counts["onset_frame_count"] += strict_onset_counts.numel()
+                    strict_counts["offset_frame_count"] += strict_offset_counts.numel()
+                    _accumulate_pred_key_histogram(loose_counts["onset_hist"], loose_onset_counts)
+                    _accumulate_pred_key_histogram(loose_counts["offset_hist"], loose_offset_counts)
+                    _accumulate_pred_key_histogram(strict_counts["onset_hist"], strict_onset_counts)
+                    _accumulate_pred_key_histogram(strict_counts["offset_hist"], strict_offset_counts)
 
-                    f1_on_sel = _binary_f1(onset_pred_sel.reshape(-1), onset_any.reshape(-1))
-                    f1_off_sel = _binary_f1(offset_pred_sel.reshape(-1), offset_any.reshape(-1))
+                    f1_on_loose = _binary_f1(loose_onset_pred.reshape(-1), onset_any.reshape(-1))
+                    f1_off_loose = _binary_f1(loose_offset_pred.reshape(-1), offset_any.reshape(-1))
+                    f1_on_strict = _binary_f1(strict_onset_pred.reshape(-1), onset_any.reshape(-1))
+                    f1_off_strict = _binary_f1(strict_offset_pred.reshape(-1), offset_any.reshape(-1))
                     f1_on_legacy = _binary_f1(onset_pred_legacy.reshape(-1), onset_any.reshape(-1))
                     f1_off_legacy = _binary_f1(offset_pred_legacy.reshape(-1), offset_any.reshape(-1))
-                    if f1_on_sel is not None:
-                        metric_counts["onset_f1"] += f1_on_sel
-                        metric_counts["n_on"] += 1
-                    if f1_off_sel is not None:
-                        metric_counts["offset_f1"] += f1_off_sel
-                        metric_counts["n_off"] += 1
+                    if f1_on_loose is not None:
+                        loose_counts["onset_f1"] += f1_on_loose
+                        loose_counts["n_on"] += 1
+                    if f1_off_loose is not None:
+                        loose_counts["offset_f1"] += f1_off_loose
+                        loose_counts["n_off"] += 1
+                    if f1_on_strict is not None:
+                        strict_counts["onset_f1"] += f1_on_strict
+                        strict_counts["n_on"] += 1
+                    if f1_off_strict is not None:
+                        strict_counts["offset_f1"] += f1_off_strict
+                        strict_counts["n_off"] += 1
                     if f1_on_legacy is not None:
                         legacy_counts["onset_f1"] += f1_on_legacy
                         legacy_counts["n_on"] += 1
@@ -1889,10 +1946,16 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         legacy_counts["offset_f1"] += f1_off_legacy
                         legacy_counts["n_off"] += 1
 
-                    metric_counts["onset_pos_rate"] += onset_any.mean().item()
-                    metric_counts["offset_pos_rate"] += offset_any.mean().item()
-                    metric_counts["onset_pred_rate"] += onset_pred_sel.mean().item()
-                    metric_counts["offset_pred_rate"] += offset_pred_sel.mean().item()
+                    onset_pos_rate = onset_any.mean().item()
+                    offset_pos_rate = offset_any.mean().item()
+                    loose_counts["onset_pos_rate"] += onset_pos_rate
+                    loose_counts["offset_pos_rate"] += offset_pos_rate
+                    strict_counts["onset_pos_rate"] += onset_pos_rate
+                    strict_counts["offset_pos_rate"] += offset_pos_rate
+                    loose_counts["onset_pred_rate"] += loose_onset_pred.mean().item()
+                    loose_counts["offset_pred_rate"] += loose_offset_pred.mean().item()
+                    strict_counts["onset_pred_rate"] += strict_onset_pred.mean().item()
+                    strict_counts["offset_pred_rate"] += strict_offset_pred.mean().item()
                     legacy_counts["onset_pred_rate"] += onset_pred_legacy.mean().item()
                     legacy_counts["offset_pred_rate"] += offset_pred_legacy.mean().item()
                     legacy_counts["metric_n"] += 1
@@ -1902,8 +1965,12 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     hand_pred = hand_prob.argmax(dim=-1)
                     clef_pred = clef_prob.argmax(dim=-1)
                     Bx, Tx = hand_pred.shape
-                    metric_counts["hand_acc"] += (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
-                    metric_counts["clef_acc"] += (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
+                    hand_acc_val = (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
+                    clef_acc_val = (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
+                    loose_counts["hand_acc"] += hand_acc_val
+                    loose_counts["clef_acc"] += clef_acc_val
+                    strict_counts["hand_acc"] += hand_acc_val
+                    strict_counts["clef_acc"] += clef_acc_val
 
                     metric_n += 1
 
@@ -1913,14 +1980,19 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     pitch_gt = (tgt["pitch"] >= 0.5).float()
                     f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
                     if f1_pitch is not None:
-                        metric_counts["pitch_acc"] += f1_pitch
+                        loose_counts["pitch_acc"] += f1_pitch
+                        strict_counts["pitch_acc"] += f1_pitch
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
-                    metric_counts["hand_acc"] += (hand_pred == tgt["hand"]).float().mean().item()
-                    metric_counts["clef_acc"] += (clef_pred == tgt["clef"]).float().mean().item()
+                    hand_acc_val = (hand_pred == tgt["hand"]).float().mean().item()
+                    clef_acc_val = (clef_pred == tgt["clef"]).float().mean().item()
+                    loose_counts["hand_acc"] += hand_acc_val
+                    loose_counts["clef_acc"] += clef_acc_val
+                    strict_counts["hand_acc"] += hand_acc_val
+                    strict_counts["clef_acc"] += clef_acc_val
 
-                    onset_pred_sel, _ = _aggregate_onoff_predictions(
+                    loose_onset_pred, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
                         thr_on,
                         mode=agg_cfg["mode"],
@@ -1930,7 +2002,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=onset_cal["temperature"],
                         bias=onset_cal["bias"],
                     )
-                    offset_pred_sel, _ = _aggregate_onoff_predictions(
+                    loose_offset_pred, _ = _aggregate_onoff_predictions(
                         out["offset_logits"],
                         thr_off,
                         mode=agg_cfg["mode"],
@@ -1940,8 +2012,32 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                     )
-                    onset_pred_sel = onset_pred_sel.float()
-                    offset_pred_sel = offset_pred_sel.float()
+                    strict_onset_pred, _ = _aggregate_onoff_predictions(
+                        out["onset_logits"],
+                        thr_on,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_onset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=onset_cal["temperature"],
+                        bias=onset_cal["bias"],
+                        cap_count=agg_cfg["k_onset"],
+                    )
+                    strict_offset_pred, _ = _aggregate_onoff_predictions(
+                        out["offset_logits"],
+                        thr_off,
+                        mode=agg_cfg["mode"],
+                        k=agg_cfg["k_offset"],
+                        top_k=agg_cfg["top_k"],
+                        tau_sum=agg_cfg["tau_sum"],
+                        temperature=offset_cal["temperature"],
+                        bias=offset_cal["bias"],
+                        cap_count=agg_cfg["k_offset"],
+                    )
+                    loose_onset_pred = loose_onset_pred.float()
+                    loose_offset_pred = loose_offset_pred.float()
+                    strict_onset_pred = strict_onset_pred.float()
+                    strict_offset_pred = strict_offset_pred.float()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
@@ -1969,16 +2065,24 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     onset_gt_bin = (tgt["onset"] >= 0.5).float().any(dim=-1)
                     offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
 
-                    onset_f1_sel = _binary_f1(onset_pred_sel, onset_gt_bin)
-                    offset_f1_sel = _binary_f1(offset_pred_sel, offset_gt_bin)
+                    onset_f1_loose = _binary_f1(loose_onset_pred, onset_gt_bin)
+                    offset_f1_loose = _binary_f1(loose_offset_pred, offset_gt_bin)
+                    onset_f1_strict = _binary_f1(strict_onset_pred, onset_gt_bin)
+                    offset_f1_strict = _binary_f1(strict_offset_pred, offset_gt_bin)
                     onset_f1_legacy = _binary_f1(onset_pred_legacy, onset_gt_bin)
                     offset_f1_legacy = _binary_f1(offset_pred_legacy, offset_gt_bin)
-                    if onset_f1_sel is not None:
-                        metric_counts["onset_f1"] += onset_f1_sel
-                        metric_counts["n_on"] += 1
-                    if offset_f1_sel is not None:
-                        metric_counts["offset_f1"] += offset_f1_sel
-                        metric_counts["n_off"] += 1
+                    if onset_f1_loose is not None:
+                        loose_counts["onset_f1"] += onset_f1_loose
+                        loose_counts["n_on"] += 1
+                    if offset_f1_loose is not None:
+                        loose_counts["offset_f1"] += offset_f1_loose
+                        loose_counts["n_off"] += 1
+                    if onset_f1_strict is not None:
+                        strict_counts["onset_f1"] += onset_f1_strict
+                        strict_counts["n_on"] += 1
+                    if offset_f1_strict is not None:
+                        strict_counts["offset_f1"] += offset_f1_strict
+                        strict_counts["n_off"] += 1
                     if onset_f1_legacy is not None:
                         legacy_counts["onset_f1"] += onset_f1_legacy
                         legacy_counts["n_on"] += 1
@@ -1986,8 +2090,12 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         legacy_counts["offset_f1"] += offset_f1_legacy
                         legacy_counts["n_off"] += 1
 
-                    metric_counts["onset_pos_rate"] += onset_gt_bin.mean().item()
-                    metric_counts["offset_pos_rate"] += offset_gt_bin.mean().item()
+                    onset_pos_rate = onset_gt_bin.mean().item()
+                    offset_pos_rate = offset_gt_bin.mean().item()
+                    loose_counts["onset_pos_rate"] += onset_pos_rate
+                    loose_counts["offset_pos_rate"] += offset_pos_rate
+                    strict_counts["onset_pos_rate"] += onset_pos_rate
+                    strict_counts["offset_pos_rate"] += offset_pos_rate
                     metric_n += 1
         if warmup_elapsed is not None and not warmup_logged:
             throughput_live_fallback = warmup_processed / max(warmup_elapsed, 1e-6)
@@ -2119,51 +2227,59 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
 
     # averages
     losses = {k: sums[k] / max(1, n_batches) for k in sums}
-    metrics = {}
-    metrics["pitch_acc"]  = metric_counts["pitch_acc"] / max(1, metric_n)
-    metrics["hand_acc"]   = metric_counts["hand_acc"]  / max(1, metric_n)
-    metrics["clef_acc"]   = metric_counts["clef_acc"]  / max(1, metric_n)
-    metrics["onset_f1"]   = metric_counts["onset_f1"]  / max(1, metric_counts.get("n_on", 0))
-    metrics["offset_f1"]  = metric_counts["offset_f1"] / max(1, metric_counts.get("n_off", 0))
-    metrics["onset_pos_rate"]  = metric_counts["onset_pos_rate"]  / max(1, metric_n)
-    metrics["offset_pos_rate"] = metric_counts["offset_pos_rate"] / max(1, metric_n)
-    metrics["onset_pred_rate"]  = metric_counts["onset_pred_rate"]  / max(1, metric_n)
-    metrics["offset_pred_rate"] = metric_counts["offset_pred_rate"] / max(1, metric_n)
-    onset_frames = metric_counts["onset_frame_count"]
-    offset_frames = metric_counts["offset_frame_count"]
-    if onset_frames > 0:
-        metrics["mean_pred_keys_per_frame_onset"] = metric_counts["onset_key_sum"] / onset_frames
-        onset_hist = metric_counts["onset_hist"]
-        metrics["pred_keys_hist_onset_0"] = onset_hist[0] / onset_frames
-        metrics["pred_keys_hist_onset_1"] = onset_hist[1] / onset_frames
-        metrics["pred_keys_hist_onset_2"] = onset_hist[2] / onset_frames
-        metrics["pred_keys_hist_onset_3"] = onset_hist[3] / onset_frames
-        metrics["pred_keys_hist_onset_ge4"] = onset_hist[4] / onset_frames
-    else:
-        metrics["mean_pred_keys_per_frame_onset"] = 0.0
-        metrics["pred_keys_hist_onset_0"] = 0.0
-        metrics["pred_keys_hist_onset_1"] = 0.0
-        metrics["pred_keys_hist_onset_2"] = 0.0
-        metrics["pred_keys_hist_onset_3"] = 0.0
-        metrics["pred_keys_hist_onset_ge4"] = 0.0
+    def _finalize_branch_counts(counts: Dict[str, Any]) -> Dict[str, float]:
+        branch: Dict[str, float] = {}
+        denom = max(1, metric_n)
+        branch["pitch_acc"] = counts["pitch_acc"] / denom
+        branch["hand_acc"] = counts["hand_acc"] / denom
+        branch["clef_acc"] = counts["clef_acc"] / denom
+        branch["onset_f1"] = counts["onset_f1"] / max(1, counts.get("n_on", 0))
+        branch["offset_f1"] = counts["offset_f1"] / max(1, counts.get("n_off", 0))
+        branch["onset_pos_rate"] = counts["onset_pos_rate"] / denom
+        branch["offset_pos_rate"] = counts["offset_pos_rate"] / denom
+        branch["onset_pred_rate"] = counts["onset_pred_rate"] / denom
+        branch["offset_pred_rate"] = counts["offset_pred_rate"] / denom
 
-    if offset_frames > 0:
-        metrics["mean_pred_keys_per_frame_offset"] = metric_counts["offset_key_sum"] / offset_frames
-        offset_hist = metric_counts["offset_hist"]
-        metrics["pred_keys_hist_offset_0"] = offset_hist[0] / offset_frames
-        metrics["pred_keys_hist_offset_1"] = offset_hist[1] / offset_frames
-        metrics["pred_keys_hist_offset_2"] = offset_hist[2] / offset_frames
-        metrics["pred_keys_hist_offset_3"] = offset_hist[3] / offset_frames
-        metrics["pred_keys_hist_offset_ge4"] = offset_hist[4] / offset_frames
-    else:
-        metrics["mean_pred_keys_per_frame_offset"] = 0.0
-        metrics["pred_keys_hist_offset_0"] = 0.0
-        metrics["pred_keys_hist_offset_1"] = 0.0
-        metrics["pred_keys_hist_offset_2"] = 0.0
-        metrics["pred_keys_hist_offset_3"] = 0.0
-        metrics["pred_keys_hist_offset_ge4"] = 0.0
+        onset_frames = counts["onset_frame_count"]
+        offset_frames = counts["offset_frame_count"]
+        if onset_frames > 0:
+            onset_hist = counts["onset_hist"]
+            branch["mean_pred_keys_per_frame_onset"] = counts["onset_key_sum"] / onset_frames
+            branch["pred_keys_hist_onset_0"] = onset_hist[0] / onset_frames
+            branch["pred_keys_hist_onset_1"] = onset_hist[1] / onset_frames
+            branch["pred_keys_hist_onset_2"] = onset_hist[2] / onset_frames
+            branch["pred_keys_hist_onset_3"] = onset_hist[3] / onset_frames
+            branch["pred_keys_hist_onset_ge4"] = onset_hist[4] / onset_frames
+        else:
+            branch["mean_pred_keys_per_frame_onset"] = 0.0
+            branch["pred_keys_hist_onset_0"] = 0.0
+            branch["pred_keys_hist_onset_1"] = 0.0
+            branch["pred_keys_hist_onset_2"] = 0.0
+            branch["pred_keys_hist_onset_3"] = 0.0
+            branch["pred_keys_hist_onset_ge4"] = 0.0
 
-    metrics_any = dict(metrics)
+        if offset_frames > 0:
+            offset_hist = counts["offset_hist"]
+            branch["mean_pred_keys_per_frame_offset"] = counts["offset_key_sum"] / offset_frames
+            branch["pred_keys_hist_offset_0"] = offset_hist[0] / offset_frames
+            branch["pred_keys_hist_offset_1"] = offset_hist[1] / offset_frames
+            branch["pred_keys_hist_offset_2"] = offset_hist[2] / offset_frames
+            branch["pred_keys_hist_offset_3"] = offset_hist[3] / offset_frames
+            branch["pred_keys_hist_offset_ge4"] = offset_hist[4] / offset_frames
+        else:
+            branch["mean_pred_keys_per_frame_offset"] = 0.0
+            branch["pred_keys_hist_offset_0"] = 0.0
+            branch["pred_keys_hist_offset_1"] = 0.0
+            branch["pred_keys_hist_offset_2"] = 0.0
+            branch["pred_keys_hist_offset_3"] = 0.0
+            branch["pred_keys_hist_offset_ge4"] = 0.0
+
+        return branch
+
+    loose_branch = _finalize_branch_counts(loose_counts)
+    strict_branch = _finalize_branch_counts(strict_counts)
+
+    metrics_any = dict(loose_branch)
     metrics_any["onset_f1"] = legacy_counts["onset_f1"] / max(1, legacy_counts.get("n_on", 0))
     metrics_any["offset_f1"] = legacy_counts["offset_f1"] / max(1, legacy_counts.get("n_off", 0))
     metrics_any["onset_pred_rate"] = legacy_counts["onset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
@@ -2173,22 +2289,28 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
         warn_msg = "[eval WARNING] No valid clips to score after filtering. Metrics set to 0."
         print(warn_msg, flush=True)
         logger.warning(warn_msg)
-        metrics = {k: 0.0 for k in metrics.keys()}
+        loose_branch = {k: 0.0 for k in loose_branch.keys()}
+        strict_branch = {k: 0.0 for k in strict_branch.keys()}
         metrics_any = {k: 0.0 for k in metrics_any.keys()}
 
-    val_metrics = {**losses, **metrics}
+    loose_prefixed = {f"loose_{k}": v for k, v in loose_branch.items()}
+    strict_prefixed = {f"strict_{k}": v for k, v in strict_branch.items()}
+
+    val_metrics = {**losses, **loose_prefixed, **strict_prefixed}
     legacy_metrics = {**losses, **metrics_any}
 
     def _fmt_metrics_line(items: Mapping[str, float]):
         return " ".join(f"{k}={v:.3f}\t" for k, v in items.items())
 
-    agg_label = agg_cfg["mode"].replace("_", "-")
-    selected_line = _fmt_metrics_line(val_metrics)
+    loose_line = _fmt_metrics_line({**losses, **loose_branch})
+    strict_line = _fmt_metrics_line({**losses, **strict_branch})
     legacy_line = _fmt_metrics_line(legacy_metrics)
-    print(f"[{agg_label}] {selected_line}\n")
+    print(f"[loose] {loose_line}\n")
+    print(f"[strict] {strict_line}\n")
     print(f"[any] {legacy_line}\n")
     quiet_extra = {QUIET_INFO_FLAG: True}
-    logger.info("[%s] %s", agg_label, selected_line, extra=quiet_extra)
+    logger.info("[loose] %s", loose_line, extra=quiet_extra)
+    logger.info("[strict] %s", strict_line, extra=quiet_extra)
     logger.info("[any] %s", legacy_line, extra=quiet_extra)
 
     processed_total = progress.get("count", 0)
