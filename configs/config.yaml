@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 2
+  epochs: 5
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
