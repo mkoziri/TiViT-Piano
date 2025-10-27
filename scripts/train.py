@@ -1863,7 +1863,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                     )
-                    strict_onset_pred, strict_onset_counts, strict_onset_mask = _aggregate_onoff_predictions(
+                    strict_onset_pred, strict_onset_counts = _aggregate_onoff_predictions(
                         out["onset_logits"],
                         thr_on,
                         mode=agg_cfg["mode"],
@@ -1873,9 +1873,8 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=onset_cal["temperature"],
                         bias=onset_cal["bias"],
                         cap_count=agg_cfg["k_onset"],
-                        return_mask=True,
                     )
-                    strict_offset_pred, strict_offset_counts, strict_offset_mask = _aggregate_onoff_predictions(
+                    strict_offset_pred, strict_offset_counts = _aggregate_onoff_predictions(
                         out["offset_logits"],
                         thr_off,
                         mode=agg_cfg["mode"],
@@ -1885,14 +1884,11 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                         cap_count=agg_cfg["k_offset"],
-                        return_mask=True,
                     )
                     loose_onset_pred = loose_onset_pred.float()
                     loose_offset_pred = loose_offset_pred.float()
                     strict_onset_pred = strict_onset_pred.float()
                     strict_offset_pred = strict_offset_pred.float()
-                    strict_onset_mask_float = strict_onset_mask.float()
-                    strict_offset_mask_float = strict_offset_mask.float()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
@@ -1930,13 +1926,10 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     _accumulate_pred_key_histogram(strict_counts["onset_hist"], strict_onset_counts)
                     _accumulate_pred_key_histogram(strict_counts["offset_hist"], strict_offset_counts)
 
-                    onset_gt_mask = (onset_roll > 0).float()
-                    offset_gt_mask = (offset_roll > 0).float()
-
                     f1_on_loose = _binary_f1(loose_onset_pred.reshape(-1), onset_any.reshape(-1))
                     f1_off_loose = _binary_f1(loose_offset_pred.reshape(-1), offset_any.reshape(-1))
-                    f1_on_strict = _binary_f1(strict_onset_mask_float.reshape(-1), onset_gt_mask.reshape(-1))
-                    f1_off_strict = _binary_f1(strict_offset_mask_float.reshape(-1), offset_gt_mask.reshape(-1))
+                    f1_on_strict = _binary_f1(strict_onset_pred.reshape(-1), onset_any.reshape(-1))
+                    f1_off_strict = _binary_f1(strict_offset_pred.reshape(-1), offset_any.reshape(-1))
                     f1_on_legacy = _binary_f1(onset_pred_legacy.reshape(-1), onset_any.reshape(-1))
                     f1_off_legacy = _binary_f1(offset_pred_legacy.reshape(-1), offset_any.reshape(-1))
                     if f1_on_loose is not None:
@@ -1962,12 +1955,12 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     offset_pos_rate = offset_any.mean().item()
                     loose_counts["onset_pos_rate"] += onset_pos_rate
                     loose_counts["offset_pos_rate"] += offset_pos_rate
-                    strict_counts["onset_pos_rate"] += onset_gt_mask.mean().item()
-                    strict_counts["offset_pos_rate"] += offset_gt_mask.mean().item()
+                    strict_counts["onset_pos_rate"] += onset_pos_rate
+                    strict_counts["offset_pos_rate"] += offset_pos_rate
                     loose_counts["onset_pred_rate"] += loose_onset_pred.mean().item()
                     loose_counts["offset_pred_rate"] += loose_offset_pred.mean().item()
-                    strict_counts["onset_pred_rate"] += strict_onset_mask_float.mean().item()
-                    strict_counts["offset_pred_rate"] += strict_offset_mask_float.mean().item()
+                    strict_counts["onset_pred_rate"] += strict_onset_pred.mean().item()
+                    strict_counts["offset_pred_rate"] += strict_offset_pred.mean().item()
                     legacy_counts["onset_pred_rate"] += onset_pred_legacy.mean().item()
                     legacy_counts["offset_pred_rate"] += offset_pred_legacy.mean().item()
                     legacy_counts["metric_n"] += 1
@@ -2024,7 +2017,7 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                     )
-                    strict_onset_pred, _, strict_onset_mask = _aggregate_onoff_predictions(
+                    strict_onset_pred, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
                         thr_on,
                         mode=agg_cfg["mode"],
@@ -2034,9 +2027,8 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=onset_cal["temperature"],
                         bias=onset_cal["bias"],
                         cap_count=agg_cfg["k_onset"],
-                        return_mask=True,
                     )
-                    strict_offset_pred, _, strict_offset_mask = _aggregate_onoff_predictions(
+                    strict_offset_pred, _ = _aggregate_onoff_predictions(
                         out["offset_logits"],
                         thr_off,
                         mode=agg_cfg["mode"],
@@ -2046,14 +2038,11 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         temperature=offset_cal["temperature"],
                         bias=offset_cal["bias"],
                         cap_count=agg_cfg["k_offset"],
-                        return_mask=True,
                     )
                     loose_onset_pred = loose_onset_pred.float()
                     loose_offset_pred = loose_offset_pred.float()
                     strict_onset_pred = strict_onset_pred.float()
                     strict_offset_pred = strict_offset_pred.float()
-                    strict_onset_mask_float = strict_onset_mask.float()
-                    strict_offset_mask_float = strict_offset_mask.float()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
@@ -2078,15 +2067,13 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     onset_pred_legacy = onset_pred_legacy.float()
                     offset_pred_legacy = offset_pred_legacy.float()
 
-                    onset_gt = (tgt["onset"] >= 0.5).float()
-                    offset_gt = (tgt["offset"] >= 0.5).float()
-                    onset_gt_bin = onset_gt.any(dim=-1)
-                    offset_gt_bin = offset_gt.any(dim=-1)
+                    onset_gt_bin = (tgt["onset"] >= 0.5).float().any(dim=-1)
+                    offset_gt_bin = (tgt["offset"] >= 0.5).float().any(dim=-1)
 
                     onset_f1_loose = _binary_f1(loose_onset_pred, onset_gt_bin)
                     offset_f1_loose = _binary_f1(loose_offset_pred, offset_gt_bin)
-                    onset_f1_strict = _binary_f1(strict_onset_mask_float.reshape(-1), onset_gt.reshape(-1))
-                    offset_f1_strict = _binary_f1(strict_offset_mask_float.reshape(-1), offset_gt.reshape(-1))
+                    onset_f1_strict = _binary_f1(strict_onset_pred, onset_gt_bin)
+                    offset_f1_strict = _binary_f1(strict_offset_pred, offset_gt_bin)
                     onset_f1_legacy = _binary_f1(onset_pred_legacy, onset_gt_bin)
                     offset_f1_legacy = _binary_f1(offset_pred_legacy, offset_gt_bin)
                     if onset_f1_loose is not None:
@@ -2112,12 +2099,12 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                     offset_pos_rate = offset_gt_bin.mean().item()
                     loose_counts["onset_pos_rate"] += onset_pos_rate
                     loose_counts["offset_pos_rate"] += offset_pos_rate
-                    strict_counts["onset_pos_rate"] += onset_gt.mean().item()
-                    strict_counts["offset_pos_rate"] += offset_gt.mean().item()
+                    strict_counts["onset_pos_rate"] += onset_pos_rate
+                    strict_counts["offset_pos_rate"] += offset_pos_rate
                     loose_counts["onset_pred_rate"] += loose_onset_pred.mean().item()
                     loose_counts["offset_pred_rate"] += loose_offset_pred.mean().item()
-                    strict_counts["onset_pred_rate"] += strict_onset_mask_float.mean().item()
-                    strict_counts["offset_pred_rate"] += strict_offset_mask_float.mean().item()
+                    strict_counts["onset_pred_rate"] += strict_onset_pred.mean().item()
+                    strict_counts["offset_pred_rate"] += strict_offset_pred.mean().item()
                     metric_n += 1
         if warmup_elapsed is not None and not warmup_logged:
             throughput_live_fallback = warmup_processed / max(warmup_elapsed, 1e-6)
