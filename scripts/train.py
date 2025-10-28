@@ -866,6 +866,181 @@ def _align_key_mask_to(pred_mask: torch.Tensor, gt_mask: torch.Tensor) -> torch.
     return aligned.to(gt_mask.dtype)
 
 
+def _median_filter_time_proxy(clip_probs: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Apply a 1D median filter over time for a single (T,P) pianoroll."""
+
+    if kernel_size <= 1:
+        return clip_probs
+    if clip_probs.ndim != 2:
+        raise ValueError(f"Median filter expects (T,P) tensor, got {clip_probs.ndim} dims")
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    pad = kernel_size // 2
+    probs_pt = clip_probs.transpose(0, 1).unsqueeze(1)  # (P,1,T)
+    padded = F.pad(probs_pt, (pad, pad), mode="replicate")
+    windows = padded.unfold(-1, kernel_size, 1)  # (P,1,T,k)
+    filtered = windows.median(dim=-1).values  # (P,1,T)
+    return filtered.squeeze(1).transpose(0, 1).contiguous()
+
+
+def _proxy_decode_mask(
+    probs: torch.Tensor,
+    *,
+    high_thr: float,
+    low_ratio: float,
+    min_on: int,
+    min_off: int,
+    gap_merge: int,
+    median: int,
+) -> torch.Tensor:
+    """Decode per-key probabilities with lightweight hysteresis-style smoothing."""
+
+    if probs.ndim not in (2, 3):
+        raise ValueError(f"Expected probs with 2 or 3 dims, got {probs.ndim}")
+    if probs.numel() == 0:
+        return torch.zeros_like(probs, dtype=torch.bool)
+
+    high_thr = float(high_thr)
+    low_thr = high_thr * float(low_ratio)
+    min_on = max(0, int(min_on))
+    min_off = max(0, int(min_off))
+    gap_merge = int(gap_merge)
+    median = int(median)
+
+    def _decode_single(single: torch.Tensor) -> torch.Tensor:
+        work = single.detach().float().cpu()
+        if median > 1:
+            work = _median_filter_time_proxy(work, median)
+        T, P = work.shape
+        mask_cpu = torch.zeros((T, P), dtype=torch.bool)
+        for pitch in range(P):
+            seq = work[:, pitch].tolist()
+            segments: list[Tuple[int, int]] = []
+            active = False
+            start_idx = 0
+            for t, raw_val in enumerate(seq):
+                val = float(raw_val) if math.isfinite(raw_val) else 0.0
+                if not active:
+                    if val >= high_thr:
+                        active = True
+                        start_idx = t
+                else:
+                    if val < low_thr:
+                        segments.append((start_idx, t))
+                        active = False
+            if active:
+                segments.append((start_idx, T))
+            if not segments:
+                continue
+            merged: list[list[int]] = []
+            for seg_start, seg_end in segments:
+                if not merged:
+                    merged.append([seg_start, seg_end])
+                    continue
+                prev_start, prev_end = merged[-1]
+                gap = seg_start - prev_end
+                should_merge = False
+                if gap_merge >= 0 and gap <= gap_merge:
+                    should_merge = True
+                if min_off > 0 and gap < min_off:
+                    should_merge = True
+                if should_merge:
+                    merged[-1][1] = seg_end
+                else:
+                    merged.append([seg_start, seg_end])
+            for seg_start, seg_end in merged:
+                if seg_end - seg_start < min_on:
+                    continue
+                mask_cpu[seg_start:seg_end, pitch] = True
+        return mask_cpu.to(single.device)
+
+    if probs.ndim == 2:
+        return _decode_single(probs)
+
+    decoded = [_decode_single(clip) for clip in probs]
+    if not decoded:
+        return torch.zeros_like(probs, dtype=torch.bool)
+    return torch.stack(decoded, dim=0)
+
+
+def _event_f1_clip(
+    pred_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    hop_seconds: float,
+    tol_sec: float,
+    eps: float = 1e-8,
+) -> Optional[float]:
+    """Compute event-level F1 for a single clip (T,P) mask pair."""
+
+    if pred_mask.shape != target_mask.shape:
+        raise ValueError("Prediction and target masks must share shape for event F1")
+
+    pred_idx = pred_mask.nonzero(as_tuple=False)
+    target_idx = target_mask.nonzero(as_tuple=False)
+    if pred_idx.numel() == 0 and target_idx.numel() == 0:
+        return None
+
+    pred_idx = pred_idx.cpu()
+    target_idx = target_idx.cpu()
+    pred_times = pred_idx[:, 0].to(torch.float32) * float(hop_seconds)
+    target_times = target_idx[:, 0].to(torch.float32) * float(hop_seconds)
+    pred_pitch = pred_idx[:, 1]
+    target_pitch = target_idx[:, 1]
+
+    used = torch.zeros(target_idx.shape[0], dtype=torch.bool)
+    tp = 0
+    for i in range(pred_idx.shape[0]):
+        pitch = pred_pitch[i]
+        time_val = pred_times[i]
+        mask = (target_pitch == pitch) & (~used)
+        if mask.any():
+            cand_idx = torch.where(mask)[0]
+            diffs = torch.abs(target_times[cand_idx] - time_val)
+            min_diff, rel = torch.min(diffs, dim=0)
+            if min_diff.item() <= float(tol_sec):
+                tp += 1
+                used[cand_idx[rel]] = True
+
+    fp = pred_idx.shape[0] - tp
+    fn = target_idx.shape[0] - tp
+    precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+    if precision == 0.0 and recall == 0.0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall + eps)
+
+
+def _event_f1_batch(
+    pred_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    hop_seconds: float,
+    tol_sec: float,
+) -> Tuple[float, int]:
+    """Aggregate event-level F1 over a batch."""
+
+    if pred_mask.shape != target_mask.shape:
+        raise ValueError("Predictions and targets must align for batch event F1")
+
+    if pred_mask.ndim == 2:
+        score = _event_f1_clip(pred_mask, target_mask, hop_seconds, tol_sec)
+        if score is None:
+            return 0.0, 0
+        return float(score), 1
+
+    if pred_mask.ndim != 3:
+        raise ValueError("Expected 2D or 3D pianoroll masks for event F1 computation")
+
+    total = 0.0
+    count = 0
+    for clip_pred, clip_target in zip(pred_mask, target_mask):
+        score = _event_f1_clip(clip_pred, clip_target, hop_seconds, tol_sec)
+        if score is None:
+            continue
+        total += float(score)
+        count += 1
+    return total, count
+
+
 def _format_mmss(seconds: float) -> str:
     total_seconds = max(0.0, float(seconds))
     minutes = int(total_seconds // 60)
@@ -1402,6 +1577,7 @@ def save_checkpoint(
     epoch: int,
     cfg: Mapping[str, Any],
     best_val: float | None = None,
+    best_event_f1: float | None = None,
     trainer_state: Optional[Dict[str, Any]] = None,
 ):
     state = {
@@ -1410,6 +1586,7 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "config": cfg,
         "best_val": best_val,
+        "best_event_f1": best_event_f1,
     }
     if trainer_state is not None:
         state["trainer_state"] = trainer_state
@@ -1584,6 +1761,27 @@ def evaluate_one_epoch(
     thr_on = onset_cal["threshold"]
     thr_off = offset_cal["threshold"]
     agg_cfg = _get_aggregation_config(cfg)
+    dataset_cfg = cfg.get("dataset", {}) or {}
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    if hop_seconds <= 0.0:
+        decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
+        hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
+    frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
+    event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
+    proxy_decoder_cfg = metrics_cfg.get("proxy_decoder", {}) or {}
+    proxy_decoder = {
+        "low_ratio": float(proxy_decoder_cfg.get("low_ratio", 0.6)),
+        "min_on": int(proxy_decoder_cfg.get("min_on", 2)),
+        "min_off": int(proxy_decoder_cfg.get("min_off", 2)),
+        "gap_merge": int(proxy_decoder_cfg.get("gap_merge", 1)),
+        "median": int(proxy_decoder_cfg.get("median", 3)),
+    }
+    event_proxy_accum = {
+        "onset_sum": 0.0,
+        "offset_sum": 0.0,
+        "onset_count": 0,
+        "offset_count": 0,
+    }
 
     logger.info(
         "[eval-thresholds] onset=%.3f offset=%.3f (default=%.3f) | temps (on=%.2f, off=%.2f) bias (on=%.3f, off=%.3f)",
@@ -2123,6 +2321,52 @@ def evaluate_one_epoch(
                     strict_offset_pred = strict_offset_pred.float()
                     strict_onset_mask_float = strict_onset_mask.float()
                     strict_offset_mask_float = strict_offset_mask.float()
+                    onset_event_mask = strict_onset_mask.bool()
+                    offset_event_mask = strict_offset_mask.bool()
+
+                    onset_probs_proxy = onset_probs_valid
+                    if onset_probs_proxy is None and "onset_logits" in out:
+                        onset_probs_proxy = _apply_sigmoid_calibration(
+                            out["onset_logits"],
+                            temperature=onset_cal["temperature"],
+                            bias=onset_cal["bias"],
+                        )
+                    if onset_probs_proxy is not None and onset_probs_proxy.shape == strict_onset_mask_float.shape:
+                        masked_onset_probs = (onset_probs_proxy.float() * strict_onset_mask_float).contiguous()
+                        try:
+                            onset_event_mask = _proxy_decode_mask(
+                                masked_onset_probs,
+                                high_thr=thr_on,
+                                low_ratio=proxy_decoder["low_ratio"],
+                                min_on=proxy_decoder["min_on"],
+                                min_off=proxy_decoder["min_off"],
+                                gap_merge=proxy_decoder["gap_merge"],
+                                median=proxy_decoder["median"],
+                            )
+                        except ValueError:
+                            onset_event_mask = strict_onset_mask.bool()
+
+                    offset_probs_proxy = offset_probs_valid
+                    if offset_probs_proxy is None and "offset_logits" in out:
+                        offset_probs_proxy = _apply_sigmoid_calibration(
+                            out["offset_logits"],
+                            temperature=offset_cal["temperature"],
+                            bias=offset_cal["bias"],
+                        )
+                    if offset_probs_proxy is not None and offset_probs_proxy.shape == strict_offset_mask_float.shape:
+                        masked_offset_probs = (offset_probs_proxy.float() * strict_offset_mask_float).contiguous()
+                        try:
+                            offset_event_mask = _proxy_decode_mask(
+                                masked_offset_probs,
+                                high_thr=thr_off,
+                                low_ratio=proxy_decoder["low_ratio"],
+                                min_on=proxy_decoder["min_on"],
+                                min_off=proxy_decoder["min_off"],
+                                gap_merge=proxy_decoder["gap_merge"],
+                                median=proxy_decoder["median"],
+                            )
+                        except ValueError:
+                            offset_event_mask = strict_offset_mask.bool()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
                         out["onset_logits"],
@@ -2164,6 +2408,27 @@ def evaluate_one_epoch(
                     offset_gt_mask = (offset_roll > 0).float()
                     onset_gt_mask = _align_key_mask_to(strict_onset_mask_float, onset_gt_mask)
                     offset_gt_mask = _align_key_mask_to(strict_offset_mask_float, offset_gt_mask)
+                    onset_gt_bool = onset_gt_mask > 0.5
+                    offset_gt_bool = offset_gt_mask > 0.5
+
+                    if onset_event_mask.ndim == 3:
+                        sum_on, count_on = _event_f1_batch(
+                            onset_event_mask,
+                            onset_gt_bool,
+                            hop_seconds,
+                            event_tolerance,
+                        )
+                        event_proxy_accum["onset_sum"] += sum_on
+                        event_proxy_accum["onset_count"] += count_on
+                    if offset_event_mask.ndim == 3:
+                        sum_off, count_off = _event_f1_batch(
+                            offset_event_mask,
+                            offset_gt_bool,
+                            hop_seconds,
+                            event_tolerance,
+                        )
+                        event_proxy_accum["offset_sum"] += sum_off
+                        event_proxy_accum["offset_count"] += count_off
 
                     f1_on_loose = _binary_f1(loose_onset_pred.reshape(-1), onset_any.reshape(-1))
                     f1_off_loose = _binary_f1(loose_offset_pred.reshape(-1), offset_any.reshape(-1))
@@ -2539,6 +2804,10 @@ def evaluate_one_epoch(
     metrics_any["onset_pred_rate"] = legacy_counts["onset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
     metrics_any["offset_pred_rate"] = legacy_counts["offset_pred_rate"] / max(1, legacy_counts.get("metric_n", 0))
 
+    onset_event_f1 = event_proxy_accum["onset_sum"] / event_proxy_accum["onset_count"] if event_proxy_accum["onset_count"] > 0 else 0.0
+    offset_event_f1 = event_proxy_accum["offset_sum"] / event_proxy_accum["offset_count"] if event_proxy_accum["offset_count"] > 0 else 0.0
+    event_f1_mean = 0.5 * (onset_event_f1 + offset_event_f1)
+
     if not have_valid_metrics:
         warn_msg = "[eval WARNING] No valid clips to score after filtering. Metrics set to 0."
         print(warn_msg, flush=True)
@@ -2546,12 +2815,21 @@ def evaluate_one_epoch(
         loose_branch = {k: 0.0 for k in loose_branch.keys()}
         strict_branch = {k: 0.0 for k in strict_branch.keys()}
         metrics_any = {k: 0.0 for k in metrics_any.keys()}
+        onset_event_f1 = 0.0
+        offset_event_f1 = 0.0
+        event_f1_mean = 0.0
 
     loose_prefixed = {f"loose_{k}": v for k, v in loose_branch.items()}
     strict_prefixed = {f"strict_{k}": v for k, v in strict_branch.items()}
 
-    val_metrics = {**losses, **loose_prefixed, **strict_prefixed}
-    legacy_metrics = {**losses, **metrics_any}
+    event_metrics = {
+        "event_f1_onset_proxy": float(onset_event_f1),
+        "event_f1_offset_proxy": float(offset_event_f1),
+        "event_f1_mean_proxy": float(event_f1_mean),
+    }
+
+    val_metrics = {**losses, **loose_prefixed, **strict_prefixed, **event_metrics}
+    legacy_metrics = {**losses, **metrics_any, **event_metrics}
 
     def _fmt_metrics_line(items: Mapping[str, float]):
         return " ".join(f"{k}={v:.3f}\t" for k, v in items.items())
@@ -2562,10 +2840,16 @@ def evaluate_one_epoch(
     print(f"[loose] {loose_line}\n")
     print(f"[strict] {strict_line}\n")
     print(f"[any] {legacy_line}\n")
+    event_line = (
+        f"onset={onset_event_f1:.3f}\t offset={offset_event_f1:.3f}\t mean={event_f1_mean:.3f} "
+        f"(clips_on={event_proxy_accum['onset_count']} clips_off={event_proxy_accum['offset_count']})"
+    )
+    print(f"[event-proxy] {event_line}\n")
     quiet_extra = {QUIET_INFO_FLAG: True}
     logger.info("[loose] %s", loose_line, extra=quiet_extra)
     logger.info("[strict] %s", strict_line, extra=quiet_extra)
     logger.info("[any] %s", legacy_line, extra=quiet_extra)
+    logger.info("[event-proxy] %s", event_line, extra=quiet_extra)
 
     processed_total = progress.get("count", 0)
     throughput_for_cache = throughput_used if throughput_used and throughput_used > 0 else processed_total / max(elapsed_total, 1e-6)
@@ -2795,6 +3079,8 @@ def main():
 
     best_val = math.inf
     best_path = ckpt_dir / "tivit_best.pt"
+    best_event_f1 = float("-inf")
+    best_event_path = ckpt_dir / "tivit_best_by_eventf1.pt"
     last_path = ckpt_dir / "tivit_last.pt"
     eval_freq = int(cfg["training"].get("eval_freq", 0))
 
@@ -2807,6 +3093,7 @@ def main():
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
         best_val = ckpt.get("best_val", math.inf)
+        best_event_f1 = float(ckpt.get("best_event_f1", float("-inf")))
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception as e:
@@ -2833,6 +3120,7 @@ def main():
             prior_cfg = float(bias_cfg.get("onoff_prior_mean", 0.02))
             _set_onoff_head_bias(model, prior=prior_cfg)
         best_val = math.inf
+        best_event_f1 = float("-inf")
         start_epoch = 1
         
     def _freeze_backbone_keep_heads(model):
@@ -3086,6 +3374,9 @@ def main():
                     logger.warning("[train:eval] skip write (lock timeout)")
 
                 val_total = val_metrics.get("total")
+                event_f1_mean = val_metrics.get("event_f1_mean_proxy")
+                event_f1_on = val_metrics.get("event_f1_onset_proxy")
+                event_f1_off = val_metrics.get("event_f1_offset_proxy")
                 if val_total is not None and val_total < best_val:
                     best_val = val_total
                     save_checkpoint(
@@ -3095,10 +3386,56 @@ def main():
                         epoch,
                         cfg,
                         best_val,
+                        best_event_f1,
                         trainer_state=_snapshot_trainer_state(),
                     )
                     print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
                     logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
+                if event_f1_mean is not None and math.isfinite(event_f1_mean):
+                    if event_f1_mean > best_event_f1 + 1e-9:
+                        best_event_f1 = event_f1_mean
+                        event_on_display = float(event_f1_on) if event_f1_on is not None else float("nan")
+                        event_off_display = float(event_f1_off) if event_f1_off is not None else float("nan")
+                        save_checkpoint(
+                            best_event_path,
+                            model,
+                            optimizer,
+                            epoch,
+                            cfg,
+                            best_val,
+                            best_event_f1,
+                            trainer_state=_snapshot_trainer_state(),
+                        )
+                        print(
+                            f"Saved BEST-EVENT to: {best_event_path} "
+                            f"(event_f1_mean_proxy={event_f1_mean:.3f}, onset={event_on_display:.3f}, offset={event_off_display:.3f})"
+                        )
+                        logger.info(
+                            "Saved BEST-EVENT to: %s (event_f1_mean_proxy=%.3f onset=%.3f offset=%.3f)",
+                            best_event_path,
+                            event_f1_mean,
+                            event_on_display,
+                            event_off_display,
+                        )
+                best_loss_label = f"{best_val:.3f}" if best_val is not None and math.isfinite(best_val) else "inf"
+                if best_event_f1 > float("-inf") and math.isfinite(best_event_f1):
+                    best_event_label = f"{best_event_f1:.3f}"
+                    best_event_path_label = best_event_path.name
+                else:
+                    best_event_label = "n/a"
+                    best_event_path_label = "n/a"
+                summary_line = (
+                    f"loss={best_loss_label} ({best_path.name}) | "
+                    f"event_f1={best_event_label} ({best_event_path_label})"
+                )
+                print(f"[best-checkpoints] {summary_line}")
+                logger.info(
+                    "[best-checkpoints] loss=%s path=%s | event_f1=%s path=%s",
+                    best_loss_label,
+                    best_path,
+                    best_event_label,
+                    best_event_path_label,
+                )
 
         epoch_finish = getattr(train_base_dataset, "finish_epoch_snapshot", None)
         if callable(epoch_finish):
@@ -3115,6 +3452,7 @@ def main():
             epoch,
             cfg,
             best_val,
+            best_event_f1,
             trainer_state=_snapshot_trainer_state(),
         )
         if (epoch % save_every) == 0:
@@ -3126,6 +3464,7 @@ def main():
                 epoch,
                 cfg,
                 best_val,
+                best_event_f1,
                 trainer_state=_snapshot_trainer_state(),
             )
 
