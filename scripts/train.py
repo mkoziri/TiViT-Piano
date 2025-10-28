@@ -64,6 +64,111 @@ INNER_EVAL_BUDGET_MAX = 2700  # seconds
 # Toggle for per-epoch debug metrics; set to False to mute quickly.
 DEBUG_EVAL_METRICS = True
 
+class PosRateEMA:
+    """Track an exponential moving average for positive class rates."""
+
+    def __init__(self, alpha: float):
+        self.alpha = float(alpha)
+        self.value: Optional[torch.Tensor] = None
+
+    def process(self, observation: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        """
+        Incorporate a new observation and return the effective EMA value.
+
+        Args:
+            observation: Tensor containing the latest positive rate estimate.
+            update: Whether to update the internal EMA state.
+
+        Returns:
+            Tensor with the EMA-smoothed positive rate (clone, on CPU).
+        """
+        obs = observation.detach().float().cpu()
+        if self.value is None:
+            if update:
+                self.value = obs.clone()
+            return obs.clone()
+        if update:
+            self.value.mul_(1.0 - self.alpha)
+            self.value.add_(obs * self.alpha)
+        return self.value.clone()
+
+    def peek(self) -> Optional[torch.Tensor]:
+        return None if self.value is None else self.value.clone()
+
+    def state_dict(self) -> Dict[str, Any]:
+        if self.value is None:
+            return {"value": None}
+        return {"value": self.value.tolist()}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        value = state.get("value") if isinstance(state, Mapping) else None
+        if value is None:
+            self.value = None
+        else:
+            self.value = torch.tensor(value, dtype=torch.float32)
+
+
+def _tensor_from_scalar(value: float) -> torch.Tensor:
+    return torch.tensor([float(value)], dtype=torch.float32)
+
+
+def _pos_weight_from_rate(
+    rate: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    clamp_min: float = 1.0,
+    clamp_max: float = 100.0,
+) -> torch.Tensor:
+    rate_clamped = rate.clone().clamp(min=eps, max=1.0 - eps)
+    pos_weight = (1.0 - rate_clamped) / rate_clamped
+    return pos_weight.clamp_(min=clamp_min, max=clamp_max)
+
+
+class OnOffPosWeightEMA:
+    """Maintain EMA statistics for onset/offset heads (clip & frame modes)."""
+
+    def __init__(self, alpha: float):
+        alpha = float(alpha)
+        self.alpha = alpha
+        self.clip = {"onset": PosRateEMA(alpha), "offset": PosRateEMA(alpha)}
+        self.frame = {"onset": PosRateEMA(alpha), "offset": PosRateEMA(alpha)}
+
+    @staticmethod
+    def _reduce_clip_targets(targets: torch.Tensor) -> torch.Tensor:
+        return _tensor_from_scalar(float(targets.float().mean().item()))
+
+    @staticmethod
+    def _reduce_frame_roll(roll: torch.Tensor) -> torch.Tensor:
+        P = roll.shape[-1]
+        return roll.reshape(-1, P).float().mean(dim=0).cpu()
+
+    def clip_pos_weight(self, head: str, targets: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        tracker = self.clip[head]
+        rate = tracker.process(self._reduce_clip_targets(targets), update=update)
+        return _pos_weight_from_rate(rate)
+
+    def frame_pos_weight(self, head: str, roll: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        tracker = self.frame[head]
+        rate = tracker.process(self._reduce_frame_roll(roll), update=update)
+        return _pos_weight_from_rate(rate)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "alpha": self.alpha,
+            "clip": {k: v.state_dict() for k, v in self.clip.items()},
+            "frame": {k: v.state_dict() for k, v in self.frame.items()},
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            return
+        for scope_name, registry in (("clip", self.clip), ("frame", self.frame)):
+            saved_scope = state.get(scope_name, {}) if isinstance(state.get(scope_name), Mapping) else {}
+            for head, tracker in registry.items():
+                tracker_state = saved_scope.get(head)
+                if tracker_state is not None:
+                    tracker.load_state_dict(tracker_state)
+
 def ensure_dirs(cfg: Mapping[str, Any]) -> Tuple[Path, Path]:
     log_cfg = cfg.get("logging", {})
     ckpt = Path(log_cfg.get("checkpoint_dir", "./checkpoints")).expanduser()
@@ -260,13 +365,27 @@ def _set_onoff_head_bias(model, prior: float = 0.02):
         _seed_bias(getattr(model, "head_onset", None))
         _seed_bias(getattr(model, "head_offset", None))
 
-def _dynamic_pos_weighted_bce(logits: torch.Tensor, targets: torch.Tensor, base_crit: nn.BCEWithLogitsLoss):
-    """Compute BCEWithLogits with adaptive pos_weight derived from current batch."""
+def _dynamic_pos_weighted_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    base_crit: nn.BCEWithLogitsLoss,
+    *,
+    pos_rate_override: Optional[torch.Tensor] = None,
+    pos_weight_override: Optional[torch.Tensor] = None,
+):
+    """Compute BCEWithLogits with adaptive or overridden positive class weights."""
 
     eps = 1e-6
     target_float = targets.float()
-    positive_rate = target_float.mean().clamp(min=eps, max=1.0 - eps)
-    pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
+    if pos_weight_override is not None:
+        pos_weight = pos_weight_override.detach().to(device=logits.device, dtype=logits.dtype)
+    else:
+        if pos_rate_override is not None:
+            positive_rate = pos_rate_override.detach().to(device=logits.device, dtype=logits.dtype)
+        else:
+            positive_rate = target_float.mean()
+        positive_rate = positive_rate.clamp(min=eps, max=1.0 - eps)
+        pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
 
     reduction = getattr(base_crit, "reduction", "mean")
     weight = getattr(base_crit, "weight", None)
@@ -283,14 +402,46 @@ def _dynamic_pos_weighted_bce(logits: torch.Tensor, targets: torch.Tensor, base_
         reduction=reduction,
     )
 
-def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
+def compute_loss(
+    out: dict,
+    tgt: dict,
+    crit: dict,
+    weights: dict,
+    pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+    *,
+    update_stats: bool = True,
+):
     # Guard: if logits are time-distributed but we're in clip-loss, pool over time
     if out["pitch_logits"].dim() == 3:  # (B,T,P)
         out = _time_pool_out_to_clip(out)
-        
+
     loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], tgt["pitch"], crit["pitch"]) * weights["pitch"]
-    loss_onset = _dynamic_pos_weighted_bce(out["onset_logits"], tgt["onset"], crit["onset"]) * weights["onset"]
-    loss_offset = _dynamic_pos_weighted_bce(out["offset_logits"], tgt["offset"], crit["offset"]) * weights["offset"]
+
+    pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()
+    onset_pw_override: Optional[torch.Tensor] = None
+    offset_pw_override: Optional[torch.Tensor] = None
+
+    if pw_mode == "fixed":
+        pw_val = float(weights.get("onoff_pos_weight", 0.0))
+        if pw_val > 0.0:
+            onset_pw_override = torch.tensor([pw_val], dtype=torch.float32)
+            offset_pw_override = torch.tensor([pw_val], dtype=torch.float32)
+    elif pw_mode == "ema" and pos_rate_state is not None:
+        onset_pw_override = pos_rate_state.clip_pos_weight("onset", tgt["onset"], update=update_stats)
+        offset_pw_override = pos_rate_state.clip_pos_weight("offset", tgt["offset"], update=update_stats)
+
+    loss_onset = _dynamic_pos_weighted_bce(
+        out["onset_logits"],
+        tgt["onset"],
+        crit["onset"],
+        pos_weight_override=onset_pw_override,
+    ) * weights["onset"]
+    loss_offset = _dynamic_pos_weighted_bce(
+        out["offset_logits"],
+        tgt["offset"],
+        crit["offset"],
+        pos_weight_override=offset_pw_override,
+    ) * weights["offset"]
     loss_hand   = crit["hand"](out["hand_logits"],    tgt["hand"])    * weights["hand"]
     loss_clef   = crit["clef"](out["clef_logits"],    tgt["clef"])    * weights["clef"]
 
@@ -305,7 +456,14 @@ def compute_loss(out: dict, tgt: dict, crit: dict, weights: dict):
     }
     return total, parts
     
-def compute_loss_frame(out: dict, batch: dict, weights: dict):
+def compute_loss_frame(
+    out: dict,
+    batch: dict,
+    weights: dict,
+    pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+    *,
+    update_stats: bool = True,
+):
     """
     Frame-level objective with the repo's time alignment:
       - Align targets from T (labels) to T' (model logits) using:
@@ -394,7 +552,7 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
     # --- onset/offset loss: "bce_pos" (adaptive/fixed) OR "focal" ---
     onoff_mode = str(weights.get("onoff_loss", "focal")).lower()  # "bce_pos" | "focal"
     if onoff_mode == "bce_pos":
-        pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()  # "adaptive" | "fixed"
+        pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()  # "adaptive" | "fixed" | "ema"
         pos_w_on = None
         pos_w_off = None
         if pw_mode == "fixed":
@@ -406,6 +564,9 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
                 # fallback to adaptive if fixed value is not positive
                 pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
                 pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
+        elif pw_mode == "ema" and pos_rate_state is not None:
+            pos_w_on = pos_rate_state.frame_pos_weight("onset", onset_roll, update=update_stats)
+            pos_w_off = pos_rate_state.frame_pos_weight("offset", offset_roll, update=update_stats)
         elif pw_mode == "adaptive":
             pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
             pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
@@ -414,6 +575,10 @@ def compute_loss_frame(out: dict, batch: dict, weights: dict):
             pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
             pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
 
+        if pos_w_on is not None:
+            pos_w_on = pos_w_on.to(device=device, dtype=torch.float32)
+        if pos_w_off is not None:
+            pos_w_off = pos_w_off.to(device=device, dtype=torch.float32)
         bce_on  = nn.BCEWithLogitsLoss(pos_weight=pos_w_on)
         bce_off = nn.BCEWithLogitsLoss(pos_weight=pos_w_off)
         loss_onset  = bce_on(onset_logit,  onset_roll)
@@ -1109,7 +1274,15 @@ def _atomic_write_metrics(metrics: Mapping[str, Any], output_path: Path, lock_ti
     
 # ----------------------- train loop -----------------------
 
-def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
+def train_one_epoch(
+    model,
+    train_loader,
+    optimizer,
+    cfg,
+    writer=None,
+    epoch=1,
+    pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+):
     summary = _targets_summary(train_loader)
     if summary:
         logger.info(summary)
@@ -1161,12 +1334,12 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
             )
 
             if use_frame:
-                loss, parts = compute_loss_frame(out, batch, weights=w)
+                loss, parts = compute_loss_frame(out, batch, weights=w, pos_rate_state=pos_rate_state)
             else:
                 # Guard: if model outputs (B,T,...) but we're using clip loss, pool over time
                 if out["pitch_logits"].dim() == 3:
                     out = _time_pool_out_to_clip(out)
-                loss, parts = compute_loss(out, tgt, crit, w)
+                loss, parts = compute_loss(out, tgt, crit, w, pos_rate_state=pos_rate_state)
 
         # Backprop / step
         scaler.scale(loss / accum_steps).backward()
@@ -1222,7 +1395,15 @@ def train_one_epoch(model, train_loader, optimizer, cfg, writer=None, epoch=1):
     return avg
 
 
-def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: Mapping[str, Any], best_val: float | None = None):
+def save_checkpoint(
+    path: Path,
+    model,
+    optimizer,
+    epoch: int,
+    cfg: Mapping[str, Any],
+    best_val: float | None = None,
+    trainer_state: Optional[Dict[str, Any]] = None,
+):
     state = {
         "epoch": epoch,
         "model": model.state_dict(),
@@ -1230,10 +1411,20 @@ def save_checkpoint(path: Path, model, optimizer, epoch: int, cfg: Mapping[str, 
         "config": cfg,
         "best_val": best_val,
     }
+    if trainer_state is not None:
+        state["trainer_state"] = trainer_state
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, path)
     
-def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: int = 15):
+def evaluate_one_epoch(
+    model,
+    loader,
+    cfg,
+    *,
+    optimizer=None,
+    timeout_minutes: int = 15,
+    pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+):
     summary = _targets_summary(loader)
     if summary:
         logger.info(summary)
@@ -1773,13 +1964,26 @@ def evaluate_one_epoch(model, loader, cfg, *, optimizer=None, timeout_minutes: i
                         "hand_frame": _select_valid(batch["hand_frame"]).long(),
                         "clef_frame": _select_valid(batch["clef_frame"]).long(),
                     }
-                    loss, parts = compute_loss_frame(out, frame_batch, weights=w)
+                    loss, parts = compute_loss_frame(
+                        out,
+                        frame_batch,
+                        weights=w,
+                        pos_rate_state=pos_rate_state,
+                        update_stats=False,
+                    )
                 else:
                     if out["pitch_logits"].dim() == 3:
                         out = _time_pool_out_to_clip(out)
                         onset_probs_valid = None
                         offset_probs_valid = None
-                    loss, parts = compute_loss(out, tgt, crit, w)
+                    loss, parts = compute_loss(
+                        out,
+                        tgt,
+                        crit,
+                        w,
+                        pos_rate_state=pos_rate_state,
+                        update_stats=False,
+                    )
 
                 for k in sums:
                     sums[k] += parts[k]
@@ -2561,6 +2765,25 @@ def main():
 
     optimizer = build_optimizer(model, cfg["training"])
 
+    loss_weights_cfg = cfg["training"]["loss_weights"]
+    onoff_mode = str(loss_weights_cfg.get("onoff_pos_weight_mode", "adaptive")).lower()
+    ema_alpha = float(loss_weights_cfg.get("onoff_pos_weight_ema_alpha", 0.05))
+    pos_rate_state = OnOffPosWeightEMA(ema_alpha) if onoff_mode == "ema" else None
+
+    if pos_rate_state is not None:
+        mode_msg = f"[loss:onoff] mode=ema alpha={ema_alpha:.4f}"
+    elif onoff_mode == "fixed":
+        mode_msg = f"[loss:onoff] mode=fixed pos_weight={float(loss_weights_cfg.get('onoff_pos_weight', 0.0)):.3f}"
+    else:
+        mode_msg = f"[loss:onoff] mode={onoff_mode}"
+    print(mode_msg)
+    logger.info(mode_msg, extra={QUIET_INFO_FLAG: True})
+
+    def _snapshot_trainer_state() -> Optional[Dict[str, Any]]:
+        if pos_rate_state is None:
+            return None
+        return {"pos_rate_ema": pos_rate_state.state_dict()}
+
     accum_steps = int(cfg.get("train", {}).get("accumulate_steps", 1))
     grad_clip = float(cfg["optim"].get("grad_clip", 1.0))
     freeze_backbone_epochs = int(cfg.get("train", {}).get("freeze_backbone_epochs", 0))
@@ -2590,6 +2813,11 @@ def main():
             print(f"[resume] optimizer groups mismatch; skipping optimizer state. ({e})")
             logger.warning("[resume] optimizer groups mismatch; skipping optimizer state. (%s)", e)
             # scheduler will be re-created fresh below
+        trainer_state = ckpt.get("trainer_state")
+        if pos_rate_state is not None and isinstance(trainer_state, Mapping):
+            pos_snapshot = trainer_state.get("pos_rate_ema")
+            if pos_snapshot is not None:
+                pos_rate_state.load_state_dict(pos_snapshot)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
     else:
         if resume_path.exists() and not want_resume:
@@ -2751,12 +2979,12 @@ def main():
             )
 
             if use_frame:
-                loss, parts = compute_loss_frame(out, batch, weights=w)
+                loss, parts = compute_loss_frame(out, batch, weights=w, pos_rate_state=pos_rate_state)
             else:
                 # Guard: if model outputs (B,T,...) but we're using clip loss, pool over time
                 if out["pitch_logits"].dim() == 3:
                     out = _time_pool_out_to_clip(out)
-                loss, parts = compute_loss(out, tgt, crit, w)
+                loss, parts = compute_loss(out, tgt, crit, w, pos_rate_state=pos_rate_state)
 
             (loss / accum_steps).backward()
             if (it + 1) % accum_steps == 0:
@@ -2828,7 +3056,13 @@ def main():
         # --- evaluation & best checkpoint ---
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
-            val_metrics = evaluate_one_epoch(model, val_loader, cfg, optimizer=optimizer)
+            val_metrics = evaluate_one_epoch(
+                model,
+                val_loader,
+                cfg,
+                optimizer=optimizer,
+                pos_rate_state=pos_rate_state,
+            )
             if val_metrics is None:
                 logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
             else:
@@ -2854,7 +3088,15 @@ def main():
                 val_total = val_metrics.get("total")
                 if val_total is not None and val_total < best_val:
                     best_val = val_total
-                    save_checkpoint(best_path, model, optimizer, epoch, cfg, best_val)
+                    save_checkpoint(
+                        best_path,
+                        model,
+                        optimizer,
+                        epoch,
+                        cfg,
+                        best_val,
+                        trainer_state=_snapshot_trainer_state(),
+                    )
                     print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
                     logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
 
@@ -2866,10 +3108,26 @@ def main():
                 logger.warning("[train] failed to finalize epoch snapshot: %s", exc)
 
         # --- always save LAST ---
-        save_checkpoint(last_path, model, optimizer, epoch, cfg, best_val)
+        save_checkpoint(
+            last_path,
+            model,
+            optimizer,
+            epoch,
+            cfg,
+            best_val,
+            trainer_state=_snapshot_trainer_state(),
+        )
         if (epoch % save_every) == 0:
             # optional per-epoch named snapshot
-            save_checkpoint(ckpt_dir / f"tivit_epoch_{epoch:03d}.pt", model, optimizer, epoch, cfg, best_val)
+            save_checkpoint(
+                ckpt_dir / f"tivit_epoch_{epoch:03d}.pt",
+                model,
+                optimizer,
+                epoch,
+                cfg,
+                best_val,
+                trainer_state=_snapshot_trainer_state(),
+            )
 
     # close writer
     if writer is not None:
