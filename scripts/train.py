@@ -682,15 +682,23 @@ def _align_key_mask_to(pred_mask: torch.Tensor, gt_mask: torch.Tensor) -> torch.
         raise ValueError("Expected 3D masks for alignment")
     Bp, Tp, Pp = pred_mask.shape
     Bg, Tg, Pg = gt_mask.shape
-    if Bp != Bg or Pp != Pg:
+    if Bp != Bg:
         raise ValueError(
-            f"Cannot align masks with shapes pred={pred_mask.shape} and gt={gt_mask.shape}"
+            f"Cannot align masks with different batch sizes pred={pred_mask.shape} gt={gt_mask.shape}"
         )
+
+    aligned = gt_mask
     if Tg != Tp:
-        gt_mask = gt_mask.permute(0, 2, 1)
-        gt_mask = F.adaptive_max_pool1d(gt_mask, Tp)
-        gt_mask = gt_mask.permute(0, 2, 1).contiguous()
-    return gt_mask
+        aligned = aligned.permute(0, 2, 1).float()
+        aligned = F.adaptive_max_pool1d(aligned, Tp)
+        aligned = aligned.permute(0, 2, 1).contiguous()
+
+    if Pg != Pp:
+        aligned = aligned.reshape(Bg * Tp, 1, Pg).float()
+        aligned = F.adaptive_max_pool1d(aligned, Pp)
+        aligned = aligned.reshape(Bg, Tp, Pp)
+
+    return aligned.to(gt_mask.dtype)
 
 
 def _format_mmss(seconds: float) -> str:
