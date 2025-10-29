@@ -17,7 +17,7 @@ CLI:
     reproducibility settings.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast, overload, Literal
 
 
 import argparse
@@ -402,6 +402,83 @@ def _dynamic_pos_weighted_bce(
         reduction=reduction,
     )
 
+
+def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build per-head onset/offset loss settings with backward-compatible defaults.
+
+    Legacy flat keys (onoff_loss, focal_gamma, ...) remain supported, while
+    per-head overrides can be provided via ``onoff_heads.<head>.<key>`` or
+    simple aliases such as ``offset_focal_gamma``.
+    """
+    if not isinstance(weights, Mapping):
+        weights = {}
+
+    default_cfg = {
+        "loss": str(weights.get("onoff_loss", "bce_pos")).lower(),
+        "pos_weight_mode": str(weights.get("onoff_pos_weight_mode", "adaptive")).lower(),
+        "pos_weight": weights.get("onoff_pos_weight"),
+        "focal_gamma": float(weights.get("focal_gamma", 2.0)),
+        "focal_alpha": float(weights.get("focal_alpha", 0.25)),
+        "prior_mean": float(weights.get("onoff_prior_mean", 0.12)),
+        "prior_weight": float(weights.get("onoff_prior_weight", 0.0)),
+    }
+
+    per_head_overrides = weights.get("onoff_heads", {})
+    if not isinstance(per_head_overrides, Mapping):
+        per_head_overrides = {}
+
+    alias_patterns = {
+        "loss": ("{head}_loss", "{head}_onoff_loss"),
+        "pos_weight_mode": ("{head}_pos_weight_mode", "{head}_onoff_pos_weight_mode"),
+        "pos_weight": ("{head}_pos_weight", "{head}_onoff_pos_weight"),
+        "focal_gamma": ("{head}_focal_gamma",),
+        "focal_alpha": ("{head}_focal_alpha",),
+        "prior_mean": ("{head}_prior_mean", "{head}_onoff_prior_mean"),
+        "prior_weight": ("{head}_prior_weight", "{head}_onoff_prior_weight"),
+    }
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for head in ("onset", "offset"):
+        cfg = dict(default_cfg)
+
+        nested = per_head_overrides.get(head)
+        if isinstance(nested, Mapping):
+            for key, value in nested.items():
+                if key in cfg:
+                    cfg[key] = value
+
+        for key, patterns in alias_patterns.items():
+            for pattern in patterns:
+                alias = pattern.format(head=head)
+                if alias in weights:
+                    cfg[key] = weights[alias]
+                    break
+
+        cfg["loss"] = str(cfg["loss"]).lower()
+        cfg["pos_weight_mode"] = str(cfg["pos_weight_mode"]).lower()
+        cfg["focal_gamma"] = float(cfg["focal_gamma"])
+        cfg["focal_alpha"] = float(cfg["focal_alpha"])
+        cfg["prior_mean"] = float(cfg["prior_mean"])
+        cfg["prior_weight"] = float(cfg["prior_weight"])
+
+        pos_weight_raw = cfg.get("pos_weight")
+        if pos_weight_raw is None:
+            pos_weight_val: Optional[float] = None
+        else:
+            try:
+                pos_weight_val = float(pos_weight_raw)
+            except (TypeError, ValueError):
+                pos_weight_val = None
+        if pos_weight_val is None or pos_weight_val <= 0.0:
+            cfg["pos_weight"] = None
+        else:
+            cfg["pos_weight"] = pos_weight_val
+
+        resolved[head] = cfg
+
+    return resolved
+
 def compute_loss(
     out: dict,
     tgt: dict,
@@ -415,33 +492,55 @@ def compute_loss(
     if out["pitch_logits"].dim() == 3:  # (B,T,P)
         out = _time_pool_out_to_clip(out)
 
-    loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], tgt["pitch"], crit["pitch"]) * weights["pitch"]
+    loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], tgt["pitch"], crit["pitch"]) * float(weights.get("pitch", 1.0))
 
-    pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()
-    onset_pw_override: Optional[torch.Tensor] = None
-    offset_pw_override: Optional[torch.Tensor] = None
+    head_cfgs = _resolve_onoff_loss_config(weights)
+    onset_cfg = head_cfgs["onset"]
+    offset_cfg = head_cfgs["offset"]
 
-    if pw_mode == "fixed":
-        pw_val = float(weights.get("onoff_pos_weight", 0.0))
-        if pw_val > 0.0:
-            onset_pw_override = torch.tensor([pw_val], dtype=torch.float32)
-            offset_pw_override = torch.tensor([pw_val], dtype=torch.float32)
-    elif pw_mode == "ema" and pos_rate_state is not None:
-        onset_pw_override = pos_rate_state.clip_pos_weight("onset", tgt["onset"], update=update_stats)
-        offset_pw_override = pos_rate_state.clip_pos_weight("offset", tgt["offset"], update=update_stats)
+    def _clip_pos_weight(
+        head: str,
+        cfg: Mapping[str, Any],
+        targets: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
+        loss_mode = str(cfg.get("loss", "bce_pos")).lower()
+        if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
+            return None
+        if mode == "fixed" and cfg.get("pos_weight") is not None:
+            return torch.full((targets.shape[-1],), float(cfg["pos_weight"]), dtype=torch.float32)
+        if mode == "ema" and pos_rate_state is not None:
+            return pos_rate_state.clip_pos_weight(head, targets, update=update_stats)
+        if mode in {"none", "off"}:
+            return None
+        # adaptive / fallback handled within _dynamic_pos_weighted_bce
+        return None
 
-    loss_onset = _dynamic_pos_weighted_bce(
-        out["onset_logits"],
-        tgt["onset"],
-        crit["onset"],
-        pos_weight_override=onset_pw_override,
-    ) * weights["onset"]
-    loss_offset = _dynamic_pos_weighted_bce(
-        out["offset_logits"],
-        tgt["offset"],
-        crit["offset"],
-        pos_weight_override=offset_pw_override,
-    ) * weights["offset"]
+    def _compute_clip_head_loss(
+        head: str,
+        cfg: Mapping[str, Any],
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        base_crit: nn.BCEWithLogitsLoss,
+    ) -> torch.Tensor:
+        mode = str(cfg.get("loss", "bce_pos")).lower()
+        if mode in {"focal", "focal_bce"}:
+            gamma = float(cfg.get("focal_gamma", 2.0))
+            alpha = float(cfg.get("focal_alpha", 0.25))
+            bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+            probs = torch.sigmoid(logits)
+            weight = (alpha * (1.0 - probs).pow(gamma)).detach()
+            return (weight * bce).mean()
+        pos_weight_override = _clip_pos_weight(head, cfg, targets)
+        return _dynamic_pos_weighted_bce(
+            logits,
+            targets,
+            base_crit,
+            pos_weight_override=pos_weight_override,
+        )
+
+    loss_onset = _compute_clip_head_loss("onset", onset_cfg, out["onset_logits"], tgt["onset"], crit["onset"]) * float(weights.get("onset", 1.0))
+    loss_offset = _compute_clip_head_loss("offset", offset_cfg, out["offset_logits"], tgt["offset"], crit["offset"]) * float(weights.get("offset", 1.0))
     loss_hand   = crit["hand"](out["hand_logits"],    tgt["hand"])    * weights["hand"]
     loss_clef   = crit["clef"](out["clef_logits"],    tgt["clef"])    * weights["clef"]
 
@@ -549,55 +648,57 @@ def compute_loss_frame(
         p = roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
         return ((1.0 - p) / (p + eps)).clamp(1.0, 100.0).detach()
 
-    # --- onset/offset loss: "bce_pos" (adaptive/fixed) OR "focal" ---
-    onoff_mode = str(weights.get("onoff_loss", "focal")).lower()  # "bce_pos" | "focal"
-    if onoff_mode == "bce_pos":
-        pw_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()  # "adaptive" | "fixed" | "ema"
-        pos_w_on = None
-        pos_w_off = None
-        if pw_mode == "fixed":
-            pw_val = float(weights.get("onoff_pos_weight", 0.0))
-            if pw_val > 0.0:
-                pos_w_on  = torch.tensor([pw_val], device=device)
-                pos_w_off = torch.tensor([pw_val], device=device)
-            else:
-                # fallback to adaptive if fixed value is not positive
-                pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
-                pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
-        elif pw_mode == "ema" and pos_rate_state is not None:
-            pos_w_on = pos_rate_state.frame_pos_weight("onset", onset_roll, update=update_stats)
-            pos_w_off = pos_rate_state.frame_pos_weight("offset", offset_roll, update=update_stats)
-        elif pw_mode == "adaptive":
-            pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
-            pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
+    head_cfgs = _resolve_onoff_loss_config(weights)
+    onset_cfg = head_cfgs["onset"]
+    offset_cfg = head_cfgs["offset"]
+
+    def _frame_pos_weight(head: str, cfg: Mapping[str, Any], roll: torch.Tensor) -> Optional[torch.Tensor]:
+        mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
+        loss_mode = str(cfg.get("loss", "bce_pos")).lower()
+        if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
+            return None
+        if mode == "fixed" and cfg.get("pos_weight") is not None:
+            return torch.full((P,), float(cfg["pos_weight"]), dtype=torch.float32)
+        if mode == "ema" and pos_rate_state is not None:
+            return pos_rate_state.frame_pos_weight(head, roll, update=update_stats)
+        if mode in {"none", "off"}:
+            return None
+        if mode in {"adaptive", "auto"}:
+            return _adaptive_pos_weight(roll, P, eps)
+        # fallback if unknown
+        return _adaptive_pos_weight(roll, P, eps)
+
+    def _compute_frame_head_loss(
+        head: str,
+        cfg: Mapping[str, Any],
+        logits: torch.Tensor,
+        roll: torch.Tensor,
+        pos_weight: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        mode = str(cfg.get("loss", "bce_pos")).lower()
+        if mode in {"focal", "focal_bce"}:
+            gamma = float(cfg.get("focal_gamma", 2.0))
+            alpha = float(cfg.get("focal_alpha", 0.25))
+            bce = F.binary_cross_entropy_with_logits(logits, roll, reduction="none")
+            probs = torch.sigmoid(logits)
+            weight = (alpha * (1.0 - probs).pow(gamma)).detach()
+            return (weight * bce).mean()
+
+        # default: BCE with optional pos_weight
+        if pos_weight is not None:
+            pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+            crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
-            # fallback to adaptive if unknown mode
-            pos_w_on  = _adaptive_pos_weight(onset_roll, P, eps)
-            pos_w_off = _adaptive_pos_weight(offset_roll, P, eps)
+            crit = nn.BCEWithLogitsLoss()
+        return crit(logits, roll)
 
-        if pos_w_on is not None:
-            pos_w_on = pos_w_on.to(device=device, dtype=torch.float32)
-        if pos_w_off is not None:
-            pos_w_off = pos_w_off.to(device=device, dtype=torch.float32)
-        bce_on  = nn.BCEWithLogitsLoss(pos_weight=pos_w_on)
-        bce_off = nn.BCEWithLogitsLoss(pos_weight=pos_w_off)
-        loss_onset  = bce_on(onset_logit,  onset_roll)
-        loss_offset = bce_off(offset_logit, offset_roll)
+    pos_w_on = _frame_pos_weight("onset", onset_cfg, onset_roll)
+    pos_w_off = _frame_pos_weight("offset", offset_cfg, offset_roll)
 
-    else:
-        # focal BCE on logits (your original path)
-        gamma = float(weights.get("focal_gamma", 2.0))
-        alpha = float(weights.get("focal_alpha", 0.15))
-        bce_on  = F.binary_cross_entropy_with_logits(onset_logit,  onset_roll,  reduction="none")
-        bce_off = F.binary_cross_entropy_with_logits(offset_logit, offset_roll, reduction="none")
-        p_on    = torch.sigmoid(onset_logit)
-        p_off   = torch.sigmoid(offset_logit)
-        w_on    = (alpha * (1.0 - p_on).pow(gamma)).detach()
-        w_off   = (alpha * (1.0 - p_off).pow(gamma)).detach()
-        loss_onset  = (w_on  * bce_on ).mean()
-        loss_offset = (w_off * bce_off).mean()
+    loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on)
+    loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off)
 
-    loss_onset  = loss_onset  * float(weights.get("onset",  1.0))
+    loss_onset = loss_onset * float(weights.get("onset", 1.0))
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
 
     # --- hand / clef CE at T' ---
@@ -615,14 +716,25 @@ def compute_loss_frame(
         "clef":   float(loss_clef.detach().cpu()),
     }
 
-    prior_w = float(weights.get("onoff_prior_weight", 0.0))
-    if prior_w > 0.0:
-        prior_target = float(weights.get("onoff_prior_mean", 0.12))
-        p_on_mean  = torch.sigmoid(onset_logit).mean()
-        p_off_mean = torch.sigmoid(offset_logit).mean()
-        reg_onoff = prior_w * (p_on_mean - prior_target).abs() + prior_w * (p_off_mean - prior_target).abs()
-        total = total + reg_onoff
-        parts["reg_onoff"] = float(reg_onoff.detach().cpu())
+    reg_terms: Dict[str, torch.Tensor] = {}
+    for head, cfg, logits in (
+        ("onset", onset_cfg, onset_logit),
+        ("offset", offset_cfg, offset_logit),
+    ):
+        prior_w = float(cfg.get("prior_weight", 0.0))
+        if prior_w <= 0.0:
+            continue
+        prior_mean = float(cfg.get("prior_mean", 0.12))
+        act_mean = torch.sigmoid(logits).mean()
+        reg = prior_w * (act_mean - prior_mean).abs()
+        total = total + reg
+        reg_terms[head] = reg
+
+    if reg_terms:
+        reg_sum = sum(float(reg.detach().cpu()) for reg in reg_terms.values())
+        parts["reg_onoff"] = reg_sum
+        for head, reg in reg_terms.items():
+            parts[f"reg_{head}"] = float(reg.detach().cpu())
 
     parts["total"] = float(total.detach().cpu())
     return total, parts
@@ -741,6 +853,40 @@ def _get_aggregation_config(cfg: Mapping[str, Any]):
     }
 
 
+@overload
+def _aggregate_onoff_predictions(
+    logits: torch.Tensor,
+    threshold: float,
+    *,
+    mode: str,
+    k: int,
+    top_k: int,
+    tau_sum: float,
+    temperature: float = 1.0,
+    bias: float = 0.0,
+    cap_count: Optional[int] = None,
+    return_mask: Literal[True],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ...
+
+
+@overload
+def _aggregate_onoff_predictions(
+    logits: torch.Tensor,
+    threshold: float,
+    *,
+    mode: str,
+    k: int,
+    top_k: int,
+    tau_sum: float,
+    temperature: float = 1.0,
+    bias: float = 0.0,
+    cap_count: Optional[int] = None,
+    return_mask: Literal[False] = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    ...
+
+
 def _aggregate_onoff_predictions(
     logits: torch.Tensor,
     threshold: float,
@@ -753,7 +899,7 @@ def _aggregate_onoff_predictions(
     bias: float = 0.0,
     cap_count: Optional[int] = None,
     return_mask: bool = False,
-):
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     squeeze_time = logits.dim() == 2
     if squeeze_time:
         logits = logits.unsqueeze(1)
@@ -1644,10 +1790,14 @@ def evaluate_one_epoch(
     cache_data = _load_inner_eval_cache()
     cached_throughput: Optional[float] = None
     if cache_data:
-        try:
-            cached_throughput = float(cache_data.get("throughput_win_per_s"))
-        except (TypeError, ValueError):
+        trough_val = cache_data.get("throughput_win_per_s")
+        if trough_val is None:
             cached_throughput = None
+        else:
+            try:
+                cached_throughput = float(trough_val)
+            except (TypeError, ValueError):
+                cached_throughput = None
         if cached_throughput is not None and (not math.isfinite(cached_throughput) or cached_throughput <= 0):
             cached_throughput = None
 
@@ -2155,12 +2305,29 @@ def evaluate_one_epoch(
 
                 frame_batch = None
                 if use_frame:
+                    pitch_roll_sel = _select_valid(batch["pitch_roll"])
+                    onset_roll_sel = _select_valid(batch["onset_roll"])
+                    offset_roll_sel = _select_valid(batch["offset_roll"])
+                    hand_frame_sel = _select_valid(batch["hand_frame"])
+                    clef_frame_sel = _select_valid(batch["clef_frame"])
+
+                    required_tensors = (pitch_roll_sel, onset_roll_sel, offset_roll_sel, hand_frame_sel, clef_frame_sel)
+                    if any(sel is None or not torch.is_tensor(sel) for sel in required_tensors):
+                        logger.warning("[eval] Missing frame targets after validity filtering; skipping batch.")
+                        continue
+
+                    pitch_roll_tensor = cast(torch.Tensor, pitch_roll_sel)
+                    onset_roll_tensor = cast(torch.Tensor, onset_roll_sel)
+                    offset_roll_tensor = cast(torch.Tensor, offset_roll_sel)
+                    hand_frame_tensor = cast(torch.Tensor, hand_frame_sel)
+                    clef_frame_tensor = cast(torch.Tensor, clef_frame_sel)
+
                     frame_batch = {
-                        "pitch_roll": _select_valid(batch["pitch_roll"]).float(),
-                        "onset_roll": _select_valid(batch["onset_roll"]).float(),
-                        "offset_roll": _select_valid(batch["offset_roll"]).float(),
-                        "hand_frame": _select_valid(batch["hand_frame"]).long(),
-                        "clef_frame": _select_valid(batch["clef_frame"]).long(),
+                        "pitch_roll": pitch_roll_tensor.float(),
+                        "onset_roll": onset_roll_tensor.float(),
+                        "offset_roll": offset_roll_tensor.float(),
+                        "hand_frame": hand_frame_tensor.long(),
+                        "clef_frame": clef_frame_tensor.long(),
                     }
                     loss, parts = compute_loss_frame(
                         out,
@@ -2216,26 +2383,30 @@ def evaluate_one_epoch(
                     offset_logits = out.get("offset_logits")
                     if onset_logits is not None and onset_logit_stats is not None and onset_prob_stats is not None:
                         _update_stats(onset_logit_stats, onset_logits)
-                        onset_probs_stats = onset_probs_valid
+                        onset_probs_stats = onset_probs_valid if torch.is_tensor(onset_probs_valid) else None
                         if onset_probs_stats is None and onset_logits is not None:
                             onset_probs_stats = _apply_sigmoid_calibration(
                                 onset_logits,
                                 temperature=onset_cal["temperature"],
                                 bias=onset_cal["bias"],
                             )
+                            if not torch.is_tensor(onset_probs_stats):
+                                onset_probs_stats = None
                         _update_stats(onset_prob_stats, onset_probs_stats)
                         if onset_k_effective is None:
                             onset_dim = onset_logits.shape[-1] if onset_logits.ndim > 0 else 1
                             onset_k_effective = max(1, min(int(agg_cfg["k_onset"]), onset_dim))
                     if offset_logits is not None and offset_logit_stats is not None and offset_prob_stats is not None:
                         _update_stats(offset_logit_stats, offset_logits)
-                        offset_probs_stats = offset_probs_valid
+                        offset_probs_stats = offset_probs_valid if torch.is_tensor(offset_probs_valid) else None
                         if offset_probs_stats is None and offset_logits is not None:
                             offset_probs_stats = _apply_sigmoid_calibration(
                                 offset_logits,
                                 temperature=offset_cal["temperature"],
                                 bias=offset_cal["bias"],
                             )
+                            if not torch.is_tensor(offset_probs_stats):
+                                offset_probs_stats = None
                         _update_stats(offset_prob_stats, offset_probs_stats)
                         if offset_k_effective is None:
                             offset_dim = offset_logits.shape[-1] if offset_logits.ndim > 0 else 1
@@ -2244,6 +2415,9 @@ def evaluate_one_epoch(
                 # --- metrics ---
                 if use_frame:
                     # --- align frame targets to logits time (T -> T_logits) ---
+                    if frame_batch is None:
+                        logger.warning("[eval] Frame batch missing despite frame_mode; skipping batch for metrics.")
+                        continue
                     B, T_logits, P = out["onset_logits"].shape
 
                     onset_roll = frame_batch["onset_roll"]
@@ -2324,13 +2498,15 @@ def evaluate_one_epoch(
                     onset_event_mask = strict_onset_mask.bool()
                     offset_event_mask = strict_offset_mask.bool()
 
-                    onset_probs_proxy = onset_probs_valid
+                    onset_probs_proxy = onset_probs_valid if torch.is_tensor(onset_probs_valid) else None
                     if onset_probs_proxy is None and "onset_logits" in out:
-                        onset_probs_proxy = _apply_sigmoid_calibration(
+                        maybe_proxy = _apply_sigmoid_calibration(
                             out["onset_logits"],
                             temperature=onset_cal["temperature"],
                             bias=onset_cal["bias"],
                         )
+                        if torch.is_tensor(maybe_proxy):
+                            onset_probs_proxy = maybe_proxy
                     if onset_probs_proxy is not None and onset_probs_proxy.shape == strict_onset_mask_float.shape:
                         masked_onset_probs = (onset_probs_proxy.float() * strict_onset_mask_float).contiguous()
                         try:
@@ -2346,13 +2522,15 @@ def evaluate_one_epoch(
                         except ValueError:
                             onset_event_mask = strict_onset_mask.bool()
 
-                    offset_probs_proxy = offset_probs_valid
+                    offset_probs_proxy = offset_probs_valid if torch.is_tensor(offset_probs_valid) else None
                     if offset_probs_proxy is None and "offset_logits" in out:
-                        offset_probs_proxy = _apply_sigmoid_calibration(
+                        maybe_proxy_off = _apply_sigmoid_calibration(
                             out["offset_logits"],
                             temperature=offset_cal["temperature"],
                             bias=offset_cal["bias"],
                         )
+                        if torch.is_tensor(maybe_proxy_off):
+                            offset_probs_proxy = maybe_proxy_off
                     if offset_probs_proxy is not None and offset_probs_proxy.shape == strict_offset_mask_float.shape:
                         masked_offset_probs = (offset_probs_proxy.float() * strict_offset_mask_float).contiguous()
                         try:
@@ -3050,16 +3228,36 @@ def main():
     optimizer = build_optimizer(model, cfg["training"])
 
     loss_weights_cfg = cfg["training"]["loss_weights"]
-    onoff_mode = str(loss_weights_cfg.get("onoff_pos_weight_mode", "adaptive")).lower()
+    head_cfgs = _resolve_onoff_loss_config(loss_weights_cfg)
     ema_alpha = float(loss_weights_cfg.get("onoff_pos_weight_ema_alpha", 0.05))
-    pos_rate_state = OnOffPosWeightEMA(ema_alpha) if onoff_mode == "ema" else None
 
-    if pos_rate_state is not None:
-        mode_msg = f"[loss:onoff] mode=ema alpha={ema_alpha:.4f}"
-    elif onoff_mode == "fixed":
-        mode_msg = f"[loss:onoff] mode=fixed pos_weight={float(loss_weights_cfg.get('onoff_pos_weight', 0.0)):.3f}"
-    else:
-        mode_msg = f"[loss:onoff] mode={onoff_mode}"
+    def _uses_ema(head_cfg: Mapping[str, Any]) -> bool:
+        mode = str(head_cfg.get("pos_weight_mode", "adaptive")).lower()
+        loss_mode = str(head_cfg.get("loss", "bce_pos")).lower()
+        return mode == "ema" and loss_mode in {"bce_pos", "bce", "bce_with_logits"}
+
+    ema_heads = [head for head, cfg_head in head_cfgs.items() if _uses_ema(cfg_head)]
+    pos_rate_state = OnOffPosWeightEMA(ema_alpha) if ema_heads else None
+
+    def _describe_head(head: str, cfg_head: Mapping[str, Any]) -> str:
+        mode = str(cfg_head.get("loss", "bce_pos")).lower()
+        bits: List[str] = [mode]
+        if mode in {"focal", "focal_bce"}:
+            bits.append(f"gamma={float(cfg_head.get('focal_gamma', 2.0)):.2f}")
+            bits.append(f"alpha={float(cfg_head.get('focal_alpha', 0.25)):.2f}")
+        else:
+            pw_mode = str(cfg_head.get("pos_weight_mode", "adaptive")).lower()
+            bits.append(f"pos={pw_mode}")
+            if pw_mode == "fixed" and cfg_head.get("pos_weight") is not None:
+                bits.append(f"pw={float(cfg_head['pos_weight']):.3f}")
+            if pw_mode == "ema" and head in ema_heads:
+                bits.append(f"ema={ema_alpha:.4f}")
+        prior_w = float(cfg_head.get("prior_weight", 0.0))
+        if prior_w > 0.0:
+            bits.append(f"prior(mean={float(cfg_head.get('prior_mean', 0.12)):.3f},w={prior_w:.3f})")
+        return f"{head}=" + ",".join(bits)
+
+    mode_msg = "[loss:onoff] " + " | ".join(_describe_head(head, cfg_head) for head, cfg_head in head_cfgs.items())
     print(mode_msg)
     logger.info(mode_msg, extra={QUIET_INFO_FLAG: True})
 

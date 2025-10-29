@@ -14,7 +14,7 @@ dataset:
   - offset
   - hand
   - clef
-  max_clips: 150 #null
+  max_clips: 50 #null
   manifest:
     train: null
     val: null
@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 4
+  epochs: 10
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -111,15 +111,27 @@ training:
     focal_alpha: 0.25
     onoff_prior_mean: 0.012
     onoff_prior_weight: 0.15
+    onoff_heads:
+      onset:
+        loss: bce_pos
+        pos_weight_mode: fixed
+        prior_mean: 0.012
+        prior_weight: 0.15
+      offset:
+        loss: focal
+        focal_gamma: 3.0
+        focal_alpha: 0.20
+        prior_mean: 0.010
+        prior_weight: 0.25
     onset: 1.8
     offset: 0.6
     pitch: 1.2
     hand: 0.3
     clef: 0.3
   metrics:
-    prob_threshold: 0.40
-    prob_threshold_onset: 0.40
-    prob_threshold_offset: 0.40
+    prob_threshold: 0.48
+    prob_threshold_onset: 0.48
+    prob_threshold_offset: 0.56
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
     prob_temperature_offset: 1.25
