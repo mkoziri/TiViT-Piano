@@ -47,8 +47,8 @@ CLI Arguments:
         Dataset split evaluated during fast metrics checks.
     --calib_max_clips INT (default: None)
         Override the maximum clips seen during calibration (falls back to config).
-    --calib_frames INT (default: None)
-        Override the number of frames per clip when calibrating (falls back to config).
+    --calib_frames INT (default: 96)
+        Override the number of frames per clip when calibrating/evaluating.
     --temperature FLOAT (default: None)
         Manually set calibration temperature instead of discovering it.
     --bias FLOAT (default: None)
@@ -75,6 +75,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import io
 import datetime as _dt
 import json
 import logging
@@ -133,10 +135,50 @@ def load_cfg() -> dict:
         return yaml.safe_load(f)
 
 
+def _inject_decoder_comments(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    target_prefix = ["training", "metrics", "decoder"]
+    comment_keys = {
+        "onset": {"open", "hold", "min_on", "merge_gap"},
+        "offset": {"open", "hold", "min_off", "merge_gap"},
+    }
+    path: list[tuple[str, int]] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while path and indent <= path[-1][1]:
+            path.pop()
+        if stripped.endswith(":"):
+            key = stripped[:-1]
+            path.append((key, indent))
+            continue
+        keys_path = [item[0] for item in path]
+        if len(keys_path) < 4 or keys_path[:3] != target_prefix:
+            continue
+        head = keys_path[3]
+        allowed = comment_keys.get(head)
+        if not allowed:
+            continue
+        key_name = stripped.split(":", 1)[0]
+        if key_name not in allowed:
+            continue
+        if "# default" in line:
+            continue
+        lines[idx] = line.rstrip("\n").rstrip() + "  # default\n"
+    return "".join(lines)
+
+
 def save_cfg(cfg: dict) -> None:
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.StringIO()
+    yaml.safe_dump(cfg, buffer, sort_keys=False)
+    rendered = _inject_decoder_comments(buffer.getvalue())
     with CONFIG.open("w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
+        f.write(rendered)
 
 
 def ensure_default(cfg: dict, keys: Iterable[str], value) -> bool:
@@ -565,6 +607,7 @@ def run_fast_grid_calibration(
     temperature: Optional[float] = None,
     bias: Optional[float] = None,
     *,
+    frames: Optional[int] = None,
     verbose: Optional[str] = None,
     seed: Optional[int] = None,
     deterministic: Optional[bool] = None,
@@ -580,7 +623,8 @@ def run_fast_grid_calibration(
         cmd.extend(["--split", split])
     cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in FAST_GRID_THRESHOLDS)])
     cmd.append("--grid_prob_thresholds")
-    cmd.extend(["--max-clips", "80", "--frames", "64"])
+    frame_count = frames if frames is not None else 96
+    cmd.extend(["--max-clips", "80", "--frames", str(frame_count)])
     if temperature is not None:
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
@@ -739,6 +783,7 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     cfg = load_cfg()
     train_cfg = cfg.setdefault("training", {})
     metrics_cfg = train_cfg.setdefault("metrics", {})
+    decoder_snapshot = copy.deepcopy(metrics_cfg.get("decoder"))
     agg_cfg = metrics_cfg.setdefault("aggregation", {})
     k_cfg = agg_cfg.setdefault("k", {})
     calibration = load_calibration(CALIB_JSON)
@@ -817,6 +862,10 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
             k_onset=k_onset_final if k_onset_final is not None else "None",
         )
     )
+    if decoder_snapshot is None:
+        metrics_cfg.pop("decoder", None)
+    else:
+        metrics_cfg["decoder"] = decoder_snapshot
     save_cfg(cfg)
 
 
@@ -1053,6 +1102,7 @@ def perform_calibration(
             split,
             temperature=args.temperature,
             bias=args.bias,
+            frames=args.calib_frames,
             verbose=args.verbose,
             seed=seed,
             deterministic=deterministic,
@@ -1122,6 +1172,7 @@ RESULT_HEADER = [
     "onset_ev_f1",
     "offset_ev_f1",
     "ev_f1_mean",
+    "decoder_kind",
     "decoder_onset_open",
     "decoder_onset_hold",
     "decoder_offset_open",
@@ -1289,6 +1340,7 @@ def append_results(
         _fmt_float(metrics.get("onset_event_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("offset_event_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("ev_f1_mean"), ".4f", "0.0000"),
+        str(metrics.get("decoder_kind") or ""),
         _fmt_float(metrics.get("decoder_onset_open"), ".4f"),
         _fmt_float(metrics.get("decoder_onset_hold"), ".4f"),
         _fmt_float(metrics.get("decoder_offset_open"), ".4f"),
@@ -1326,7 +1378,8 @@ def main() -> int:
     ap.add_argument("--ckpt_dir", type=Path, default=Path("checkpoints"))
     ap.add_argument("--split_eval", default="val")
     ap.add_argument("--calib_max_clips", type=int)
-    ap.add_argument("--calib_frames", type=int)
+    ap.add_argument("--calib_frames", type=int, default=96,
+                    help="Override frames per clip during calibration/eval (default: 96)")
     ap.add_argument("--temperature", type=float)
     ap.add_argument("--bias", type=float)
     ap.add_argument("--stdout_dir", type=Path, default=DEFAULT_STDOUT_DIR)

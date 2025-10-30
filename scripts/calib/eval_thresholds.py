@@ -218,6 +218,23 @@ def _resolve_decoder_from_config(metrics_cfg: Mapping[str, Any]) -> dict[str, di
     if not isinstance(metrics_cfg, Mapping):
         metrics_cfg = {}
 
+    legacy_global: dict[str, Any] = {}
+    legacy_map = {
+        "open": metrics_cfg.get("decoder_open"),
+        "hold": metrics_cfg.get("decoder_hold"),
+        "low_ratio": metrics_cfg.get("decoder_low_ratio"),
+        "min_on": metrics_cfg.get("decoder_min_on"),
+        "min_off": metrics_cfg.get("decoder_min_off"),
+        "merge_gap": metrics_cfg.get("decoder_merge_gap"),
+        "gap_merge": metrics_cfg.get("decoder_gap_merge"),
+        "median": metrics_cfg.get("decoder_median"),
+    }
+    for key, value in legacy_map.items():
+        if value is not None:
+            legacy_global[key] = value
+    if legacy_global:
+        _apply_decoder_values(collected, ("onset", "offset"), legacy_global)
+
     for section_key in ("temporal_decoder", "proxy_decoder"):
         section = metrics_cfg.get(section_key)
         if not isinstance(section, Mapping):
@@ -336,6 +353,39 @@ def _decoder_notice_text(decoder_kind: str, decoder_params: dict) -> str:
         f"merge_gap={int(offset.get('merge_gap', 0))} "
         f"median={int(offset.get('median', 1))})"
     )
+
+
+def _topk_mask(values: torch.Tensor, count: int) -> torch.Tensor:
+    if count <= 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    dim = values.dim()
+    if dim < 1:
+        raise ValueError(f"Expected tensor with at least 1 dim for top-k mask, got {dim}")
+    last = values.shape[-1]
+    count_eff = min(max(int(count), 0), last)
+    if count_eff <= 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    if count_eff >= last:
+        return torch.ones_like(values, dtype=torch.bool)
+    topk_idx = values.topk(count_eff, dim=-1).indices
+    mask = torch.zeros_like(values, dtype=torch.bool)
+    return mask.scatter(-1, topk_idx, True)
+
+
+def _build_threshold_mask(
+    values: torch.Tensor,
+    threshold: float,
+    *,
+    mode: str,
+    cap_count: int,
+    top_k: int,
+) -> torch.Tensor:
+    mask = values >= float(threshold)
+    if mode == "top_k_cap" and top_k > 0:
+        mask = mask & _topk_mask(values, top_k)
+    if cap_count > 0:
+        mask = mask & _topk_mask(values, cap_count)
+    return mask
 
 
 def _prepare_logits_for_dump(tensor: torch.Tensor) -> np.ndarray:
@@ -998,8 +1048,31 @@ def main():
     metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
     agg_cfg = metrics_cfg.get("aggregation", {}) or {}
     agg_mode = str(agg_cfg.get("mode", "any")).lower()
+    agg_top_k = int(agg_cfg.get("top_k", 0) or 0)
+    agg_tau_sum = float(agg_cfg.get("tau_sum", 0.0) or 0.0)
     agg_k_cfg = agg_cfg.get("k", {}) or {}
     default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
+    default_k_offset = int(agg_k_cfg.get("offset", 1) or 1)
+    sweep_cfg = metrics_cfg.get("sweep", {}) or {}
+    floor_band_raw = sweep_cfg.get("floor_band", [0.20, 0.30, 0.40])
+    floor_band: List[float] = []
+    if isinstance(floor_band_raw, (list, tuple)):
+        for item in floor_band_raw:
+            try:
+                val = float(item)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= val <= 1.0:
+                floor_band.append(val)
+    else:
+        try:
+            val = float(floor_band_raw)
+        except (TypeError, ValueError):
+            val = None
+        if val is not None and 0.0 <= val <= 1.0:
+            floor_band.append(val)
+    if not floor_band:
+        floor_band = [0.20, 0.30, 0.40]
 
     calibration_data = None
     if args.calibration:
@@ -1166,6 +1239,11 @@ def main():
             per_head_sweep_vals = args.thresholds if args.thresholds is not None else args.prob_thresholds
             per_head_use_logits = args.thresholds is not None
             per_head_mode = "logit" if per_head_use_logits else "prob"
+
+    calib_pairs: int = 0
+    logit_pairs: int = 0
+    prob_pairs: int = 0
+    num_prob_combos: int = 0
 
     if args.head is None:
         calib_pairs = 0
@@ -1506,13 +1584,14 @@ def main():
         )
         return max_prob, stats
 
-    floor_band = [0.20, 0.30, 0.40]
     offset_lower_hint = 0.10  # base guardrail
 
-    _summarize_probs("onset", onset_probs)
-    max_prob_offset, _ = _summarize_probs("offset", offset_probs)
-    offset_lower_hint = max(offset_lower_hint, max_prob_offset - 0.10)
-    offset_lower_hint = float(max(0.0, min(offset_lower_hint, 0.95)))
+    onset_max_prob, onset_stats = _summarize_probs("onset", onset_probs)
+    offset_max_prob, offset_stats = _summarize_probs("offset", offset_probs)
+    onset_peak = max(onset_max_prob, float(onset_stats.get(0.99, onset_max_prob)))
+    offset_peak = max(offset_max_prob, float(offset_stats.get(0.99, offset_max_prob)))
+    onset_lower_hint = float(max(0.0, min(onset_peak - 0.10, 0.95)))
+    offset_lower_hint = float(max(0.0, min(offset_peak - 0.10, 0.95)))
 
     def _format_list(vals: List[float]) -> str:
         return "[" + ",".join(f"{v:.3f}" for v in vals) + "]"
@@ -1526,21 +1605,30 @@ def main():
             else:
                 offset_list = list(onset_list)
 
+            lowest_onset_thr = min(onset_list) if onset_list else None
             lowest_offset_thr = min(offset_list) if offset_list else None
-            extend_needed = (
-                lowest_offset_thr is not None
-                and max_prob_offset + 1e-9 < lowest_offset_thr
+            onset_extend_needed = (
+                lowest_onset_thr is not None
+                and onset_peak + 1e-9 < lowest_onset_thr
             )
-            inserted_lower = None
+            offset_extend_needed = (
+                lowest_offset_thr is not None
+                and offset_peak + 1e-9 < lowest_offset_thr
+            )
+            inserted_lower_onset = None
+            inserted_lower_offset = None
 
             if using_grid:
                 onset_set = set(onset_list)
                 offset_set = set(offset_list)
                 onset_set.update(floor_band)
                 offset_set.update(floor_band)
-                if extend_needed:
+                if onset_extend_needed:
+                    onset_set.add(onset_lower_hint)
+                    inserted_lower_onset = onset_lower_hint
+                if offset_extend_needed:
                     offset_set.add(offset_lower_hint)
-                    inserted_lower = offset_lower_hint
+                    inserted_lower_offset = offset_lower_hint
                 args.prob_thresholds = sorted(onset_set)
                 args.offset_prob_thresholds = sorted(offset_set)
             else:
@@ -1554,9 +1642,12 @@ def main():
 
                 for val in floor_band:
                     _add_pair(val, val)
-                if extend_needed:
+                if onset_extend_needed:
+                    _add_pair(onset_lower_hint, onset_lower_hint)
+                    inserted_lower_onset = onset_lower_hint
+                if offset_extend_needed:
                     _add_pair(offset_lower_hint, offset_lower_hint)
-                    inserted_lower = offset_lower_hint
+                    inserted_lower_offset = offset_lower_hint
 
                 pairs = list(pair_map.values())
                 pairs.sort(key=lambda item: (item[1], item[0]))
@@ -1577,14 +1668,20 @@ def main():
             num_thr_pairs = calib_pairs + logit_pairs + prob_pairs
             num_combos = calib_pairs + logit_pairs + num_prob_combos
 
-            if inserted_lower is not None:
+            if inserted_lower_onset is not None:
                 _log_progress(
-                    "[sweep] offset max prob %.4f < min sweep %.4f → added %.4f to sweep list."
-                    % (max_prob_offset, lowest_offset_thr, inserted_lower),
+                    "[sweep] onset peak prob %.4f < min sweep %.4f → added %.4f to sweep list."
+                    % (onset_peak, lowest_onset_thr, inserted_lower_onset),
+                    force=True,
+                )
+            if inserted_lower_offset is not None:
+                _log_progress(
+                    "[sweep] offset peak prob %.4f < min sweep %.4f → added %.4f to sweep list."
+                    % (offset_peak, lowest_offset_thr, inserted_lower_offset),
                     force=True,
                 )
             _log_progress(
-                f"[sweep] ensured floor band {', '.join(f'{v:.2f}' for v in floor_band)} in probability sweep.",
+                f"[sweep] ensured floor band {', '.join(f'{v:.2f}' for v in sorted(floor_band))} in probability sweep.",
                 force=True,
             )
             if using_grid:
@@ -1609,16 +1706,23 @@ def main():
             inserted_lower = None
             if args.head == "offset":
                 lowest = min(values) if values else None
-                extend_needed = lowest is not None and max_prob_offset + 1e-9 < lowest
+                extend_needed = lowest is not None and offset_peak + 1e-9 < lowest
                 if extend_needed:
                     values.add(offset_lower_hint)
                     inserted_lower = offset_lower_hint
+            elif args.head == "onset":
+                lowest = min(values) if values else None
+                extend_needed = lowest is not None and onset_peak + 1e-9 < lowest
+                if extend_needed:
+                    values.add(onset_lower_hint)
+                    inserted_lower = onset_lower_hint
             per_head_sweep_vals = sorted(values)
             num_combos = len(per_head_sweep_vals)
             if inserted_lower is not None:
+                peak_val = offset_peak if args.head == "offset" else onset_peak
                 _log_progress(
-                    "[sweep] per-head offset max prob %.4f → added %.4f to sweep list."
-                    % (max_prob_offset, inserted_lower),
+                    "[sweep] per-head %s peak prob %.4f → added %.4f to sweep list."
+                    % (args.head, peak_val, inserted_lower),
                     force=True,
                 )
             _log_progress(
@@ -1663,10 +1767,37 @@ def main():
         nonlocal decoder_notice_printed, decoder_logits_warned
         if k_onset is None:
             k_onset = default_k_onset
+        k_onset = max(1, int(k_onset))
+        k_offset = max(1, int(default_k_offset))
         onset_open_thr: Optional[float] = None
         onset_hold_thr: Optional[float] = None
         offset_open_thr: Optional[float] = None
         offset_hold_thr: Optional[float] = None
+        base_onset_tensor = onset_logits if use_logits else onset_probs
+        base_offset_tensor = offset_logits if use_logits else offset_probs
+        base_onset = torch.as_tensor(base_onset_tensor) if not torch.is_tensor(base_onset_tensor) else base_onset_tensor
+        base_offset = torch.as_tensor(base_offset_tensor) if not torch.is_tensor(base_offset_tensor) else base_offset_tensor
+
+        onset_mask_bool = _build_threshold_mask(
+            base_onset,
+            on_thr,
+            mode=agg_mode,
+            cap_count=k_onset,
+            top_k=agg_top_k,
+        )
+        offset_mask_bool = _build_threshold_mask(
+            base_offset,
+            off_thr,
+            mode=agg_mode,
+            cap_count=k_offset,
+            top_k=agg_top_k,
+        )
+
+        onset_mask_float = onset_mask_bool.float()
+        offset_mask_float = offset_mask_bool.float()
+        onset_pred_bin = onset_mask_float
+        offset_pred_bin = offset_mask_float
+
         if decoder_kind == "hysteresis" and not use_logits:
             if not decoder_notice_printed:
                 print(f"[decoder] {_decoder_notice_text(decoder_kind, decoder_params)}", flush=True)
@@ -1681,8 +1812,12 @@ def main():
                 fallback_open=off_thr,
                 default_hold=_DECODER_DEFAULTS["offset"]["hold"],
             )
+            onset_probs_tensor = torch.as_tensor(onset_probs) if not torch.is_tensor(onset_probs) else onset_probs
+            offset_probs_tensor = torch.as_tensor(offset_probs) if not torch.is_tensor(offset_probs) else offset_probs
+            masked_onset_probs = (onset_probs_tensor * onset_mask_float).contiguous()
+            masked_offset_probs = (offset_probs_tensor * offset_mask_float).contiguous()
             onset_pred_mask = decode_hysteresis(
-                onset_probs,
+                masked_onset_probs,
                 onset_open_thr,
                 onset_hold_thr,
                 onset_decoder["min_on"],
@@ -1691,7 +1826,7 @@ def main():
                 onset_decoder["median"],
             )
             offset_pred_mask = decode_hysteresis(
-                offset_probs,
+                masked_offset_probs,
                 offset_open_thr,
                 offset_hold_thr,
                 offset_decoder["min_on"],
@@ -1699,8 +1834,8 @@ def main():
                 offset_decoder["merge_gap"],
                 offset_decoder["median"],
             )
-            onset_pred_bin = onset_pred_mask.to(onset_probs.dtype)
-            offset_pred_bin = offset_pred_mask.to(offset_probs.dtype)
+            onset_pred_bin = onset_pred_mask.to(onset_probs_tensor.dtype)
+            offset_pred_bin = offset_pred_mask.to(offset_probs_tensor.dtype)
         elif use_logits:
             if decoder_kind == "hysteresis" and not decoder_logits_warned:
                 LOGGER.warning(
@@ -1708,16 +1843,8 @@ def main():
                     extra=QUIET_EXTRA,
                 )
                 decoder_logits_warned = True
-            onset_pred_bin = (onset_logits >= on_thr).float()
-            offset_pred_bin = (offset_logits >= off_thr).float()
-        else:
-            onset_pred_bin = (onset_probs >= on_thr).float()
-            offset_pred_bin = (offset_probs >= off_thr).float()
-
-        if agg_mode == "k_of_p" and k_onset > 1:
-            counts = onset_pred_bin.sum(dim=-1, keepdim=True)
-            keep = (counts >= k_onset).float()
-            onset_pred_bin = onset_pred_bin * keep
+            onset_pred_bin = onset_mask_bool.float()
+            offset_pred_bin = offset_mask_bool.float()
         
         f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
         f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))

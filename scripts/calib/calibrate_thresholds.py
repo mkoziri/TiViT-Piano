@@ -47,7 +47,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Mapping, Optional, Tuple, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -63,6 +63,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 from utils import load_config, align_pitch_dim, configure_verbosity
+from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
@@ -79,6 +80,456 @@ DEFAULT_PROB_GRID = torch.arange(0.01, 0.99 + 1e-9, 0.01)
 _OFFSET_EXTRA = torch.arange(0.99, 1.001 + 1e-9, 0.002)
 OFFSET_PROB_GRID = torch.unique(torch.cat([DEFAULT_PROB_GRID, _OFFSET_EXTRA]))
 OFFSET_PROB_GRID = torch.sort(OFFSET_PROB_GRID).values.clamp(max=0.999)
+
+_DECODER_DEFAULTS = {
+    "onset": {
+        "open": 0.36,
+        "hold": 0.28,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+    "offset": {
+        "open": 0.32,
+        "hold": 0.24,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+}
+
+
+def _apply_decoder_values(
+    target: dict[str, dict[str, Any]],
+    heads: Iterable[str],
+    source: Mapping[str, Any] | None,
+) -> None:
+    if not isinstance(source, Mapping):
+        return
+    for key, value in source.items():
+        if value is None:
+            continue
+        key_str = str(key)
+        norm_key = "merge_gap" if key_str == "gap_merge" else key_str
+        if norm_key not in {
+            "open",
+            "hold",
+            "low_ratio",
+            "min_on",
+            "min_off",
+            "merge_gap",
+            "median",
+        }:
+            continue
+        for head in heads:
+            target.setdefault(head, {})[norm_key] = value
+
+
+def _normalize_decoder_params(
+    raw: Mapping[str, dict[str, Any]],
+    *,
+    fallback_open: Optional[Mapping[str, float]] = None,
+) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
+    for head in ("onset", "offset"):
+        defaults = _DECODER_DEFAULTS[head]
+        source = raw.get(head, {}) if isinstance(raw, Mapping) else {}
+        entry: dict[str, Any] = {}
+
+        open_defined = "open" in source and source.get("open") is not None
+        hold_defined = "hold" in source and source.get("hold") is not None
+
+        open_candidate = source.get("open")
+        if open_candidate is None and fallback_open:
+            open_candidate = fallback_open.get(head)
+        if open_candidate is None:
+            open_candidate = defaults["open"]
+        try:
+            open_val = float(open_candidate)
+        except (TypeError, ValueError):
+            open_val = defaults["open"]
+        if not math.isfinite(open_val):
+            open_val = defaults["open"]
+        open_val = max(0.0, min(open_val, 1.0))
+
+        ratio_candidate = source.get("low_ratio")
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
+            try:
+                ratio_val = float(ratio_candidate)
+            except (TypeError, ValueError):
+                ratio_val = None
+            else:
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
+
+        hold_candidate = source.get("hold")
+        if hold_candidate is None and ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        if hold_candidate is None:
+            hold_candidate = defaults["hold"]
+        try:
+            hold_val = float(hold_candidate)
+        except (TypeError, ValueError):
+            hold_val = defaults["hold"]
+        if not math.isfinite(hold_val):
+            hold_val = defaults["hold"]
+        if hold_val < 0.0:
+            hold_val = 0.0
+        if hold_val > open_val and open_val > 0.0:
+            hold_val = open_val
+
+        for key in ("min_on", "min_off", "merge_gap"):
+            default_val = defaults[key]
+            src_val = source.get(key, default_val)
+            try:
+                int_val = int(src_val)
+            except (TypeError, ValueError):
+                int_val = default_val
+            if int_val < 0:
+                int_val = 0
+            entry[key] = int_val
+
+        median_default = defaults["median"]
+        median_candidate = source.get("median", median_default)
+        try:
+            median_val = int(median_candidate)
+        except (TypeError, ValueError):
+            median_val = median_default
+        if median_val < 1:
+            median_val = 1
+        if median_val % 2 == 0:
+            median_val += 1
+
+        if ratio_val is None:
+            if open_val > 0.0:
+                ratio_val = hold_val / open_val if open_val > 0.0 else 0.0
+            else:
+                ratio_val = 0.0
+
+        entry.update(
+            {
+                "open": open_val,
+                "hold": hold_val,
+                "low_ratio": max(0.0, ratio_val or 0.0),
+                "median": median_val,
+                "open_defined": bool(open_defined),
+                "hold_defined": bool(hold_defined),
+            }
+        )
+        normalized[head] = entry
+    return normalized
+
+
+def _resolve_decoder_from_config(metrics_cfg: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    collected: dict[str, dict[str, Any]] = {"onset": {}, "offset": {}}
+
+    if not isinstance(metrics_cfg, Mapping):
+        metrics_cfg = {}
+
+    legacy_global: dict[str, Any] = {}
+    legacy_map = {
+        "open": metrics_cfg.get("decoder_open"),
+        "hold": metrics_cfg.get("decoder_hold"),
+        "low_ratio": metrics_cfg.get("decoder_low_ratio"),
+        "min_on": metrics_cfg.get("decoder_min_on"),
+        "min_off": metrics_cfg.get("decoder_min_off"),
+        "merge_gap": metrics_cfg.get("decoder_merge_gap"),
+        "gap_merge": metrics_cfg.get("decoder_gap_merge"),
+        "median": metrics_cfg.get("decoder_median"),
+    }
+    for key, value in legacy_map.items():
+        if value is not None:
+            legacy_global[key] = value
+    if legacy_global:
+        _apply_decoder_values(collected, ("onset", "offset"), legacy_global)
+
+    for section_key in ("temporal_decoder", "proxy_decoder"):
+        section = metrics_cfg.get(section_key)
+        if not isinstance(section, Mapping):
+            continue
+        _apply_decoder_values(collected, ("onset", "offset"), section)
+        shared = section.get("shared")
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
+        for head in ("onset", "offset"):
+            head_cfg = section.get(head)
+            _apply_decoder_values(collected, (head,), head_cfg)
+
+    decoder_cfg = metrics_cfg.get("decoder")
+    if isinstance(decoder_cfg, Mapping):
+        _apply_decoder_values(collected, ("onset", "offset"), decoder_cfg)
+        shared = decoder_cfg.get("shared")
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
+        for head in ("onset", "offset"):
+            head_cfg = decoder_cfg.get(head)
+            _apply_decoder_values(collected, (head,), head_cfg)
+
+    return _normalize_decoder_params(collected)
+
+
+def _resolve_decoder_thresholds(
+    entry: Mapping[str, Any],
+    *,
+    fallback_open: float,
+    default_hold: float,
+) -> Tuple[float, float]:
+    fallback = float(fallback_open)
+    if not math.isfinite(fallback):
+        fallback = 0.5
+    elif fallback < 0.0:
+        fallback = 0.0
+    elif fallback > 1.0:
+        fallback = 1.0
+
+    open_defined = bool(entry.get("open_defined"))
+    open_candidate = entry.get("open", fallback)
+    try:
+        open_val = float(open_candidate)
+    except (TypeError, ValueError):
+        open_val = fallback
+    if not math.isfinite(open_val):
+        open_val = fallback
+    if not open_defined:
+        open_val = fallback
+    open_val = max(0.0, min(open_val, 1.0))
+
+    hold_defined = bool(entry.get("hold_defined"))
+    hold_candidate = entry.get("hold", default_hold)
+    ratio_candidate = entry.get("low_ratio")
+    if not hold_defined:
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
+            try:
+                ratio_val = float(ratio_candidate)
+            except (TypeError, ValueError):
+                ratio_val = None
+            else:
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
+        if ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        else:
+            hold_candidate = default_hold
+    try:
+        hold_val = float(hold_candidate)
+    except (TypeError, ValueError):
+        hold_val = float(default_hold)
+    if not math.isfinite(hold_val):
+        hold_val = float(default_hold)
+    if hold_val < 0.0:
+        hold_val = 0.0
+    if hold_val > open_val:
+        hold_val = open_val
+
+    return open_val, hold_val
+
+
+def _format_decoder_settings(decoder_kind: str, decoder_params: dict) -> str:
+    if decoder_kind != "hysteresis":
+        return f"decoder={decoder_kind}"
+    onset = decoder_params.get("onset", {})
+    offset = decoder_params.get("offset", {})
+    return (
+        "decoder=hysteresis "
+        f"onset_open={onset.get('open', 0.0):.4f} "
+        f"onset_hold={onset.get('hold', 0.0):.4f} "
+        f"onset_min_on={int(onset.get('min_on', 0))} "
+        f"onset_merge_gap={int(onset.get('merge_gap', 0))} "
+        f"offset_open={offset.get('open', 0.0):.4f} "
+        f"offset_hold={offset.get('hold', 0.0):.4f} "
+        f"offset_min_off={int(offset.get('min_off', 0))} "
+        f"offset_merge_gap={int(offset.get('merge_gap', 0))}"
+    )
+
+
+def _decoder_notice_text(decoder_kind: str, decoder_params: dict) -> str:
+    if decoder_kind != "hysteresis":
+        return f"{decoder_kind} decoder active"
+    onset = decoder_params.get("onset", {})
+    offset = decoder_params.get("offset", {})
+    return (
+        "hysteresis "
+        f"onset(open={onset.get('open', 0.0):.2f} "
+        f"hold={onset.get('hold', 0.0):.2f} "
+        f"min_on={int(onset.get('min_on', 0))} "
+        f"merge_gap={int(onset.get('merge_gap', 0))} "
+        f"median={int(onset.get('median', 1))}) "
+        f"offset(open={offset.get('open', 0.0):.2f} "
+        f"hold={offset.get('hold', 0.0):.2f} "
+        f"min_off={int(offset.get('min_off', 0))} "
+        f"merge_gap={int(offset.get('merge_gap', 0))} "
+        f"median={int(offset.get('median', 1))})"
+    )
+
+
+def _median_filter_time(clip_probs: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return clip_probs
+    if clip_probs.ndim != 2:
+        raise ValueError(f"median filter expects 2D tensor, got {clip_probs.ndim}D")
+    pad = kernel_size // 2
+    probs_PT = clip_probs.transpose(0, 1)
+    padded = F.pad(probs_PT.unsqueeze(1), (pad, pad), mode="replicate").squeeze(1)
+    windows = padded.unfold(-1, kernel_size, 1)
+    filtered = windows.median(dim=-1).values
+    return filtered.transpose(0, 1).contiguous()
+
+
+def decode_hysteresis(
+    probs: torch.Tensor,
+    open_thr: float,
+    hold_thr: float,
+    min_on: int,
+    min_off: int,
+    merge_gap: int,
+    median: int,
+) -> torch.Tensor:
+    if probs.ndim not in (2, 3):
+        raise ValueError(f"Expected probs with 2 or 3 dims, got {probs.ndim}")
+    high_thr = float(open_thr)
+    low_thr = float(hold_thr)
+    if not math.isfinite(high_thr):
+        high_thr = 0.5
+    if not math.isfinite(low_thr):
+        low_thr = high_thr
+    if low_thr > high_thr:
+        low_thr = high_thr
+    if high_thr < 0.0:
+        high_thr = 0.0
+    if low_thr < 0.0:
+        low_thr = 0.0
+    min_on = max(0, int(min_on))
+    min_off = max(0, int(min_off))
+    merge_gap = max(0, int(merge_gap))
+    if probs.numel() == 0:
+        return torch.zeros_like(probs, dtype=torch.bool)
+
+    def _decode_clip(clip_probs: torch.Tensor) -> torch.Tensor:
+        if median > 1:
+            processed = _median_filter_time(clip_probs, median)
+        else:
+            processed = clip_probs
+        T, P = processed.shape
+        mask = torch.zeros((T, P), dtype=torch.bool, device=clip_probs.device)
+        for pitch in range(P):
+            seq = processed[:, pitch]
+            vals = seq.tolist()
+            segments = []
+            state = False
+            start_idx = 0
+            for t, raw_val in enumerate(vals):
+                val = float(raw_val) if math.isfinite(raw_val) else 0.0
+                if not state:
+                    if val >= high_thr:
+                        state = True
+                        start_idx = t
+                else:
+                    if val < low_thr:
+                        segments.append([start_idx, t])
+                        state = False
+            if state:
+                segments.append([start_idx, T])
+            if not segments:
+                continue
+            merged = []
+            for seg_start, seg_end in segments:
+                if not merged:
+                    merged.append([seg_start, seg_end])
+                    continue
+                prev_start, prev_end = merged[-1]
+                gap = seg_start - prev_end
+                should_merge = False
+                if merge_gap >= 0 and gap <= merge_gap:
+                    should_merge = True
+                if min_off > 0 and gap < min_off:
+                    should_merge = True
+                if should_merge:
+                    merged[-1][1] = seg_end
+                else:
+                    merged.append([seg_start, seg_end])
+            for seg_start, seg_end in merged:
+                if seg_end - seg_start < min_on:
+                    continue
+                mask[seg_start:seg_end, pitch] = True
+        return mask
+
+    if probs.ndim == 2:
+        return _decode_clip(probs)
+
+    batches = [_decode_clip(clip) for clip in probs]
+    if not batches:
+        return torch.zeros_like(probs, dtype=torch.bool)
+    return torch.stack(batches, dim=0)
+
+
+def _topk_mask(values: torch.Tensor, count: int) -> torch.Tensor:
+    if count <= 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    dim = values.dim()
+    if dim < 1:
+        raise ValueError(f"Expected tensor with at least 1 dim for top-k mask, got {dim}")
+    last = values.shape[-1]
+    count_eff = min(max(int(count), 0), last)
+    if count_eff <= 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    if count_eff >= last:
+        return torch.ones_like(values, dtype=torch.bool)
+    topk_idx = values.topk(count_eff, dim=-1).indices
+    mask = torch.zeros_like(values, dtype=torch.bool)
+    return mask.scatter(-1, topk_idx, True)
+
+
+def _build_threshold_mask(
+    values: torch.Tensor,
+    threshold: float,
+    *,
+    mode: str,
+    cap_count: int,
+    top_k: int,
+) -> torch.Tensor:
+    mask = values >= float(threshold)
+    if mode == "top_k_cap" and top_k > 0:
+        mask = mask & _topk_mask(values, top_k)
+    if cap_count > 0:
+        mask = mask & _topk_mask(values, cap_count)
+    return mask
+
+
+def _event_f1(pred, target, hop_seconds: float, tol_sec: float, eps: float = 1e-8):
+    pred_pos = pred.nonzero(as_tuple=False)
+    true_pos = target.nonzero(as_tuple=False)
+    if pred_pos.numel() == 0 and true_pos.numel() == 0:
+        return None
+
+    pred_times = torch.as_tensor(frame_to_sec(pred_pos[:, 0], hop_seconds))
+    true_times = torch.as_tensor(frame_to_sec(true_pos[:, 0], hop_seconds))
+    pred_pitch = pred_pos[:, 1]
+    true_pitch = true_pos[:, 1]
+
+    used = torch.zeros(true_pos.shape[0], dtype=torch.bool)
+    tp = 0
+    for i in range(pred_pos.shape[0]):
+        pitch = pred_pitch[i]
+        time_val = pred_times[i]
+        mask = (true_pitch == pitch) & (~used)
+        if mask.any():
+            cand_idx = torch.where(mask)[0]
+            diffs = torch.abs(true_times[cand_idx] - time_val)
+            min_diff, j = torch.min(diffs, dim=0)
+            if min_diff.item() <= tol_sec:
+                tp += 1
+                used[cand_idx[j]] = True
+    fp = pred_pos.shape[0] - tp
+    fn = true_pos.shape[0] - tp
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    return 2 * precision * recall / (precision + recall + eps)
 
 
 def _print_progress(processed: int, total: Optional[int]) -> None:
@@ -569,48 +1020,141 @@ def _compute_metrics(
     *,
     prob_grid: Optional[torch.Tensor] = None,
     logit_grid: Optional[torch.Tensor] = None,
+    agg_mode: str,
+    agg_top_k: int,
+    cap_count: int,
+    decoder_kind: str,
+    decoder_params: Mapping[str, Any],
+    hop_seconds: float,
+    event_tolerance: float,
 ):
     logits_flat = logits.reshape(-1)
     probs_flat = probs.reshape(-1)
     targets_flat = targets.reshape(-1)
 
-    if logit_grid is None:
-        logit_grid = DEFAULT_LOGIT_GRID
-    logit_grid = logit_grid.to(logits_flat.device)
-    best_logit, best_f1_logit, pred_rate_logit = -4.0, -1.0, 0.0
-    for thr in logit_grid:
-        pred = (logits_flat >= thr).float()
-        f1 = _binary_f1(pred, targets_flat)
-        if f1 > best_f1_logit:
-            best_f1_logit = f1
-            best_logit = float(thr.item())
-            pred_rate_logit = pred.mean().item()
+    logit_grid_tensor = logit_grid if logit_grid is not None else DEFAULT_LOGIT_GRID
+    logit_grid_tensor = logit_grid_tensor.to(logits_flat.device)
+    prob_grid_tensor = prob_grid if prob_grid is not None else DEFAULT_PROB_GRID
+    prob_grid_tensor = prob_grid_tensor.to(probs_flat.device)
 
-    if prob_grid is None:
-        prob_grid = DEFAULT_PROB_GRID
-    prob_grid = prob_grid.to(probs_flat.device)
-    best_prob, best_f1_prob, pred_rate_prob = 0.5, -1.0, 0.0
-    for thr in prob_grid:
-        pred = (probs_flat >= thr).float()
+    frame_best_logit, frame_best_f1_logit, frame_pred_rate_logit = -4.0, -1.0, 0.0
+    for thr in logit_grid_tensor:
+        thr_val = float(thr.item())
+        pred = (logits_flat >= thr_val).float()
         f1 = _binary_f1(pred, targets_flat)
-        if f1 > best_f1_prob:
-            best_f1_prob = f1
-            best_prob = float(thr.item())
-            pred_rate_prob = pred.mean().item()
+        if f1 > frame_best_f1_logit:
+            frame_best_f1_logit = f1
+            frame_best_logit = thr_val
+            frame_pred_rate_logit = float(pred.mean().item())
+
+    frame_best_prob, frame_best_f1_prob, frame_pred_rate_prob = 0.5, -1.0, 0.0
+    for thr in prob_grid_tensor:
+        thr_val = float(thr.item())
+        pred = (probs_flat >= thr_val).float()
+        f1 = _binary_f1(pred, targets_flat)
+        if f1 > frame_best_f1_prob:
+            frame_best_f1_prob = f1
+            frame_best_prob = thr_val
+            frame_pred_rate_prob = float(pred.mean().item())
+
+    event_best_logit = float(frame_best_logit)
+    event_best_f1_logit = -1.0
+    event_pred_rate_logit = 0.0
+    for thr in logit_grid_tensor:
+        thr_val = float(thr.item())
+        mask_bool = _build_threshold_mask(
+            logits,
+            thr_val,
+            mode=agg_mode,
+            cap_count=cap_count,
+            top_k=agg_top_k,
+        )
+        mask_float = mask_bool.float()
+        fallback_prob = 1.0 / (1.0 + math.exp(-thr_val))
+        pred_bin = mask_float
+        if decoder_kind == "hysteresis":
+            open_thr, hold_thr = _resolve_decoder_thresholds(
+                decoder_params,
+                fallback_open=fallback_prob,
+                default_hold=_DECODER_DEFAULTS[name]["hold"],
+            )
+            masked_probs = (probs * mask_float).contiguous()
+            pred_mask = decode_hysteresis(
+                masked_probs,
+                open_thr,
+                hold_thr,
+                decoder_params["min_on"],
+                decoder_params["min_off"],
+                decoder_params["merge_gap"],
+                decoder_params["median"],
+            )
+            pred_bin = pred_mask.to(mask_float.dtype)
+        ev_f1 = _event_f1(pred_bin, targets, hop_seconds, event_tolerance)
+        if ev_f1 is None:
+            ev_f1 = 0.0
+        pred_rate = float(pred_bin.mean().item())
+        if ev_f1 > event_best_f1_logit + 1e-9:
+            event_best_f1_logit = ev_f1
+            event_best_logit = thr_val
+            event_pred_rate_logit = pred_rate
+
+    event_best_prob = float(frame_best_prob)
+    event_best_f1_prob = -1.0
+    event_pred_rate_prob = 0.0
+    for thr in prob_grid_tensor:
+        thr_val = float(thr.item())
+        mask_bool = _build_threshold_mask(
+            probs,
+            thr_val,
+            mode=agg_mode,
+            cap_count=cap_count,
+            top_k=agg_top_k,
+        )
+        mask_float = mask_bool.float()
+        pred_bin = mask_float
+        if decoder_kind == "hysteresis":
+            open_thr, hold_thr = _resolve_decoder_thresholds(
+                decoder_params,
+                fallback_open=thr_val,
+                default_hold=_DECODER_DEFAULTS[name]["hold"],
+            )
+            masked_probs = (probs * mask_float).contiguous()
+            pred_mask = decode_hysteresis(
+                masked_probs,
+                open_thr,
+                hold_thr,
+                decoder_params["min_on"],
+                decoder_params["min_off"],
+                decoder_params["merge_gap"],
+                decoder_params["median"],
+            )
+            pred_bin = pred_mask.to(mask_float.dtype)
+        ev_f1 = _event_f1(pred_bin, targets, hop_seconds, event_tolerance)
+        if ev_f1 is None:
+            ev_f1 = 0.0
+        pred_rate = float(pred_bin.mean().item())
+        if ev_f1 > event_best_f1_prob + 1e-9:
+            event_best_f1_prob = ev_f1
+            event_best_prob = thr_val
+            event_pred_rate_prob = pred_rate
 
     pos_rate = targets_flat.mean().item()
     ece, brier = _reliability_curve(probs_flat.numpy(), targets_flat.numpy(), 10, name)
 
     return {
-        "best_logit": best_logit,
-        "best_prob": best_prob,
-        "f1_logit": best_f1_logit,
-        "f1_prob": best_f1_prob,
-        "pred_rate_logit": pred_rate_logit,
-        "pred_rate_prob": pred_rate_prob,
+        "best_logit": event_best_logit,
+        "best_prob": event_best_prob,
+        "f1_logit": event_best_f1_logit,
+        "f1_prob": event_best_f1_prob,
+        "pred_rate_logit": event_pred_rate_logit,
+        "pred_rate_prob": event_pred_rate_prob,
         "pos_rate": pos_rate,
         "ece": ece,
         "brier": brier,
+        "frame_f1_logit": frame_best_f1_logit,
+        "frame_f1_prob": frame_best_f1_prob,
+        "frame_pred_rate_logit": frame_pred_rate_logit,
+        "frame_pred_rate_prob": frame_pred_rate_prob,
     }
 
 
@@ -670,6 +1214,19 @@ def main():
         f"[determinism] seed={seed} deterministic={'on' if deterministic else 'off'}",
         flush=True,
     )
+    metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
+    agg_cfg = metrics_cfg.get("aggregation", {}) or {}
+    agg_mode = str(agg_cfg.get("mode", "any")).lower()
+    agg_top_k = int(agg_cfg.get("top_k", 0) or 0)
+    agg_k_cfg = agg_cfg.get("k", {}) or {}
+    agg_k_onset = max(1, int(agg_k_cfg.get("onset", 1) or 1))
+    agg_k_offset = max(1, int(agg_k_cfg.get("offset", 1) or 1))
+    decoder_kind = "hysteresis"
+    decoder_params = _resolve_decoder_from_config(metrics_cfg)
+    decoder_settings_summary = _format_decoder_settings(decoder_kind, decoder_params)
+    print(f"[decoder-settings] {decoder_settings_summary}")
+    print(f"[decoder] {_decoder_notice_text(decoder_kind, decoder_params)}")
+
     dataset_cfg = dict(cfg.get("dataset", {}) or {})
     cfg["dataset"] = dataset_cfg
     if args.max_clips is not None:
@@ -686,6 +1243,13 @@ def main():
             "[progress] debug mode: forcing num_workers=0, persistent_workers=False, pin_memory=False.",
             flush=True,
         )
+
+    decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    if hop_seconds <= 0.0:
+        hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
+    frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
+    event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
 
     split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
     frames_display = dataset_cfg.get("frames")
@@ -920,6 +1484,13 @@ def main():
         "onset",
         prob_grid=DEFAULT_PROB_GRID,
         logit_grid=DEFAULT_LOGIT_GRID,
+        agg_mode=agg_mode,
+        agg_top_k=agg_top_k,
+        cap_count=agg_k_onset,
+        decoder_kind=decoder_kind,
+        decoder_params=decoder_params["onset"],
+        hop_seconds=hop_seconds,
+        event_tolerance=event_tolerance,
     )
     offset_stats = _compute_metrics(
         offset_logits,
@@ -928,6 +1499,13 @@ def main():
         "offset",
         prob_grid=OFFSET_PROB_GRID,
         logit_grid=DEFAULT_LOGIT_GRID,
+        agg_mode=agg_mode,
+        agg_top_k=agg_top_k,
+        cap_count=agg_k_offset,
+        decoder_kind=decoder_kind,
+        decoder_params=decoder_params["offset"],
+        hop_seconds=hop_seconds,
+        event_tolerance=event_tolerance,
     )
     onset_platt = _fit_platt_scaling(onset_logits, onset_tgts, head="onset")
     offset_platt = _fit_platt_scaling(offset_logits, offset_tgts, head="offset")
@@ -957,8 +1535,10 @@ def main():
         diff = stats["calibrated_pred_rate"] - stats["pos_rate"]
         print(
             f"{name}: pos_rate={stats['pos_rate']:.4f} | "
-            f"best_logit={stats['best_logit']:.2f} (pred_rate={stats['pred_rate_logit']:.4f}, F1={stats['f1_logit']:.3f}) | "
-            f"best_prob={stats['best_prob']:.2f} (pred_rate={stats['pred_rate_prob']:.4f}, F1={stats['f1_prob']:.3f}) | "
+            f"best_logit={stats['best_logit']:.2f} "
+            f"(event_F1={stats['f1_logit']:.3f}, frame_F1={stats['frame_f1_logit']:.3f}, pred_rate={stats['pred_rate_logit']:.4f}) | "
+            f"best_prob={stats['best_prob']:.2f} "
+            f"(event_F1={stats['f1_prob']:.3f}, frame_F1={stats['frame_f1_prob']:.3f}, pred_rate={stats['pred_rate_prob']:.4f}) | "
             f"temp={stats['temperature']:.3f} bias={stats['logit_bias']:.3f} calibrated_rate={stats['calibrated_pred_rate']:.4f} (Δ={diff:+.4f})"
         )
 

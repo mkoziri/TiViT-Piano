@@ -1183,6 +1183,23 @@ def _resolve_temporal_decoder_config(
     if not isinstance(metrics_cfg, Mapping):
         metrics_cfg = {}
 
+    legacy_global: dict[str, Any] = {}
+    legacy_map = {
+        "open": metrics_cfg.get("decoder_open"),
+        "hold": metrics_cfg.get("decoder_hold"),
+        "low_ratio": metrics_cfg.get("decoder_low_ratio"),
+        "min_on": metrics_cfg.get("decoder_min_on"),
+        "min_off": metrics_cfg.get("decoder_min_off"),
+        "merge_gap": metrics_cfg.get("decoder_merge_gap"),
+        "gap_merge": metrics_cfg.get("decoder_gap_merge"),
+        "median": metrics_cfg.get("decoder_median"),
+    }
+    for key, value in legacy_map.items():
+        if value is not None:
+            legacy_global[key] = value
+    if legacy_global:
+        _apply_decoder_values(collected, ("onset", "offset"), legacy_global)
+
     for section_key in ("temporal_decoder", "proxy_decoder"):
         section = metrics_cfg.get(section_key)
         if not isinstance(section, Mapping):
@@ -3299,6 +3316,15 @@ def evaluate_one_epoch(
     logger.info("[strict] %s", strict_line, extra=quiet_extra)
     logger.info("[any] %s", legacy_line, extra=quiet_extra)
     logger.info("[event-proxy] %s", event_line, extra=quiet_extra)
+
+    calibration_line = (
+        f"thr.onset={thr_on:.3f} thr.offset={thr_off:.3f} "
+        f"k.onset={int(agg_cfg['k_onset'])} k.offset={int(agg_cfg['k_offset'])} "
+        f"temp.onset={float(onset_cal['temperature']):.3f} temp.offset={float(offset_cal['temperature']):.3f} "
+        f"bias.onset={float(onset_cal['bias']):+.3f} bias.offset={float(offset_cal['bias']):+.3f}"
+    )
+    print(f"[calibration] {calibration_line}")
+    logger.info("[calibration] %s", calibration_line, extra=quiet_extra)
 
     decoder_onset_line = (
         f"decoder.onset: open={decoder_onset.get('open_effective', onset_open_thr):.3f} "
