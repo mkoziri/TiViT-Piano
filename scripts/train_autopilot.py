@@ -1415,8 +1415,18 @@ def main() -> int:
 
     save_cfg(cfg)
 
-    ckpt_dir = args.ckpt_dir.expanduser().resolve()
+    ckpt_arg = args.ckpt_dir.expanduser()
+    ckpt_hint: Optional[Path] = None
+    if ckpt_arg.suffix == ".pt" or (ckpt_arg.exists() and ckpt_arg.is_file()):
+        try:
+            ckpt_hint = ckpt_arg.resolve()
+        except OSError:
+            ckpt_hint = ckpt_arg
+        ckpt_arg = ckpt_arg.parent
+    ckpt_dir = ckpt_arg.resolve()
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if ckpt_hint is not None:
+        print(f"[autopilot] ckpt_dir resolved to file {ckpt_hint.name}; using parent {ckpt_dir} for new checkpoints")
 
     results_path = args.results.expanduser()
     ensure_results_header(results_path, RESULT_HEADER)
@@ -1455,6 +1465,10 @@ def main() -> int:
             k_cfg["offset"] = 1
         train_cfg["eval_freq"] = 1
         ckpt = find_ckpt(ckpt_dir)
+        if ckpt is None and ckpt_hint and ckpt_hint.exists():
+            ckpt = ckpt_hint
+        if ckpt is not None:
+            ckpt_hint = ckpt
         resume_requested = round_idx > 1 or args.mode == "resume"
         resuming = bool(resume_requested and ckpt is not None)
         train_cfg["resume"] = resuming
@@ -1478,6 +1492,10 @@ def main() -> int:
         metrics: Optional[Dict[str, float]] = None
         eval_ret = 0
         ckpt = find_ckpt(ckpt_dir)
+        if ckpt is None and ckpt_hint and ckpt_hint.exists():
+            ckpt = ckpt_hint
+        if ckpt is not None:
+            ckpt_hint = ckpt
 
         pre_round_calib = (
             round_idx == start_round
@@ -1593,6 +1611,10 @@ def main() -> int:
         else:
             if training_executed:
                 ckpt = find_ckpt(ckpt_dir)
+            if ckpt is None and ckpt_hint and ckpt_hint.exists():
+                ckpt = ckpt_hint
+            if ckpt is not None:
+                ckpt_hint = ckpt
             if ckpt is None:
                 print(f"No checkpoint found in {ckpt_dir}", file=sys.stderr)
                 return 1
