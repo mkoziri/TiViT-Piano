@@ -17,7 +17,7 @@ CLI:
     reproducibility settings.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple, cast, overload, Literal
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, cast, overload, Literal
 
 
 import argparse
@@ -1029,84 +1029,191 @@ def _median_filter_time_proxy(clip_probs: torch.Tensor, kernel_size: int) -> tor
     return filtered.squeeze(1).transpose(0, 1).contiguous()
 
 
-_TEMPORAL_DECODER_KEYS = ("low_ratio", "min_on", "min_off", "gap_merge", "median")
-_TEMPORAL_DECODER_DEFAULTS = {"low_ratio": 0.6, "min_on": 2, "min_off": 2, "gap_merge": 1, "median": 3}
+_DECODER_DEFAULTS = {
+    "onset": {
+        "open": 0.36,
+        "hold": 0.28,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+    "offset": {
+        "open": 0.32,
+        "hold": 0.24,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+}
 
 
-def _normalize_temporal_decoder(raw: dict) -> dict:
-    normalized = {}
+def _apply_decoder_values(
+    target: dict[str, dict[str, Any]],
+    heads: Iterable[str],
+    source: Mapping[str, Any] | None,
+) -> None:
+    if not isinstance(source, Mapping):
+        return
+    for key, value in source.items():
+        if value is None:
+            continue
+        key_str = str(key)
+        norm_key = "merge_gap" if key_str == "gap_merge" else key_str
+        if norm_key not in {
+            "open",
+            "hold",
+            "low_ratio",
+            "min_on",
+            "min_off",
+            "merge_gap",
+            "median",
+        }:
+            continue
+        for head in heads:
+            target.setdefault(head, {})[norm_key] = value
+
+
+def _normalize_decoder_config(
+    raw: Mapping[str, dict[str, Any]],
+    *,
+    fallback_open: Optional[Mapping[str, float]] = None,
+) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
     for head in ("onset", "offset"):
-        source = raw.get(head, {}) if isinstance(raw, dict) else {}
-        entry = {}
-        low_ratio = source.get("low_ratio", _TEMPORAL_DECODER_DEFAULTS["low_ratio"])
-        try:
-            low_ratio = float(low_ratio)
-        except (TypeError, ValueError):
-            low_ratio = _TEMPORAL_DECODER_DEFAULTS["low_ratio"]
-        entry["low_ratio"] = max(0.0, low_ratio)
+        defaults = _DECODER_DEFAULTS[head]
+        source = raw.get(head, {}) if isinstance(raw, Mapping) else {}
+        entry: dict[str, Any] = {}
 
-        for key in ("min_on", "min_off", "gap_merge"):
-            value = source.get(key, _TEMPORAL_DECODER_DEFAULTS[key])
+        open_defined = "open" in source and source.get("open") is not None
+        hold_defined = "hold" in source and source.get("hold") is not None
+
+        open_candidate = source.get("open")
+        if open_candidate is None and fallback_open:
+            open_candidate = fallback_open.get(head)
+        if open_candidate is None:
+            open_candidate = defaults["open"]
+        try:
+            open_val = float(open_candidate)
+        except (TypeError, ValueError):
+            open_val = defaults["open"]
+        if not math.isfinite(open_val):
+            open_val = defaults["open"]
+        open_val = max(0.0, min(open_val, 1.0))
+
+        ratio_candidate = source.get("low_ratio")
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
             try:
-                value = int(value)
+                ratio_val = float(ratio_candidate)
             except (TypeError, ValueError):
-                value = _TEMPORAL_DECODER_DEFAULTS[key]
-            if key == "gap_merge":
-                entry[key] = max(0, value)
+                ratio_val = None
             else:
-                entry[key] = max(0, value)
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
 
-        median_val = source.get("median", _TEMPORAL_DECODER_DEFAULTS["median"])
+        hold_candidate = source.get("hold")
+        if hold_candidate is None and ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        if hold_candidate is None:
+            hold_candidate = defaults["hold"]
         try:
-            median_int = int(median_val)
+            hold_val = float(hold_candidate)
         except (TypeError, ValueError):
-            median_int = _TEMPORAL_DECODER_DEFAULTS["median"]
-        if median_int < 1:
-            median_int = 1
-        if median_int % 2 == 0:
-            median_int += 1
-        entry["median"] = median_int
+            hold_val = defaults["hold"]
+        if not math.isfinite(hold_val):
+            hold_val = defaults["hold"]
+        if hold_val < 0.0:
+            hold_val = 0.0
+        if hold_val > open_val and open_val > 0.0:
+            hold_val = open_val
+
+        for key in ("min_on", "min_off", "merge_gap"):
+            default_val = defaults[key]
+            src_val = source.get(key, default_val)
+            try:
+                int_val = int(src_val)
+            except (TypeError, ValueError):
+                int_val = default_val
+            if int_val < 0:
+                int_val = 0
+            entry[key] = int_val
+
+        median_default = defaults["median"]
+        median_candidate = source.get("median", median_default)
+        try:
+            median_val = int(median_candidate)
+        except (TypeError, ValueError):
+            median_val = median_default
+        if median_val < 1:
+            median_val = 1
+        if median_val % 2 == 0:
+            median_val += 1
+
+        if ratio_val is None:
+            if open_val > 0.0:
+                ratio_val = hold_val / open_val if open_val > 0.0 else 0.0
+            else:
+                ratio_val = 0.0
+
+        entry.update(
+            {
+                "open": open_val,
+                "hold": hold_val,
+                "low_ratio": max(0.0, ratio_val or 0.0),
+                "median": median_val,
+                "open_defined": bool(open_defined),
+                "hold_defined": bool(hold_defined),
+            }
+        )
         normalized[head] = entry
     return normalized
 
 
-def _resolve_temporal_decoder_config(metrics_cfg: dict) -> dict:
-    result = {"onset": dict(_TEMPORAL_DECODER_DEFAULTS), "offset": dict(_TEMPORAL_DECODER_DEFAULTS)}
+def _resolve_temporal_decoder_config(
+    metrics_cfg: Mapping[str, Any],
+    *,
+    fallback_open: Optional[Mapping[str, float]] = None,
+) -> dict[str, dict[str, Any]]:
+    collected: dict[str, dict[str, Any]] = {"onset": {}, "offset": {}}
 
-    def _apply(source: dict, dest: dict):
-        if not isinstance(source, dict):
-            return
-        for key in _TEMPORAL_DECODER_KEYS:
-            if key not in source:
-                continue
-            dest[key] = source[key]
+    if not isinstance(metrics_cfg, Mapping):
+        metrics_cfg = {}
 
     for section_key in ("temporal_decoder", "proxy_decoder"):
-        section = metrics_cfg.get(section_key, {}) if isinstance(metrics_cfg, dict) else {}
-        if not isinstance(section, dict):
+        section = metrics_cfg.get(section_key)
+        if not isinstance(section, Mapping):
             continue
-        _apply(section, result["onset"])
-        _apply(section, result["offset"])
+        _apply_decoder_values(collected, ("onset", "offset"), section)
         shared = section.get("shared")
-        if isinstance(shared, dict):
-            _apply(shared, result["onset"])
-            _apply(shared, result["offset"])
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
         for head in ("onset", "offset"):
             head_cfg = section.get(head)
-            if isinstance(head_cfg, dict):
-                _apply(head_cfg, result[head])
+            _apply_decoder_values(collected, (head,), head_cfg)
 
-    return _normalize_temporal_decoder(result)
+    decoder_cfg = metrics_cfg.get("decoder")
+    if isinstance(decoder_cfg, Mapping):
+        _apply_decoder_values(collected, ("onset", "offset"), decoder_cfg)
+        shared = decoder_cfg.get("shared")
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
+        for head in ("onset", "offset"):
+            head_cfg = decoder_cfg.get(head)
+            _apply_decoder_values(collected, (head,), head_cfg)
+
+    return _normalize_decoder_config(collected, fallback_open=fallback_open)
 
 
 def _proxy_decode_mask(
     probs: torch.Tensor,
     *,
-    high_thr: float,
-    low_ratio: float,
+    open_thr: float,
+    hold_thr: float,
     min_on: int,
     min_off: int,
-    gap_merge: int,
+    merge_gap: int,
     median: int,
 ) -> torch.Tensor:
     """Decode per-key probabilities with lightweight hysteresis-style smoothing."""
@@ -1116,11 +1223,21 @@ def _proxy_decode_mask(
     if probs.numel() == 0:
         return torch.zeros_like(probs, dtype=torch.bool)
 
-    high_thr = float(high_thr)
-    low_thr = high_thr * float(low_ratio)
+    high_thr = float(open_thr)
+    low_thr = float(hold_thr)
+    if not math.isfinite(high_thr):
+        high_thr = 0.5
+    if not math.isfinite(low_thr):
+        low_thr = high_thr
+    if low_thr > high_thr:
+        low_thr = high_thr
+    if high_thr < 0.0:
+        high_thr = 0.0
+    if low_thr < 0.0:
+        low_thr = 0.0
     min_on = max(0, int(min_on))
     min_off = max(0, int(min_off))
-    gap_merge = int(gap_merge)
+    merge_gap = max(0, int(merge_gap))
     median = int(median)
 
     def _decode_single(single: torch.Tensor) -> torch.Tensor:
@@ -1156,7 +1273,7 @@ def _proxy_decode_mask(
                 prev_start, prev_end = merged[-1]
                 gap = seg_start - prev_end
                 should_merge = False
-                if gap_merge >= 0 and gap <= gap_merge:
+                if merge_gap >= 0 and gap <= merge_gap:
                     should_merge = True
                 if min_off > 0 and gap < min_off:
                     should_merge = True
@@ -1177,6 +1294,67 @@ def _proxy_decode_mask(
     if not decoded:
         return torch.zeros_like(probs, dtype=torch.bool)
     return torch.stack(decoded, dim=0)
+
+
+def _resolve_decoder_thresholds(
+    entry: Mapping[str, Any],
+    *,
+    fallback_open: float,
+    default_hold: float,
+) -> Tuple[float, float]:
+    """Return (open, hold) thresholds, honoring config overrides and fallbacks."""
+
+    fallback = float(fallback_open)
+    if not math.isfinite(fallback):
+        fallback = 0.5
+    elif fallback < 0.0:
+        fallback = 0.0
+    elif fallback > 1.0:
+        fallback = 1.0
+
+    open_defined = bool(entry.get("open_defined"))
+    open_candidate = entry.get("open", fallback)
+    try:
+        open_val = float(open_candidate)
+    except (TypeError, ValueError):
+        open_val = fallback
+    if not math.isfinite(open_val):
+        open_val = fallback
+    if not open_defined:
+        open_val = fallback
+    open_val = max(0.0, min(open_val, 1.0))
+
+    hold_defined = bool(entry.get("hold_defined"))
+    hold_candidate = entry.get("hold", default_hold)
+    ratio_candidate = entry.get("low_ratio")
+    if not hold_defined:
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
+            try:
+                ratio_val = float(ratio_candidate)
+            except (TypeError, ValueError):
+                ratio_val = None
+            else:
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
+        if ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        else:
+            hold_candidate = default_hold
+    try:
+        hold_val = float(hold_candidate)
+    except (TypeError, ValueError):
+        hold_val = float(default_hold)
+    if not math.isfinite(hold_val):
+        hold_val = float(default_hold)
+    if hold_val < 0.0:
+        hold_val = 0.0
+    if hold_val > open_val:
+        hold_val = open_val
+
+    return open_val, hold_val
 
 
 def _event_f1_clip(
@@ -1988,9 +2166,26 @@ def evaluate_one_epoch(
         hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
-    temporal_decoder_cfg = _resolve_temporal_decoder_config(metrics_cfg)
+    temporal_decoder_cfg = _resolve_temporal_decoder_config(
+        metrics_cfg,
+        fallback_open={"onset": thr_on, "offset": thr_off},
+    )
     decoder_onset = temporal_decoder_cfg["onset"]
     decoder_offset = temporal_decoder_cfg["offset"]
+    onset_open_thr, onset_hold_thr = _resolve_decoder_thresholds(
+        decoder_onset,
+        fallback_open=thr_on,
+        default_hold=_DECODER_DEFAULTS["onset"]["hold"],
+    )
+    offset_open_thr, offset_hold_thr = _resolve_decoder_thresholds(
+        decoder_offset,
+        fallback_open=thr_off,
+        default_hold=_DECODER_DEFAULTS["offset"]["hold"],
+    )
+    decoder_onset["open_effective"] = onset_open_thr
+    decoder_onset["hold_effective"] = onset_hold_thr
+    decoder_offset["open_effective"] = offset_open_thr
+    decoder_offset["hold_effective"] = offset_hold_thr
     event_proxy_accum = {
         "onset_sum": 0.0,
         "offset_sum": 0.0,
@@ -2577,11 +2772,11 @@ def evaluate_one_epoch(
                         try:
                             onset_event_mask = _proxy_decode_mask(
                                 masked_onset_probs,
-                                high_thr=thr_on,
-                                low_ratio=decoder_onset["low_ratio"],
+                                open_thr=onset_open_thr,
+                                hold_thr=onset_hold_thr,
                                 min_on=decoder_onset["min_on"],
                                 min_off=decoder_onset["min_off"],
-                                gap_merge=decoder_onset["gap_merge"],
+                                merge_gap=decoder_onset["merge_gap"],
                                 median=decoder_onset["median"],
                             )
                         except ValueError:
@@ -2601,11 +2796,11 @@ def evaluate_one_epoch(
                         try:
                             offset_event_mask = _proxy_decode_mask(
                                 masked_offset_probs,
-                                high_thr=thr_off,
-                                low_ratio=decoder_offset["low_ratio"],
+                                open_thr=offset_open_thr,
+                                hold_thr=offset_hold_thr,
                                 min_on=decoder_offset["min_on"],
                                 min_off=decoder_offset["min_off"],
-                                gap_merge=decoder_offset["gap_merge"],
+                                merge_gap=decoder_offset["merge_gap"],
                                 median=decoder_offset["median"],
                             )
                         except ValueError:
@@ -3065,14 +3260,25 @@ def evaluate_one_epoch(
     loose_prefixed = {f"loose_{k}": v for k, v in loose_branch.items()}
     strict_prefixed = {f"strict_{k}": v for k, v in strict_branch.items()}
 
+    decoder_metrics = {
+        "decoder_onset_open": float(decoder_onset.get("open_effective", onset_open_thr)),
+        "decoder_onset_hold": float(decoder_onset.get("hold_effective", onset_hold_thr)),
+        "decoder_onset_min_on": float(decoder_onset["min_on"]),
+        "decoder_onset_merge_gap": float(decoder_onset["merge_gap"]),
+        "decoder_offset_open": float(decoder_offset.get("open_effective", offset_open_thr)),
+        "decoder_offset_hold": float(decoder_offset.get("hold_effective", offset_hold_thr)),
+        "decoder_offset_min_off": float(decoder_offset["min_off"]),
+        "decoder_offset_merge_gap": float(decoder_offset["merge_gap"]),
+    }
+
     event_metrics = {
         "event_f1_onset_proxy": float(onset_event_f1),
         "event_f1_offset_proxy": float(offset_event_f1),
         "event_f1_mean_proxy": float(event_f1_mean),
     }
 
-    val_metrics = {**losses, **loose_prefixed, **strict_prefixed, **event_metrics}
-    legacy_metrics = {**losses, **metrics_any, **event_metrics}
+    val_metrics = {**losses, **loose_prefixed, **strict_prefixed, **event_metrics, **decoder_metrics}
+    legacy_metrics = {**losses, **metrics_any, **event_metrics, **decoder_metrics}
 
     def _fmt_metrics_line(items: Mapping[str, float]):
         return " ".join(f"{k}={v:.3f}\t" for k, v in items.items())
@@ -3093,6 +3299,23 @@ def evaluate_one_epoch(
     logger.info("[strict] %s", strict_line, extra=quiet_extra)
     logger.info("[any] %s", legacy_line, extra=quiet_extra)
     logger.info("[event-proxy] %s", event_line, extra=quiet_extra)
+
+    decoder_onset_line = (
+        f"decoder.onset: open={decoder_onset.get('open_effective', onset_open_thr):.3f} "
+        f"hold={decoder_onset.get('hold_effective', onset_hold_thr):.3f} "
+        f"min_on={int(decoder_onset['min_on'])} "
+        f"merge_gap={int(decoder_onset['merge_gap'])}"
+    )
+    decoder_offset_line = (
+        f"decoder.offset: open={decoder_offset.get('open_effective', offset_open_thr):.3f} "
+        f"hold={decoder_offset.get('hold_effective', offset_hold_thr):.3f} "
+        f"min_off={int(decoder_offset['min_off'])} "
+        f"merge_gap={int(decoder_offset['merge_gap'])}"
+    )
+    print(f"[decoder] {decoder_onset_line}")
+    print(f"[decoder] {decoder_offset_line}\n")
+    logger.info("[decoder] %s", decoder_onset_line, extra=quiet_extra)
+    logger.info("[decoder] %s", decoder_offset_line, extra=quiet_extra)
 
     processed_total = progress.get("count", 0)
     throughput_for_cache = throughput_used if throughput_used and throughput_used > 0 else processed_total / max(elapsed_total, 1e-6)

@@ -23,7 +23,7 @@ from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Any, Iterable, Mapping, Optional, List, Tuple
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -68,75 +68,236 @@ DEFAULT_THRESHOLDS = [
     1.00,
 ]
 
-_DECODER_PARAM_KEYS = ("low_ratio", "min_on", "min_off", "gap_merge", "median")
-_DECODER_DEFAULTS = {"low_ratio": 0.6, "min_on": 2, "min_off": 2, "gap_merge": 1, "median": 3}
+_DECODER_DEFAULTS = {
+    "onset": {
+        "open": 0.36,
+        "hold": 0.28,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+    "offset": {
+        "open": 0.32,
+        "hold": 0.24,
+        "min_on": 2,
+        "min_off": 2,
+        "merge_gap": 1,
+        "median": 3,
+    },
+}
 
 
-def _normalize_decoder_params(raw: dict) -> dict:
-    normalized = {}
+def _apply_decoder_values(
+    target: dict[str, dict[str, Any]],
+    heads: Iterable[str],
+    source: Mapping[str, Any] | None,
+) -> None:
+    if not isinstance(source, Mapping):
+        return
+    for key, value in source.items():
+        if value is None:
+            continue
+        key_str = str(key)
+        norm_key = "merge_gap" if key_str == "gap_merge" else key_str
+        if norm_key not in {
+            "open",
+            "hold",
+            "low_ratio",
+            "min_on",
+            "min_off",
+            "merge_gap",
+            "median",
+        }:
+            continue
+        for head in heads:
+            target.setdefault(head, {})[norm_key] = value
+
+
+def _normalize_decoder_params(
+    raw: Mapping[str, dict[str, Any]],
+    *,
+    fallback_open: Optional[Mapping[str, float]] = None,
+) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {}
     for head in ("onset", "offset"):
-        source = raw.get(head, {}) if isinstance(raw, dict) else {}
-        entry = {}
-        low_ratio = source.get("low_ratio", _DECODER_DEFAULTS["low_ratio"])
-        try:
-            low_ratio = float(low_ratio)
-        except (TypeError, ValueError):
-            low_ratio = _DECODER_DEFAULTS["low_ratio"]
-        entry["low_ratio"] = max(0.0, low_ratio)
+        defaults = _DECODER_DEFAULTS[head]
+        source = raw.get(head, {}) if isinstance(raw, Mapping) else {}
+        entry: dict[str, Any] = {}
 
-        for key in ("min_on", "min_off", "gap_merge"):
-            value = source.get(key, _DECODER_DEFAULTS[key])
+        open_defined = "open" in source and source.get("open") is not None
+        hold_defined = "hold" in source and source.get("hold") is not None
+
+        open_candidate = source.get("open")
+        if open_candidate is None and fallback_open:
+            open_candidate = fallback_open.get(head)
+        if open_candidate is None:
+            open_candidate = defaults["open"]
+        try:
+            open_val = float(open_candidate)
+        except (TypeError, ValueError):
+            open_val = defaults["open"]
+        if not math.isfinite(open_val):
+            open_val = defaults["open"]
+        open_val = max(0.0, min(open_val, 1.0))
+
+        ratio_candidate = source.get("low_ratio")
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
             try:
-                value = int(value)
+                ratio_val = float(ratio_candidate)
             except (TypeError, ValueError):
-                value = _DECODER_DEFAULTS[key]
-            if key == "gap_merge":
-                entry[key] = max(0, value)
+                ratio_val = None
             else:
-                entry[key] = max(0, value)
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
 
-        median_val = source.get("median", _DECODER_DEFAULTS["median"])
+        hold_candidate = source.get("hold")
+        if hold_candidate is None and ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        if hold_candidate is None:
+            hold_candidate = defaults["hold"]
         try:
-            median_int = int(median_val)
+            hold_val = float(hold_candidate)
         except (TypeError, ValueError):
-            median_int = _DECODER_DEFAULTS["median"]
-        if median_int < 1:
-            median_int = 1
-        if median_int % 2 == 0:
-            median_int += 1
-        entry["median"] = median_int
+            hold_val = defaults["hold"]
+        if not math.isfinite(hold_val):
+            hold_val = defaults["hold"]
+        if hold_val < 0.0:
+            hold_val = 0.0
+        if hold_val > open_val and open_val > 0.0:
+            hold_val = open_val
+
+        for key in ("min_on", "min_off", "merge_gap"):
+            default_val = defaults[key]
+            src_val = source.get(key, default_val)
+            try:
+                int_val = int(src_val)
+            except (TypeError, ValueError):
+                int_val = default_val
+            if int_val < 0:
+                int_val = 0
+            entry[key] = int_val
+
+        median_default = defaults["median"]
+        median_candidate = source.get("median", median_default)
+        try:
+            median_val = int(median_candidate)
+        except (TypeError, ValueError):
+            median_val = median_default
+        if median_val < 1:
+            median_val = 1
+        if median_val % 2 == 0:
+            median_val += 1
+
+        if ratio_val is None:
+            if open_val > 0.0:
+                ratio_val = hold_val / open_val if open_val > 0.0 else 0.0
+            else:
+                ratio_val = 0.0
+
+        entry.update(
+            {
+                "open": open_val,
+                "hold": hold_val,
+                "low_ratio": max(0.0, ratio_val or 0.0),
+                "median": median_val,
+                "open_defined": bool(open_defined),
+                "hold_defined": bool(hold_defined),
+            }
+        )
         normalized[head] = entry
     return normalized
 
 
-def _resolve_decoder_from_config(metrics_cfg: dict) -> dict:
-    result = {"onset": dict(_DECODER_DEFAULTS), "offset": dict(_DECODER_DEFAULTS)}
+def _resolve_decoder_from_config(metrics_cfg: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    collected: dict[str, dict[str, Any]] = {"onset": {}, "offset": {}}
 
-    def _apply(source: dict, dest: dict):
-        if not isinstance(source, dict):
-            return
-        for key in _DECODER_PARAM_KEYS:
-            if key not in source:
-                continue
-            value = source[key]
-            dest[key] = value
+    if not isinstance(metrics_cfg, Mapping):
+        metrics_cfg = {}
 
     for section_key in ("temporal_decoder", "proxy_decoder"):
-        section = metrics_cfg.get(section_key, {}) if isinstance(metrics_cfg, dict) else {}
-        if not isinstance(section, dict):
+        section = metrics_cfg.get(section_key)
+        if not isinstance(section, Mapping):
             continue
-        _apply(section, result["onset"])
-        _apply(section, result["offset"])
+        _apply_decoder_values(collected, ("onset", "offset"), section)
         shared = section.get("shared")
-        if isinstance(shared, dict):
-            _apply(shared, result["onset"])
-            _apply(shared, result["offset"])
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
         for head in ("onset", "offset"):
             head_cfg = section.get(head)
-            if isinstance(head_cfg, dict):
-                _apply(head_cfg, result[head])
+            _apply_decoder_values(collected, (head,), head_cfg)
 
-    return _normalize_decoder_params(result)
+    decoder_cfg = metrics_cfg.get("decoder")
+    if isinstance(decoder_cfg, Mapping):
+        _apply_decoder_values(collected, ("onset", "offset"), decoder_cfg)
+        shared = decoder_cfg.get("shared")
+        _apply_decoder_values(collected, ("onset", "offset"), shared)
+        for head in ("onset", "offset"):
+            head_cfg = decoder_cfg.get(head)
+            _apply_decoder_values(collected, (head,), head_cfg)
+
+    return _normalize_decoder_params(collected)
+
+
+def _resolve_decoder_thresholds(
+    entry: Mapping[str, Any],
+    *,
+    fallback_open: float,
+    default_hold: float,
+) -> Tuple[float, float]:
+    fallback = float(fallback_open)
+    if not math.isfinite(fallback):
+        fallback = 0.5
+    elif fallback < 0.0:
+        fallback = 0.0
+    elif fallback > 1.0:
+        fallback = 1.0
+
+    open_defined = bool(entry.get("open_defined"))
+    open_candidate = entry.get("open", fallback)
+    try:
+        open_val = float(open_candidate)
+    except (TypeError, ValueError):
+        open_val = fallback
+    if not math.isfinite(open_val):
+        open_val = fallback
+    if not open_defined:
+        open_val = fallback
+    open_val = max(0.0, min(open_val, 1.0))
+
+    hold_defined = bool(entry.get("hold_defined"))
+    hold_candidate = entry.get("hold", default_hold)
+    ratio_candidate = entry.get("low_ratio")
+    if not hold_defined:
+        ratio_val: Optional[float] = None
+        if ratio_candidate is not None:
+            try:
+                ratio_val = float(ratio_candidate)
+            except (TypeError, ValueError):
+                ratio_val = None
+            else:
+                if not math.isfinite(ratio_val):
+                    ratio_val = None
+                elif ratio_val < 0.0:
+                    ratio_val = 0.0
+        if ratio_val is not None and open_val > 0.0:
+            hold_candidate = ratio_val * open_val
+        else:
+            hold_candidate = default_hold
+    try:
+        hold_val = float(hold_candidate)
+    except (TypeError, ValueError):
+        hold_val = float(default_hold)
+    if not math.isfinite(hold_val):
+        hold_val = float(default_hold)
+    if hold_val < 0.0:
+        hold_val = 0.0
+    if hold_val > open_val:
+        hold_val = open_val
+
+    return open_val, hold_val
 
 
 def _format_decoder_settings(decoder_kind: str, decoder_params: dict) -> str:
@@ -146,16 +307,14 @@ def _format_decoder_settings(decoder_kind: str, decoder_params: dict) -> str:
     offset = decoder_params.get("offset", {})
     return (
         "decoder=hysteresis "
-        f"onset_low_ratio={onset.get('low_ratio', 0.0):.4f} "
+        f"onset_open={onset.get('open', 0.0):.4f} "
+        f"onset_hold={onset.get('hold', 0.0):.4f} "
         f"onset_min_on={int(onset.get('min_on', 0))} "
-        f"onset_min_off={int(onset.get('min_off', 0))} "
-        f"onset_gap_merge={int(onset.get('gap_merge', 0))} "
-        f"onset_median={int(onset.get('median', 1))} "
-        f"offset_low_ratio={offset.get('low_ratio', 0.0):.4f} "
-        f"offset_min_on={int(offset.get('min_on', 0))} "
+        f"onset_merge_gap={int(onset.get('merge_gap', 0))} "
+        f"offset_open={offset.get('open', 0.0):.4f} "
+        f"offset_hold={offset.get('hold', 0.0):.4f} "
         f"offset_min_off={int(offset.get('min_off', 0))} "
-        f"offset_gap_merge={int(offset.get('gap_merge', 0))} "
-        f"offset_median={int(offset.get('median', 1))}"
+        f"offset_merge_gap={int(offset.get('merge_gap', 0))}"
     )
 
 
@@ -166,15 +325,15 @@ def _decoder_notice_text(decoder_kind: str, decoder_params: dict) -> str:
     offset = decoder_params.get("offset", {})
     return (
         "hysteresis "
-        f"onset(low_ratio={onset.get('low_ratio', 0.0):.2f} "
+        f"onset(open={onset.get('open', 0.0):.2f} "
+        f"hold={onset.get('hold', 0.0):.2f} "
         f"min_on={int(onset.get('min_on', 0))} "
-        f"min_off={int(onset.get('min_off', 0))} "
-        f"gap_merge={int(onset.get('gap_merge', 0))} "
+        f"merge_gap={int(onset.get('merge_gap', 0))} "
         f"median={int(onset.get('median', 1))}) "
-        f"offset(low_ratio={offset.get('low_ratio', 0.0):.2f} "
-        f"min_on={int(offset.get('min_on', 0))} "
+        f"offset(open={offset.get('open', 0.0):.2f} "
+        f"hold={offset.get('hold', 0.0):.2f} "
         f"min_off={int(offset.get('min_off', 0))} "
-        f"gap_merge={int(offset.get('gap_merge', 0))} "
+        f"merge_gap={int(offset.get('merge_gap', 0))} "
         f"median={int(offset.get('median', 1))})"
     )
 
@@ -327,22 +486,32 @@ def _median_filter_time(clip_probs: torch.Tensor, kernel_size: int) -> torch.Ten
 
 def decode_hysteresis(
     probs: torch.Tensor,
-    high_thr: float,
-    low_ratio: float,
+    open_thr: float,
+    hold_thr: float,
     min_on: int,
     min_off: int,
-    gap_merge: int,
+    merge_gap: int,
     median: int,
 ) -> torch.Tensor:
     """Decode per-key probabilities with hysteresis and simple duration rules."""
 
     if probs.ndim not in (2, 3):
         raise ValueError(f"Expected probs with 2 or 3 dims, got {probs.ndim}")
-    high_thr = float(high_thr)
-    low_thr = high_thr * float(low_ratio)
+    high_thr = float(open_thr)
+    low_thr = float(hold_thr)
+    if not math.isfinite(high_thr):
+        high_thr = 0.5
+    if not math.isfinite(low_thr):
+        low_thr = high_thr
+    if low_thr > high_thr:
+        low_thr = high_thr
+    if high_thr < 0.0:
+        high_thr = 0.0
+    if low_thr < 0.0:
+        low_thr = 0.0
     min_on = max(0, int(min_on))
     min_off = max(0, int(min_off))
-    gap_merge = int(gap_merge)
+    merge_gap = max(0, int(merge_gap))
     if probs.numel() == 0:
         return torch.zeros_like(probs, dtype=torch.bool)
 
@@ -381,7 +550,7 @@ def decode_hysteresis(
                 prev_start, prev_end = merged[-1]
                 gap = seg_start - prev_end
                 should_merge = False
-                if gap_merge >= 0 and gap <= gap_merge:
+                if merge_gap >= 0 and gap <= merge_gap:
                     should_merge = True
                 if min_off > 0 and gap < min_off:
                     should_merge = True
@@ -1477,8 +1646,8 @@ def main():
         decoder_params["onset"]["min_off"] = int(args.min_off)
         decoder_params["offset"]["min_off"] = int(args.min_off)
     if args.gap_merge is not None:
-        decoder_params["onset"]["gap_merge"] = int(args.gap_merge)
-        decoder_params["offset"]["gap_merge"] = int(args.gap_merge)
+        decoder_params["onset"]["merge_gap"] = int(args.gap_merge)
+        decoder_params["offset"]["merge_gap"] = int(args.gap_merge)
     if args.median is not None:
         decoder_params["onset"]["median"] = int(args.median)
         decoder_params["offset"]["median"] = int(args.median)
@@ -1494,26 +1663,40 @@ def main():
         nonlocal decoder_notice_printed, decoder_logits_warned
         if k_onset is None:
             k_onset = default_k_onset
+        onset_open_thr: Optional[float] = None
+        onset_hold_thr: Optional[float] = None
+        offset_open_thr: Optional[float] = None
+        offset_hold_thr: Optional[float] = None
         if decoder_kind == "hysteresis" and not use_logits:
             if not decoder_notice_printed:
                 print(f"[decoder] {_decoder_notice_text(decoder_kind, decoder_params)}", flush=True)
                 decoder_notice_printed = True
+            onset_open_thr, onset_hold_thr = _resolve_decoder_thresholds(
+                onset_decoder,
+                fallback_open=on_thr,
+                default_hold=_DECODER_DEFAULTS["onset"]["hold"],
+            )
+            offset_open_thr, offset_hold_thr = _resolve_decoder_thresholds(
+                offset_decoder,
+                fallback_open=off_thr,
+                default_hold=_DECODER_DEFAULTS["offset"]["hold"],
+            )
             onset_pred_mask = decode_hysteresis(
                 onset_probs,
-                on_thr,
-                onset_decoder["low_ratio"],
+                onset_open_thr,
+                onset_hold_thr,
                 onset_decoder["min_on"],
                 onset_decoder["min_off"],
-                onset_decoder["gap_merge"],
+                onset_decoder["merge_gap"],
                 onset_decoder["median"],
             )
             offset_pred_mask = decode_hysteresis(
                 offset_probs,
-                off_thr,
-                offset_decoder["low_ratio"],
+                offset_open_thr,
+                offset_hold_thr,
                 offset_decoder["min_on"],
                 offset_decoder["min_off"],
-                offset_decoder["gap_merge"],
+                offset_decoder["merge_gap"],
                 offset_decoder["median"],
             )
             onset_pred_bin = onset_pred_mask.to(onset_probs.dtype)
@@ -1551,6 +1734,10 @@ def main():
         return {
             "onset_thr": float(on_thr),
             "offset_thr": float(off_thr),
+            "decoder_onset_open": float(onset_open_thr) if onset_open_thr is not None else None,
+            "decoder_onset_hold": float(onset_hold_thr) if onset_hold_thr is not None else None,
+            "decoder_offset_open": float(offset_open_thr) if offset_open_thr is not None else None,
+            "decoder_offset_hold": float(offset_hold_thr) if offset_hold_thr is not None else None,
             "f1_on": float(f1_on),
             "f1_off": float(f1_off),
             "onset_pred_rate": float(onset_pred_rate),
@@ -1799,6 +1986,29 @@ def main():
                     best_result["onset_thr"],
                     best_result["offset_thr"],
                     best_result["k_onset"],
+                )
+            )
+        onset_open_best = best_result.get("decoder_onset_open")
+        onset_hold_best = best_result.get("decoder_onset_hold")
+        offset_open_best = best_result.get("decoder_offset_open")
+        offset_hold_best = best_result.get("decoder_offset_hold")
+        if (
+            onset_open_best is not None
+            and onset_hold_best is not None
+            and offset_open_best is not None
+            and offset_hold_best is not None
+        ):
+            print(
+                "[best-decoder] onset_open={:.3f} hold={:.3f} min_on={} merge_gap={} | "
+                "offset_open={:.3f} hold={:.3f} min_off={} merge_gap={}".format(
+                    onset_open_best,
+                    onset_hold_best,
+                    onset_decoder["min_on"],
+                    onset_decoder["merge_gap"],
+                    offset_open_best,
+                    offset_hold_best,
+                    offset_decoder["min_off"],
+                    offset_decoder["merge_gap"],
                 )
             )
 

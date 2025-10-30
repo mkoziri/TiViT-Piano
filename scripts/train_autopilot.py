@@ -460,6 +460,24 @@ def _parse_decoder_settings_line(line: str) -> Dict[str, Any]:
     return settings
 
 
+def _alias_decoder_settings(payload: Dict[str, Any]) -> None:
+    """Populate decoder_* aliases while preserving original keys."""
+
+    alias_map = {
+        "onset_open": "decoder_onset_open",
+        "onset_hold": "decoder_onset_hold",
+        "onset_min_on": "decoder_onset_min_on",
+        "onset_merge_gap": "decoder_onset_merge_gap",
+        "offset_open": "decoder_offset_open",
+        "offset_hold": "decoder_offset_hold",
+        "offset_min_off": "decoder_offset_min_off",
+        "offset_merge_gap": "decoder_offset_merge_gap",
+    }
+    for src, dst in alias_map.items():
+        if src in payload and dst not in payload:
+            payload[dst] = payload[src]
+
+
 def parse_eval_table(lines: List[str]) -> Optional[Dict[str, Any]]:
     decoder_settings: Dict[str, Any] = {}
     for line in lines:
@@ -527,6 +545,7 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, Any]]:
             best = row
     if best is not None and decoder_settings:
         best.update(decoder_settings)
+        _alias_decoder_settings(best)
     return best
 
 
@@ -1097,11 +1116,20 @@ RESULT_HEADER = [
     "ckpt",
     "onset_thr",
     "offset_thr",
+    "k_onset",
     "onset_f1",
     "offset_f1",
     "onset_ev_f1",
     "offset_ev_f1",
     "ev_f1_mean",
+    "decoder_onset_open",
+    "decoder_onset_hold",
+    "decoder_offset_open",
+    "decoder_offset_hold",
+    "decoder_onset_min_on",
+    "decoder_offset_min_off",
+    "decoder_onset_merge_gap",
+    "decoder_offset_merge_gap",
     "patience",
     "exp",
     "val_line",
@@ -1121,7 +1149,9 @@ def load_resume_state(results_path: Path, metric_key: str, default_patience: int
                     continue
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) < len(RESULT_HEADER):
-                    continue
+                    parts = parts + [""] * (len(RESULT_HEADER) - len(parts))
+                elif len(parts) > len(RESULT_HEADER):
+                    parts = parts[: len(RESULT_HEADER)]
                 rows.append(dict(zip(RESULT_HEADER, parts)))
     except OSError:
         return None
@@ -1174,19 +1204,21 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
         if decoder_kind:
             bits.append(f"decoder={decoder_kind}")
         decoder_fields = [
-            ("onset_low_ratio", "{:.3f}", float),
-            ("onset_min_on", "{:d}", int),
-            ("onset_min_off", "{:d}", int),
-            ("onset_gap_merge", "{:d}", int),
-            ("onset_median", "{:d}", int),
-            ("offset_low_ratio", "{:.3f}", float),
-            ("offset_min_on", "{:d}", int),
-            ("offset_min_off", "{:d}", int),
-            ("offset_gap_merge", "{:d}", int),
-            ("offset_median", "{:d}", int),
+            ("decoder_onset_open", ("decoder_onset_open", "onset_open"), "{:.3f}", float),
+            ("decoder_onset_hold", ("decoder_onset_hold", "onset_hold"), "{:.3f}", float),
+            ("decoder_onset_min_on", ("decoder_onset_min_on", "onset_min_on"), "{:d}", int),
+            ("decoder_onset_merge_gap", ("decoder_onset_merge_gap", "onset_merge_gap"), "{:d}", int),
+            ("decoder_offset_open", ("decoder_offset_open", "offset_open"), "{:.3f}", float),
+            ("decoder_offset_hold", ("decoder_offset_hold", "offset_hold"), "{:.3f}", float),
+            ("decoder_offset_min_off", ("decoder_offset_min_off", "offset_min_off"), "{:d}", int),
+            ("decoder_offset_merge_gap", ("decoder_offset_merge_gap", "offset_merge_gap"), "{:d}", int),
         ]
-        for key, fmt, caster in decoder_fields:
-            value = metrics.get(key)
+        for label, keys, fmt, caster in decoder_fields:
+            value = None
+            for key in keys:
+                if key in metrics and metrics[key] is not None:
+                    value = metrics[key]
+                    break
             if value is None:
                 continue
             if caster is int:
@@ -1194,7 +1226,7 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
                     coerced = int(round(float(value)))
                 except (TypeError, ValueError):
                     continue
-                bits.append(f"{key}={fmt.format(coerced)}")
+                bits.append(f"{label}={fmt.format(coerced)}")
             else:
                 try:
                     coerced = float(value)
@@ -1202,7 +1234,7 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
                     continue
                 if math.isnan(coerced) or math.isinf(coerced):
                     continue
-                bits.append(f"{key}={fmt.format(coerced)}")
+                bits.append(f"{label}={fmt.format(coerced)}")
     return " ".join(bits)
 
 
@@ -1217,19 +1249,54 @@ def append_results(
     val_line: str,
     retcode: int,
 ) -> None:
+    def _fmt_float(val: Optional[float], precision: str = ".4f", default: str = "") -> str:
+        if val is None:
+            return default
+        try:
+            coerced = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(coerced):
+            return default
+        return format(coerced, precision)
+
+    def _fmt_int(val: Optional[float], default: str = "") -> str:
+        if val is None:
+            return default
+        try:
+            coerced = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(coerced):
+            return default
+        try:
+            return str(int(round(coerced)))
+        except (TypeError, ValueError):
+            return default
+
     iso = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+    k_onset_val = metrics.get("k_onset")
     row = [
         iso,
         str(round_idx),
         str(burst_epochs),
         ckpt_used.name,
-        f"{metrics['onset_thr']:.4f}",
-        f"{metrics['offset_thr']:.4f}",
-        f"{metrics['onset_f1']:.4f}",
-        f"{metrics['offset_f1']:.4f}",
-        f"{metrics['onset_event_f1']:.4f}",
-        f"{metrics['offset_event_f1']:.4f}",
-        f"{metrics['ev_f1_mean']:.4f}",
+        _fmt_float(metrics.get("onset_thr"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("offset_thr"), ".4f", "0.0000"),
+        _fmt_int(k_onset_val, "1"),
+        _fmt_float(metrics.get("onset_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("offset_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("onset_event_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("offset_event_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("ev_f1_mean"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("decoder_onset_open"), ".4f"),
+        _fmt_float(metrics.get("decoder_onset_hold"), ".4f"),
+        _fmt_float(metrics.get("decoder_offset_open"), ".4f"),
+        _fmt_float(metrics.get("decoder_offset_hold"), ".4f"),
+        _fmt_int(metrics.get("decoder_onset_min_on")),
+        _fmt_int(metrics.get("decoder_offset_min_off")),
+        _fmt_int(metrics.get("decoder_onset_merge_gap")),
+        _fmt_int(metrics.get("decoder_offset_merge_gap")),
         str(patience_left),
         exp_name,
         val_line,
@@ -1475,6 +1542,7 @@ def main() -> int:
                 {
                     "onset_thr": 0.0,
                     "offset_thr": 0.0,
+                    "k_onset": 1,
                     "onset_f1": 0.0,
                     "offset_f1": 0.0,
                     "onset_event_f1": 0.0,
@@ -1482,6 +1550,14 @@ def main() -> int:
                     "ev_f1_mean": 0.0,
                     "onset_pred_rate": 0.0,
                     "onset_pos_rate": 0.0,
+                    "decoder_onset_open": float("nan"),
+                    "decoder_onset_hold": float("nan"),
+                    "decoder_offset_open": float("nan"),
+                    "decoder_offset_hold": float("nan"),
+                    "decoder_onset_min_on": float("nan"),
+                    "decoder_offset_min_off": float("nan"),
+                    "decoder_onset_merge_gap": float("nan"),
+                    "decoder_offset_merge_gap": float("nan"),
                 },
                 patience_left,
                 cfg.get("experiment", {}).get("name", ""),
@@ -1504,6 +1580,14 @@ def main() -> int:
                 "onset_pred_rate": 0.0,
                 "onset_pos_rate": 0.0,
                 "k_onset": 1,
+                "decoder_onset_open": 0.36,
+                "decoder_onset_hold": 0.28,
+                "decoder_offset_open": 0.32,
+                "decoder_offset_hold": 0.24,
+                "decoder_onset_min_on": 2,
+                "decoder_offset_min_off": 2,
+                "decoder_onset_merge_gap": 1,
+                "decoder_offset_merge_gap": 1,
             }
             eval_ret = 0
         else:

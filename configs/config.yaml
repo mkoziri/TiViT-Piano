@@ -138,6 +138,16 @@ training:
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
     prob_logit_bias_offset: -0.40
+    decoder: # per-head hysteresis defaults (kept constant across autopilot rounds)
+      onset:
+        open: 0.36 # high threshold to open onset events
+        hold: 0.28 # sustain threshold for ongoing onset events
+        min_on: 2 # minimum onset event duration in frames
+        merge_gap: 1 # merge onset events separated by <= this many frames
+      offset:
+        open: 0.32 # high threshold to open offset events
+        hold: 0.24 # sustain threshold for ongoing offset events
+        min_off: 2 # minimum offset event duration in frames
     temporal_decoder:
       shared:
         low_ratio: 0.6
