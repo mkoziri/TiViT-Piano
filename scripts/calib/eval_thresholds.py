@@ -68,6 +68,116 @@ DEFAULT_THRESHOLDS = [
     1.00,
 ]
 
+_DECODER_PARAM_KEYS = ("low_ratio", "min_on", "min_off", "gap_merge", "median")
+_DECODER_DEFAULTS = {"low_ratio": 0.6, "min_on": 2, "min_off": 2, "gap_merge": 1, "median": 3}
+
+
+def _normalize_decoder_params(raw: dict) -> dict:
+    normalized = {}
+    for head in ("onset", "offset"):
+        source = raw.get(head, {}) if isinstance(raw, dict) else {}
+        entry = {}
+        low_ratio = source.get("low_ratio", _DECODER_DEFAULTS["low_ratio"])
+        try:
+            low_ratio = float(low_ratio)
+        except (TypeError, ValueError):
+            low_ratio = _DECODER_DEFAULTS["low_ratio"]
+        entry["low_ratio"] = max(0.0, low_ratio)
+
+        for key in ("min_on", "min_off", "gap_merge"):
+            value = source.get(key, _DECODER_DEFAULTS[key])
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = _DECODER_DEFAULTS[key]
+            if key == "gap_merge":
+                entry[key] = max(0, value)
+            else:
+                entry[key] = max(0, value)
+
+        median_val = source.get("median", _DECODER_DEFAULTS["median"])
+        try:
+            median_int = int(median_val)
+        except (TypeError, ValueError):
+            median_int = _DECODER_DEFAULTS["median"]
+        if median_int < 1:
+            median_int = 1
+        if median_int % 2 == 0:
+            median_int += 1
+        entry["median"] = median_int
+        normalized[head] = entry
+    return normalized
+
+
+def _resolve_decoder_from_config(metrics_cfg: dict) -> dict:
+    result = {"onset": dict(_DECODER_DEFAULTS), "offset": dict(_DECODER_DEFAULTS)}
+
+    def _apply(source: dict, dest: dict):
+        if not isinstance(source, dict):
+            return
+        for key in _DECODER_PARAM_KEYS:
+            if key not in source:
+                continue
+            value = source[key]
+            dest[key] = value
+
+    for section_key in ("temporal_decoder", "proxy_decoder"):
+        section = metrics_cfg.get(section_key, {}) if isinstance(metrics_cfg, dict) else {}
+        if not isinstance(section, dict):
+            continue
+        _apply(section, result["onset"])
+        _apply(section, result["offset"])
+        shared = section.get("shared")
+        if isinstance(shared, dict):
+            _apply(shared, result["onset"])
+            _apply(shared, result["offset"])
+        for head in ("onset", "offset"):
+            head_cfg = section.get(head)
+            if isinstance(head_cfg, dict):
+                _apply(head_cfg, result[head])
+
+    return _normalize_decoder_params(result)
+
+
+def _format_decoder_settings(decoder_kind: str, decoder_params: dict) -> str:
+    if decoder_kind != "hysteresis":
+        return f"decoder={decoder_kind}"
+    onset = decoder_params.get("onset", {})
+    offset = decoder_params.get("offset", {})
+    return (
+        "decoder=hysteresis "
+        f"onset_low_ratio={onset.get('low_ratio', 0.0):.4f} "
+        f"onset_min_on={int(onset.get('min_on', 0))} "
+        f"onset_min_off={int(onset.get('min_off', 0))} "
+        f"onset_gap_merge={int(onset.get('gap_merge', 0))} "
+        f"onset_median={int(onset.get('median', 1))} "
+        f"offset_low_ratio={offset.get('low_ratio', 0.0):.4f} "
+        f"offset_min_on={int(offset.get('min_on', 0))} "
+        f"offset_min_off={int(offset.get('min_off', 0))} "
+        f"offset_gap_merge={int(offset.get('gap_merge', 0))} "
+        f"offset_median={int(offset.get('median', 1))}"
+    )
+
+
+def _decoder_notice_text(decoder_kind: str, decoder_params: dict) -> str:
+    if decoder_kind != "hysteresis":
+        return f"{decoder_kind} decoder active"
+    onset = decoder_params.get("onset", {})
+    offset = decoder_params.get("offset", {})
+    return (
+        "hysteresis "
+        f"onset(low_ratio={onset.get('low_ratio', 0.0):.2f} "
+        f"min_on={int(onset.get('min_on', 0))} "
+        f"min_off={int(onset.get('min_off', 0))} "
+        f"gap_merge={int(onset.get('gap_merge', 0))} "
+        f"median={int(onset.get('median', 1))}) "
+        f"offset(low_ratio={offset.get('low_ratio', 0.0):.2f} "
+        f"min_on={int(offset.get('min_on', 0))} "
+        f"min_off={int(offset.get('min_off', 0))} "
+        f"gap_merge={int(offset.get('gap_merge', 0))} "
+        f"median={int(offset.get('median', 1))})"
+    )
+
 
 def _prepare_logits_for_dump(tensor: torch.Tensor) -> np.ndarray:
     """Flatten a tensor to (T,P) and return a contiguous float64 numpy array."""
@@ -401,32 +511,32 @@ def main():
     ap.add_argument(
         "--low_ratio",
         type=float,
-        default=0.6,
-        help="Multiplier to derive the low hysteresis threshold (default: 0.6)",
+        default=None,
+        help="Multiplier to derive the low hysteresis threshold (default: config or 0.6)",
     )
     ap.add_argument(
         "--min_on",
         type=int,
-        default=2,
-        help="Drop predicted on-segments shorter than this many frames (default: 2)",
+        default=None,
+        help="Drop predicted on-segments shorter than this many frames (default: config or 2)",
     )
     ap.add_argument(
         "--min_off",
         type=int,
-        default=2,
-        help="Merge gaps shorter than this many frames between ons (default: 2)",
+        default=None,
+        help="Merge gaps shorter than this many frames between ons (default: config or 2)",
     )
     ap.add_argument(
         "--gap_merge",
         type=int,
-        default=1,
-        help="Merge on-segments separated by gaps <= this many frames (default: 1)",
+        default=None,
+        help="Merge on-segments separated by gaps <= this many frames (default: config or 1)",
     )
     ap.add_argument(
         "--median",
         type=int,
-        default=3,
-        help="Odd window size for optional time-axis median smoothing (default: 3)",
+        default=None,
+        help="Odd window size for optional time-axis median smoothing (default: config or 3)",
     )
     ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
     ap.add_argument(
@@ -491,19 +601,19 @@ def main():
             )
             return
 
-    if args.low_ratio < 0.0:
+    if args.low_ratio is not None and args.low_ratio < 0.0:
         print("error: --low_ratio must be non-negative", file=sys.stderr)
         return
-    if args.min_on < 0:
+    if args.min_on is not None and args.min_on < 0:
         print("error: --min_on must be >= 0", file=sys.stderr)
         return
-    if args.min_off < 0:
+    if args.min_off is not None and args.min_off < 0:
         print("error: --min_off must be >= 0", file=sys.stderr)
         return
-    if args.gap_merge < 0:
+    if args.gap_merge is not None and args.gap_merge < 0:
         print("error: --gap_merge must be >= 0", file=sys.stderr)
         return
-    if args.median < 1 or args.median % 2 == 0:
+    if args.median is not None and (args.median < 1 or args.median % 2 == 0):
         print("error: --median must be an odd integer >= 1", file=sys.stderr)
         return
 
@@ -1356,15 +1466,29 @@ def main():
     offset_true_bin = (offset_tgts > 0).float()
 
     decoder_kind = args.decoder
-    decoder_params = {
-        "low_ratio": args.low_ratio,
-        "min_on": args.min_on,
-        "min_off": args.min_off,
-        "gap_merge": args.gap_merge,
-        "median": args.median,
-    }
+    decoder_params = _resolve_decoder_from_config(metrics_cfg)
+    if args.low_ratio is not None:
+        decoder_params["onset"]["low_ratio"] = float(args.low_ratio)
+        decoder_params["offset"]["low_ratio"] = float(args.low_ratio)
+    if args.min_on is not None:
+        decoder_params["onset"]["min_on"] = int(args.min_on)
+        decoder_params["offset"]["min_on"] = int(args.min_on)
+    if args.min_off is not None:
+        decoder_params["onset"]["min_off"] = int(args.min_off)
+        decoder_params["offset"]["min_off"] = int(args.min_off)
+    if args.gap_merge is not None:
+        decoder_params["onset"]["gap_merge"] = int(args.gap_merge)
+        decoder_params["offset"]["gap_merge"] = int(args.gap_merge)
+    if args.median is not None:
+        decoder_params["onset"]["median"] = int(args.median)
+        decoder_params["offset"]["median"] = int(args.median)
+    decoder_params = _normalize_decoder_params(decoder_params)
+    onset_decoder = decoder_params["onset"]
+    offset_decoder = decoder_params["offset"]
     decoder_notice_printed = False
     decoder_logits_warned = False
+    decoder_settings_summary = _format_decoder_settings(decoder_kind, decoder_params)
+    print(f"[decoder-settings] {decoder_settings_summary}")
 
     def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None):
         nonlocal decoder_notice_printed, decoder_logits_warned
@@ -1372,33 +1496,25 @@ def main():
             k_onset = default_k_onset
         if decoder_kind == "hysteresis" and not use_logits:
             if not decoder_notice_printed:
-                print(
-                    "[decoder] hysteresis "
-                    f"low_ratio={decoder_params['low_ratio']:.2f} "
-                    f"min_on={decoder_params['min_on']} "
-                    f"min_off={decoder_params['min_off']} "
-                    f"gap_merge={decoder_params['gap_merge']} "
-                    f"median={decoder_params['median']}",
-                    flush=True,
-                )
+                print(f"[decoder] {_decoder_notice_text(decoder_kind, decoder_params)}", flush=True)
                 decoder_notice_printed = True
             onset_pred_mask = decode_hysteresis(
                 onset_probs,
                 on_thr,
-                decoder_params["low_ratio"],
-                decoder_params["min_on"],
-                decoder_params["min_off"],
-                decoder_params["gap_merge"],
-                decoder_params["median"],
+                onset_decoder["low_ratio"],
+                onset_decoder["min_on"],
+                onset_decoder["min_off"],
+                onset_decoder["gap_merge"],
+                onset_decoder["median"],
             )
             offset_pred_mask = decode_hysteresis(
                 offset_probs,
                 off_thr,
-                decoder_params["low_ratio"],
-                decoder_params["min_on"],
-                decoder_params["min_off"],
-                decoder_params["gap_merge"],
-                decoder_params["median"],
+                offset_decoder["low_ratio"],
+                offset_decoder["min_on"],
+                offset_decoder["min_off"],
+                offset_decoder["gap_merge"],
+                offset_decoder["median"],
             )
             onset_pred_bin = onset_pred_mask.to(onset_probs.dtype)
             offset_pred_bin = offset_pred_mask.to(offset_probs.dtype)

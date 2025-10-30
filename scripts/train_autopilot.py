@@ -87,7 +87,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import yaml
@@ -426,7 +426,47 @@ def run_fast_eval(
     return ret, lines
 
 
-def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
+def _parse_decoder_settings_line(line: str) -> Dict[str, Any]:
+    """Extract decoder settings emitted by eval_thresholds.py."""
+
+    if not line:
+        return {}
+    stripped = line.strip()
+    if not stripped.startswith("[decoder-settings]"):
+        return {}
+    parts = stripped.split("]", 1)
+    if len(parts) < 2:
+        return {}
+    payload = parts[1].strip()
+    if not payload:
+        return {}
+    settings: Dict[str, Any] = {}
+    for token in payload.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if key == "decoder":
+            settings["decoder_kind"] = value
+            continue
+        try:
+            num = float(value)
+        except ValueError:
+            settings[key] = value
+            continue
+        if abs(num - round(num)) <= 1e-9:
+            settings[key] = int(round(num))
+        else:
+            settings[key] = num
+    return settings
+
+
+def parse_eval_table(lines: List[str]) -> Optional[Dict[str, Any]]:
+    decoder_settings: Dict[str, Any] = {}
+    for line in lines:
+        if line.strip().startswith("[decoder-settings]"):
+            decoder_settings = _parse_decoder_settings_line(line)
+            break
+
     header_idx = None
     for i, line in enumerate(lines):
         if TABLE_HEADER_RE.match(line.strip()):
@@ -485,6 +525,8 @@ def parse_eval_table(lines: List[str]) -> Optional[Dict[str, float]]:
         }
         if best is None or row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
             best = row
+    if best is not None and decoder_settings:
+        best.update(decoder_settings)
     return best
 
 
@@ -1128,6 +1170,39 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
         bits.append(f"onset_pred_rate={metrics['onset_pred_rate']:.3f}")
         bits.append(f"onset_pos_rate={metrics['onset_pos_rate']:.3f}")
         bits.append("total=-1")
+        decoder_kind = metrics.get("decoder_kind")
+        if decoder_kind:
+            bits.append(f"decoder={decoder_kind}")
+        decoder_fields = [
+            ("onset_low_ratio", "{:.3f}", float),
+            ("onset_min_on", "{:d}", int),
+            ("onset_min_off", "{:d}", int),
+            ("onset_gap_merge", "{:d}", int),
+            ("onset_median", "{:d}", int),
+            ("offset_low_ratio", "{:.3f}", float),
+            ("offset_min_on", "{:d}", int),
+            ("offset_min_off", "{:d}", int),
+            ("offset_gap_merge", "{:d}", int),
+            ("offset_median", "{:d}", int),
+        ]
+        for key, fmt, caster in decoder_fields:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            if caster is int:
+                try:
+                    coerced = int(round(float(value)))
+                except (TypeError, ValueError):
+                    continue
+                bits.append(f"{key}={fmt.format(coerced)}")
+            else:
+                try:
+                    coerced = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isnan(coerced) or math.isinf(coerced):
+                    continue
+                bits.append(f"{key}={fmt.format(coerced)}")
     return " ".join(bits)
 
 

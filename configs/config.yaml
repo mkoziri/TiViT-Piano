@@ -138,6 +138,13 @@ training:
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
     prob_logit_bias_offset: -0.40
+    temporal_decoder:
+      shared:
+        low_ratio: 0.6
+        min_on: 2
+        min_off: 2
+        gap_merge: 1
+        median: 3
     aggregation:
       mode: k_of_p
       k:

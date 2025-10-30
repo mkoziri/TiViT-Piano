@@ -1029,6 +1029,76 @@ def _median_filter_time_proxy(clip_probs: torch.Tensor, kernel_size: int) -> tor
     return filtered.squeeze(1).transpose(0, 1).contiguous()
 
 
+_TEMPORAL_DECODER_KEYS = ("low_ratio", "min_on", "min_off", "gap_merge", "median")
+_TEMPORAL_DECODER_DEFAULTS = {"low_ratio": 0.6, "min_on": 2, "min_off": 2, "gap_merge": 1, "median": 3}
+
+
+def _normalize_temporal_decoder(raw: dict) -> dict:
+    normalized = {}
+    for head in ("onset", "offset"):
+        source = raw.get(head, {}) if isinstance(raw, dict) else {}
+        entry = {}
+        low_ratio = source.get("low_ratio", _TEMPORAL_DECODER_DEFAULTS["low_ratio"])
+        try:
+            low_ratio = float(low_ratio)
+        except (TypeError, ValueError):
+            low_ratio = _TEMPORAL_DECODER_DEFAULTS["low_ratio"]
+        entry["low_ratio"] = max(0.0, low_ratio)
+
+        for key in ("min_on", "min_off", "gap_merge"):
+            value = source.get(key, _TEMPORAL_DECODER_DEFAULTS[key])
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = _TEMPORAL_DECODER_DEFAULTS[key]
+            if key == "gap_merge":
+                entry[key] = max(0, value)
+            else:
+                entry[key] = max(0, value)
+
+        median_val = source.get("median", _TEMPORAL_DECODER_DEFAULTS["median"])
+        try:
+            median_int = int(median_val)
+        except (TypeError, ValueError):
+            median_int = _TEMPORAL_DECODER_DEFAULTS["median"]
+        if median_int < 1:
+            median_int = 1
+        if median_int % 2 == 0:
+            median_int += 1
+        entry["median"] = median_int
+        normalized[head] = entry
+    return normalized
+
+
+def _resolve_temporal_decoder_config(metrics_cfg: dict) -> dict:
+    result = {"onset": dict(_TEMPORAL_DECODER_DEFAULTS), "offset": dict(_TEMPORAL_DECODER_DEFAULTS)}
+
+    def _apply(source: dict, dest: dict):
+        if not isinstance(source, dict):
+            return
+        for key in _TEMPORAL_DECODER_KEYS:
+            if key not in source:
+                continue
+            dest[key] = source[key]
+
+    for section_key in ("temporal_decoder", "proxy_decoder"):
+        section = metrics_cfg.get(section_key, {}) if isinstance(metrics_cfg, dict) else {}
+        if not isinstance(section, dict):
+            continue
+        _apply(section, result["onset"])
+        _apply(section, result["offset"])
+        shared = section.get("shared")
+        if isinstance(shared, dict):
+            _apply(shared, result["onset"])
+            _apply(shared, result["offset"])
+        for head in ("onset", "offset"):
+            head_cfg = section.get(head)
+            if isinstance(head_cfg, dict):
+                _apply(head_cfg, result[head])
+
+    return _normalize_temporal_decoder(result)
+
+
 def _proxy_decode_mask(
     probs: torch.Tensor,
     *,
@@ -1918,14 +1988,9 @@ def evaluate_one_epoch(
         hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
-    proxy_decoder_cfg = metrics_cfg.get("proxy_decoder", {}) or {}
-    proxy_decoder = {
-        "low_ratio": float(proxy_decoder_cfg.get("low_ratio", 0.6)),
-        "min_on": int(proxy_decoder_cfg.get("min_on", 2)),
-        "min_off": int(proxy_decoder_cfg.get("min_off", 2)),
-        "gap_merge": int(proxy_decoder_cfg.get("gap_merge", 1)),
-        "median": int(proxy_decoder_cfg.get("median", 3)),
-    }
+    temporal_decoder_cfg = _resolve_temporal_decoder_config(metrics_cfg)
+    decoder_onset = temporal_decoder_cfg["onset"]
+    decoder_offset = temporal_decoder_cfg["offset"]
     event_proxy_accum = {
         "onset_sum": 0.0,
         "offset_sum": 0.0,
@@ -2513,11 +2578,11 @@ def evaluate_one_epoch(
                             onset_event_mask = _proxy_decode_mask(
                                 masked_onset_probs,
                                 high_thr=thr_on,
-                                low_ratio=proxy_decoder["low_ratio"],
-                                min_on=proxy_decoder["min_on"],
-                                min_off=proxy_decoder["min_off"],
-                                gap_merge=proxy_decoder["gap_merge"],
-                                median=proxy_decoder["median"],
+                                low_ratio=decoder_onset["low_ratio"],
+                                min_on=decoder_onset["min_on"],
+                                min_off=decoder_onset["min_off"],
+                                gap_merge=decoder_onset["gap_merge"],
+                                median=decoder_onset["median"],
                             )
                         except ValueError:
                             onset_event_mask = strict_onset_mask.bool()
@@ -2537,11 +2602,11 @@ def evaluate_one_epoch(
                             offset_event_mask = _proxy_decode_mask(
                                 masked_offset_probs,
                                 high_thr=thr_off,
-                                low_ratio=proxy_decoder["low_ratio"],
-                                min_on=proxy_decoder["min_on"],
-                                min_off=proxy_decoder["min_off"],
-                                gap_merge=proxy_decoder["gap_merge"],
-                                median=proxy_decoder["median"],
+                                low_ratio=decoder_offset["low_ratio"],
+                                min_on=decoder_offset["min_on"],
+                                min_off=decoder_offset["min_off"],
+                                gap_merge=decoder_offset["gap_merge"],
+                                median=decoder_offset["median"],
                             )
                         except ValueError:
                             offset_event_mask = strict_offset_mask.bool()
