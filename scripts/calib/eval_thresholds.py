@@ -23,7 +23,7 @@ from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -1202,6 +1202,150 @@ def main():
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
+
+    def _percentile(flat: torch.Tensor, q: float) -> float:
+        if flat.numel() == 0:
+            return 0.0
+        try:
+            return float(torch.quantile(flat, q).item())
+        except (RuntimeError, AttributeError):
+            # Fallback for older torch – rely on numpy.
+            return float(np.quantile(flat.numpy(), q))
+
+    def _summarize_probs(name: str, tensor: torch.Tensor) -> Tuple[float, dict]:
+        flat = tensor.reshape(-1).float()
+        max_prob = float(flat.max().item()) if flat.numel() else 0.0
+        stats = {
+            0.95: _percentile(flat, 0.95),
+            0.99: _percentile(flat, 0.99),
+            0.995: _percentile(flat, 0.995),
+        }
+        _log_progress(
+            "[sweep] %s prob stats: max=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
+            % (name, max_prob, stats[0.95], stats[0.99], stats[0.995]),
+            force=True,
+        )
+        return max_prob, stats
+
+    floor_band = [0.20, 0.30, 0.40]
+    offset_lower_hint = 0.10  # base guardrail
+
+    _summarize_probs("onset", onset_probs)
+    max_prob_offset, _ = _summarize_probs("offset", offset_probs)
+    offset_lower_hint = max(offset_lower_hint, max_prob_offset - 0.10)
+    offset_lower_hint = float(max(0.0, min(offset_lower_hint, 0.95)))
+
+    def _format_list(vals: List[float]) -> str:
+        return "[" + ",".join(f"{v:.3f}" for v in vals) + "]"
+
+    if args.head is None:
+        if args.prob_thresholds:
+            using_grid = bool(args.grid_prob_thresholds)
+            onset_list = list(args.prob_thresholds)
+            if args.offset_prob_thresholds is not None:
+                offset_list = list(args.offset_prob_thresholds)
+            else:
+                offset_list = list(onset_list)
+
+            lowest_offset_thr = min(offset_list) if offset_list else None
+            extend_needed = (
+                lowest_offset_thr is not None
+                and max_prob_offset + 1e-9 < lowest_offset_thr
+            )
+            inserted_lower = None
+
+            if using_grid:
+                onset_set = set(onset_list)
+                offset_set = set(offset_list)
+                onset_set.update(floor_band)
+                offset_set.update(floor_band)
+                if extend_needed:
+                    offset_set.add(offset_lower_hint)
+                    inserted_lower = offset_lower_hint
+                args.prob_thresholds = sorted(onset_set)
+                args.offset_prob_thresholds = sorted(offset_set)
+            else:
+                pairs = [(float(o), float(off)) for o, off in zip(onset_list, offset_list)]
+                pair_map = {(round(o, 6), round(off, 6)): (o, off) for o, off in pairs}
+
+                def _add_pair(on_val: float, off_val: float) -> None:
+                    key = (round(on_val, 6), round(off_val, 6))
+                    if key not in pair_map:
+                        pair_map[key] = (float(on_val), float(off_val))
+
+                for val in floor_band:
+                    _add_pair(val, val)
+                if extend_needed:
+                    _add_pair(offset_lower_hint, offset_lower_hint)
+                    inserted_lower = offset_lower_hint
+
+                pairs = list(pair_map.values())
+                pairs.sort(key=lambda item: (item[1], item[0]))
+                args.prob_thresholds = [p[0] for p in pairs]
+                args.offset_prob_thresholds = [p[1] for p in pairs]
+
+            onset_list = list(args.prob_thresholds)
+            offset_list = (
+                list(args.offset_prob_thresholds)
+                if args.offset_prob_thresholds is not None
+                else list(onset_list)
+            )
+            if using_grid:
+                prob_pairs = len(onset_list) * len(offset_list)
+            else:
+                prob_pairs = len(onset_list)
+            num_prob_combos = prob_pairs * len(k_candidates)
+            num_thr_pairs = calib_pairs + logit_pairs + prob_pairs
+            num_combos = calib_pairs + logit_pairs + num_prob_combos
+
+            if inserted_lower is not None:
+                _log_progress(
+                    "[sweep] offset max prob %.4f < min sweep %.4f → added %.4f to sweep list."
+                    % (max_prob_offset, lowest_offset_thr, inserted_lower),
+                    force=True,
+                )
+            _log_progress(
+                f"[sweep] ensured floor band {', '.join(f'{v:.2f}' for v in floor_band)} in probability sweep.",
+                force=True,
+            )
+            if using_grid:
+                prob_desc = f"prob_grid:{len(onset_list)}x{len(offset_list)}"
+            else:
+                prob_desc = f"prob_pairs:{prob_pairs}"
+            thr_desc = []
+            if logit_pairs:
+                thr_desc.append(f"logit:{logit_pairs}")
+            thr_desc.append(prob_desc)
+            if calib_pairs:
+                thr_desc.append(f"calib:{calib_pairs}")
+            _log_progress(
+                f"[sweep] updated probability grids → onset={_format_list(onset_list)} "
+                f"offset={_format_list(offset_list)} combos={num_combos}",
+                force=True,
+            )
+    else:
+        if per_head_mode == "prob" and per_head_sweep_vals is not None:
+            values = set(float(v) for v in per_head_sweep_vals)
+            values.update(floor_band)
+            inserted_lower = None
+            if args.head == "offset":
+                lowest = min(values) if values else None
+                extend_needed = lowest is not None and max_prob_offset + 1e-9 < lowest
+                if extend_needed:
+                    values.add(offset_lower_hint)
+                    inserted_lower = offset_lower_hint
+            per_head_sweep_vals = sorted(values)
+            num_combos = len(per_head_sweep_vals)
+            if inserted_lower is not None:
+                _log_progress(
+                    "[sweep] per-head offset max prob %.4f → added %.4f to sweep list."
+                    % (max_prob_offset, inserted_lower),
+                    force=True,
+                )
+            _log_progress(
+                f"[sweep] per-head sweep ({args.head}) values={_format_list(per_head_sweep_vals)} combos={num_combos}",
+                force=True,
+            )
 
     # Use all key/time positions rather than collapsing with ``any``.
     # Collapsing across the note dimension causes the predicted rate to be
