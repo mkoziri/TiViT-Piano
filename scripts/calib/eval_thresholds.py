@@ -1758,7 +1758,9 @@ def main():
     onset_decoder = decoder_params["onset"]
     offset_decoder = decoder_params["offset"]
     decoder_choice = args.decoder or "auto"
-    decoder_kind = "hysteresis" if decoder_choice == "auto" else decoder_choice
+    if decoder_choice == "none":
+        print("[decoder] requested decoder=none -> forcing hysteresis with config defaults", flush=True)
+    decoder_kind = "hysteresis" if decoder_choice in {"auto", "none"} else decoder_choice
     decoder_notice_printed = False
     decoder_logits_warned = False
     decoder_settings_summary = _format_decoder_settings(decoder_kind, decoder_params)
