@@ -459,8 +459,14 @@ def run_fast_eval(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
-    if eval_extras:
-        cmd.extend(list(eval_extras))
+    extras_list = list(eval_extras) if eval_extras else []
+    has_decoder_override = any(
+        token == "--decoder" or token.startswith("--decoder=") for token in extras_list
+    )
+    if not has_decoder_override:
+        cmd.extend(["--decoder", "auto"])
+    if extras_list:
+        cmd.extend(extras_list)
     cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()
@@ -629,6 +635,7 @@ def run_fast_grid_calibration(
         cmd.extend(["--temperature", str(temperature)])
     if bias is not None:
         cmd.extend(["--bias", str(bias)])
+    cmd.extend(["--decoder", "auto"])
     cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     _log_eval_settings()

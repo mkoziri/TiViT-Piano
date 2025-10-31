@@ -723,9 +723,9 @@ def main():
     )
     ap.add_argument(
         "--decoder",
-        choices=["none", "hysteresis"],
-        default="none",
-        help="Temporal decoder applied during evaluation (default: none)",
+        choices=["auto", "none", "hysteresis"],
+        default="auto",
+        help="Temporal decoder applied during evaluation (default: auto → hysteresis using config)",
     )
     ap.add_argument(
         "--low_ratio",
@@ -952,7 +952,7 @@ def main():
                 filtered[key] = [paths_field[i] for i in keep_indices]
                 continue
             if total is not None:
-                if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == total:
+                if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == total:
                     idx_tensor = torch.as_tensor(keep_indices, dtype=torch.long, device=value.device)
                     filtered[key] = value.index_select(0, idx_tensor)
                     continue
@@ -1738,7 +1738,6 @@ def main():
     onset_true_bin = (onset_tgts > 0).float()
     offset_true_bin = (offset_tgts > 0).float()
 
-    decoder_kind = args.decoder
     decoder_params = _resolve_decoder_from_config(metrics_cfg)
     if args.low_ratio is not None:
         decoder_params["onset"]["low_ratio"] = float(args.low_ratio)
@@ -1758,6 +1757,8 @@ def main():
     decoder_params = _normalize_decoder_params(decoder_params)
     onset_decoder = decoder_params["onset"]
     offset_decoder = decoder_params["offset"]
+    decoder_choice = args.decoder or "auto"
+    decoder_kind = "hysteresis" if decoder_choice == "auto" else decoder_choice
     decoder_notice_printed = False
     decoder_logits_warned = False
     decoder_settings_summary = _format_decoder_settings(decoder_kind, decoder_params)
@@ -1865,6 +1866,7 @@ def main():
             "decoder_onset_hold": float(onset_hold_thr) if onset_hold_thr is not None else None,
             "decoder_offset_open": float(offset_open_thr) if offset_open_thr is not None else None,
             "decoder_offset_hold": float(offset_hold_thr) if offset_hold_thr is not None else None,
+            "decoder_kind": decoder_kind,
             "f1_on": float(f1_on),
             "f1_off": float(f1_off),
             "onset_pred_rate": float(onset_pred_rate),
