@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 30
+  epochs: 31
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -140,15 +140,15 @@ training:
     prob_logit_bias_offset: -0.4
     decoder:
       onset:
-        open: 0.32  # default: 36
-        hold: 0.24  # default: 28
-        min_on: 2   # default: 2
-        merge_gap: 1  # default: 1
+        open: 0.24  
+        hold: 0.18  
+        min_on: 2  
+        merge_gap: 1  
       offset:
-        open: 0.22  # default: 32
-        hold: 0.18  # default: 24
-        min_off: 2  # default: 2
-        merge_gap: 1  # default: 1
+        open: 0.11  
+        hold: 0.07  
+        min_off: 2  
+        merge_gap: 1  
     temporal_decoder:
       shared:
         low_ratio: 0.6
