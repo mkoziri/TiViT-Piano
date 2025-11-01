@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_preT3_baseline_clean_start
+  name: TiViT-Piano_PianoYT_preT3_autopilot
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 31
+  epochs: 30
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -97,8 +97,8 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: true
-  reset_head_bias: false
+  resume: false
+  reset_head_bias: true
   bias_seed:
     onoff_prior_mean: 0.02
   loss_weights:
@@ -119,7 +119,7 @@ training:
         prior_weight: 0.15
       offset:
         loss: focal
-        focal_gamma: 3.0
+        focal_gamma: 2.5
         focal_alpha: 0.2
         prior_mean: 0.01
         prior_weight: 0.15
@@ -129,9 +129,9 @@ training:
     hand: 0.3
     clef: 0.3
   metrics:
-    prob_threshold: 0.4
-    prob_threshold_onset: 0.4
-    prob_threshold_offset: 0.4
+    prob_threshold: 0.20
+    prob_threshold_onset: 0.20
+    prob_threshold_offset: 0.06
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
     prob_temperature_offset: 1.25
