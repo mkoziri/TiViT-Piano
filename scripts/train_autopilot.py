@@ -11,10 +11,8 @@ Purpose:
 
 Key Functions/Classes:
     - run_command: Execute helper scripts while teeing stdout/stderr to disk.
-    - run_calibration / run_fast_eval: Invoke calibration/evaluation helpers and
-      parse their metrics.
-    - run_fast_grid_calibration: Perform a coarse sweep for fallback
-      calibration.
+    - run_calibration / calibrate_and_score: Invoke calibration/evaluation helpers
+      and parse their metrics.
     - append_results: Persist round metadata to ``runs/auto/results.txt``.
     - main: CLI entry point that drives the automation loop.
 
@@ -89,7 +87,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
     import yaml
@@ -121,6 +119,17 @@ TARGET_METRIC_FIELDS = {
 sys.path.insert(0, str(REPO / "src"))
 from utils.logging_utils import QUIET_INFO_FLAG, configure_verbosity
 from utils.determinism import resolve_deterministic_flag, resolve_seed
+from utils.selection import (
+    SweepSpec,
+    SelectionRequest,
+    SelectionResult,
+    SelectionContext,
+    calibrate_and_score,
+    record_best,
+    SelectionError,
+    decoder_snapshot_from_config,
+    tolerance_snapshot_from_config,
+)
 
 LOGGER = logging.getLogger("autopilot")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
@@ -419,182 +428,6 @@ def _log_eval_settings() -> None:
     print(message)
 
 
-def run_fast_eval(
-    ckpt: Path,
-    log_dir: Path,
-    split: str,
-    calibration_json: Path,
-    *,
-    frames: Optional[int] = None,
-    max_clips: Optional[int] = None,
-    onset_probs: Optional[Iterable[float]] = None,
-    offset_probs: Optional[Iterable[float]] = None,
-    temperature: Optional[float] = None,
-    bias: Optional[float] = None,
-    verbose: Optional[str] = None,
-    eval_extras: Optional[Iterable[str]] = None,
-    seed: Optional[int] = None,
-    deterministic: Optional[bool] = None,
-) -> Tuple[int, List[str]]:
-    log_path = log_dir / "eval_fast.txt"
-    cmd = [
-        sys.executable,
-        "-u",
-        str(EVAL_THRESH),
-        "--ckpt",
-        str(ckpt),
-        "--calibration",
-        str(calibration_json),
-    ]
-    cmd.extend(_build_dataset_cli(split, frames, max_clips))
-    onset_list = None
-    if onset_probs is not None:
-        onset_list = [max(0.0, min(1.0, p)) for p in onset_probs]
-        cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in onset_list)])
-    offset_list = None
-    if offset_probs is not None:
-        offset_list = [max(0.0, min(1.0, p)) for p in offset_probs]
-        cmd.extend(["--offset_prob_thresholds", ",".join(f"{p:.2f}" for p in offset_list)])
-    if temperature is not None:
-        cmd.extend(["--temperature", str(temperature)])
-    if bias is not None:
-        cmd.extend(["--bias", str(bias)])
-    extras_list = list(eval_extras) if eval_extras else []
-    has_decoder_override = any(
-        token == "--decoder" or token.startswith("--decoder=") for token in extras_list
-    )
-    if not has_decoder_override:
-        cmd.extend(["--decoder", "auto"])
-    if extras_list:
-        cmd.extend(extras_list)
-    cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
-    cmd = _with_verbose(cmd, verbose)
-    _log_eval_settings()
-    ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
-    return ret, lines
-
-
-def _parse_decoder_settings_line(line: str) -> Dict[str, Any]:
-    """Extract decoder settings emitted by eval_thresholds.py."""
-
-    if not line:
-        return {}
-    stripped = line.strip()
-    if not stripped.startswith("[decoder-settings]"):
-        return {}
-    parts = stripped.split("]", 1)
-    if len(parts) < 2:
-        return {}
-    payload = parts[1].strip()
-    if not payload:
-        return {}
-    settings: Dict[str, Any] = {}
-    for token in payload.split():
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        if key == "decoder":
-            settings["decoder_kind"] = value
-            continue
-        try:
-            num = float(value)
-        except ValueError:
-            settings[key] = value
-            continue
-        if abs(num - round(num)) <= 1e-9:
-            settings[key] = int(round(num))
-        else:
-            settings[key] = num
-    return settings
-
-
-def _alias_decoder_settings(payload: Dict[str, Any]) -> None:
-    """Populate decoder_* aliases while preserving original keys."""
-
-    alias_map = {
-        "onset_open": "decoder_onset_open",
-        "onset_hold": "decoder_onset_hold",
-        "onset_min_on": "decoder_onset_min_on",
-        "onset_merge_gap": "decoder_onset_merge_gap",
-        "offset_open": "decoder_offset_open",
-        "offset_hold": "decoder_offset_hold",
-        "offset_min_off": "decoder_offset_min_off",
-        "offset_merge_gap": "decoder_offset_merge_gap",
-    }
-    for src, dst in alias_map.items():
-        if src in payload and dst not in payload:
-            payload[dst] = payload[src]
-
-
-def parse_eval_table(lines: List[str]) -> Optional[Dict[str, Any]]:
-    decoder_settings: Dict[str, Any] = {}
-    for line in lines:
-        if line.strip().startswith("[decoder-settings]"):
-            decoder_settings = _parse_decoder_settings_line(line)
-            break
-
-    header_idx = None
-    for i, line in enumerate(lines):
-        if TABLE_HEADER_RE.match(line.strip()):
-            header_idx = i
-            break
-    if header_idx is None:
-        return None
-    header = lines[header_idx].strip().split("\t")
-    col_idx = {name: idx for idx, name in enumerate(header)}
-    required = {
-        "onset_thr",
-        "offset_thr",
-        "onset_f1",
-        "offset_f1",
-        "onset_pred_rate",
-        "onset_pos_rate",
-        "onset_event_f1",
-        "offset_event_f1",
-    }
-    if not required.issubset(col_idx):
-        return None
-    best = None
-    for line in lines[header_idx + 1 :]:
-        if not line.strip() or line.startswith("["):
-            continue
-        parts = line.strip().split("\t")
-        try:
-            onset_thr = float(parts[col_idx["onset_thr"]])
-            offset_thr = float(parts[col_idx["offset_thr"]])
-            onset_f1 = float(parts[col_idx["onset_f1"]])
-            offset_f1 = float(parts[col_idx["offset_f1"]])
-            onset_pr = float(parts[col_idx["onset_pred_rate"]])
-            onset_pos = float(parts[col_idx["onset_pos_rate"]])
-            onset_ev = float(parts[col_idx["onset_event_f1"]])
-            offset_ev = float(parts[col_idx["offset_event_f1"]])
-        except (ValueError, KeyError, IndexError):
-            continue
-        k_onset = 1
-        if "k_onset" in col_idx:
-            try:
-                k_onset = int(float(parts[col_idx["k_onset"]]))
-            except (ValueError, IndexError):
-                k_onset = 1
-        ev_mean = 0.5 * (onset_ev + offset_ev)
-        row = {
-            "onset_thr": onset_thr,
-            "offset_thr": offset_thr,
-            "onset_f1": onset_f1,
-            "offset_f1": offset_f1,
-            "onset_pred_rate": onset_pr,
-            "onset_pos_rate": onset_pos,
-            "onset_event_f1": onset_ev,
-            "offset_event_f1": offset_ev,
-            "ev_f1_mean": ev_mean,
-            "k_onset": k_onset,
-        }
-        if best is None or row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
-            best = row
-    if best is not None and decoder_settings:
-        best.update(decoder_settings)
-        _alias_decoder_settings(best)
-    return best
 
 
 FAST_GRID_THRESHOLDS = [0.40, 0.44, 0.48, 0.52, 0.56, 0.60]
@@ -605,53 +438,32 @@ FAST_RESULT_MIN = 0.02
 FAST_RESULT_MAX = 0.98
 
 
-
-def run_fast_grid_calibration(
-    ckpt: Path,
-    log_dir: Path,
-    split: str,
-    temperature: Optional[float] = None,
-    bias: Optional[float] = None,
-    *,
-    frames: Optional[int] = None,
-    verbose: Optional[str] = None,
-    seed: Optional[int] = None,
-    deterministic: Optional[bool] = None,
-) -> Tuple[int, Optional[Dict[str, float]], List[str]]:
-    log_path = log_dir / "calibration_fast_grid.txt"
-    cmd = [
-        sys.executable,
-        str(EVAL_THRESH),
-        "--ckpt",
-        str(ckpt),
-    ]
-    if split:
-        cmd.extend(["--split", split])
-    cmd.extend(["--prob_thresholds", ",".join(f"{p:.2f}" for p in FAST_GRID_THRESHOLDS)])
-    cmd.append("--grid_prob_thresholds")
-    frame_count = frames if frames is not None else 96
-    cmd.extend(["--max-clips", "80", "--frames", str(frame_count)])
-    if temperature is not None:
-        cmd.extend(["--temperature", str(temperature)])
-    if bias is not None:
-        cmd.extend(["--bias", str(bias)])
-    cmd.extend(["--decoder", "auto"])
-    cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
-    cmd = _with_verbose(cmd, verbose)
-    _log_eval_settings()
-    ret, _, lines = run_command(cmd, log_path, capture_last_val=False, verbose=verbose)
-    if ret != 0:
-        return ret, None, lines
-    metrics = parse_eval_table(lines)
-    return ret, metrics, lines
+def _result_to_metrics(result: SelectionResult) -> Dict[str, float]:
+    metrics = {
+        "onset_thr": result.onset_threshold,
+        "offset_thr": result.offset_threshold,
+        "onset_f1": result.onset_f1 or 0.0,
+        "offset_f1": result.offset_f1 or 0.0,
+        "onset_event_f1": result.onset_event_f1,
+        "offset_event_f1": result.offset_event_f1,
+        "onset_pred_rate": result.onset_pred_rate or 0.0,
+        "onset_pos_rate": result.onset_pos_rate or 0.0,
+        "ev_f1_mean": result.mean_event_f1,
+        "k_onset": result.k_onset,
+    }
+    if result.decoder_kind:
+        metrics["decoder_kind"] = result.decoder_kind
+    if result.decoder_settings:
+        metrics.update(result.decoder_settings)
+    return metrics
 
 
-def ensure_calibration_json(metrics: Dict[str, float]) -> None:
+def _write_calibration_json(result: SelectionResult) -> None:
     data = load_calibration(CALIB_JSON) or {}
     onset = data.get("onset", {})
     offset = data.get("offset", {})
-    onset["best_prob"] = _clamp_fast_result(float(metrics["onset_thr"]))
-    offset["best_prob"] = _clamp_fast_result(float(metrics["offset_thr"]))
+    onset["best_prob"] = _clamp_fast_result(float(result.onset_threshold))
+    offset["best_prob"] = _clamp_fast_result(float(result.offset_threshold))
     data["onset"] = onset
     data["offset"] = offset
     with CALIB_JSON.open("w") as f:
@@ -698,24 +510,6 @@ def _clamp_probability(prob: float) -> float:
 
 def _clamp_range(prob: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(prob)))
-
-
-def _bounded_fast_sweep_candidates(center: float, delta: float) -> Tuple[float, ...]:
-    raw_candidates = (
-        center - delta,
-        center,
-        center + delta,
-    )
-    seen = set()
-    ordered: List[float] = []
-    for value in raw_candidates:
-        clipped = _clamp_range(value, FAST_SWEEP_CLIP_MIN, FAST_SWEEP_CLIP_MAX)
-        key = int(round(clipped * 1000))
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(clipped)
-    return tuple(ordered)
 
 
 def _clamp_fast_result(prob: float) -> float:
@@ -874,6 +668,12 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     else:
         metrics_cfg["decoder"] = decoder_snapshot
     save_cfg(cfg)
+    reloaded_cfg = load_cfg()
+    reloaded_metrics = reloaded_cfg.get("training", {}).get("metrics", {}) if isinstance(reloaded_cfg, Mapping) else {}
+    decoder_after = reloaded_metrics.get("decoder") if isinstance(reloaded_metrics, Mapping) else {}
+    if decoder_after != decoder_snapshot:
+        print("[autopilot] ERROR: decoder subtree changed during write-back; aborting to protect config", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def infer_current_epoch(ckpt_dir: Path) -> int:
@@ -985,7 +785,7 @@ def perform_calibration(
     calibration_count: int,
     seed: int,
     deterministic: bool,
-) -> Tuple[Optional[Dict[str, float]], int]:
+) -> Tuple[Optional[SelectionResult], Optional[SelectionContext], List[str], int]:
     first_calibration = calibration_count == 0
     prefer_fast_grid = first_calibration and args.fast_first_calib
     desired_kind = args.first_calib if first_calibration else "fast"
@@ -1018,7 +818,56 @@ def perform_calibration(
             return float(_clamp_probability(previous)), None, "best"
         return float(_clamp_probability(fallback)), None, "fallback"
 
-    def _run_fast_eval_with_calib(calib: dict) -> Tuple[Optional[Dict[str, float]], int]:
+    decoder_snapshot = decoder_snapshot_from_config(cfg_snapshot)
+    tolerance_snapshot = tolerance_snapshot_from_config(cfg_snapshot)
+    exp_name = cfg_snapshot.get("experiment", {}).get("name", "")
+    prob_delta = 0.05
+
+    def _build_request(
+        onset_center: float,
+        offset_center: float,
+        *,
+        log_name: str,
+        sweep_override: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
+        extras: Optional[Sequence[str]] = None,
+        low_guard: float = 0.10,
+    ) -> SelectionRequest:
+        onset_explicit = sweep_override[0] if sweep_override else None
+        offset_explicit = sweep_override[1] if sweep_override else None
+        sweep = SweepSpec(
+            onset_center=onset_center,
+            offset_center=offset_center,
+            delta=prob_delta,
+            clamp_min=FAST_SWEEP_CLIP_MIN,
+            clamp_max=FAST_SWEEP_CLIP_MAX,
+            low_guard=low_guard,
+            onset_explicit=onset_explicit,
+            offset_explicit=offset_explicit,
+        )
+        eval_extras = list(args.eval_extras_tokens or [])
+        if extras:
+            eval_extras.extend(extras)
+        frames = args.calib_frames if args.calib_frames is not None else 96
+        max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
+        return SelectionRequest(
+            ckpt=ckpt,
+            split=split,
+            frames=frames,
+            max_clips=max_clips,
+            sweep=sweep,
+            decoder=decoder_snapshot,
+            tolerances=tolerance_snapshot,
+            temperature=args.temperature,
+            bias=args.bias,
+            seed=seed,
+            deterministic=deterministic,
+            eval_extras=eval_extras,
+            verbose=args.verbose,
+            log_path=stdout_dir / log_name,
+            run_id=exp_name,
+        )
+
+    def _run_selection_with_calibration(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
         onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
@@ -1035,9 +884,6 @@ def perform_calibration(
         )
         onset_prob = _clamp_fast_result(onset_prob)
         offset_prob = _clamp_fast_result(offset_prob)
-        prob_delta = 0.05
-        onset_probs = _bounded_fast_sweep_candidates(onset_prob, prob_delta)
-        offset_probs = _bounded_fast_sweep_candidates(offset_prob, prob_delta)
         if onset_src == offset_src:
             anchor_source = onset_src
         else:
@@ -1049,75 +895,31 @@ def perform_calibration(
             anchor_source,
             extra=QUIET_EXTRA,
         )
-        combos = len(onset_probs) * len(offset_probs)
-        LOGGER.info(
-            "[autopilot:grid] onset_probs=%s offset_probs=%s combos=%d",
-            "[" + ",".join(f"{p:.4f}" for p in onset_probs) + "]",
-            "[" + ",".join(f"{p:.4f}" for p in offset_probs) + "]",
-            combos,
-            extra=QUIET_EXTRA,
-        )
-        eval_ret, lines = run_fast_eval(
-            ckpt,
-            stdout_dir,
-            split,
-            CALIB_JSON,
-            frames=args.calib_frames,
-            max_clips=args.calib_max_clips,
-            onset_probs=onset_probs,
-            offset_probs=offset_probs,
-            temperature=args.temperature,
-            bias=args.bias,
-            verbose=args.verbose,
-            eval_extras=args.eval_extras_tokens,
-            seed=seed,
-            deterministic=deterministic,
-        )
-        if eval_ret != 0:
-            return None, eval_ret
-        metrics = parse_eval_table(lines)
-        if metrics is None:
-            return None, 1
-        onset_thr = metrics.get("onset_thr")
-        offset_thr = metrics.get("offset_thr")
-        if onset_thr is None or onset_thr < 0.0 or onset_thr > 1.0:
-            metrics["onset_thr"] = onset_prob
-        elif onset_logit is not None and math.isclose(onset_thr, onset_logit, rel_tol=1e-9, abs_tol=1e-6):
-            metrics["onset_thr"] = onset_prob
-        else:
-            metrics["onset_thr"] = _clamp_fast_result(float(onset_thr))
-        if offset_thr is None or offset_thr < 0.0 or offset_thr > 1.0:
-            metrics["offset_thr"] = offset_prob
-        elif offset_logit is not None and math.isclose(offset_thr, offset_logit, rel_tol=1e-9, abs_tol=1e-6):
-            metrics["offset_thr"] = offset_prob
-        else:
-            metrics["offset_thr"] = _clamp_fast_result(float(offset_thr))
-        calib.setdefault("onset", {})["best_prob"] = metrics["onset_thr"]
-        calib.setdefault("offset", {})["best_prob"] = metrics["offset_thr"]
-        with CALIB_JSON.open("w") as f:
-            json.dump(calib, f, indent=2)
-        return metrics, eval_ret
+        request = _build_request(onset_prob, offset_prob, log_name=log_name)
+        result, context, lines = calibrate_and_score(request)
+        _write_calibration_json(result)
+        return result, context, lines
 
-    def _run_fast_grid(reason: Optional[str] = None) -> Tuple[Optional[Dict[str, float]], int]:
+    def _run_fast_grid(reason: Optional[str] = None) -> Tuple[Optional[SelectionResult], Optional[SelectionContext], List[str], int]:
         if reason:
             print(f"[autopilot] WARNING: {reason} → falling back to fast grid calibration")
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
-        ret, metrics, _ = run_fast_grid_calibration(
-            ckpt,
-            stdout_dir,
-            split,
-            temperature=args.temperature,
-            bias=args.bias,
-            frames=args.calib_frames,
-            verbose=args.verbose,
-            seed=seed,
-            deterministic=deterministic,
-        )
-        if ret != 0 or metrics is None:
-            return None, ret or 1
-        ensure_calibration_json(metrics)
-        return metrics, ret
+        try:
+            request = _build_request(
+                0.5,
+                0.5,
+                log_name="calibration_fast_grid.txt",
+                sweep_override=(FAST_GRID_THRESHOLDS, FAST_GRID_THRESHOLDS),
+                extras=["--grid_prob_thresholds"],
+                low_guard=0.02,
+            )
+            result, context, lines = calibrate_and_score(request)
+        except SelectionError as exc:
+            LOGGER.error("fast grid calibration failed: %s", exc)
+            return None, None, [], 1
+        _write_calibration_json(result)
+        return result, context, lines, 0
 
     if prefer_fast_grid:
         return _run_fast_grid()
@@ -1141,18 +943,22 @@ def perform_calibration(
         calib = load_calibration(CALIB_JSON)
         if calib is None:
             return _run_fast_grid("calibration.json missing after thorough calibration")
-        metrics, eval_ret = _run_fast_eval_with_calib(calib)
-        if metrics is None:
+        try:
+            result, context, lines = _run_selection_with_calibration(calib, log_name="eval_fast.txt")
+        except SelectionError as exc:
+            LOGGER.error("fast evaluation failed after thorough calibration: %s", exc)
             return _run_fast_grid("fast evaluation failed after thorough calibration")
-        return metrics, eval_ret
+        return result, context, lines, 0
 
     calib = load_calibration(CALIB_JSON)
     if calib is None:
         return _run_fast_grid("calibration.json missing for fast calibration")
-    metrics, eval_ret = _run_fast_eval_with_calib(calib)
-    if metrics is None:
+    try:
+        result, context, lines = _run_selection_with_calibration(calib, log_name="eval_fast.txt")
+    except SelectionError as exc:
+        LOGGER.error("fast evaluation failed: %s", exc)
         return _run_fast_grid("fast evaluation failed")
-    return metrics, eval_ret
+    return result, context, lines, 0
 
 
 # ---------------------------------------------------------------------------
@@ -1451,6 +1257,7 @@ def main() -> int:
 
     train_cfg = cfg.setdefault("training", {})
     metrics_cfg = train_cfg.setdefault("metrics", {})
+    decoder_snapshot = copy.deepcopy(metrics_cfg.get("decoder"))
     loss_cfg = train_cfg.setdefault("loss_weights", {})
     dataset_cfg = cfg.setdefault("dataset", {})
     frame_cfg = dataset_cfg.setdefault("frame_targets", {})
@@ -1472,8 +1279,13 @@ def main() -> int:
         changed = True
     if changed:
         print("[autopilot] updated config defaults/determinism for training/calibration")
-
     save_cfg(cfg)
+    reloaded_cfg = load_cfg()
+    reloaded_metrics = reloaded_cfg.get("training", {}).get("metrics", {}) if isinstance(reloaded_cfg, Mapping) else {}
+    decoder_after = reloaded_metrics.get("decoder") if isinstance(reloaded_metrics, Mapping) else {}
+    if decoder_after != decoder_snapshot:
+        print("[autopilot] ERROR: decoder subtree changed during write-back; aborting to protect config", file=sys.stderr)
+        raise SystemExit(1)
 
     ckpt_arg = args.ckpt_dir.expanduser()
     ckpt_hint: Optional[Path] = None
@@ -1515,6 +1327,14 @@ def main() -> int:
 
     for round_idx in range(start_round, args.max_rounds + 1):
         cfg = load_cfg()
+        autopilot_cfg = cfg.setdefault("autopilot", {})
+        best_sel_cfg = autopilot_cfg.setdefault("best_selection", {})
+        owner_value = str(best_sel_cfg.get("owner", "autopilot")).lower()
+        if owner_value not in {"autopilot", "train"}:
+            owner_value = "autopilot"
+        autopilot_is_owner = owner_value == "autopilot"
+        best_owner = owner_value
+
         train_cfg = cfg.setdefault("training", {})
         metrics_cfg = train_cfg.setdefault("metrics", {})
         agg_cfg = metrics_cfg.setdefault("aggregation", {})
@@ -1550,6 +1370,9 @@ def main() -> int:
         last_val: Optional[str] = None
         training_executed = False
         metrics: Optional[Dict[str, float]] = None
+        selection_result: Optional[SelectionResult] = None
+        selection_context: Optional[SelectionContext] = None
+        selection_lines: List[str] = []
         eval_ret = 0
         ckpt = find_ckpt(ckpt_dir)
         if ckpt is None and ckpt_hint and ckpt_hint.exists():
@@ -1565,7 +1388,7 @@ def main() -> int:
         )
         if pre_round_calib:
             assert ckpt is not None
-            metrics, eval_ret = perform_calibration(
+            selection_result, selection_context, selection_lines, eval_ret = perform_calibration(
                 ckpt=ckpt,
                 args=args,
                 results_path=results_path,
@@ -1575,10 +1398,11 @@ def main() -> int:
                 seed=seed,
                 deterministic=deterministic,
             )
-            if metrics is None:
+            if selection_result is None:
                 print("Calibration failed", file=sys.stderr)
                 return eval_ret or 1
             calibration_count += 1
+            metrics = _result_to_metrics(selection_result)
             apply_metrics_to_config(metrics)
 
         skip_training = (
@@ -1679,9 +1503,9 @@ def main() -> int:
                 print(f"No checkpoint found in {ckpt_dir}", file=sys.stderr)
                 return 1
             ckpt_used = ckpt
-            need_post_calib = metrics is None or training_executed
+            need_post_calib = selection_result is None or training_executed
             if need_post_calib:
-                metrics, eval_ret = perform_calibration(
+                selection_result, selection_context, selection_lines, eval_ret = perform_calibration(
                     ckpt=ckpt,
                     args=args,
                     results_path=results_path,
@@ -1691,10 +1515,11 @@ def main() -> int:
                     seed=seed,
                     deterministic=deterministic,
                 )
-                if metrics is None:
+                if selection_result is None:
                     print("Calibration failed", file=sys.stderr)
                     return eval_ret or 1
                 calibration_count += 1
+                metrics = _result_to_metrics(selection_result)
                 apply_metrics_to_config(metrics)
 
         if metrics is None:
@@ -1743,24 +1568,32 @@ def main() -> int:
             if not target_ckpt.exists() or not training_executed:
                 target_ckpt = ckpt_used
             best_ckpt = ckpt_dir / "tivit_best.pt"
-            try:
-                same_target = target_ckpt.resolve(strict=False) == best_ckpt.resolve(strict=False)
-            except OSError:
-                same_target = False
-
-            if not same_target:
-                tmp_ckpt = best_ckpt.with_name(best_ckpt.name + ".tmp")
-                try:
-                    tmp_ckpt.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                shutil.copy2(target_ckpt, tmp_ckpt)
-                os.replace(tmp_ckpt, best_ckpt)
             best_metric = metric_value
             patience_left = patience_budget
+            if autopilot_is_owner:
+                if selection_result is not None and selection_context is not None:
+                    record_best(
+                        source=target_ckpt,
+                        destination=best_ckpt,
+                        result=selection_result,
+                        context=selection_context,
+                        repo_root=REPO,
+                    )
+                else:
+                    tmp_ckpt = best_ckpt.with_name(best_ckpt.name + ".tmp")
+                    try:
+                        tmp_ckpt.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    shutil.copy2(target_ckpt, tmp_ckpt)
+                    os.replace(tmp_ckpt, best_ckpt)
+                    print(
+                        "[autopilot] WARNING: selection result missing; copied checkpoint without metadata",
+                        flush=True,
+                    )
             print(
                 f"[autopilot] New best {args.target_metric}={metric_value:.4f} "
-                f"(round {round_idx}); updated tivit_best.pt | ev_f1_mean={ev_mean:.4f}"
+                f"(round {round_idx}); ev_f1_mean={ev_mean:.4f} owner={best_owner}"
             )
         else:
             patience_left = patience_record

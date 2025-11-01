@@ -17,10 +17,11 @@ CLI:
     reproducibility settings.
 """
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, cast, overload, Literal
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, cast, overload, Literal
 
 
 import argparse
+import copy
 import faulthandler
 import json
 import os
@@ -48,8 +49,23 @@ from models import build_model
 from utils import load_config, configure_verbosity, get_logger
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 from utils.logging_utils import QUIET_INFO_FLAG
+from utils.selection import (
+    SweepSpec,
+    SelectionRequest,
+    SelectionResult,
+    SelectionContext,
+    calibrate_and_score,
+    record_best,
+    SelectionError,
+    decoder_snapshot_from_config,
+    tolerance_snapshot_from_config,
+    read_selection_metadata,
+)
 
 logger = get_logger(__name__)
+
+REPO = Path(__file__).resolve().parents[1]
+CONFIG_PATH = Path("configs/config.yaml")
 
 INNER_EVAL_WARMUP_WINDOWS = 120
 INNER_EVAL_CACHE_PATH = Path("runs/cache/inner_eval_stats.json")
@@ -106,6 +122,83 @@ class PosRateEMA:
             self.value = None
         else:
             self.value = torch.tensor(value, dtype=torch.float32)
+
+
+def _coerce_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    try:
+        float_val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if float_val <= 0.0:
+        return None
+    rounded = int(round(float_val))
+    if abs(float_val - rounded) > 1e-6:
+        return None
+    return rounded if rounded > 0 else None
+
+
+def _load_selection_metric(path: Path, field: str = "mean_event_f1") -> Optional[float]:
+    metadata = read_selection_metadata(path)
+    if not metadata:
+        return None
+    metrics = metadata.get("metrics", {})
+    value = metrics.get(field)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _update_selection_in_config(
+    result: SelectionResult,
+    context: SelectionContext,
+    cfg: MutableMapping[str, Any],
+    decoder_snapshot: Mapping[str, Any],
+) -> None:
+    training_cfg = cast(MutableMapping[str, Any], cfg.setdefault("training", {}))
+    metrics_cfg = cast(MutableMapping[str, Any], training_cfg.setdefault("metrics", {}))
+    decoder_before = copy.deepcopy(metrics_cfg.get("decoder"))
+
+    metrics_cfg["prob_threshold_onset"] = float(result.onset_threshold)
+    metrics_cfg["prob_threshold"] = float(result.onset_threshold)
+    metrics_cfg["prob_threshold_offset"] = float(result.offset_threshold)
+
+    agg_cfg = cast(MutableMapping[str, Any], metrics_cfg.setdefault("aggregation", {}))
+    k_cfg = cast(MutableMapping[str, Any], agg_cfg.setdefault("k", {}))
+    k_cfg["onset"] = int(result.k_onset)
+    if _coerce_positive_int(k_cfg.get("offset")) is None:
+        k_cfg["offset"] = 1
+
+    if context.temperature is not None:
+        temp_val = float(context.temperature)
+        metrics_cfg["prob_temperature_onset"] = temp_val
+        metrics_cfg["prob_temperature_offset"] = temp_val
+        metrics_cfg["prob_temperature"] = temp_val
+    if context.bias is not None:
+        bias_val = float(context.bias)
+        metrics_cfg["prob_logit_bias_onset"] = bias_val
+        metrics_cfg["prob_logit_bias_offset"] = bias_val
+        metrics_cfg["prob_logit_bias"] = bias_val
+
+    config_path = CONFIG_PATH
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
+
+    reloaded_cfg = load_config(config_path)
+    reloaded_metrics = reloaded_cfg.get("training", {}).get("metrics", {}) if isinstance(reloaded_cfg, Mapping) else {}
+    decoder_after = reloaded_metrics.get("decoder") if isinstance(reloaded_metrics, Mapping) else {}
+    snapshot_normalized = copy.deepcopy(decoder_snapshot)
+    if decoder_after != decoder_before or decoder_after != snapshot_normalized:
+        logger.error("[train] decoder subtree changed during selection write-back; aborting to protect config")
+        raise RuntimeError("Decoder subtree changed during selection write-back")
 
 
 def _tensor_from_scalar(value: float) -> torch.Tensor:
@@ -3377,10 +3470,12 @@ def main():
     )
     ap.add_argument("--smoke", action="store_true", help="Run a quick synthetic pass")
     args = ap.parse_args()
+    global CONFIG_PATH
+    CONFIG_PATH = Path(args.config).expanduser()
 
     args.verbose = configure_verbosity(args.verbose)
 
-    cfg = dict(load_config(args.config))
+    cfg = dict(load_config(CONFIG_PATH))
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)
     exp_cfg = cfg.setdefault("experiment", {})
@@ -3589,23 +3684,28 @@ def main():
     save_every = int(cfg["training"].get("save_every", 1))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    best_val = math.inf
-    best_path = ckpt_dir / "tivit_best.pt"
-    best_event_f1 = float("-inf")
-    best_event_path = ckpt_dir / "tivit_best_by_eventf1.pt"
+    best_loss_value = math.inf
+    best_loss_path = ckpt_dir / "tivit_best_by_loss.pt"
+    best_proxy_value = float("-inf")
+    best_proxy_path = ckpt_dir / "tivit_best_by_eventf1_proxy.pt"
+    best_calibrated_value = float("-inf")
+    best_calibrated_path = ckpt_dir / "tivit_best_by_eventf1_calibrated.pt"
+    primary_best_path = ckpt_dir / "tivit_best.pt"
     last_path = ckpt_dir / "tivit_last.pt"
+    last_calibration_epoch = 0
+    best_proxy_trigger_value = float("-inf")
     eval_freq = int(cfg["training"].get("eval_freq", 0))
 
     # Try to resume from checkpoint
-    resume_path = ckpt_dir / "tivit_best.pt"
+    resume_path = primary_best_path
     want_resume = bool(cfg.get("training", {}).get("resume", False))
     if resume_path.exists() and want_resume:
         print(f"[resume] Loading from {resume_path}")
         logger.info("[resume] Loading from %s", resume_path)
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model"], strict=False)
-        best_val = ckpt.get("best_val", math.inf)
-        best_event_f1 = float(ckpt.get("best_event_f1", float("-inf")))
+        best_loss_value = ckpt.get("best_val", math.inf)
+        best_proxy_value = float(ckpt.get("best_event_f1", float("-inf")))
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception as e:
@@ -3631,9 +3731,66 @@ def main():
             bias_cfg = training_cfg.get("bias_seed", {})
             prior_cfg = float(bias_cfg.get("onoff_prior_mean", 0.02))
             _set_onoff_head_bias(model, prior=prior_cfg)
-        best_val = math.inf
-        best_event_f1 = float("-inf")
+        best_loss_value = math.inf
+        best_proxy_value = float("-inf")
         start_epoch = 1
+
+    existing_calibrated_meta = read_selection_metadata(best_calibrated_path)
+    if existing_calibrated_meta:
+        cal_metrics = existing_calibrated_meta.get("metrics", {}) or {}
+        cal_mean = cal_metrics.get("mean_event_f1")
+        cal_mean_coerced = _coerce_float(cal_mean)
+        if cal_mean_coerced is not None and math.isfinite(cal_mean_coerced):
+            best_calibrated_value = cal_mean_coerced
+
+    training_cfg = cast(MutableMapping[str, Any], cfg.setdefault("training", {}))
+    metrics_cfg = cast(MutableMapping[str, Any], training_cfg.setdefault("metrics", {}))
+    best_sel_cfg = cast(MutableMapping[str, Any], training_cfg.setdefault("best_selection", {}))
+    aggregation_cfg = cast(MutableMapping[str, Any], metrics_cfg.setdefault("aggregation", {}))
+    k_cfg = cast(MutableMapping[str, Any], aggregation_cfg.setdefault("k", {}))
+    selection_mode = str(best_sel_cfg.get("mode", "calibrated_event")).lower()
+    if selection_mode not in {"loss", "proxy_event", "calibrated_event"}:
+        selection_mode = "calibrated_event"
+    selection_trigger = str(best_sel_cfg.get("trigger", "on_proxy_improvement")).lower()
+    if selection_trigger not in {"on_proxy_improvement", "every_n_epochs"}:
+        selection_trigger = "on_proxy_improvement"
+    selection_interval = _coerce_positive_int(best_sel_cfg.get("n")) or 1
+    selection_write_back = bool(best_sel_cfg.get("write_back", False))
+    selection_frames = _coerce_positive_int(best_sel_cfg.get("frames")) or 96
+    selection_max_clips = _coerce_positive_int(best_sel_cfg.get("max_clips")) or 80
+    selection_split = str(best_sel_cfg.get("split", "val"))
+    sweep_cfg = best_sel_cfg.get("sweep", {}) if isinstance(best_sel_cfg, Mapping) else {}
+    sweep_delta = float(_coerce_float(sweep_cfg.get("delta"), 0.05) or 0.05)
+    sweep_low_guard = float(_coerce_float(sweep_cfg.get("low_guard"), 0.10) or 0.10)
+    sweep_min_prob = float(_coerce_float(sweep_cfg.get("min_prob"), 0.02) or 0.02)
+    sweep_max_prob = float(_coerce_float(sweep_cfg.get("max_prob"), 0.98) or 0.98)
+    selection_temperature = _coerce_float(best_sel_cfg.get("temperature"))
+    selection_bias = _coerce_float(best_sel_cfg.get("bias"))
+    decoder_snapshot = decoder_snapshot_from_config(cfg)
+    tolerance_snapshot = tolerance_snapshot_from_config(cfg)
+    experiment_cfg_raw = cfg.get("experiment", {})
+    experiment_cfg = experiment_cfg_raw if isinstance(experiment_cfg_raw, MutableMapping) else {}
+    run_id = str(experiment_cfg.get("name", ""))
+    selection_seed = _coerce_positive_int(experiment_cfg.get("seed"))
+    selection_deterministic = bool(experiment_cfg.get("deterministic", False))
+    autopilot_cfg = cfg.get("autopilot", {}) if isinstance(cfg, Mapping) else {}
+    autopilot_best_cfg = autopilot_cfg.get("best_selection", {}) if isinstance(autopilot_cfg, Mapping) else {}
+    best_owner = str(autopilot_best_cfg.get("owner", "autopilot")).lower()
+    if best_owner not in {"autopilot", "train"}:
+        best_owner = "autopilot"
+    train_is_owner = best_owner == "train"
+    primary_owner_label = best_owner
+    onset_center = _coerce_float(metrics_cfg.get("prob_threshold_onset"))
+    if onset_center is None:
+        onset_center = _coerce_float(metrics_cfg.get("prob_threshold"), 0.4) or 0.4
+    offset_center = _coerce_float(metrics_cfg.get("prob_threshold_offset"), onset_center)
+    k_onset_cfg = _coerce_positive_int(k_cfg.get("onset")) or 1
+    if _coerce_positive_int(k_cfg.get("onset")) is None:
+        k_cfg["onset"] = k_onset_cfg
+    if "offset" not in k_cfg or not int(k_cfg.get("offset", 0)):
+        k_cfg["offset"] = 1
+    selection_log_dir = ckpt_dir / "selection_logs"
+    selection_log_dir.mkdir(parents=True, exist_ok=True)
         
     def _freeze_backbone_keep_heads(model):
         for _, p in model.named_parameters():
@@ -3667,6 +3824,7 @@ def main():
             n_trainable = sum(p.requires_grad for p in model.parameters())
             print(f"[warmup] trainable params: {n_trainable}")    
         t0 = perf_counter()
+        last_saved_for_epoch = False
         epoch_prepare = getattr(train_base_dataset, "prepare_epoch_snapshot", None)
         if callable(epoch_prepare):
             try:
@@ -3885,69 +4043,234 @@ def main():
                     print("[train:eval] skip write (lock timeout)", flush=True)
                     logger.warning("[train:eval] skip write (lock timeout)")
 
-                val_total = val_metrics.get("total")
-                event_f1_mean = val_metrics.get("event_f1_mean_proxy")
-                event_f1_on = val_metrics.get("event_f1_onset_proxy")
-                event_f1_off = val_metrics.get("event_f1_offset_proxy")
-                if val_total is not None and val_total < best_val:
-                    best_val = val_total
+                val_total_raw = val_metrics.get("total")
+                event_f1_mean_raw = val_metrics.get("event_f1_mean_proxy")
+                event_f1_on_raw = val_metrics.get("event_f1_onset_proxy")
+                event_f1_off_raw = val_metrics.get("event_f1_offset_proxy")
+
+                event_f1_mean_val = _coerce_float(event_f1_mean_raw)
+                event_f1_on_val = _coerce_float(event_f1_on_raw, 0.0) or 0.0
+                event_f1_off_val = _coerce_float(event_f1_off_raw, 0.0) or 0.0
+                onset_f1_val = _coerce_float(val_metrics.get("onset_f1_proxy"), event_f1_on_val) or event_f1_on_val
+                offset_f1_val = _coerce_float(val_metrics.get("offset_f1_proxy"), event_f1_off_val) or event_f1_off_val
+                onset_pred_rate_val = _coerce_float(val_metrics.get("onset_pred_rate"), 0.0) or 0.0
+                onset_pos_rate_val = _coerce_float(val_metrics.get("onset_pos_rate"), 0.0) or 0.0
+
+                checkpoint_best_event_f1 = max(best_proxy_value, best_calibrated_value)
+                save_checkpoint(
+                    last_path,
+                    model,
+                    optimizer,
+                    epoch,
+                    cfg,
+                    best_loss_value,
+                    checkpoint_best_event_f1,
+                    trainer_state=_snapshot_trainer_state(),
+                )
+                last_saved_for_epoch = True
+
+                timestamp_now = time.time()
+                proxy_result = SelectionResult(
+                    onset_threshold=float(onset_center),
+                    offset_threshold=float(offset_center if offset_center is not None else onset_center),
+                    k_onset=int(k_onset_cfg),
+                    onset_event_f1=float(event_f1_on_val),
+                    offset_event_f1=float(event_f1_off_val),
+                    mean_event_f1=float(event_f1_mean_val or 0.0),
+                    onset_f1=float(onset_f1_val),
+                    offset_f1=float(offset_f1_val),
+                    onset_pred_rate=float(onset_pred_rate_val),
+                    onset_pos_rate=float(onset_pos_rate_val),
+                    decoder_kind=None,
+                    decoder_settings={},
+                )
+                proxy_context = SelectionContext(
+                    split=selection_split,
+                    frames=int(selection_frames),
+                    max_clips=int(selection_max_clips),
+                    seed=selection_seed,
+                    deterministic=selection_deterministic,
+                    decoder=decoder_snapshot,
+                    tolerances=tolerance_snapshot,
+                    sweep={
+                        "delta": sweep_delta,
+                        "clamp_min": sweep_min_prob,
+                        "clamp_max": sweep_max_prob,
+                        "low_guard": sweep_low_guard,
+                        "k_onset": [k_onset_cfg],
+                    },
+                    temperature=selection_temperature,
+                    bias=selection_bias,
+                    run_id=run_id,
+                    start_time=timestamp_now,
+                    end_time=timestamp_now,
+                )
+
+                if val_total_raw is not None:
+                    val_total_float = float(val_total_raw)
+                    if val_total_float < best_loss_value:
+                        best_loss_value = val_total_float
+                        record_best(
+                            source=last_path,
+                            destination=best_loss_path,
+                            result=proxy_result,
+                            context=proxy_context,
+                            repo_root=REPO,
+                            metadata_extra={"kind": "loss", "val_total": val_total_float, "epoch": int(epoch)},
+                        )
+                        if train_is_owner and selection_mode == "loss":
+                            record_best(
+                                source=last_path,
+                                destination=primary_best_path,
+                                result=proxy_result,
+                                context=proxy_context,
+                                repo_root=REPO,
+                                metadata_extra={"kind": "primary", "val_total": val_total_float, "epoch": int(epoch)},
+                            )
+
+                if event_f1_mean_val is not None and math.isfinite(event_f1_mean_val):
+                    if event_f1_mean_val > best_proxy_value + 1e-9:
+                        best_proxy_value = event_f1_mean_val
+                        record_best(
+                            source=last_path,
+                            destination=best_proxy_path,
+                            result=proxy_result,
+                            context=proxy_context,
+                            repo_root=REPO,
+                            metadata_extra={"kind": "proxy_event", "epoch": int(epoch)},
+                        )
+                        if train_is_owner and selection_mode == "proxy_event":
+                            record_best(
+                                source=last_path,
+                                destination=primary_best_path,
+                                result=proxy_result,
+                                context=proxy_context,
+                                repo_root=REPO,
+                                metadata_extra={"kind": "primary", "epoch": int(epoch)},
+                            )
+
+                calibrated_ran = False
+                if selection_mode == "calibrated_event" and event_f1_mean_val is not None and math.isfinite(event_f1_mean_val):
+                    spacing_ready = (epoch - last_calibration_epoch) >= selection_interval
+                    should_calibrate = False
+                    if selection_trigger == "every_n_epochs":
+                        should_calibrate = spacing_ready
+                    elif selection_trigger == "on_proxy_improvement":
+                        improved_proxy = event_f1_mean_val > best_proxy_trigger_value + 1e-9
+                        should_calibrate = spacing_ready and improved_proxy
+                        if improved_proxy:
+                            best_proxy_trigger_value = event_f1_mean_val
+                    if should_calibrate:
+                        sweep = SweepSpec(
+                            onset_center=float(onset_center),
+                            offset_center=float(offset_center if offset_center is not None else onset_center),
+                            delta=sweep_delta,
+                            clamp_min=sweep_min_prob,
+                            clamp_max=sweep_max_prob,
+                            low_guard=sweep_low_guard,
+                        )
+                        sweep.k_onset_candidates = (int(k_onset_cfg),)
+                        selection_request = SelectionRequest(
+                            ckpt=last_path,
+                            split=selection_split,
+                            frames=int(selection_frames),
+                            max_clips=int(selection_max_clips),
+                            sweep=sweep,
+                            decoder=decoder_snapshot,
+                            tolerances=tolerance_snapshot,
+                            temperature=selection_temperature,
+                            bias=selection_bias,
+                            seed=selection_seed,
+                            deterministic=selection_deterministic,
+                            log_path=selection_log_dir / f"epoch_{epoch:03d}.txt",
+                            run_id=run_id,
+                        )
+                        try:
+                            calibrated_result, calibrated_context, _ = calibrate_and_score(selection_request)
+                        except SelectionError as exc:
+                            logger.warning("[train] calibrated selection failed: %s", exc)
+                        else:
+                            calibrated_ran = True
+                            last_calibration_epoch = epoch
+                            if calibrated_result.mean_event_f1 > best_calibrated_value + 1e-9:
+                                best_calibrated_value = calibrated_result.mean_event_f1
+                                record_best(
+                                    source=last_path,
+                                    destination=best_calibrated_path,
+                                    result=calibrated_result,
+                                    context=calibrated_context,
+                                    repo_root=REPO,
+                                    metadata_extra={"kind": "calibrated_event", "epoch": int(epoch)},
+                                )
+                                if train_is_owner:
+                                    record_best(
+                                        source=last_path,
+                                        destination=primary_best_path,
+                                        result=calibrated_result,
+                                        context=calibrated_context,
+                                        repo_root=REPO,
+                                        metadata_extra={"kind": "primary", "epoch": int(epoch)},
+                                    )
+                            if selection_write_back:
+                                _update_selection_in_config(calibrated_result, calibrated_context, cfg, decoder_snapshot)
+                    elif selection_trigger == "on_proxy_improvement" and event_f1_mean_val is not None:
+                        best_proxy_trigger_value = max(best_proxy_trigger_value, event_f1_mean_val)
+                elif selection_mode != "calibrated_event" and event_f1_mean_val is not None:
+                    best_proxy_trigger_value = max(best_proxy_trigger_value, event_f1_mean_val)
+
+                updated_best_event_f1 = max(best_proxy_value, best_calibrated_value)
+                if calibrated_ran and updated_best_event_f1 > checkpoint_best_event_f1 + 1e-12:
+                    checkpoint_best_event_f1 = updated_best_event_f1
                     save_checkpoint(
-                        best_path,
+                        last_path,
                         model,
                         optimizer,
                         epoch,
                         cfg,
-                        best_val,
-                        best_event_f1,
+                        best_loss_value,
+                        checkpoint_best_event_f1,
                         trainer_state=_snapshot_trainer_state(),
                     )
-                    print(f"Saved BEST to: {best_path} (val_total={val_total:.3f})")
-                    logger.info("Saved BEST to: %s (val_total=%.3f)", best_path, val_total)
-                if event_f1_mean is not None and math.isfinite(event_f1_mean):
-                    if event_f1_mean > best_event_f1 + 1e-9:
-                        best_event_f1 = event_f1_mean
-                        event_on_display = float(event_f1_on) if event_f1_on is not None else float("nan")
-                        event_off_display = float(event_f1_off) if event_f1_off is not None else float("nan")
-                        save_checkpoint(
-                            best_event_path,
-                            model,
-                            optimizer,
-                            epoch,
-                            cfg,
-                            best_val,
-                            best_event_f1,
-                            trainer_state=_snapshot_trainer_state(),
-                        )
-                        print(
-                            f"Saved BEST-EVENT to: {best_event_path} "
-                            f"(event_f1_mean_proxy={event_f1_mean:.3f}, onset={event_on_display:.3f}, offset={event_off_display:.3f})"
-                        )
-                        logger.info(
-                            "Saved BEST-EVENT to: %s (event_f1_mean_proxy=%.3f onset=%.3f offset=%.3f)",
-                            best_event_path,
-                            event_f1_mean,
-                            event_on_display,
-                            event_off_display,
-                        )
-                best_loss_label = f"{best_val:.3f}" if best_val is not None and math.isfinite(best_val) else "inf"
-                if best_event_f1 > float("-inf") and math.isfinite(best_event_f1):
-                    best_event_label = f"{best_event_f1:.3f}"
-                    best_event_path_label = best_event_path.name
-                else:
-                    best_event_label = "n/a"
-                    best_event_path_label = "n/a"
+
+                loss_label = f"{best_loss_value:.3f}" if math.isfinite(best_loss_value) else "inf"
+                proxy_label = f"{best_proxy_value:.3f}" if math.isfinite(best_proxy_value) else "n/a"
+                calibrated_label = f"{best_calibrated_value:.3f}" if math.isfinite(best_calibrated_value) else "n/a"
                 summary_line = (
-                    f"loss={best_loss_label} ({best_path.name}) | "
-                    f"event_f1={best_event_label} ({best_event_path_label})"
+                    f"loss={loss_label} ({best_loss_path.name}) | "
+                    f"proxy_event={proxy_label} ({best_proxy_path.name}) | "
+                    f"calibrated_event={calibrated_label} ({best_calibrated_path.name}) | "
+                    f"owner={primary_owner_label}"
                 )
                 print(f"[best-checkpoints] {summary_line}")
                 logger.info(
-                    "[best-checkpoints] loss=%s path=%s | event_f1=%s path=%s",
-                    best_loss_label,
-                    best_path,
-                    best_event_label,
-                    best_event_path_label,
+                    "[best-checkpoints] loss=%s path=%s | proxy=%s path=%s | calibrated=%s path=%s owner=%s",
+                    loss_label,
+                    best_loss_path,
+                    proxy_label,
+                    best_proxy_path,
+                    calibrated_label,
+                    best_calibrated_path,
+                    primary_owner_label,
                 )
+
+                metrics = dict(val_metrics)
+                metrics["onset_thr"] = float(proxy_result.onset_threshold)
+                metrics["offset_thr"] = float(proxy_result.offset_threshold)
+                metrics["ev_f1_mean"] = float(proxy_result.mean_event_f1)
+                metrics["onset_event_f1"] = float(proxy_result.onset_event_f1)
+                metrics["offset_event_f1"] = float(proxy_result.offset_event_f1)
+                metrics["onset_f1"] = float(onset_f1_val)
+                metrics["offset_f1"] = float(offset_f1_val)
+                metrics["onset_pred_rate"] = float(onset_pred_rate_val)
+                metrics["onset_pos_rate"] = float(onset_pos_rate_val)
+                metrics["k_onset"] = int(proxy_result.k_onset)
+                for head_name, head_values in (decoder_snapshot or {}).items():
+                    if not isinstance(head_values, Mapping):
+                        continue
+                    for key_name, key_value in head_values.items():
+                        metric_key = f"decoder_{head_name}_{key_name}"
+                        if isinstance(key_value, (int, float)) and math.isfinite(float(key_value)):
+                            metrics[metric_key] = float(key_value)
 
         epoch_finish = getattr(train_base_dataset, "finish_epoch_snapshot", None)
         if callable(epoch_finish):
@@ -3957,16 +4280,18 @@ def main():
                 logger.warning("[train] failed to finalize epoch snapshot: %s", exc)
 
         # --- always save LAST ---
-        save_checkpoint(
-            last_path,
-            model,
-            optimizer,
-            epoch,
-            cfg,
-            best_val,
-            best_event_f1,
-            trainer_state=_snapshot_trainer_state(),
-        )
+        state_best_event_f1 = max(best_proxy_value, best_calibrated_value)
+        if not last_saved_for_epoch:
+            save_checkpoint(
+                last_path,
+                model,
+                optimizer,
+                epoch,
+                cfg,
+                best_loss_value,
+                state_best_event_f1,
+                trainer_state=_snapshot_trainer_state(),
+            )
         if (epoch % save_every) == 0:
             # optional per-epoch named snapshot
             save_checkpoint(
@@ -3975,8 +4300,8 @@ def main():
                 optimizer,
                 epoch,
                 cfg,
-                best_val,
-                best_event_f1,
+                best_loss_value,
+                state_best_event_f1,
                 trainer_state=_snapshot_trainer_state(),
             )
 
