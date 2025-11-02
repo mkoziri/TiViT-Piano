@@ -333,6 +333,10 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         str(request.ckpt),
     ]
     cmd.extend(_build_dataset_cli(request.split, request.frames, request.max_clips))
+    need_grid = False
+    if onset_candidates and offset_candidates and len(onset_candidates) != len(offset_candidates):
+        need_grid = True
+
     if onset_candidates:
         cmd.extend(
             [
@@ -353,8 +357,12 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         cmd.extend(["--bias", str(request.bias)])
     if len(tuple(sweep.k_onset_candidates)) > 1:
         cmd.append("--sweep_k_onset")
-    if request.eval_extras:
-        cmd.extend(request.eval_extras)
+    extras_list = list(request.eval_extras or [])
+    has_grid_flag = any(token == "--grid_prob_thresholds" for token in extras_list)
+    if need_grid and not has_grid_flag:
+        cmd.append("--grid_prob_thresholds")
+    if extras_list:
+        cmd.extend(extras_list)
     if request.seed is not None:
         cmd.extend(["--seed", str(request.seed)])
     if request.deterministic is not None:
@@ -393,7 +401,11 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
     lines = stdout.splitlines()
     parsed = _parse_eval_table(lines)
     if parsed is None:
-        raise SelectionError("Could not parse evaluation table from eval_thresholds output")
+        tail = "\n".join(lines[-10:]) if lines else "<no stdout captured>"
+        raise SelectionError(
+            "Could not parse evaluation table from eval_thresholds output. "
+            f"Last lines:\n{tail}"
+        )
 
     result = SelectionResult(
         onset_threshold=float(parsed["onset_thr"]),
