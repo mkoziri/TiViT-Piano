@@ -27,6 +27,7 @@ CLI:
 
 import argparse, shutil, sys, json
 from pathlib import Path
+from datetime import datetime
 
 # --------- Helpers ---------
 def rm_path(p: Path, dry: bool):
@@ -43,6 +44,46 @@ def rm_path(p: Path, dry: bool):
         except IsADirectoryError:
             shutil.rmtree(p, ignore_errors=True)
     return True
+
+def should_backup_path(group: str, p: Path) -> bool:
+    """Decide if the current path requires a backup before deletion."""
+    name = p.name.lower()
+    if "reg_refined" in name:
+        return False
+    if group == "logs":
+        return True
+    if group == "ckpts":
+        return True
+    if name == "av_lags.json":
+        return True
+    if p.suffix.lower() == ".json" and "calib" in name:
+        return True
+    return False
+
+def init_backup_root(project_root: Path, dry: bool) -> Path:
+    """Create (or reference, when dry-run) a timestamped backup directory."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_root = project_root / "backups" / "clean_tivit" / ts
+    if not dry:
+        backup_root.mkdir(parents=True, exist_ok=True)
+    return backup_root
+
+def backup_path(src: Path, project_root: Path, backup_root: Path, dry: bool):
+    """Copy the path into the backup directory, preserving relative structure."""
+    try:
+        rel = src.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        rel = Path(src.name)
+    dest = backup_root / rel
+    if dry:
+        print(f"[DRY][BACKUP] {src} -> {dest}")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dest)
+    print(f"[BACKUP] {src} -> {dest}")
 
 def load_cfg_paths(root: Path):
     """Read configs/config.yaml to discover logging dirs if present."""
@@ -95,8 +136,29 @@ def list_targets(root: Path, preset: str, keep_best: bool, from_cfg=True):
 
     logs_dir, ckpt_dir = load_cfg_paths(root) if from_cfg else (root / "logs", root / "checkpoints")
 
+    av_lag_file = root / "av_lags.json"
+    calibration_jsons = []
+    candidate_dirs = [root]
+    reports_dir = root / "reports"
+    if reports_dir.exists():
+        candidate_dirs.append(reports_dir)
+    seen = set()
+    for directory in candidate_dirs:
+        if not directory.exists():
+            continue
+        for candidate in directory.glob("*calib*.json"):
+            name_lower = candidate.name.lower()
+            if "reg_refined" in name_lower:
+                continue
+            real_path = candidate.resolve()
+            if real_path in seen:
+                continue
+            seen.add(real_path)
+            calibration_jsons.append(candidate)
+    calibration_jsons.sort()
+
     targets = {
-        "logs":   [logs_dir],
+        "logs":   [logs_dir, av_lag_file, *calibration_jsons],
         "ckpts":  [ckpt_dir],
         "caches": [data_cache, data_processed],
         "tmp":    [tmp_dir],
@@ -134,6 +196,7 @@ def list_targets(root: Path, preset: str, keep_best: bool, from_cfg=True):
 def delete_groups(root: Path, targets: dict, groups: set, dry: bool):
     removed = []
     dataset_root = root / "data" / "omaps"  # protect any path inside data/omaps
+    backup_root = None
     for g in groups:
         for p in targets.get(g, []):
             p = Path(p)
@@ -141,6 +204,10 @@ def delete_groups(root: Path, targets: dict, groups: set, dry: bool):
             if is_within(p, dataset_root):
                 print(f"[SKIP] {p} (inside dataset)")
                 continue
+            if should_backup_path(g, p) and p.exists():
+                if backup_root is None:
+                    backup_root = init_backup_root(root, dry)
+                backup_path(p, root, backup_root, dry)
             if rm_path(p, dry):
                 removed.append(str(p))
     return removed
@@ -203,4 +270,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

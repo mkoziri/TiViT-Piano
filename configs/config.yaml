@@ -131,7 +131,7 @@ training:
   metrics:
     prob_threshold: 0.20
     prob_threshold_onset: 0.20
-    prob_threshold_offset: 0.06
+    prob_threshold_offset: 0.20
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
     prob_temperature_offset: 1.25
@@ -164,9 +164,9 @@ training:
       top_k: 3
       tau_sum: 0.0
   best_selection:
-    mode: calibrated_event
-    trigger: on_proxy_improvement
-    n: 1
+    mode: loss
+    trigger: every_n_epochs
+    n: 999
     write_back: false
     frames: 96
     max_clips: 80
