@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -9,8 +11,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-
-import copy
 
 
 FAST_SWEEP_CLIP_MIN = 0.02
@@ -22,6 +22,8 @@ DEFAULT_DELTA = 0.05
 DEFAULT_LOW_GUARD = 0.10
 
 EVAL_SCRIPT = Path("scripts") / "calib" / "eval_thresholds.py"
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+FLOAT_PREFIX_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 
 
 class SelectionError(RuntimeError):
@@ -202,21 +204,22 @@ def _alias_decoder(payload: Dict[str, Any]) -> None:
 
 
 def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
+    cleaned_lines = [ANSI_ESCAPE_RE.sub("", line) for line in lines]
     decoder_settings: Dict[str, Any] = {}
-    for line in lines:
+    for line in cleaned_lines:
         decoded = _format_decoder_settings_line(line)
         if decoded:
             decoder_settings = decoded
             break
 
     header_idx = None
-    for i, line in enumerate(lines):
+    for i, line in enumerate(cleaned_lines):
         if line.strip().startswith("onset_thr"):
             header_idx = i
             break
     if header_idx is None:
         return None
-    header = lines[header_idx].strip().split("\t")
+    header = cleaned_lines[header_idx].strip().split("\t")
     col_idx = {name: idx for idx, name in enumerate(header)}
     required = {
         "onset_thr",
@@ -231,27 +234,59 @@ def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
     if not required.issubset(col_idx):
         return None
     best: Optional[Dict[str, Any]] = None
-    for raw_line in lines[header_idx + 1 :]:
+    for raw_line in cleaned_lines[header_idx + 1 :]:
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("["):
+        if not stripped or stripped.startswith("[") or stripped.startswith("#"):
             continue
-        parts = stripped.split("\t")
+        parts = [segment.strip() for segment in raw_line.split("\t")]
+        if len(parts) < len(header):
+            continue
+        def _scrub(cell: str) -> str:
+            cell = cell.strip()
+            if not cell:
+                return cell
+            # Drop any inline annotations (e.g. "0.42 [DEBUG ...]")
+            for marker in (" [", "\t[", " {", " (", " <"):
+                if marker in cell:
+                    cell = cell.split(marker, 1)[0]
+            if "[" in cell:
+                cell = cell.split("[", 1)[0]
+            if "#" in cell:
+                cell = cell.split("#", 1)[0]
+            return cell.strip()
+
+        def _parse_float(col: str) -> float:
+            idx = col_idx.get(col)
+            if idx is None or idx >= len(parts):
+                raise ValueError
+            cell = _scrub(parts[idx])
+            if not cell:
+                raise ValueError
+            try:
+                return float(cell)
+            except ValueError:
+                match = FLOAT_PREFIX_RE.match(cell)
+                if match:
+                    return float(match.group(0))
+                raise
+
         try:
-            onset_thr = float(parts[col_idx["onset_thr"]])
-            offset_thr = float(parts[col_idx["offset_thr"]])
-            onset_f1 = float(parts[col_idx["onset_f1"]])
-            offset_f1 = float(parts[col_idx["offset_f1"]])
-            onset_pr = float(parts[col_idx["onset_pred_rate"]])
-            onset_pos = float(parts[col_idx["onset_pos_rate"]])
-            onset_ev = float(parts[col_idx["onset_event_f1"]])
-            offset_ev = float(parts[col_idx["offset_event_f1"]])
-        except (KeyError, ValueError, IndexError):
+            onset_thr = _parse_float("onset_thr")
+            offset_thr = _parse_float("offset_thr")
+            onset_f1 = _parse_float("onset_f1")
+            offset_f1 = _parse_float("offset_f1")
+            onset_pr = _parse_float("onset_pred_rate")
+            onset_pos = _parse_float("onset_pos_rate")
+            onset_ev = _parse_float("onset_event_f1")
+            offset_ev = _parse_float("offset_event_f1")
+        except ValueError:
             continue
         k_onset = 1
         if "k_onset" in col_idx:
             try:
-                k_onset = int(float(parts[col_idx["k_onset"]]))
-            except (ValueError, IndexError):
+                k_val = _parse_float("k_onset")
+                k_onset = int(round(k_val))
+            except ValueError:
                 k_onset = 1
         ev_mean = 0.5 * (onset_ev + offset_ev)
         row = {
