@@ -413,27 +413,50 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         log_path.parent.mkdir(parents=True, exist_ok=True)
         stdout_target = log_path
 
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    log_handle = None
     if stdout_target is not None:
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        with stdout_target.open("w", encoding="utf-8") as fh:
-            fh.write(f"# selection run at {timestamp}\n")
-            fh.write(stdout)
-            if stderr:
-                fh.write("\n# stderr\n")
-                fh.write(stderr)
-    if proc.returncode != 0:
-        raise SelectionError(
-            f"Evaluation script failed with code {proc.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        log_handle = stdout_target.open("w", encoding="utf-8")
+        log_handle.write(f"# selection run at {timestamp}\n")
+        log_handle.flush()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-    lines = stdout.splitlines()
+    except OSError as exc:
+        if log_handle is not None:
+            log_handle.close()
+        raise SelectionError(f"Failed to launch evaluation: {exc}") from exc
+
+    assert proc.stdout is not None
+    lines: List[str] = []
+    try:
+        for raw_line in proc.stdout:
+            if log_handle is not None:
+                log_handle.write(raw_line)
+                log_handle.flush()
+            # Mirror child output to our stdout for real-time visibility.
+            sys.stdout.write(raw_line)
+            sys.stdout.flush()
+            lines.append(raw_line.rstrip("\n"))
+    finally:
+        proc.stdout.close()
+        retcode = proc.wait()
+        if log_handle is not None:
+            log_handle.close()
+
+    if retcode != 0:
+        tail = "\n".join(lines[-10:]) if lines else "<no stdout captured>"
+        raise SelectionError(
+            "Evaluation script failed with code {code}\nLast output lines:\n{tail}".format(
+                code=retcode, tail=tail
+            )
+        )
     parsed = _parse_eval_table(lines)
     if parsed is None:
         tail = "\n".join(lines[-10:]) if lines else "<no stdout captured>"
