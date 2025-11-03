@@ -6,8 +6,10 @@ Purpose:
     event-level F1 is achieved or patience expires. The script keeps
     ``configs/config.yaml`` synchronized with calibration results, mirrors
     helper stdout/stderr to logs, and records each round in a TSV ledger. It
-    can resume from an existing experiment, jump straight to calibration, or
-    fall back to coarse sweeps when thorough passes fail.
+    can resume from an existing experiment, jump straight to calibration, or run
+    a two-stage onset decoder/threshold sweep when requested to stabilize
+    event-F1 improvements. When thorough passes fail, it falls back to coarse
+    sweeps.
 
 Key Functions/Classes:
     - run_command: Execute helper scripts while teeing stdout/stderr to disk.
@@ -65,6 +67,18 @@ CLI Arguments:
         Logging verbosity for the autopilot and child processes.
     --eval_extras STR (default: "")
         Additional CLI tokens appended to ``eval_thresholds.py`` during fast evaluation.
+    --fast_strategy {classic,two_stage} (default: two_stage)
+        Select the fast calibration routine (legacy sweep or two-stage onset optimizer).
+    --onset_open_grid FLOAT [FLOAT ...]
+        Candidate onset decoder open gates explored during Stage-A (default: 0.22–0.28).
+    --onset_min_on_grid INT [INT ...]
+        Candidate onset decoder ``min_on`` values for Stage-A (default: 2, 3).
+    --onset_hold_mode {fixed_delta,config}
+        Hold-gate policy for Stage-A (default: fixed_delta → open − 0.06).
+    --onset_thr_delta FLOAT (default: 0.05)
+        Radius around the anchor used for the Stage-B micro-sweep.
+    --onset_thr_steps INT (default: 5)
+        Number of samples evaluated in the Stage-B micro-sweep.
 
 Usage:
     python scripts/train_autopilot.py --mode fresh --first_step train --burst_epochs 3
@@ -129,6 +143,7 @@ from utils.selection import (
     SelectionError,
     decoder_snapshot_from_config,
     tolerance_snapshot_from_config,
+    parse_eval_rows,
 )
 
 LOGGER = logging.getLogger("autopilot")
@@ -437,6 +452,40 @@ FAST_SWEEP_CLIP_MAX = 0.98
 FAST_RESULT_MIN = 0.02
 FAST_RESULT_MAX = 0.98
 
+DEFAULT_FAST_STRATEGY = "two_stage"
+DEFAULT_ONSET_OPEN_GRID = [0.22, 0.24, 0.26, 0.28]
+DEFAULT_ONSET_MIN_ON_GRID = [2, 3]
+DEFAULT_ONSET_HOLD_MODE = "fixed_delta"
+DEFAULT_ONSET_HOLD_DELTA = 0.06
+DEFAULT_ONSET_HOLD_MIN = 0.04
+DEFAULT_ONSET_MERGE_GAP = 1
+DEFAULT_ONSET_THR_ANCHOR = 0.20
+DEFAULT_ONSET_THR_DELTA = 0.05
+DEFAULT_ONSET_THR_STEPS = 5
+ONSET_OPEN_MIN = 0.16
+ONSET_OPEN_MAX = 0.36
+ONSET_THR_MIN = 0.10
+ONSET_THR_MAX = 0.40
+ONSET_PRED_RATE_MIN_FACTOR = 0.5
+ONSET_PRED_RATE_MAX_FACTOR = 3.0
+ONSET_TIE_TOL = 1e-4
+
+
+def _normalize_probability_list(values: Iterable[float], *, lo: float, hi: float) -> List[float]:
+    seen: Dict[int, float] = {}
+    for raw in values or []:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        val = max(lo, min(hi, val))
+        key = int(round(val * 1000))
+        if key not in seen:
+            seen[key] = val
+    return sorted(seen.values())
+
 
 def _result_to_metrics(result: SelectionResult) -> Dict[str, float]:
     metrics = {
@@ -653,6 +702,31 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
                 metrics_cfg["prob_logit_bias_offset"] = offset_bias
             elif offset_oob:
                 print("[autopilot] WARNING: offset Platt params outside safe range; skipping write")
+    onset_open_new = _coerce_optional_float(metrics.get("decoder_onset_open"))
+    onset_hold_new = _coerce_optional_float(metrics.get("decoder_onset_hold"))
+    onset_min_on_new = _coerce_positive_int(metrics.get("decoder_onset_min_on"))
+    onset_merge_gap_new = _coerce_positive_int(metrics.get("decoder_onset_merge_gap"))
+    if onset_open_new is not None or onset_hold_new is not None or onset_min_on_new is not None or onset_merge_gap_new is not None:
+        if isinstance(decoder_snapshot, Mapping):
+            decoder_dict: Dict[str, Any] = copy.deepcopy(dict(decoder_snapshot))
+        else:
+            decoder_dict = {}
+        onset_decoder_cfg = decoder_dict.setdefault("onset", {})
+        if onset_open_new is not None:
+            onset_decoder_cfg["open"] = max(0.0, min(1.0, float(onset_open_new)))
+        if onset_hold_new is not None:
+            hold_val = max(0.0, float(onset_hold_new))
+            open_cap = onset_decoder_cfg.get("open")
+            if isinstance(open_cap, (int, float)):
+                hold_val = min(hold_val, float(open_cap))
+            onset_decoder_cfg["hold"] = hold_val
+        if onset_min_on_new is not None:
+            onset_decoder_cfg["min_on"] = int(max(0, onset_min_on_new))
+        if onset_merge_gap_new is not None:
+            onset_decoder_cfg["merge_gap"] = int(max(0, onset_merge_gap_new))
+        decoder_dict.setdefault("offset", decoder_dict.get("offset", {}))
+        decoder_snapshot = decoder_dict
+
     onset_final = _coerce_optional_float(metrics_cfg.get("prob_threshold_onset"))
     offset_final = _coerce_optional_float(metrics_cfg.get("prob_threshold_offset"))
     k_onset_final = _coerce_positive_int(k_cfg.get("onset"))
@@ -867,7 +941,368 @@ def perform_calibration(
             run_id=exp_name,
         )
 
+    def _run_two_stage(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
+        onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
+        offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
+        onset_prob, onset_logit, onset_src = _resolve_anchor(
+            onset_entry,
+            previous=prev_onset_best,
+            fallback=args.onset_thr_anchor,
+        )
+        offset_prob, offset_logit, offset_src = _resolve_anchor(
+            offset_entry,
+            previous=prev_offset_best,
+            fallback=0.3,
+        )
+        def _clamp_onset_threshold(value: float) -> float:
+            return max(ONSET_THR_MIN, min(ONSET_THR_MAX, float(value)))
+
+        onset_prob = _clamp_onset_threshold(onset_prob)
+        offset_prob = _clamp_fast_result(offset_prob)
+        anchor_source = onset_src if onset_src == offset_src else f"onset:{onset_src},offset:{offset_src}"
+
+        LOGGER.info(
+            "[autopilot:two-stage] anchors onset=%.4f offset=%.4f (source=%s)",
+            onset_prob,
+            offset_prob,
+            anchor_source,
+            extra=QUIET_EXTRA,
+        )
+
+        prev_onset_decoder = {}
+        if isinstance(decoder_snapshot, Mapping):
+            prev_onset_decoder = decoder_snapshot.get("onset", {}) or {}
+        prev_open_cfg = _coerce_optional_float(prev_onset_decoder.get("open"))
+        prev_hold_cfg = _coerce_optional_float(prev_onset_decoder.get("hold"))
+        prev_min_on_cfg = _coerce_positive_int(prev_onset_decoder.get("min_on")) or 2
+
+        merge_gap = int(args.onset_merge_gap)
+        hold_mode = (args.onset_hold_mode or DEFAULT_ONSET_HOLD_MODE).lower()
+        hold_delta = float(args.onset_hold_delta)
+        hold_min = float(args.onset_hold_min)
+
+        def _compute_hold(open_val: float) -> float:
+            if hold_mode == "config" and prev_hold_cfg is not None:
+                return max(0.0, min(open_val, prev_hold_cfg))
+            hold = open_val - hold_delta
+            if hold_min > 0.0:
+                hold = max(hold, hold_min)
+            return max(0.0, min(open_val, hold))
+
+        def _is_prev_candidate(open_val: float, min_on_val: int) -> bool:
+            if prev_open_cfg is None:
+                return False
+            if abs(open_val - prev_open_cfg) > 1e-4:
+                return False
+            return min_on_val == prev_min_on_cfg
+
+        def _stage_log_prefix() -> str:
+            base = Path(log_name).stem
+            return base or "eval_fast"
+
+        stage_a_records: List[Dict[str, Any]] = []
+        total_candidates = max(1, len(args.onset_open_grid) * len(args.onset_min_on_grid))
+        frames = args.calib_frames if args.calib_frames is not None else 96
+        max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
+        print(
+            "[Stage-A] onset decoder sweep: anchor_thr={:.4f} offset_anchor={:.4f} "
+            "candidates={} frames={} clips={}".format(
+                onset_prob,
+                offset_prob,
+                total_candidates,
+                frames,
+                max_clips,
+            )
+        )
+        candidate_idx = 0
+        for open_val in args.onset_open_grid:
+            open_clamped = max(ONSET_OPEN_MIN, min(ONSET_OPEN_MAX, float(open_val)))
+            hold_val = _compute_hold(open_clamped)
+            hold_val = max(0.0, min(open_clamped, hold_val))
+            for min_on_val in args.onset_min_on_grid:
+                candidate_idx += 1
+                extras = [
+                    "--decoder-onset-open",
+                    f"{open_clamped:.4f}",
+                    "--decoder-onset-hold",
+                    f"{hold_val:.4f}",
+                    "--decoder-onset-min-on",
+                    str(int(min_on_val)),
+                    "--decoder-onset-merge-gap",
+                    str(merge_gap),
+                ]
+                log_file = f"{_stage_log_prefix()}_stageA_{candidate_idx:02d}.txt"
+                try:
+                    request = _build_request(
+                        onset_prob,
+                        offset_prob,
+                        log_name=log_file,
+                        sweep_override=([onset_prob], [offset_prob]),
+                        extras=extras,
+                        low_guard=ONSET_THR_MIN,
+                    )
+                    stage_result, stage_context, stage_lines = calibrate_and_score(request)
+                    rows = parse_eval_rows(stage_lines)
+                except SelectionError as exc:
+                    LOGGER.warning(
+                        "Stage-A candidate failed (open=%.3f min_on=%d): %s",
+                        open_clamped,
+                        min_on_val,
+                        exc,
+                        extra=QUIET_EXTRA,
+                    )
+                    continue
+                if not rows:
+                    LOGGER.warning(
+                        "Stage-A candidate open=%.3f min_on=%d produced no rows",
+                        open_clamped,
+                        min_on_val,
+                        extra=QUIET_EXTRA,
+                    )
+                    continue
+                row = rows[0]
+                onset_pred = float(row["onset_pred_rate"])
+                onset_pos = float(row["onset_pos_rate"])
+                guard_lo = ONSET_PRED_RATE_MIN_FACTOR * onset_pos
+                guard_hi = ONSET_PRED_RATE_MAX_FACTOR * onset_pos
+                valid = guard_lo <= onset_pred <= guard_hi
+                note = ""
+                if not valid:
+                    note = (
+                        f"pred_rate={onset_pred:.4f} outside "
+                        f"[{guard_lo:.4f},{guard_hi:.4f}]"
+                    )
+                status = "[OK]"
+                if not valid:
+                    status = f"[REJECT:{note}]"
+                print(
+                    "[Stage-A] {:2d}/{:2d} open={:.3f} hold={:.3f} min_on={} "
+                    "onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} {}".format(
+                        candidate_idx,
+                        total_candidates,
+                        open_clamped,
+                        hold_val,
+                        int(min_on_val),
+                        float(row["onset_event_f1"]),
+                        onset_pred,
+                        onset_pos,
+                        status,
+                    )
+                )
+                stage_a_records.append(
+                    {
+                        "open": open_clamped,
+                        "hold": hold_val,
+                        "min_on": int(min_on_val),
+                        "merge_gap": merge_gap,
+                        "row": row,
+                        "valid": valid,
+                        "note": note,
+                        "extras": extras,
+                        "context": stage_context,
+                    }
+                )
+        if not stage_a_records:
+            raise SelectionError("Stage-A search produced no candidates")
+
+        valid_stage_a = [rec for rec in stage_a_records if rec["valid"]]
+        stage_a_pool = valid_stage_a or stage_a_records
+        stage_a_winner = stage_a_pool[0]
+        for rec in stage_a_pool[1:]:
+            cur_f1 = float(rec["row"]["onset_event_f1"])
+            best_f1 = float(stage_a_winner["row"]["onset_event_f1"])
+            if cur_f1 > best_f1 + ONSET_TIE_TOL:
+                stage_a_winner = rec
+                continue
+            if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
+                rec_prev = _is_prev_candidate(rec["open"], rec["min_on"])
+                best_prev = _is_prev_candidate(stage_a_winner["open"], stage_a_winner["min_on"])
+                if rec_prev and not best_prev:
+                    stage_a_winner = rec
+                    continue
+                if rec_prev == best_prev:
+                    if rec["open"] > stage_a_winner["open"] + 1e-6:
+                        stage_a_winner = rec
+                        continue
+                    if (
+                        abs(rec["open"] - stage_a_winner["open"]) <= 1e-6
+                        and rec["min_on"] < stage_a_winner["min_on"]
+                    ):
+                        stage_a_winner = rec
+                        continue
+        print(
+            "[Stage-A] winner open={:.3f} hold={:.3f} min_on={} "
+            "onset_event_f1={:.4f}".format(
+                stage_a_winner["open"],
+                stage_a_winner["hold"],
+                stage_a_winner["min_on"],
+                float(stage_a_winner["row"]["onset_event_f1"]),
+            )
+        )
+
+        def _build_threshold_list(anchor: float, delta: float, steps: int) -> List[float]:
+            steps = max(steps, 1)
+            if steps == 1:
+                return [anchor]
+            values: List[float] = []
+            for idx in range(steps):
+                fraction = idx / (steps - 1)
+                val = anchor - delta + 2 * delta * fraction
+                values.append(val)
+            values.append(anchor)
+            return _normalize_probability_list(values, lo=ONSET_THR_MIN, hi=ONSET_THR_MAX)
+
+        thresholds = _build_threshold_list(onset_prob, float(args.onset_thr_delta), int(args.onset_thr_steps))
+        if not thresholds:
+            thresholds = [onset_prob]
+        print(
+            "[Stage-B] threshold micro-sweep anchor={:.4f} delta={:.3f} steps={} "
+            "grid={}".format(
+                onset_prob,
+                float(args.onset_thr_delta),
+                int(args.onset_thr_steps),
+                ",".join(f"{v:.4f}" for v in thresholds),
+            )
+        )
+
+        stage_b_log = f"{_stage_log_prefix()}_stageB.txt"
+        try:
+            request = _build_request(
+                onset_prob,
+                offset_prob,
+                log_name=stage_b_log,
+                sweep_override=(thresholds, [offset_prob]),
+                extras=stage_a_winner["extras"],
+                low_guard=ONSET_THR_MIN,
+            )
+            _, stage_b_context, stage_b_lines = calibrate_and_score(request)
+            rows_b = parse_eval_rows(stage_b_lines)
+        except SelectionError as exc:
+            raise SelectionError(f"Stage-B evaluation failed: {exc}") from exc
+        if not rows_b:
+            raise SelectionError("Stage-B evaluation returned no rows")
+
+        stage_b_candidates: List[Dict[str, Any]] = []
+        for row in rows_b:
+            thr_val = float(row["onset_thr"])
+            pred_rate = float(row["onset_pred_rate"])
+            pos_rate = float(row["onset_pos_rate"])
+            guard_lo = ONSET_PRED_RATE_MIN_FACTOR * pos_rate
+            guard_hi = ONSET_PRED_RATE_MAX_FACTOR * pos_rate
+            valid = guard_lo <= pred_rate <= guard_hi
+            note = ""
+            if not valid:
+                note = (
+                    f"pred_rate={pred_rate:.4f} outside "
+                    f"[{guard_lo:.4f},{guard_hi:.4f}]"
+                )
+            status = "[OK]"
+            if not valid:
+                status = f"[REJECT:{note}]"
+            print(
+                "[Stage-B] thr={:.4f} onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} {}".format(
+                    thr_val,
+                    float(row["onset_event_f1"]),
+                    pred_rate,
+                    pos_rate,
+                    status,
+                )
+            )
+            stage_b_candidates.append(
+                {
+                    "row": row,
+                    "valid": valid,
+                    "note": note,
+                }
+            )
+
+        valid_stage_b = [cand for cand in stage_b_candidates if cand["valid"]]
+        stage_b_pool = valid_stage_b or stage_b_candidates
+        stage_b_winner = stage_b_pool[0]
+        tie_break_note = ""
+        for cand in stage_b_pool[1:]:
+            cur_f1 = float(cand["row"]["onset_event_f1"])
+            best_f1 = float(stage_b_winner["row"]["onset_event_f1"])
+            if cur_f1 > best_f1 + ONSET_TIE_TOL:
+                stage_b_winner = cand
+                tie_break_note = ""
+                continue
+            if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
+                prev_threshold = prev_onset_best
+                cand_thr = float(cand["row"]["onset_thr"])
+                best_thr = float(stage_b_winner["row"]["onset_thr"])
+                cand_prev = prev_threshold is not None and abs(cand_thr - prev_threshold) <= 1e-5
+                best_prev = prev_threshold is not None and abs(best_thr - prev_threshold) <= 1e-5
+                if cand_prev and not best_prev:
+                    stage_b_winner = cand
+                    tie_break_note = "tie→prev_threshold"
+                    continue
+                if cand_prev == best_prev:
+                    if cand_thr > best_thr + 1e-6:
+                        stage_b_winner = cand
+                        tie_break_note = "tie→higher_threshold"
+                        continue
+                    if abs(cand_thr - best_thr) <= 1e-6:
+                        cand_diff = abs(float(cand["row"]["onset_pred_rate"]) - float(cand["row"]["onset_pos_rate"]))
+                        best_diff = abs(float(stage_b_winner["row"]["onset_pred_rate"]) - float(stage_b_winner["row"]["onset_pos_rate"]))
+                        if cand_diff < best_diff - 1e-6:
+                            stage_b_winner = cand
+                            tie_break_note = "tie→pred_rate_balance"
+                            continue
+        if not tie_break_note and not stage_b_winner["valid"]:
+            tie_break_note = "guard-fallback"
+        best_row = stage_b_winner["row"]
+        print(
+            "[Stage-B] winner thr={:.4f} onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} open={:.4f} hold={:.4f} min_on={} {}".format(
+                float(best_row["onset_thr"]),
+                float(best_row["onset_event_f1"]),
+                float(best_row["onset_pred_rate"]),
+                float(best_row["onset_pos_rate"]),
+                stage_a_winner["open"],
+                stage_a_winner["hold"],
+                stage_a_winner["min_on"],
+                tie_break_note,
+            )
+        )
+
+        decoder_payload = {
+            key: best_row[key]
+            for key in best_row.keys()
+            if key.startswith("decoder_")
+        }
+        decoder_payload.update(
+            {
+                "decoder_onset_open": stage_a_winner["open"],
+                "decoder_onset_hold": stage_a_winner["hold"],
+                "decoder_onset_min_on": stage_a_winner["min_on"],
+                "decoder_onset_merge_gap": stage_a_winner["merge_gap"],
+            }
+        )
+        if tie_break_note:
+            decoder_payload["tie_break_note"] = tie_break_note
+
+        selection = SelectionResult(
+            onset_threshold=float(best_row["onset_thr"]),
+            offset_threshold=float(best_row["offset_thr"]),
+            k_onset=int(best_row.get("k_onset", 1)),
+            onset_event_f1=float(best_row["onset_event_f1"]),
+            offset_event_f1=float(best_row["offset_event_f1"]),
+            mean_event_f1=float(best_row["ev_f1_mean"]),
+            onset_f1=float(best_row["onset_f1"]),
+            offset_f1=float(best_row["offset_f1"]),
+            onset_pred_rate=float(best_row["onset_pred_rate"]),
+            onset_pos_rate=float(best_row["onset_pos_rate"]),
+            decoder_kind=best_row.get("decoder_kind"),
+            decoder_settings=decoder_payload,
+        )
+        _write_calibration_json(selection)
+        return selection, stage_b_context, stage_b_lines
+
     def _run_selection_with_calibration(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
+        if args.fast_strategy == "two_stage":
+            banner = "NOTICE: Running TWO-STAGE fast calibration — this may take a while"
+            log_banner(results_path, banner)
+            return _run_two_stage(calib, log_name=log_name)
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
         onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
@@ -1099,6 +1534,9 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
                 if math.isnan(coerced) or math.isinf(coerced):
                     continue
                 bits.append(f"{label}={fmt.format(coerced)}")
+        tie_note = metrics.get("tie_break_note")
+        if tie_note:
+            bits.append(f"tie_break={tie_note}")
     return " ".join(bits)
 
 
@@ -1216,6 +1654,59 @@ def main() -> int:
         default="",
         help="Extra CLI arguments appended to eval_thresholds.py during fast evaluation",
     )
+    ap.add_argument(
+        "--fast_strategy",
+        choices=["classic", "two_stage"],
+        default=DEFAULT_FAST_STRATEGY,
+        help="Fast calibration strategy after training bursts",
+    )
+    ap.add_argument(
+        "--onset_open_grid",
+        type=float,
+        nargs="+",
+        help="Candidate onset decoder open gates for Stage-A search",
+    )
+    ap.add_argument(
+        "--onset_min_on_grid",
+        type=int,
+        nargs="+",
+        help="Candidate onset decoder min_on values for Stage-A search",
+    )
+    ap.add_argument(
+        "--onset_hold_mode",
+        choices=["fixed_delta", "config"],
+        help="Hold calculation strategy for Stage-A search (default: fixed_delta → open - hold_delta)",
+    )
+    ap.add_argument(
+        "--onset_hold_delta",
+        type=float,
+        help="Hold subtraction applied when hold_mode=fixed_delta (default: 0.06)",
+    )
+    ap.add_argument(
+        "--onset_hold_min",
+        type=float,
+        help="Minimum hold gate enforced when hold_mode=fixed_delta (default: 0.04)",
+    )
+    ap.add_argument(
+        "--onset_merge_gap",
+        type=int,
+        help="Merge gap applied during Stage-A decoder search (default: 1)",
+    )
+    ap.add_argument(
+        "--onset_thr_anchor",
+        type=float,
+        help="Anchor onset probability threshold for Stage-B micro-sweep (default: previous best or 0.20)",
+    )
+    ap.add_argument(
+        "--onset_thr_delta",
+        type=float,
+        help="Radius around the anchor for Stage-B threshold micro-sweep (default: 0.05)",
+    )
+    ap.add_argument(
+        "--onset_thr_steps",
+        type=int,
+        help="Number of points in the Stage-B micro-sweep (default: 5, must include anchor)",
+    )
     args = ap.parse_args()
     args.verbose = configure_verbosity(args.verbose)
     try:
@@ -1254,6 +1745,121 @@ def main() -> int:
         print(f"[autopilot] fresh mode → experiment name set to {new_name}")
     else:
         print(f"[autopilot] resume mode → keeping experiment name {exp_cfg.get('name', base_name)}")
+
+    autop_cfg_root = cfg.setdefault("autopilot", {})
+    onset_opt_cfg = autop_cfg_root.setdefault("onset_optimizer", {})
+
+    def _normalize_int_list(values: Iterable[int], *, allowed: Optional[Iterable[int]] = None, min_value: int = 0) -> List[int]:
+        allowed_set = set(int(v) for v in allowed) if allowed is not None else None
+        seen: Dict[int, int] = {}
+        for raw in values:
+            try:
+                val = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if allowed_set is not None and val not in allowed_set:
+                continue
+            if val < min_value:
+                continue
+            seen[val] = val
+        ordered = sorted(seen.values())
+        return ordered
+
+    def _assign_setting(
+        arg_value,
+        *,
+        cfg_key: str,
+        default,
+        transform,
+        attr_name: str,
+    ) -> None:
+        nonlocal changed
+        if arg_value is not None:
+            coerced = transform(arg_value)
+            onset_opt_cfg[cfg_key] = coerced
+            setattr(args, attr_name, coerced)
+            changed = True
+            return
+        if cfg_key in onset_opt_cfg:
+            coerced = transform(onset_opt_cfg[cfg_key])
+        else:
+            coerced = transform(default)
+            onset_opt_cfg[cfg_key] = coerced
+            changed = True
+        setattr(args, attr_name, coerced)
+
+    _assign_setting(
+        args.onset_open_grid,
+        cfg_key="open_grid",
+        default=DEFAULT_ONSET_OPEN_GRID,
+        transform=lambda vals: _normalize_probability_list(vals, lo=ONSET_OPEN_MIN, hi=ONSET_OPEN_MAX),
+        attr_name="onset_open_grid",
+    )
+    if not args.onset_open_grid:
+        args.onset_open_grid = _normalize_probability_list(DEFAULT_ONSET_OPEN_GRID, lo=ONSET_OPEN_MIN, hi=ONSET_OPEN_MAX)
+    _assign_setting(
+        args.onset_min_on_grid,
+        cfg_key="min_on_grid",
+        default=DEFAULT_ONSET_MIN_ON_GRID,
+        transform=lambda vals: _normalize_int_list(vals, allowed=DEFAULT_ONSET_MIN_ON_GRID, min_value=1),
+        attr_name="onset_min_on_grid",
+    )
+    if not args.onset_min_on_grid:
+        args.onset_min_on_grid = list(DEFAULT_ONSET_MIN_ON_GRID)
+    _assign_setting(
+        args.onset_hold_mode,
+        cfg_key="hold_mode",
+        default=DEFAULT_ONSET_HOLD_MODE,
+        transform=lambda val: str(val),
+        attr_name="onset_hold_mode",
+    )
+    _assign_setting(
+        args.onset_hold_delta,
+        cfg_key="hold_delta",
+        default=DEFAULT_ONSET_HOLD_DELTA,
+        transform=lambda val: max(0.0, float(val)),
+        attr_name="onset_hold_delta",
+    )
+    _assign_setting(
+        args.onset_hold_min,
+        cfg_key="hold_min",
+        default=DEFAULT_ONSET_HOLD_MIN,
+        transform=lambda val: max(0.0, float(val)),
+        attr_name="onset_hold_min",
+    )
+    _assign_setting(
+        args.onset_merge_gap,
+        cfg_key="merge_gap",
+        default=DEFAULT_ONSET_MERGE_GAP,
+        transform=lambda val: int(max(0, int(val))),
+        attr_name="onset_merge_gap",
+    )
+    _assign_setting(
+        args.onset_thr_anchor,
+        cfg_key="thr_anchor",
+        default=DEFAULT_ONSET_THR_ANCHOR,
+        transform=lambda val: float(max(ONSET_THR_MIN, min(ONSET_THR_MAX, float(val)))),
+        attr_name="onset_thr_anchor",
+    )
+    _assign_setting(
+        args.onset_thr_delta,
+        cfg_key="thr_delta",
+        default=DEFAULT_ONSET_THR_DELTA,
+        transform=lambda val: max(0.0, float(val)),
+        attr_name="onset_thr_delta",
+    )
+    _assign_setting(
+        args.onset_thr_steps,
+        cfg_key="thr_steps",
+        default=DEFAULT_ONSET_THR_STEPS,
+        transform=lambda val: max(3, int(val)),
+        attr_name="onset_thr_steps",
+    )
+    resolved_strategy = args.fast_strategy or DEFAULT_FAST_STRATEGY
+    if autop_cfg_root.get("fast_strategy") != resolved_strategy:
+        autop_cfg_root["fast_strategy"] = resolved_strategy
+        changed = True
+    args.fast_strategy = resolved_strategy
 
     train_cfg = cfg.setdefault("training", {})
     metrics_cfg = train_cfg.setdefault("metrics", {})
@@ -1591,16 +2197,20 @@ def main() -> int:
                         "[autopilot] WARNING: selection result missing; copied checkpoint without metadata",
                         flush=True,
                     )
+            tie_note = metrics.get("tie_break_note")
+            tie_suffix = f" tie_break={tie_note}" if tie_note else ""
             print(
                 f"[autopilot] New best {args.target_metric}={metric_value:.4f} "
-                f"(round {round_idx}); ev_f1_mean={ev_mean:.4f} owner={best_owner}"
+                f"(round {round_idx}); ev_f1_mean={ev_mean:.4f} owner={best_owner}{tie_suffix}"
             )
         else:
             patience_left = patience_record
+            tie_note = metrics.get("tie_break_note")
+            tie_suffix = f" tie_break={tie_note}" if tie_note else ""
             print(
                 f"[autopilot] {args.target_metric}={metric_value:.4f} "
                 f"(best={best_metric:.4f}), ev_f1_mean={ev_mean:.4f} "
-                f"patience_left={patience_left}"
+                f"patience_left={patience_left}{tie_suffix}"
             )
 
         if metric_value >= args.target_ev_f1:

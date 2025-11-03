@@ -190,6 +190,23 @@ logging:
 autopilot:
   best_selection:
     owner: autopilot
+  fast_strategy: two_stage
+  onset_optimizer:
+    open_grid:
+    - 0.22
+    - 0.24
+    - 0.26
+    - 0.28
+    min_on_grid:
+    - 2
+    - 3
+    hold_mode: fixed_delta
+    hold_delta: 0.06
+    hold_min: 0.04
+    merge_gap: 1
+    thr_anchor: 0.2
+    thr_delta: 0.05
+    thr_steps: 5
 inference:
   output_dir: inference_results
   predict_on_train: false

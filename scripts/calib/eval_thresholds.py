@@ -16,6 +16,9 @@ CLI:
     ``--thresholds``/``--prob_thresholds`` lists, ``--split`` to choose a
     dataset split, and ``--dump_logits`` to save logits to NPZ. Determinism
     controls are available via ``--seed`` and ``--deterministic``.
+    Decoder hysteresis overrides (for example ``--decoder-onset-open``,
+    ``--decoder-onset-min-on``) let callers evaluate per-head gate sweeps
+    while keeping offset settings fixed.
 """
 
 import sys, json, time, math, os, torch, logging
@@ -752,6 +755,46 @@ def main():
         help="Merge on-segments separated by gaps <= this many frames (default: config or 1)",
     )
     ap.add_argument(
+        "--decoder-onset-open",
+        type=float,
+        help="Override onset decoder open gate (probability, default: config)",
+    )
+    ap.add_argument(
+        "--decoder-onset-hold",
+        type=float,
+        help="Override onset decoder hold gate (probability, default: config or derived from low_ratio)",
+    )
+    ap.add_argument(
+        "--decoder-onset-min-on",
+        type=int,
+        help="Override onset decoder minimum on length in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-onset-merge-gap",
+        type=int,
+        help="Override onset decoder merge gap in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-open",
+        type=float,
+        help="Override offset decoder open gate (probability, default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-hold",
+        type=float,
+        help="Override offset decoder hold gate (probability, default: config or derived from low_ratio)",
+    )
+    ap.add_argument(
+        "--decoder-offset-min-off",
+        type=int,
+        help="Override offset decoder minimum off length in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-merge-gap",
+        type=int,
+        help="Override offset decoder merge gap in frames (default: config)",
+    )
+    ap.add_argument(
         "--median",
         type=int,
         default=None,
@@ -835,6 +878,30 @@ def main():
     if args.median is not None and (args.median < 1 or args.median % 2 == 0):
         print("error: --median must be an odd integer >= 1", file=sys.stderr)
         return
+    decoder_prob_fields = [
+        ("--decoder-onset-open", args.decoder_onset_open),
+        ("--decoder-onset-hold", args.decoder_onset_hold),
+        ("--decoder-offset-open", args.decoder_offset_open),
+        ("--decoder-offset-hold", args.decoder_offset_hold),
+    ]
+    for flag, value in decoder_prob_fields:
+        if value is None:
+            continue
+        if not (0.0 <= value <= 1.0):
+            print(f"error: {flag} must be within [0, 1]", file=sys.stderr)
+            return
+    decoder_int_fields = [
+        ("--decoder-onset-min-on", args.decoder_onset_min_on),
+        ("--decoder-onset-merge-gap", args.decoder_onset_merge_gap),
+        ("--decoder-offset-min-off", args.decoder_offset_min_off),
+        ("--decoder-offset-merge-gap", args.decoder_offset_merge_gap),
+    ]
+    for flag, value in decoder_int_fields:
+        if value is None:
+            continue
+        if value < 0:
+            print(f"error: {flag} must be >= 0", file=sys.stderr)
+            return
 
     onset_probs_final = list(args.prob_thresholds) if args.prob_thresholds is not None else []
     offset_probs_final = list(args.offset_prob_thresholds) if args.offset_prob_thresholds is not None else []
@@ -1754,6 +1821,26 @@ def main():
     if args.median is not None:
         decoder_params["onset"]["median"] = int(args.median)
         decoder_params["offset"]["median"] = int(args.median)
+    if args.decoder_onset_open is not None:
+        decoder_params["onset"]["open"] = float(args.decoder_onset_open)
+        decoder_params["onset"]["open_defined"] = True
+    if args.decoder_onset_hold is not None:
+        decoder_params["onset"]["hold"] = float(args.decoder_onset_hold)
+        decoder_params["onset"]["hold_defined"] = True
+    if args.decoder_onset_min_on is not None:
+        decoder_params["onset"]["min_on"] = int(args.decoder_onset_min_on)
+    if args.decoder_onset_merge_gap is not None:
+        decoder_params["onset"]["merge_gap"] = int(args.decoder_onset_merge_gap)
+    if args.decoder_offset_open is not None:
+        decoder_params["offset"]["open"] = float(args.decoder_offset_open)
+        decoder_params["offset"]["open_defined"] = True
+    if args.decoder_offset_hold is not None:
+        decoder_params["offset"]["hold"] = float(args.decoder_offset_hold)
+        decoder_params["offset"]["hold_defined"] = True
+    if args.decoder_offset_min_off is not None:
+        decoder_params["offset"]["min_off"] = int(args.decoder_offset_min_off)
+    if args.decoder_offset_merge_gap is not None:
+        decoder_params["offset"]["merge_gap"] = int(args.decoder_offset_merge_gap)
     decoder_params = _normalize_decoder_params(decoder_params)
     onset_decoder = decoder_params["onset"]
     offset_decoder = decoder_params["offset"]

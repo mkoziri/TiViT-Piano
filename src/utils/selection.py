@@ -203,7 +203,7 @@ def _alias_decoder(payload: Dict[str, Any]) -> None:
             payload[dst] = payload[src]
 
 
-def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
+def _parse_eval_table(lines: Sequence[str]) -> List[Dict[str, Any]]:
     cleaned_lines = [ANSI_ESCAPE_RE.sub("", line) for line in lines]
     decoder_settings: Dict[str, Any] = {}
     for line in cleaned_lines:
@@ -218,7 +218,7 @@ def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
             header_idx = i
             break
     if header_idx is None:
-        return None
+        return []
     header = cleaned_lines[header_idx].strip().split("\t")
     col_idx = {name: idx for idx, name in enumerate(header)}
     required = {
@@ -232,8 +232,8 @@ def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
         "offset_event_f1",
     }
     if not required.issubset(col_idx):
-        return None
-    best: Optional[Dict[str, Any]] = None
+        return []
+    rows: List[Dict[str, Any]] = []
     for raw_line in cleaned_lines[header_idx + 1 :]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("[") or stripped.startswith("#"):
@@ -301,12 +301,19 @@ def _parse_eval_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
             "ev_f1_mean": ev_mean,
             "k_onset": k_onset,
         }
-        if best is None or row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
-            best = row
-    if best is not None and decoder_settings:
-        best.update(decoder_settings)
-        _alias_decoder(best)
-    return best
+        rows.append(row)
+    if decoder_settings:
+        for row in rows:
+            for key, value in decoder_settings.items():
+                row.setdefault(key, value)
+            _alias_decoder(row)
+    return rows
+
+
+def parse_eval_rows(lines: Sequence[str]) -> List[Dict[str, Any]]:
+    """Public helper to expose parsed evaluation rows for downstream selectors."""
+    rows = _parse_eval_table(lines)
+    return [dict(row) for row in rows]
 
 
 @dataclass
@@ -457,27 +464,34 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
                 code=retcode, tail=tail
             )
         )
-    parsed = _parse_eval_table(lines)
-    if parsed is None:
+    rows = _parse_eval_table(lines)
+    if not rows:
         tail = "\n".join(lines[-10:]) if lines else "<no stdout captured>"
         raise SelectionError(
             "Could not parse evaluation table from eval_thresholds output. "
             f"Last lines:\n{tail}"
         )
+    best = rows[0]
+    for row in rows[1:]:
+        if row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
+            best = row
+        elif abs(row["ev_f1_mean"] - best["ev_f1_mean"]) <= 1e-9 and row["onset_event_f1"] > best["onset_event_f1"] + 1e-9:
+            best = row
+    decoder_payload = {k: best[k] for k in best.keys() if k.startswith("decoder_")}
 
     result = SelectionResult(
-        onset_threshold=float(parsed["onset_thr"]),
-        offset_threshold=float(parsed["offset_thr"]),
-        k_onset=int(parsed.get("k_onset", 1)),
-        onset_event_f1=float(parsed["onset_event_f1"]),
-        offset_event_f1=float(parsed["offset_event_f1"]),
-        mean_event_f1=float(parsed["ev_f1_mean"]),
-        onset_f1=float(parsed["onset_f1"]),
-        offset_f1=float(parsed["offset_f1"]),
-        onset_pred_rate=float(parsed["onset_pred_rate"]),
-        onset_pos_rate=float(parsed["onset_pos_rate"]),
-        decoder_kind=parsed.get("decoder_kind"),
-        decoder_settings={k: parsed[k] for k in parsed.keys() if k.startswith("decoder_")},
+        onset_threshold=float(best["onset_thr"]),
+        offset_threshold=float(best["offset_thr"]),
+        k_onset=int(best.get("k_onset", 1)),
+        onset_event_f1=float(best["onset_event_f1"]),
+        offset_event_f1=float(best["offset_event_f1"]),
+        mean_event_f1=float(best["ev_f1_mean"]),
+        onset_f1=float(best["onset_f1"]),
+        offset_f1=float(best["offset_f1"]),
+        onset_pred_rate=float(best["onset_pred_rate"]),
+        onset_pos_rate=float(best["onset_pos_rate"]),
+        decoder_kind=best.get("decoder_kind"),
+        decoder_settings=decoder_payload,
     )
 
     ctx = SelectionContext(
