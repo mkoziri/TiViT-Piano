@@ -196,13 +196,24 @@ def _inject_decoder_comments(text: str) -> str:
     return "".join(lines)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    tmp.replace(path)
+
+
 def save_cfg(cfg: dict) -> None:
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
     buffer = io.StringIO()
     yaml.safe_dump(cfg, buffer, sort_keys=False)
     rendered = _inject_decoder_comments(buffer.getvalue())
-    with CONFIG.open("w") as f:
-        f.write(rendered)
+    _atomic_write_text(CONFIG, rendered)
 
 
 def ensure_default(cfg: dict, keys: Iterable[str], value) -> bool:
@@ -490,6 +501,11 @@ DEFAULT_OFFSET_STAGEB_HIGH_GUARD = 0.95
 THOROUGH_CACHE_FILENAME = "stageB_thorough_cache.json"
 STAGEB_CANDIDATES_TEMPLATE = "stageB_round{round:02d}_calib{calib:02d}_candidates.json"
 STAGEB_STATE_TEMPLATE = "stageB_round{round:02d}_calib{calib:02d}_state.json"
+ROUND_STATE_TEMPLATE = "round{round:02d}_state.json"
+
+ROUND_PHASE_STAGEA_DONE = "stageA_done"
+ROUND_PHASE_STAGEB_STARTED = "stageB_started"
+ROUND_PHASE_STAGEB_DONE = "stageB_done"
 
 
 @dataclass
@@ -856,6 +872,40 @@ def _generate_stageb_candidates(anchor: StageBAnchor, params: StageBParams) -> T
     return candidates, anchor_clamped, guard_min, guard_max
 
 
+def _round_state_path(stdout_dir: Path, round_idx: int) -> Path:
+    return stdout_dir / ROUND_STATE_TEMPLATE.format(round=round_idx)
+
+
+def _load_round_state(stdout_dir: Path, round_idx: int) -> Dict[str, Any]:
+    path = _round_state_path(stdout_dir, round_idx)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_round_state(stdout_dir: Path, round_idx: int, state: Mapping[str, Any]) -> None:
+    _atomic_write_json(_round_state_path(stdout_dir, round_idx), state)
+
+
+def _extract_offset_gates(decoder_snapshot: Mapping[str, Any] | None) -> Dict[str, Optional[float]]:
+    if not isinstance(decoder_snapshot, Mapping):
+        return {}
+    offset_raw = decoder_snapshot.get("offset")
+    if not isinstance(offset_raw, Mapping):
+        return {}
+    return {
+        "open": _coerce_optional_float(offset_raw.get("open")),
+        "hold": _coerce_optional_float(offset_raw.get("hold")),
+        "min_off": _coerce_positive_int(offset_raw.get("min_off")),
+        "merge_gap": _coerce_positive_int(offset_raw.get("merge_gap")),
+    }
+
+
 def _format_candidates(values: Sequence[float]) -> str:
     return "[" + ",".join(f"{val:.4f}" for val in values) + "]"
 
@@ -1116,10 +1166,51 @@ def _blend_and_clip_platt(
     return (temp, bias), False
 
 
+def _stringify_diff_value(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    if isinstance(value, (int, str)):
+        return str(value)
+    return repr(value)
+
+
+def _nested_lookup(mapping: Mapping[str, Any] | None, path: Sequence[str]) -> Any:
+    cur: Any = mapping
+    for key in path:
+        if not isinstance(cur, Mapping):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _log_metrics_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+    tracked_paths: List[Sequence[str]] = [
+        ("prob_threshold_onset",),
+        ("prob_threshold_offset",),
+        ("decoder", "onset", "open"),
+        ("decoder", "onset", "hold"),
+        ("decoder", "onset", "min_on"),
+        ("decoder", "onset", "merge_gap"),
+    ]
+    diffs: List[str] = []
+    for path in tracked_paths:
+        old_val = _nested_lookup(before, path)
+        new_val = _nested_lookup(after, path)
+        if old_val == new_val:
+            continue
+        dotted = ".".join(path)
+        diffs.append(f"{dotted}: {_stringify_diff_value(old_val)} → {_stringify_diff_value(new_val)}")
+    if diffs:
+        print("[autopilot] config diff: " + "; ".join(diffs))
+
+
 def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     cfg = load_cfg()
     train_cfg = cfg.setdefault("training", {})
     metrics_cfg = train_cfg.setdefault("metrics", {})
+    metrics_before = copy.deepcopy(metrics_cfg)
     decoder_snapshot = copy.deepcopy(metrics_cfg.get("decoder"))
     agg_cfg = metrics_cfg.setdefault("aggregation", {})
     k_cfg = agg_cfg.setdefault("k", {})
@@ -1235,6 +1326,7 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     if decoder_after != decoder_snapshot:
         print("[autopilot] ERROR: decoder subtree changed during write-back; aborting to protect config", file=sys.stderr)
         raise SystemExit(1)
+    _log_metrics_diff(metrics_before, metrics_cfg)
 
 
 def infer_current_epoch(ckpt_dir: Path) -> int:
@@ -1494,145 +1586,378 @@ def perform_calibration(
             base = Path(log_name).stem
             return base or "eval_fast"
 
+        def _has_onset_gates(payload: Mapping[str, Any] | None) -> bool:
+            if not isinstance(payload, Mapping):
+                return False
+            onset = payload.get("onset")
+            if not isinstance(onset, Mapping):
+                return False
+            open_val = _coerce_optional_float(onset.get("open"))
+            hold_val = _coerce_optional_float(onset.get("hold"))
+            min_on_val = _coerce_positive_int(onset.get("min_on"))
+            merge_gap_val = _coerce_positive_int(onset.get("merge_gap"))
+            return (
+                open_val is not None
+                and hold_val is not None
+                and min_on_val is not None
+                and merge_gap_val is not None
+            )
+
+        stage_b_state_path = stdout_dir / STAGEB_STATE_TEMPLATE.format(round=round_index, calib=calibration_count)
+        stage_b_artifacts_exist = stage_b_state_path.exists()
+        round_state = _load_round_state(stdout_dir, round_index)
+        if round_state.get("round") not in (None, round_index):
+            round_state = {}
+        stage_a_state_payload = round_state.get("stageA") if isinstance(round_state, Mapping) else None
+        stage_a_state_valid = _has_onset_gates(stage_a_state_payload)
+        stage_a_state_source = ""
+        stage_a_tie_note = ""
+        stage_a_reused = False
+
         stage_a_records: List[Dict[str, Any]] = []
+        stage_a_winner: Optional[Dict[str, Any]] = None
         total_candidates = max(1, len(args.onset_open_grid) * len(args.onset_min_on_grid))
         frames = args.calib_frames if args.calib_frames is not None else 96
         max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
-        print(
-            "[Stage-A] onset decoder sweep: anchor_thr={:.4f} offset_anchor={:.4f} "
-            "candidates={} frames={} clips={}".format(
-                onset_prob,
-                offset_prob,
-                total_candidates,
-                frames,
-                max_clips,
+        if stage_a_state_valid:
+            onset_state = stage_a_state_payload.get("onset") if isinstance(stage_a_state_payload, Mapping) else {}
+            open_val = _coerce_optional_float(onset_state.get("open")) if isinstance(onset_state, Mapping) else None
+            hold_val = _coerce_optional_float(onset_state.get("hold")) if isinstance(onset_state, Mapping) else None
+            min_on_val = _coerce_positive_int(onset_state.get("min_on")) if isinstance(onset_state, Mapping) else None
+            merge_gap_val = _coerce_positive_int(onset_state.get("merge_gap")) if isinstance(onset_state, Mapping) else None
+            stage_a_state_source = stage_a_state_payload.get("source", "state") if isinstance(stage_a_state_payload, Mapping) else "state"
+            stage_a_tie_note = stage_a_state_payload.get("tie_break", "") if isinstance(stage_a_state_payload, Mapping) else ""
+            stage_a_reused = True
+            print(
+                "[Stage-A] reuse onset gates open={:.3f} hold={:.3f} min_on={} merge_gap={} (source={})".format(
+                    float(open_val) if open_val is not None else prev_open_cfg or 0.0,
+                    float(hold_val) if hold_val is not None else (prev_hold_cfg or 0.0),
+                    int(min_on_val) if min_on_val is not None else prev_min_on_cfg,
+                    int(merge_gap_val) if merge_gap_val is not None else merge_gap,
+                    stage_a_state_source,
+                )
             )
-        )
-        candidate_idx = 0
-        for open_val in args.onset_open_grid:
-            open_clamped = max(ONSET_OPEN_MIN, min(ONSET_OPEN_MAX, float(open_val)))
-            hold_val = _compute_hold(open_clamped)
-            hold_val = max(0.0, min(open_clamped, hold_val))
-            for min_on_val in args.onset_min_on_grid:
-                candidate_idx += 1
-                extras = [
-                    "--decoder-onset-open",
-                    f"{open_clamped:.4f}",
-                    "--decoder-onset-hold",
-                    f"{hold_val:.4f}",
-                    "--decoder-onset-min-on",
-                    str(int(min_on_val)),
-                    "--decoder-onset-merge-gap",
-                    str(merge_gap),
-                ]
-                log_file = f"{_stage_log_prefix()}_stageA_{candidate_idx:02d}.txt"
-                try:
-                    request = _build_request(
-                        onset_prob,
-                        offset_prob,
-                        log_name=log_file,
-                        sweep_override=([onset_prob], [offset_prob]),
-                        extras=extras,
-                        low_guard=ONSET_THR_MIN,
+        else:
+            if args.mode == "resume" and stage_b_artifacts_exist:
+                fallback_open = _coerce_optional_float(prev_onset_decoder.get("open"))
+                fallback_hold = _coerce_optional_float(prev_onset_decoder.get("hold"))
+                fallback_min_on = _coerce_positive_int(prev_onset_decoder.get("min_on"))
+                if fallback_open is not None and fallback_min_on is not None:
+                    if fallback_hold is None:
+                        fallback_hold = _compute_hold(float(fallback_open))
+                    fallback_hold = max(0.0, min(float(fallback_open), float(fallback_hold)))
+                    timestamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+                    stage_a_state_payload = {
+                        "onset": {
+                            "open": float(fallback_open),
+                            "hold": float(fallback_hold),
+                            "min_on": int(fallback_min_on),
+                            "merge_gap": int(merge_gap),
+                        },
+                        "offset": _extract_offset_gates(decoder_snapshot),
+                        "source": "previous_round",
+                        "timestamp": timestamp,
+                        "tie_break": "resume_previous",
+                    }
+                    round_state = dict(round_state) if isinstance(round_state, Mapping) else {}
+                    round_state.update(
+                        {
+                            "round": round_index,
+                            "phase": ROUND_PHASE_STAGEA_DONE,
+                            "stageA": stage_a_state_payload,
+                        }
                     )
-                    stage_result, stage_context, stage_lines = calibrate_and_score(request)
-                    rows = parse_eval_rows(stage_lines)
-                except SelectionError as exc:
-                    LOGGER.warning(
-                        "Stage-A candidate failed (open=%.3f min_on=%d): %s",
-                        open_clamped,
-                        min_on_val,
-                        exc,
-                        extra=QUIET_EXTRA,
+                    _save_round_state(stdout_dir, round_index, round_state)
+                    stage_a_state_valid = True
+                    stage_a_reused = True
+                    stage_a_state_source = "previous_round"
+                    stage_a_tie_note = "resume_previous"
+                    print(
+                        "[Stage-A] resume fallback → using previous gates open={:.3f} hold={:.3f} min_on={} merge_gap={}".format(
+                            fallback_open,
+                            fallback_hold,
+                            fallback_min_on,
+                            merge_gap,
+                        )
                     )
-                    continue
-                if not rows:
-                    LOGGER.warning(
-                        "Stage-A candidate open=%.3f min_on=%d produced no rows",
-                        open_clamped,
-                        min_on_val,
-                        extra=QUIET_EXTRA,
-                    )
-                    continue
-                row = rows[0]
-                onset_pred = float(row["onset_pred_rate"])
-                onset_pos = float(row["onset_pos_rate"])
-                guard_lo = ONSET_PRED_RATE_MIN_FACTOR * onset_pos
-                guard_hi = ONSET_PRED_RATE_MAX_FACTOR * onset_pos
-                valid = guard_lo <= onset_pred <= guard_hi
-                note = ""
-                if not valid:
-                    note = (
-                        f"pred_rate={onset_pred:.4f} outside "
-                        f"[{guard_lo:.4f},{guard_hi:.4f}]"
-                    )
-                status = "[OK]"
-                if not valid:
-                    status = f"[REJECT:{note}]"
+            if not stage_a_state_valid:
+                candidate_idx = 0
+                for open_val in args.onset_open_grid:
+                    open_clamped = max(ONSET_OPEN_MIN, min(ONSET_OPEN_MAX, float(open_val)))
+                    hold_val = _compute_hold(open_clamped)
+                    hold_val = max(0.0, min(open_clamped, hold_val))
+                    for min_on_val in args.onset_min_on_grid:
+                        candidate_idx += 1
+                        extras = [
+                            "--decoder-onset-open",
+                            f"{open_clamped:.4f}",
+                            "--decoder-onset-hold",
+                            f"{hold_val:.4f}",
+                            "--decoder-onset-min-on",
+                            str(int(min_on_val)),
+                            "--decoder-onset-merge-gap",
+                            str(merge_gap),
+                        ]
+                        log_file = f"{_stage_log_prefix()}_stageA_{candidate_idx:02d}.txt"
+                        try:
+                            request = _build_request(
+                                onset_prob,
+                                offset_prob,
+                                log_name=log_file,
+                                sweep_override=([onset_prob], [offset_prob]),
+                                extras=extras,
+                                low_guard=ONSET_THR_MIN,
+                            )
+                            stage_result, stage_context, stage_lines = calibrate_and_score(request)
+                            rows = parse_eval_rows(stage_lines)
+                        except SelectionError as exc:
+                            LOGGER.warning(
+                                "Stage-A candidate failed (open=%.3f min_on=%d): %s",
+                                open_clamped,
+                                min_on_val,
+                                exc,
+                                extra=QUIET_EXTRA,
+                            )
+                            continue
+                        if not rows:
+                            LOGGER.warning(
+                                "Stage-A candidate open=%.3f min_on=%d produced no rows",
+                                open_clamped,
+                                min_on_val,
+                                extra=QUIET_EXTRA,
+                            )
+                            continue
+                        row = rows[0]
+                        onset_pred = float(row["onset_pred_rate"])
+                        onset_pos = float(row["onset_pos_rate"])
+                        guard_lo = ONSET_PRED_RATE_MIN_FACTOR * onset_pos
+                        guard_hi = ONSET_PRED_RATE_MAX_FACTOR * onset_pos
+                        valid = guard_lo <= onset_pred <= guard_hi
+                        note = ""
+                        if not valid:
+                            note = (
+                                f"pred_rate={onset_pred:.4f} outside "
+                                f"[{guard_lo:.4f},{guard_hi:.4f}]"
+                            )
+                        status = "[OK]"
+                        if not valid:
+                            status = f"[REJECT:{note}]"
+                        print(
+                            "[Stage-A] {:2d}/{:2d} open={:.3f} hold={:.3f} min_on={} "
+                            "onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} {}".format(
+                                candidate_idx,
+                                total_candidates,
+                                open_clamped,
+                                hold_val,
+                                int(min_on_val),
+                                float(row["onset_event_f1"]),
+                                onset_pred,
+                                onset_pos,
+                                status,
+                            )
+                        )
+                        stage_a_records.append(
+                            {
+                                "open": open_clamped,
+                                "hold": hold_val,
+                                "min_on": int(min_on_val),
+                                "merge_gap": merge_gap,
+                                "row": row,
+                                "valid": valid,
+                                "note": note,
+                                "extras": extras,
+                                "context": stage_context,
+                                "tie_reason": "first",
+                            }
+                        )
+                if not stage_a_records:
+                    raise SelectionError("Stage-A search produced no candidates")
+
+                valid_stage_a = [rec for rec in stage_a_records if rec["valid"]]
+                stage_a_pool = valid_stage_a or stage_a_records
+                stage_a_winner = stage_a_pool[0]
+                stage_a_winner["tie_reason"] = stage_a_winner.get("tie_reason", "first")
+                for rec in stage_a_pool[1:]:
+                    cur_f1 = float(rec["row"]["onset_event_f1"])
+                    best_f1 = float(stage_a_winner["row"]["onset_event_f1"])
+                    if cur_f1 > best_f1 + ONSET_TIE_TOL:
+                        rec["tie_reason"] = "higher_f1"
+                        stage_a_winner = rec
+                        continue
+                    if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
+                        rec_prev = _is_prev_candidate(rec["open"], rec["min_on"])
+                        best_prev = _is_prev_candidate(stage_a_winner["open"], stage_a_winner["min_on"])
+                        if rec_prev and not best_prev:
+                            rec["tie_reason"] = "prefer_previous"
+                            stage_a_winner = rec
+                            continue
+                        if rec_prev == best_prev:
+                            if rec["open"] > stage_a_winner["open"] + 1e-6:
+                                rec["tie_reason"] = "higher_open"
+                                stage_a_winner = rec
+                                continue
+                            if (
+                                abs(rec["open"] - stage_a_winner["open"]) <= 1e-6
+                                and rec["min_on"] < stage_a_winner["min_on"]
+                            ):
+                                rec["tie_reason"] = "lower_min_on"
+                                stage_a_winner = rec
+                                continue
                 print(
-                    "[Stage-A] {:2d}/{:2d} open={:.3f} hold={:.3f} min_on={} "
-                    "onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} {}".format(
-                        candidate_idx,
-                        total_candidates,
-                        open_clamped,
-                        hold_val,
-                        int(min_on_val),
-                        float(row["onset_event_f1"]),
-                        onset_pred,
-                        onset_pos,
-                        status,
+                    "[Stage-A] winner open={:.3f} hold={:.3f} min_on={} "
+                    "onset_event_f1={:.4f}".format(
+                        stage_a_winner["open"],
+                        stage_a_winner["hold"],
+                        stage_a_winner["min_on"],
+                        float(stage_a_winner["row"]["onset_event_f1"]),
                     )
                 )
-                stage_a_records.append(
+                stage_a_state_source = "grid_search"
+                stage_a_tie_note = stage_a_winner.get("tie_reason", "")
+                timestamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+                stage_a_state_payload = {
+                    "onset": {
+                        "open": float(stage_a_winner["open"]),
+                        "hold": float(stage_a_winner["hold"]),
+                        "min_on": int(stage_a_winner["min_on"]),
+                        "merge_gap": int(stage_a_winner["merge_gap"]),
+                    },
+                    "offset": _extract_offset_gates(decoder_snapshot),
+                    "source": stage_a_state_source,
+                    "timestamp": timestamp,
+                    "tie_break": stage_a_tie_note,
+                }
+                round_state = dict(round_state) if isinstance(round_state, Mapping) else {}
+                round_state.update(
                     {
-                        "open": open_clamped,
-                        "hold": hold_val,
-                        "min_on": int(min_on_val),
-                        "merge_gap": merge_gap,
-                        "row": row,
-                        "valid": valid,
-                        "note": note,
-                        "extras": extras,
-                        "context": stage_context,
+                        "round": round_index,
+                        "phase": ROUND_PHASE_STAGEA_DONE,
+                        "stageA": stage_a_state_payload,
                     }
                 )
-        if not stage_a_records:
-            raise SelectionError("Stage-A search produced no candidates")
+                _save_round_state(stdout_dir, round_index, round_state)
+                stage_a_state_valid = True
 
-        valid_stage_a = [rec for rec in stage_a_records if rec["valid"]]
-        stage_a_pool = valid_stage_a or stage_a_records
-        stage_a_winner = stage_a_pool[0]
-        for rec in stage_a_pool[1:]:
-            cur_f1 = float(rec["row"]["onset_event_f1"])
-            best_f1 = float(stage_a_winner["row"]["onset_event_f1"])
-            if cur_f1 > best_f1 + ONSET_TIE_TOL:
-                stage_a_winner = rec
-                continue
-            if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
-                rec_prev = _is_prev_candidate(rec["open"], rec["min_on"])
-                best_prev = _is_prev_candidate(stage_a_winner["open"], stage_a_winner["min_on"])
-                if rec_prev and not best_prev:
-                    stage_a_winner = rec
-                    continue
-                if rec_prev == best_prev:
-                    if rec["open"] > stage_a_winner["open"] + 1e-6:
-                        stage_a_winner = rec
-                        continue
-                    if (
-                        abs(rec["open"] - stage_a_winner["open"]) <= 1e-6
-                        and rec["min_on"] < stage_a_winner["min_on"]
-                    ):
-                        stage_a_winner = rec
-                        continue
-        print(
-            "[Stage-A] winner open={:.3f} hold={:.3f} min_on={} "
-            "onset_event_f1={:.4f}".format(
-                stage_a_winner["open"],
-                stage_a_winner["hold"],
-                stage_a_winner["min_on"],
-                float(stage_a_winner["row"]["onset_event_f1"]),
+        if not stage_a_state_valid or not isinstance(stage_a_state_payload, Mapping):
+            raise SelectionError("Stage-A state unavailable for Stage-B evaluation")
+        stage_a_onset_state = stage_a_state_payload.get("onset")
+        if not isinstance(stage_a_onset_state, Mapping):
+            raise SelectionError("Stage-A onset gates missing from state")
+        onset_open_val = _coerce_optional_float(stage_a_onset_state.get("open"))
+        onset_hold_val = _coerce_optional_float(stage_a_onset_state.get("hold"))
+        onset_min_on_val = _coerce_positive_int(stage_a_onset_state.get("min_on"))
+        onset_merge_gap_val = _coerce_positive_int(stage_a_onset_state.get("merge_gap"))
+        if onset_open_val is None or onset_hold_val is None or onset_min_on_val is None or onset_merge_gap_val is None:
+            raise SelectionError("Stage-A onset gates incomplete")
+
+        current_onset_open = float(onset_open_val)
+        current_onset_hold = float(onset_hold_val)
+        current_onset_min_on = int(onset_min_on_val)
+        current_onset_merge_gap = int(onset_merge_gap_val)
+        base_merge_gap = current_onset_merge_gap
+        stage_a_state_source = stage_a_state_source or stage_a_state_payload.get("source", "state")
+        stage_a_tie_note = stage_a_tie_note or stage_a_state_payload.get("tie_break", "")
+        fallback_prev_attempted = stage_a_state_source in {"previous_round", "fallback_previous"}
+        fallback_minigrid_attempted = False
+
+        def _stage_b_has_no_events(rows: Sequence[Mapping[str, Any]]) -> bool:
+            if not rows:
+                return True
+            for entry in rows:
+                pred_rate = _coerce_optional_float(entry.get("onset_pred_rate"))
+                if pred_rate is not None and pred_rate > 1e-4:
+                    return False
+            return True
+
+        def _mark_stage_b_started(source_label: str) -> None:
+            nonlocal round_state, stage_a_state_source
+            stage_a_state_source = source_label
+            timestamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+            stage_a_state_payload["timestamp"] = timestamp
+            stage_a_state_payload["source"] = source_label
+            stage_a_state_payload["tie_break"] = stage_a_tie_note
+            stage_a_onset_state["open"] = current_onset_open
+            stage_a_onset_state["hold"] = current_onset_hold
+            stage_a_onset_state["min_on"] = current_onset_min_on
+            stage_a_onset_state["merge_gap"] = current_onset_merge_gap
+            stage_b_state_block = {
+                "status": "running",
+                "timestamp": timestamp,
+                "gates": {
+                    "onset": {
+                        "open": current_onset_open,
+                        "hold": current_onset_hold,
+                        "min_on": current_onset_min_on,
+                        "merge_gap": current_onset_merge_gap,
+                    },
+                    "offset": copy.deepcopy(stage_a_state_payload.get("offset") or {}),
+                },
+                "resume": "reused" if stage_a_reused else "fresh",
+                "attempt": source_label,
+            }
+            new_state = dict(round_state) if isinstance(round_state, Mapping) else {}
+            new_state.update(
+                {
+                    "round": round_index,
+                    "phase": ROUND_PHASE_STAGEB_STARTED,
+                    "stageA": stage_a_state_payload,
+                    "stageB": stage_b_state_block,
+                }
             )
-        )
+            _save_round_state(stdout_dir, round_index, new_state)
+            round_state = new_state
+
+        def _apply_previous_fallback() -> bool:
+            nonlocal current_onset_open, current_onset_hold, current_onset_min_on, current_onset_merge_gap, stage_a_tie_note, stage_a_state_source
+            fallback_open_val = _coerce_optional_float(prev_onset_decoder.get("open"))
+            fallback_min_on_val = _coerce_positive_int(prev_onset_decoder.get("min_on"))
+            if fallback_open_val is None or fallback_min_on_val is None:
+                return False
+            fallback_hold_val = _coerce_optional_float(prev_onset_decoder.get("hold"))
+            if fallback_hold_val is None:
+                fallback_hold_val = _compute_hold(float(fallback_open_val))
+            if (
+                abs(current_onset_open - float(fallback_open_val)) <= 1e-6
+                and current_onset_min_on == int(fallback_min_on_val)
+            ):
+                return False
+            current_onset_open = float(max(ONSET_OPEN_MIN, min(ONSET_OPEN_MAX, float(fallback_open_val))))
+            current_onset_hold = float(max(0.0, min(current_onset_open, float(fallback_hold_val))))
+            current_onset_min_on = int(fallback_min_on_val)
+            current_onset_merge_gap = base_merge_gap
+            stage_a_tie_note = "fallback_previous"
+            stage_a_state_source = "fallback_previous"
+            print(
+                "[Stage-B] fallback: using previous-round gates open={:.3f} hold={:.3f} min_on={}".format(
+                    current_onset_open,
+                    current_onset_hold,
+                    current_onset_min_on,
+                )
+            )
+            return True
+
+        def _apply_minigrid_fallback() -> bool:
+            nonlocal current_onset_open, current_onset_hold, current_onset_min_on, current_onset_merge_gap, stage_a_tie_note, stage_a_state_source
+            candidate_open = max(ONSET_OPEN_MIN, current_onset_open - 0.02)
+            if abs(candidate_open - current_onset_open) <= 1e-6:
+                candidate_open = max(ONSET_OPEN_MIN, current_onset_open - 0.01)
+            if abs(candidate_open - current_onset_open) <= 1e-6:
+                return False
+            current_onset_open = float(candidate_open)
+            current_onset_hold = float(max(0.0, min(current_onset_open, _compute_hold(current_onset_open))))
+            min_on_candidates = args.onset_min_on_grid if args.onset_min_on_grid else [current_onset_min_on]
+            current_onset_min_on = int(min(current_onset_min_on, min(min_on_candidates)))
+            current_onset_merge_gap = base_merge_gap
+            stage_a_tie_note = "fallback_minigrid"
+            stage_a_state_source = "fallback_minigrid"
+            print(
+                "[Stage-B] fallback: widening Stage-A grid open={:.3f} hold={:.3f} min_on={}".format(
+                    current_onset_open,
+                    current_onset_hold,
+                    current_onset_min_on,
+                )
+            )
+            return True
 
         onset_candidates, onset_candidates_center, onset_guard_min, onset_guard_max = _generate_stageb_candidates(
             onset_anchor, onset_stageb_params
@@ -1662,21 +1987,63 @@ def perform_calibration(
         )
 
         stage_b_log = f"{_stage_log_prefix()}_stageB.txt"
-        try:
-            request = _build_request(
-                onset_candidates_center,
-                offset_candidates_center,
-                log_name=stage_b_log,
-                sweep_override=(onset_candidates, offset_candidates),
-                extras=stage_a_winner["extras"],
-                low_guard=onset_stageb_params.low_guard or onset_stageb_params.min_prob,
+        stage_b_context: Optional[SelectionContext] = None
+        stage_b_lines: List[str] = []
+        rows_b: List[Dict[str, Any]] = []
+        attempt_counter = 0
+        while True:
+            attempt_counter += 1
+            stage_b_extras = [
+                "--decoder-onset-open",
+                f"{current_onset_open:.4f}",
+                "--decoder-onset-hold",
+                f"{current_onset_hold:.4f}",
+                "--decoder-onset-min-on",
+                str(int(current_onset_min_on)),
+                "--decoder-onset-merge-gap",
+                str(int(current_onset_merge_gap)),
+            ]
+            print(
+                "[Stage-B] using Stage-A gates open={:.3f} hold={:.3f} min_on={} merge_gap={} (source={})".format(
+                    current_onset_open,
+                    current_onset_hold,
+                    current_onset_min_on,
+                    current_onset_merge_gap,
+                    stage_a_state_source,
+                )
             )
-            _, stage_b_context, stage_b_lines = calibrate_and_score(request)
-            rows_b = parse_eval_rows(stage_b_lines)
-        except SelectionError as exc:
-            raise SelectionError(f"Stage-B evaluation failed: {exc}") from exc
-        if not rows_b:
-            raise SelectionError("Stage-B evaluation returned no rows")
+            _mark_stage_b_started(stage_a_state_source)
+            try:
+                request = _build_request(
+                    onset_candidates_center,
+                    offset_candidates_center,
+                    log_name=stage_b_log,
+                    sweep_override=(onset_candidates, offset_candidates),
+                    extras=stage_b_extras,
+                    low_guard=onset_stageb_params.low_guard or onset_stageb_params.min_prob,
+                )
+                _, stage_b_context, stage_b_lines = calibrate_and_score(request)
+                rows_b = parse_eval_rows(stage_b_lines)
+            except SelectionError as exc:
+                raise SelectionError(f"Stage-B evaluation failed: {exc}") from exc
+            if rows_b and not _stage_b_has_no_events(rows_b):
+                break
+            reason = "empty rows" if not rows_b else "no-onset-events"
+            print(f"[Stage-B] WARNING: sweep returned {reason}; evaluating fallbacks")
+            if not fallback_prev_attempted and _apply_previous_fallback():
+                fallback_prev_attempted = True
+                continue
+            fallback_prev_attempted = True
+            if not fallback_minigrid_attempted and _apply_minigrid_fallback():
+                fallback_minigrid_attempted = True
+                continue
+            fallback_minigrid_attempted = True
+            raise SelectionError("Stage-B evaluation returned no usable rows after fallbacks")
+
+        onset_open = current_onset_open
+        onset_hold = current_onset_hold
+        onset_min_on = current_onset_min_on
+        onset_merge_gap = current_onset_merge_gap
 
         stage_b_candidates: List[Dict[str, Any]] = []
         for row in rows_b:
@@ -1754,10 +2121,22 @@ def perform_calibration(
                 float(best_row["onset_event_f1"]),
                 float(best_row["onset_pred_rate"]),
                 float(best_row["onset_pos_rate"]),
-                stage_a_winner["open"],
-                stage_a_winner["hold"],
-                stage_a_winner["min_on"],
+                float(onset_open),
+                float(onset_hold),
+                int(onset_min_on),
                 tie_break_note,
+            )
+        )
+        summary_tie = tie_break_note or "none"
+        print(
+            "stageB: gates(open={:.3f}, hold={:.3f}, min_on={}, gap={}) -> best onset_thr={:.4f} onset_event_f1={:.4f} (tie: {})".format(
+                float(onset_open),
+                float(onset_hold),
+                int(onset_min_on),
+                int(onset_merge_gap),
+                float(best_row["onset_thr"]),
+                float(best_row["onset_event_f1"]),
+                summary_tie,
             )
         )
 
@@ -1777,6 +2156,45 @@ def perform_calibration(
             winner_row=best_row,
         )
 
+        stage_b_summary = {
+            "status": "completed",
+            "timestamp": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+            "winner": {
+                "onset_thr": _coerce_optional_float(best_row.get("onset_thr")),
+                "offset_thr": _coerce_optional_float(best_row.get("offset_thr")),
+                "onset_event_f1": _coerce_optional_float(best_row.get("onset_event_f1")),
+                "offset_event_f1": _coerce_optional_float(best_row.get("offset_event_f1")),
+                "ev_f1_mean": _coerce_optional_float(best_row.get("ev_f1_mean")),
+                "tie_break": tie_break_note,
+            },
+            "metrics": {
+                "onset_pred_rate": _coerce_optional_float(best_row.get("onset_pred_rate")),
+                "onset_pos_rate": _coerce_optional_float(best_row.get("onset_pos_rate")),
+            },
+            "gates": {
+                "onset": copy.deepcopy(stage_a_onset_state),
+                "offset": copy.deepcopy(stage_a_state_payload.get("offset") or {}),
+            },
+        }
+        round_state = dict(round_state) if isinstance(round_state, Mapping) else {}
+        round_state.update(
+            {
+                "round": round_index,
+                "phase": ROUND_PHASE_STAGEB_DONE,
+                "stageA": stage_a_state_payload,
+                "stageB": stage_b_summary,
+            }
+        )
+        _save_round_state(stdout_dir, round_index, round_state)
+        summary_payload = {
+            "round": round_index,
+            "calibration_index": calibration_count,
+            "stageA": copy.deepcopy(stage_a_state_payload),
+            "stageB": copy.deepcopy(stage_b_summary),
+        }
+        summary_path = stdout_dir / f"round{round_index:02d}_summary.json"
+        _atomic_write_json(summary_path, summary_payload)
+
         decoder_payload = {
             key: best_row[key]
             for key in best_row.keys()
@@ -1784,10 +2202,10 @@ def perform_calibration(
         }
         decoder_payload.update(
             {
-                "decoder_onset_open": stage_a_winner["open"],
-                "decoder_onset_hold": stage_a_winner["hold"],
-                "decoder_onset_min_on": stage_a_winner["min_on"],
-                "decoder_onset_merge_gap": stage_a_winner["merge_gap"],
+                "decoder_onset_open": float(onset_open),
+                "decoder_onset_hold": float(onset_hold),
+                "decoder_onset_min_on": int(onset_min_on),
+                "decoder_onset_merge_gap": int(onset_merge_gap),
             }
         )
         if tie_break_note:

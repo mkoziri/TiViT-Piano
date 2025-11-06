@@ -209,9 +209,9 @@ autopilot:
     thr_add_steps: 5
     thr_mul_ratio: 1.1
     thr_mul_orders: 1
-    thr_min_prob: 0.02
+    thr_min_prob: 0.005   # was 0.02 — allow ~0.01 from thorough
     thr_max_prob: 0.98
-    thr_low_guard: 0.1
+    thr_low_guard: 0.01   # was 0.10 — don’t block tiny thresholds
     thr_high_guard: 0.6
     thr_min_points: 5
     thr_max_points: 11
