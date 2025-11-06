@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_preT3_autopilot_t2_sw_5ff2db23_auto
+  name: TiViT-Piano_PianoYT_preT3_autopilot
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 6
+  epochs: 30
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -97,8 +97,8 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: true
-  reset_head_bias: false
+  resume: false
+  reset_head_bias: true
   bias_seed:
     onoff_prior_mean: 0.02
   loss_weights:
@@ -129,26 +129,26 @@ training:
     hand: 0.3
     clef: 0.3
   metrics:
-    prob_threshold: 0.2
-    prob_threshold_onset: 0.2
-    prob_threshold_offset: 0.2
+    prob_threshold: 0.20
+    prob_threshold_onset: 0.20
+    prob_threshold_offset: 0.20
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
-    prob_temperature_offset: 1.0
+    prob_temperature_offset: 1.25
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
-    prob_logit_bias_offset: 0.0
+    prob_logit_bias_offset: -0.4
     decoder:
       onset:
-        open: 0.22  # default
-        hold: 0.16  # default
-        min_on: 2  # default
-        merge_gap: 1  # default
+        open: 0.24  
+        hold: 0.18  
+        min_on: 2  
+        merge_gap: 1  
       offset:
-        open: 0.11  # default
-        hold: 0.07  # default
-        min_off: 2  # default
-        merge_gap: 1  # default
+        open: 0.11  
+        hold: 0.07  
+        min_off: 2  
+        merge_gap: 1  
     temporal_decoder:
       shared:
         low_ratio: 0.6
@@ -173,7 +173,7 @@ training:
     split: val
     sweep:
       delta: 0.05
-      low_guard: 0.1
+      low_guard: 0.10
       min_prob: 0.02
       max_prob: 0.98
 optim:
@@ -205,28 +205,8 @@ autopilot:
     hold_min: 0.04
     merge_gap: 1
     thr_anchor: 0.2
-    thr_add_delta: 0.01
-    thr_add_steps: 5
-    thr_mul_ratio: 1.1
-    thr_mul_orders: 1
-    thr_min_prob: 0.02
-    thr_max_prob: 0.98
-    thr_low_guard: 0.1
-    thr_high_guard: 0.6
-    thr_min_points: 5
-    thr_max_points: 11
-  offset_optimizer:
-    thr_anchor: 0.3
-    thr_add_delta: 0.01
-    thr_add_steps: 5
-    thr_mul_ratio: 1.1
-    thr_mul_orders: 1
-    thr_min_prob: 0.02
-    thr_max_prob: 0.98
-    thr_low_guard: 0.02
-    thr_high_guard: 0.95
-    thr_min_points: 5
-    thr_max_points: 11
+    thr_delta: 0.05
+    thr_steps: 5
 inference:
   output_dir: inference_results
   predict_on_train: false

@@ -462,6 +462,7 @@ DEFAULT_ONSET_MERGE_GAP = 1
 DEFAULT_ONSET_THR_ANCHOR = 0.20
 DEFAULT_ONSET_THR_DELTA = 0.05
 DEFAULT_ONSET_THR_STEPS = 5
+DEFAULT_OFFSET_THR_ANCHOR = 0.30
 ONSET_OPEN_MIN = 0.16
 ONSET_OPEN_MAX = 0.36
 ONSET_THR_MIN = 0.10
@@ -469,6 +470,48 @@ ONSET_THR_MAX = 0.40
 ONSET_PRED_RATE_MIN_FACTOR = 0.5
 ONSET_PRED_RATE_MAX_FACTOR = 3.0
 ONSET_TIE_TOL = 1e-4
+
+DEFAULT_STAGEB_ADD_DELTA = 0.01
+DEFAULT_STAGEB_ADD_STEPS = 5
+DEFAULT_STAGEB_MUL_RATIO = 1.10
+DEFAULT_STAGEB_MUL_ORDERS = 1
+DEFAULT_STAGEB_MIN_PROB = 0.02
+DEFAULT_STAGEB_MAX_PROB = 0.98
+DEFAULT_STAGEB_LOW_GUARD = 0.05
+DEFAULT_STAGEB_HIGH_GUARD = 0.95
+DEFAULT_STAGEB_MIN_POINTS = 5
+DEFAULT_STAGEB_MAX_POINTS = 11
+
+DEFAULT_ONSET_STAGEB_LOW_GUARD = ONSET_THR_MIN
+DEFAULT_ONSET_STAGEB_HIGH_GUARD = 0.60
+DEFAULT_OFFSET_STAGEB_LOW_GUARD = 0.02
+DEFAULT_OFFSET_STAGEB_HIGH_GUARD = 0.95
+
+THOROUGH_CACHE_FILENAME = "stageB_thorough_cache.json"
+STAGEB_CANDIDATES_TEMPLATE = "stageB_round{round:02d}_calib{calib:02d}_candidates.json"
+STAGEB_STATE_TEMPLATE = "stageB_round{round:02d}_calib{calib:02d}_state.json"
+
+
+@dataclass
+class StageBParams:
+    add_delta: float
+    add_steps: int
+    mul_ratio: float
+    mul_orders: int
+    min_prob: float
+    max_prob: float
+    low_guard: Optional[float]
+    high_guard: Optional[float]
+    min_points: int
+    max_points: Optional[int]
+    explicit: Optional[List[float]]
+
+
+@dataclass
+class StageBAnchor:
+    prob: float
+    source: str
+    details: Dict[str, Any]
 
 
 def _normalize_probability_list(values: Iterable[float], *, lo: float, hi: float) -> List[float]:
@@ -517,6 +560,450 @@ def _write_calibration_json(result: SelectionResult) -> None:
     data["offset"] = offset
     with CALIB_JSON.open("w") as f:
         json.dump(data, f, indent=2)
+
+
+def _stageb_cache_path(stdout_dir: Path) -> Path:
+    return stdout_dir / THOROUGH_CACHE_FILENAME
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    tmp.replace(path)
+
+
+def _load_stageb_cache(stdout_dir: Path) -> Dict[str, Any]:
+    path = _stageb_cache_path(stdout_dir)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _extract_thorough_anchor(entry: Mapping[str, Any] | None, *, provenance: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, Mapping):
+        return None
+    best_prob = _coerce_optional_float(entry.get("best_prob"))
+    if best_prob is None:
+        return None
+    payload: Dict[str, Any] = {
+        "prob": _clamp_probability(best_prob),
+        "source": provenance,
+    }
+    temp_val = (
+        _coerce_optional_float(entry.get("temperature"))
+        or _coerce_optional_float(entry.get("platt_scale"))
+    )
+    if temp_val is not None:
+        payload["temperature"] = temp_val
+    bias_val = (
+        _coerce_optional_float(entry.get("logit_bias"))
+        or _coerce_optional_float(entry.get("platt_bias"))
+    )
+    if bias_val is not None:
+        payload["bias"] = bias_val
+    return payload
+
+
+def _update_stageb_cache_from_calib(stdout_dir: Path, calib: Mapping[str, Any]) -> Dict[str, Any]:
+    existing = _load_stageb_cache(stdout_dir)
+    payload: Dict[str, Any] = dict(existing)
+    anchors: Dict[str, Any] = dict(payload.get("anchors", {}))
+    changed = False
+    for head in ("onset", "offset"):
+        entry = calib.get(head) if isinstance(calib, Mapping) else None
+        anchor = _extract_thorough_anchor(entry, provenance="calibration.json")
+        if anchor is None:
+            continue
+        anchors[head] = anchor
+        changed = True
+    if changed:
+        payload["anchors"] = anchors
+        payload["timestamp"] = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+        _atomic_write_json(_stageb_cache_path(stdout_dir), payload)
+        return payload
+    return existing
+
+
+_THOROUGH_LINE_RE = re.compile(
+    r"^(Onset|Offset):.*best_prob=(?P<prob>[0-9]*\.?[0-9]+).*temp=(?P<temp>[+-]?\d+(?:\.\d+)?).*bias=(?P<bias>[+-]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_thorough_log(stdout_dir: Path) -> Dict[str, Dict[str, Any]]:
+    log_path = stdout_dir / "calibration_thorough.txt"
+    if not log_path.exists():
+        return {}
+    anchors: Dict[str, Dict[str, Any]] = {}
+    try:
+        with log_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                match = _THOROUGH_LINE_RE.search(line)
+                if not match:
+                    continue
+                head = match.group(1).lower()
+                prob_val = _coerce_optional_float(match.group("prob"))
+                if prob_val is None:
+                    continue
+                anchor: Dict[str, Any] = {
+                    "prob": _clamp_probability(prob_val),
+                    "source": "calibration_thorough.txt",
+                }
+                temp_val = _coerce_optional_float(match.group("temp"))
+                if temp_val is not None:
+                    anchor["temperature"] = temp_val
+                bias_val = _coerce_optional_float(match.group("bias"))
+                if bias_val is not None:
+                    anchor["bias"] = bias_val
+                anchors[head] = anchor
+    except OSError:
+        return {}
+    return anchors
+
+
+def _build_anchor_from_entry(entry: Mapping[str, Any] | None, *, params: StageBParams) -> Optional[StageBAnchor]:
+    if not isinstance(entry, Mapping):
+        return None
+    prob_val = _coerce_optional_float(entry.get("prob"))
+    if prob_val is None:
+        return None
+    raw_prob = float(prob_val)
+    bounded_prob = max(params.min_prob, min(params.max_prob, raw_prob))
+    details: Dict[str, Any] = {"raw_prob": raw_prob}
+    for key in ("temperature", "bias", "platt_scale", "platt_bias", "logit_bias"):
+        val = entry.get(key)
+        coerced = _coerce_optional_float(val)
+        if coerced is not None:
+            details[key] = coerced
+    source = str(entry.get("source") or "unknown")
+    return StageBAnchor(prob=bounded_prob, source=source, details=details)
+
+
+def _resolve_stageb_anchor(
+    head: str,
+    *,
+    params: StageBParams,
+    thorough_cache: Mapping[str, Any],
+    log_fallback: Mapping[str, Any],
+    previous_best: Optional[float],
+    config_anchor: float,
+) -> StageBAnchor:
+    anchors_map = thorough_cache.get("anchors") if isinstance(thorough_cache, Mapping) else None
+    if isinstance(anchors_map, Mapping):
+        entry = anchors_map.get(head)
+        anchor = _build_anchor_from_entry(entry, params=params)
+        if anchor:
+            anchor.details.setdefault("origin", "thorough_cache")
+            return anchor
+    entry = log_fallback.get(head)
+    anchor = _build_anchor_from_entry(entry, params=params)
+    if anchor:
+        anchor.details.setdefault("origin", "thorough_log")
+        return anchor
+    if previous_best is not None:
+        prob = max(params.min_prob, min(params.max_prob, float(previous_best)))
+        return StageBAnchor(
+            prob=prob,
+            source="previous",
+            details={"previous_round": previous_best},
+        )
+    prob = max(params.min_prob, min(params.max_prob, float(config_anchor)))
+    return StageBAnchor(
+        prob=prob,
+        source="config",
+        details={"config_anchor": config_anchor},
+    )
+
+
+def _dedupe_probabilities(values: Iterable[float]) -> List[float]:
+    processed: List[float] = []
+    for raw in values:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        processed.append(val)
+    processed.sort()
+    deduped: List[float] = []
+    for val in processed:
+        if not deduped or abs(val - deduped[-1]) > 1e-6:
+            deduped.append(val)
+    return deduped
+
+
+def _clamp_and_filter_candidates(values: Iterable[float], params: StageBParams) -> Tuple[List[float], float, float]:
+    processed = _dedupe_probabilities(values)
+    bounded = [max(params.min_prob, min(params.max_prob, val)) for val in processed]
+    guard_min = params.low_guard if params.low_guard is not None else params.min_prob
+    guard_max = params.high_guard if params.high_guard is not None else params.max_prob
+    guard_min = max(params.min_prob, min(params.max_prob, float(guard_min)))
+    guard_max = max(params.min_prob, min(params.max_prob, float(guard_max)))
+    if guard_min > guard_max:
+        guard_min = guard_max
+    filtered = [val for val in bounded if guard_min - 1e-6 <= val <= guard_max + 1e-6]
+    return _dedupe_probabilities(filtered), guard_min, guard_max
+
+
+def _pad_candidates(
+    candidates: List[float],
+    anchor: float,
+    params: StageBParams,
+    guard_min: float,
+    guard_max: float,
+) -> List[float]:
+    target = max(1, params.min_points)
+    if len(candidates) >= target:
+        return _dedupe_probabilities(candidates)
+    delta = params.add_delta if params.add_delta > 0 else (guard_max - guard_min) / max(target, 1)
+    delta = max(delta, 1e-3)
+    working = list(candidates)
+    seen = {int(round(val * 1e6)) for val in working}
+    step = 1
+    max_iters = 512
+    while len(working) < target and step < max_iters:
+        added = False
+        lower = anchor - step * delta
+        if lower >= guard_min - 1e-6:
+            lower_clamped = max(guard_min, min(guard_max, lower))
+            key = int(round(lower_clamped * 1e6))
+            if key not in seen:
+                working.append(lower_clamped)
+                seen.add(key)
+                added = True
+        upper = anchor + step * delta
+        if len(working) < target and upper <= guard_max + 1e-6:
+            upper_clamped = max(guard_min, min(guard_max, upper))
+            key = int(round(upper_clamped * 1e6))
+            if key not in seen:
+                working.append(upper_clamped)
+                seen.add(key)
+                added = True
+        if not added:
+            break
+        step += 1
+    return _dedupe_probabilities(working)
+
+
+def _trim_candidates(candidates: List[float], anchor: float, max_points: Optional[int]) -> List[float]:
+    limit = max_points if max_points is None else int(max_points)
+    if limit is None or limit <= 0 or len(candidates) <= limit:
+        return _dedupe_probabilities(candidates)
+    ordered = _dedupe_probabilities(candidates)
+    if not ordered:
+        return ordered
+    anchor_idx = min(range(len(ordered)), key=lambda idx: (abs(ordered[idx] - anchor), -ordered[idx]))
+    picked = {anchor_idx}
+    left = anchor_idx - 1
+    right = anchor_idx + 1
+    while len(picked) < limit and (left >= 0 or right < len(ordered)):
+        options = []
+        if left >= 0:
+            options.append(("left", abs(ordered[left] - anchor), ordered[left]))
+        if right < len(ordered):
+            options.append(("right", abs(ordered[right] - anchor), ordered[right]))
+        if not options:
+            break
+        options.sort(key=lambda item: (item[1], -item[2]))
+        side = options[0][0]
+        if side == "left":
+            picked.add(left)
+            left -= 1
+        else:
+            picked.add(right)
+            right += 1
+        if len(picked) >= limit:
+            break
+    return sorted(ordered[idx] for idx in picked)
+
+
+def _generate_stageb_candidates(anchor: StageBAnchor, params: StageBParams) -> Tuple[List[float], float, float, float]:
+    base_values: List[float] = []
+    anchor_prob = float(anchor.prob)
+    if params.explicit:
+        base_values = [float(val) for val in params.explicit]
+    else:
+        steps = params.add_steps if params.add_steps > 0 else 1
+        if steps % 2 == 0:
+            steps += 1
+        half = steps // 2
+        for idx in range(-half, half + 1):
+            base_values.append(anchor_prob + idx * params.add_delta)
+        ratio = params.mul_ratio if params.mul_ratio and params.mul_ratio > 0 else 1.0
+        if params.mul_orders > 0 and abs(ratio - 1.0) > 1e-9:
+            for order in range(-params.mul_orders, params.mul_orders + 1):
+                base_values.append(anchor_prob * (ratio ** order))
+    base_values.append(anchor_prob)
+    candidates, guard_min, guard_max = _clamp_and_filter_candidates(base_values, params)
+    anchor_clamped = max(guard_min, min(guard_max, anchor_prob))
+    if not any(abs(anchor_clamped - val) <= 1e-6 for val in candidates):
+        candidates.append(anchor_clamped)
+    candidates = _pad_candidates(candidates, anchor_clamped, params, guard_min, guard_max)
+    candidates = _trim_candidates(candidates, anchor_clamped, params.max_points)
+    return candidates, anchor_clamped, guard_min, guard_max
+
+
+def _format_candidates(values: Sequence[float]) -> str:
+    return "[" + ",".join(f"{val:.4f}" for val in values) + "]"
+
+
+def _write_stageb_artifacts(
+    stdout_dir: Path,
+    *,
+    round_idx: int,
+    calib_index: int,
+    anchors: Dict[str, StageBAnchor],
+    candidates: Dict[str, Sequence[float]],
+    tie_break: Optional[str],
+    winner_row: Mapping[str, Any],
+) -> None:
+    timestamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+    anchors_payload = {
+        head: {
+            "prob": anchor.prob,
+            "source": anchor.source,
+            "details": anchor.details,
+        }
+        for head, anchor in anchors.items()
+    }
+    candidates_payload = {
+        head: [float(val) for val in seq]
+        for head, seq in candidates.items()
+    }
+    base_payload = {
+        "timestamp": timestamp,
+        "round": round_idx,
+        "calibration_index": calib_index,
+        "anchors": anchors_payload,
+        "candidates": candidates_payload,
+        "tie_break": tie_break,
+    }
+    winner_payload = {
+        "onset_thr": _coerce_optional_float(winner_row.get("onset_thr")),
+        "offset_thr": _coerce_optional_float(winner_row.get("offset_thr")),
+        "onset_event_f1": _coerce_optional_float(winner_row.get("onset_event_f1")),
+        "offset_event_f1": _coerce_optional_float(winner_row.get("offset_event_f1")),
+        "onset_pred_rate": _coerce_optional_float(winner_row.get("onset_pred_rate")),
+        "onset_pos_rate": _coerce_optional_float(winner_row.get("onset_pos_rate")),
+        "ev_f1_mean": _coerce_optional_float(winner_row.get("ev_f1_mean")),
+    }
+    base_payload["winner_row"] = winner_payload
+
+    candidates_path = stdout_dir / STAGEB_CANDIDATES_TEMPLATE.format(round=round_idx, calib=calib_index)
+    state_path = stdout_dir / STAGEB_STATE_TEMPLATE.format(round=round_idx, calib=calib_index)
+    _atomic_write_json(candidates_path, base_payload)
+    _atomic_write_json(state_path, base_payload)
+
+
+def _resolve_stageb_params_from_cfg(
+    cfg: Mapping[str, Any] | None,
+    *,
+    explicit_key: str,
+    low_guard_default: float,
+    high_guard_default: float,
+) -> StageBParams:
+    cfg = cfg or {}
+    add_delta = _coerce_optional_float(cfg.get("thr_add_delta"))
+    if add_delta is None:
+        add_delta = DEFAULT_STAGEB_ADD_DELTA
+    add_delta = max(0.0, float(add_delta))
+
+    add_steps_val = cfg.get("thr_add_steps", DEFAULT_STAGEB_ADD_STEPS)
+    add_steps = _coerce_positive_int(add_steps_val) or int(add_steps_val or DEFAULT_STAGEB_ADD_STEPS)
+    if add_steps < 1:
+        add_steps = 1
+    if add_steps % 2 == 0:
+        add_steps += 1
+
+    mul_ratio_val = _coerce_optional_float(cfg.get("thr_mul_ratio"))
+    mul_ratio = float(mul_ratio_val) if mul_ratio_val is not None else DEFAULT_STAGEB_MUL_RATIO
+    if not math.isfinite(mul_ratio) or mul_ratio <= 1.0:
+        mul_ratio = 1.0
+
+    mul_orders_val = cfg.get("thr_mul_orders")
+    if mul_orders_val is None:
+        mul_orders = DEFAULT_STAGEB_MUL_ORDERS
+    else:
+        try:
+            mul_orders = int(mul_orders_val)
+        except (TypeError, ValueError):
+            mul_orders = DEFAULT_STAGEB_MUL_ORDERS
+        mul_orders = max(0, mul_orders)
+
+    min_prob_val = _coerce_optional_float(cfg.get("thr_min_prob"))
+    if min_prob_val is None:
+        min_prob_val = DEFAULT_STAGEB_MIN_PROB
+    min_prob = max(0.0, min(1.0, float(min_prob_val)))
+
+    max_prob_val = _coerce_optional_float(cfg.get("thr_max_prob"))
+    if max_prob_val is None:
+        max_prob_val = DEFAULT_STAGEB_MAX_PROB
+    max_prob = max(min_prob, min(1.0, float(max_prob_val)))
+
+    low_guard_val = _coerce_optional_float(cfg.get("thr_low_guard"))
+    if low_guard_val is None:
+        low_guard_val = low_guard_default
+    low_guard = None if low_guard_val is None else max(min_prob, min(max_prob, float(low_guard_val)))
+
+    high_guard_val = _coerce_optional_float(cfg.get("thr_high_guard"))
+    if high_guard_val is None:
+        high_guard_val = high_guard_default
+    high_guard = None if high_guard_val is None else max(min_prob, min(max_prob, float(high_guard_val)))
+    if high_guard is not None and low_guard is not None and high_guard < low_guard:
+        low_guard = high_guard
+
+    min_points_val = cfg.get("thr_min_points", DEFAULT_STAGEB_MIN_POINTS)
+    try:
+        min_points = int(min_points_val)
+    except (TypeError, ValueError):
+        min_points = DEFAULT_STAGEB_MIN_POINTS
+    if min_points < 1:
+        min_points = 1
+
+    max_points_val = cfg.get("thr_max_points", DEFAULT_STAGEB_MAX_POINTS)
+    max_points: Optional[int]
+    if max_points_val is None:
+        max_points = None
+    else:
+        try:
+            max_points_candidate = int(max_points_val)
+        except (TypeError, ValueError):
+            max_points_candidate = DEFAULT_STAGEB_MAX_POINTS
+        max_points = None if max_points_candidate <= 0 else max(max_points_candidate, min_points)
+
+    explicit = cfg.get(explicit_key)
+    if explicit is None:
+        explicit = cfg.get("thr_explicit")
+    explicit_list: Optional[List[float]] = None
+    if isinstance(explicit, (list, tuple)):
+        explicit_list = _dedupe_probabilities(explicit)
+
+    return StageBParams(
+        add_delta=add_delta,
+        add_steps=add_steps,
+        mul_ratio=mul_ratio,
+        mul_orders=mul_orders,
+        min_prob=min_prob,
+        max_prob=max_prob,
+        low_guard=low_guard,
+        high_guard=high_guard,
+        min_points=min_points,
+        max_points=max_points,
+        explicit=explicit_list,
+    )
 
 
 def _coerce_optional_float(value) -> Optional[float]:
@@ -859,6 +1346,7 @@ def perform_calibration(
     calibration_count: int,
     seed: int,
     deterministic: bool,
+    round_index: int,
 ) -> Tuple[Optional[SelectionResult], Optional[SelectionContext], List[str], int]:
     first_calibration = calibration_count == 0
     prefer_fast_grid = first_calibration and args.fast_first_calib
@@ -869,28 +1357,27 @@ def perform_calibration(
     prev_onset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_onset"))
     prev_offset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_offset"))
 
-    def _resolve_anchor(
-        calib_entry: Optional[dict],
-        *,
-        previous: Optional[float],
-        fallback: float,
-    ) -> Tuple[float, Optional[float], str]:
-        prob_val: Optional[float] = None
-        logit_val: Optional[float] = None
-        if isinstance(calib_entry, dict):
-            cal_prob = _coerce_optional_float(calib_entry.get("best_prob"))
-            if cal_prob is not None:
-                prob_val = _clamp_probability(cal_prob)
-            else:
-                cal_logit = _coerce_optional_float(calib_entry.get("best_logit"))
-                if cal_logit is not None:
-                    logit_val = cal_logit
-                    prob_val = _clamp_probability(_logit_to_probability(cal_logit))
-        if prob_val is not None:
-            return float(prob_val), logit_val, "calibration"
-        if previous is not None:
-            return float(_clamp_probability(previous)), None, "best"
-        return float(_clamp_probability(fallback)), None, "fallback"
+    autop_cfg = cfg_snapshot.get("autopilot", {}) if isinstance(cfg_snapshot, Mapping) else {}
+    onset_stageb_cfg = autop_cfg.get("onset_optimizer", {}) if isinstance(autop_cfg, Mapping) else {}
+    offset_stageb_cfg = autop_cfg.get("offset_optimizer", {}) if isinstance(autop_cfg, Mapping) else {}
+
+    onset_stageb_params = _resolve_stageb_params_from_cfg(
+        onset_stageb_cfg,
+        explicit_key="thr_explicit_onset",
+        low_guard_default=DEFAULT_ONSET_STAGEB_LOW_GUARD,
+        high_guard_default=DEFAULT_ONSET_STAGEB_HIGH_GUARD,
+    )
+    offset_stageb_params = _resolve_stageb_params_from_cfg(
+        offset_stageb_cfg,
+        explicit_key="thr_explicit_offset",
+        low_guard_default=DEFAULT_OFFSET_STAGEB_LOW_GUARD,
+        high_guard_default=DEFAULT_OFFSET_STAGEB_HIGH_GUARD,
+    )
+
+    offset_anchor_cfg = _coerce_optional_float((offset_stageb_cfg or {}).get("thr_anchor"))
+    offset_thr_anchor = offset_anchor_cfg if offset_anchor_cfg is not None else DEFAULT_OFFSET_THR_ANCHOR
+
+    thorough_cache = _load_stageb_cache(stdout_dir)
 
     decoder_snapshot = decoder_snapshot_from_config(cfg_snapshot)
     tolerance_snapshot = tolerance_snapshot_from_config(cfg_snapshot)
@@ -942,24 +1429,31 @@ def perform_calibration(
         )
 
     def _run_two_stage(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
-        onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
-        offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
-        onset_prob, onset_logit, onset_src = _resolve_anchor(
-            onset_entry,
-            previous=prev_onset_best,
-            fallback=args.onset_thr_anchor,
-        )
-        offset_prob, offset_logit, offset_src = _resolve_anchor(
-            offset_entry,
-            previous=prev_offset_best,
-            fallback=0.3,
-        )
-        def _clamp_onset_threshold(value: float) -> float:
-            return max(ONSET_THR_MIN, min(ONSET_THR_MAX, float(value)))
+        log_fallback = _parse_thorough_log(stdout_dir)
 
-        onset_prob = _clamp_onset_threshold(onset_prob)
-        offset_prob = _clamp_fast_result(offset_prob)
-        anchor_source = onset_src if onset_src == offset_src else f"onset:{onset_src},offset:{offset_src}"
+        onset_anchor = _resolve_stageb_anchor(
+            "onset",
+            params=onset_stageb_params,
+            thorough_cache=thorough_cache,
+            log_fallback=log_fallback,
+            previous_best=prev_onset_best,
+            config_anchor=args.onset_thr_anchor,
+        )
+        offset_anchor = _resolve_stageb_anchor(
+            "offset",
+            params=offset_stageb_params,
+            thorough_cache=thorough_cache,
+            log_fallback=log_fallback,
+            previous_best=prev_offset_best,
+            config_anchor=offset_thr_anchor,
+        )
+        onset_prob = float(onset_anchor.prob)
+        offset_prob = float(offset_anchor.prob)
+        anchor_source = (
+            onset_anchor.source
+            if onset_anchor.source == offset_anchor.source
+            else f"onset:{onset_anchor.source},offset:{offset_anchor.source}"
+        )
 
         LOGGER.info(
             "[autopilot:two-stage] anchors onset=%.4f offset=%.4f (source=%s)",
@@ -1140,40 +1634,42 @@ def perform_calibration(
             )
         )
 
-        def _build_threshold_list(anchor: float, delta: float, steps: int) -> List[float]:
-            steps = max(steps, 1)
-            if steps == 1:
-                return [anchor]
-            values: List[float] = []
-            for idx in range(steps):
-                fraction = idx / (steps - 1)
-                val = anchor - delta + 2 * delta * fraction
-                values.append(val)
-            values.append(anchor)
-            return _normalize_probability_list(values, lo=ONSET_THR_MIN, hi=ONSET_THR_MAX)
-
-        thresholds = _build_threshold_list(onset_prob, float(args.onset_thr_delta), int(args.onset_thr_steps))
-        if not thresholds:
-            thresholds = [onset_prob]
+        onset_candidates, onset_candidates_center, onset_guard_min, onset_guard_max = _generate_stageb_candidates(
+            onset_anchor, onset_stageb_params
+        )
+        offset_candidates, offset_candidates_center, offset_guard_min, offset_guard_max = _generate_stageb_candidates(
+            offset_anchor, offset_stageb_params
+        )
         print(
-            "[Stage-B] threshold micro-sweep anchor={:.4f} delta={:.3f} steps={} "
-            "grid={}".format(
-                onset_prob,
-                float(args.onset_thr_delta),
-                int(args.onset_thr_steps),
-                ",".join(f"{v:.4f}" for v in thresholds),
+            "[Stage-B] onset anchor={:.4f} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
+                onset_anchor.prob,
+                onset_anchor.source,
+                onset_guard_min,
+                onset_guard_max,
+                _format_candidates(onset_candidates),
+                len(onset_candidates),
+            )
+        )
+        print(
+            "[Stage-B] offset anchor={:.4f} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
+                offset_anchor.prob,
+                offset_anchor.source,
+                offset_guard_min,
+                offset_guard_max,
+                _format_candidates(offset_candidates),
+                len(offset_candidates),
             )
         )
 
         stage_b_log = f"{_stage_log_prefix()}_stageB.txt"
         try:
             request = _build_request(
-                onset_prob,
-                offset_prob,
+                onset_candidates_center,
+                offset_candidates_center,
                 log_name=stage_b_log,
-                sweep_override=(thresholds, [offset_prob]),
+                sweep_override=(onset_candidates, offset_candidates),
                 extras=stage_a_winner["extras"],
-                low_guard=ONSET_THR_MIN,
+                low_guard=onset_stageb_params.low_guard or onset_stageb_params.min_prob,
             )
             _, stage_b_context, stage_b_lines = calibrate_and_score(request)
             rows_b = parse_eval_rows(stage_b_lines)
@@ -1265,6 +1761,22 @@ def perform_calibration(
             )
         )
 
+        onset_anchor.details["sweep_center"] = onset_candidates_center
+        onset_anchor.details["guard"] = [onset_guard_min, onset_guard_max]
+        onset_anchor.details["candidate_count"] = len(onset_candidates)
+        offset_anchor.details["sweep_center"] = offset_candidates_center
+        offset_anchor.details["guard"] = [offset_guard_min, offset_guard_max]
+        offset_anchor.details["candidate_count"] = len(offset_candidates)
+        _write_stageb_artifacts(
+            stdout_dir,
+            round_idx=round_index,
+            calib_index=calibration_count,
+            anchors={"onset": onset_anchor, "offset": offset_anchor},
+            candidates={"onset": onset_candidates, "offset": offset_candidates},
+            tie_break=tie_break_note,
+            winner_row=best_row,
+        )
+
         decoder_payload = {
             key: best_row[key]
             for key in best_row.keys()
@@ -1305,24 +1817,29 @@ def perform_calibration(
             return _run_two_stage(calib, log_name=log_name)
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
-        onset_entry = calib.get("onset", {}) if isinstance(calib, dict) else {}
-        offset_entry = calib.get("offset", {}) if isinstance(calib, dict) else {}
-        onset_prob, onset_logit, onset_src = _resolve_anchor(
-            onset_entry,
-            previous=prev_onset_best,
-            fallback=0.3,
+        log_fallback = _parse_thorough_log(stdout_dir)
+        onset_anchor = _resolve_stageb_anchor(
+            "onset",
+            params=onset_stageb_params,
+            thorough_cache=thorough_cache,
+            log_fallback=log_fallback,
+            previous_best=prev_onset_best,
+            config_anchor=args.onset_thr_anchor,
         )
-        offset_prob, offset_logit, offset_src = _resolve_anchor(
-            offset_entry,
-            previous=prev_offset_best,
-            fallback=0.3,
+        offset_anchor = _resolve_stageb_anchor(
+            "offset",
+            params=offset_stageb_params,
+            thorough_cache=thorough_cache,
+            log_fallback=log_fallback,
+            previous_best=prev_offset_best,
+            config_anchor=offset_thr_anchor,
         )
-        onset_prob = _clamp_fast_result(onset_prob)
-        offset_prob = _clamp_fast_result(offset_prob)
-        if onset_src == offset_src:
-            anchor_source = onset_src
+        onset_prob = _clamp_fast_result(onset_anchor.prob)
+        offset_prob = _clamp_fast_result(offset_anchor.prob)
+        if onset_anchor.source == offset_anchor.source:
+            anchor_source = onset_anchor.source
         else:
-            anchor_source = f"onset:{onset_src},offset:{offset_src}"
+            anchor_source = f"onset:{onset_anchor.source},offset:{offset_anchor.source}"
         LOGGER.info(
             "[autopilot:grid] anchors onset=%.4f offset=%.4f (source=%s)",
             onset_prob,
@@ -1378,6 +1895,7 @@ def perform_calibration(
         calib = load_calibration(CALIB_JSON)
         if calib is None:
             return _run_fast_grid("calibration.json missing after thorough calibration")
+        thorough_cache = _update_stageb_cache_from_calib(stdout_dir, calib)
         try:
             result, context, lines = _run_selection_with_calibration(calib, log_name="eval_fast.txt")
         except SelectionError as exc:
@@ -1843,17 +2361,55 @@ def main() -> int:
     )
     _assign_setting(
         args.onset_thr_delta,
-        cfg_key="thr_delta",
+        cfg_key="thr_add_delta",
         default=DEFAULT_ONSET_THR_DELTA,
         transform=lambda val: max(0.0, float(val)),
         attr_name="onset_thr_delta",
     )
     _assign_setting(
         args.onset_thr_steps,
-        cfg_key="thr_steps",
+        cfg_key="thr_add_steps",
         default=DEFAULT_ONSET_THR_STEPS,
         transform=lambda val: max(3, int(val)),
         attr_name="onset_thr_steps",
+    )
+    offset_opt_cfg = autop_cfg_root.setdefault("offset_optimizer", {})
+
+    def _ensure_stageb_defaults(cfg_dict: dict, defaults: Mapping[str, Any]) -> None:
+        nonlocal changed
+        for key, value in defaults.items():
+            if key not in cfg_dict:
+                cfg_dict[key] = value
+                changed = True
+
+    _ensure_stageb_defaults(
+        onset_opt_cfg,
+        {
+            "thr_mul_ratio": DEFAULT_STAGEB_MUL_RATIO,
+            "thr_mul_orders": DEFAULT_STAGEB_MUL_ORDERS,
+            "thr_min_prob": DEFAULT_STAGEB_MIN_PROB,
+            "thr_max_prob": DEFAULT_STAGEB_MAX_PROB,
+            "thr_low_guard": DEFAULT_ONSET_STAGEB_LOW_GUARD,
+            "thr_high_guard": DEFAULT_ONSET_STAGEB_HIGH_GUARD,
+            "thr_min_points": DEFAULT_STAGEB_MIN_POINTS,
+            "thr_max_points": DEFAULT_STAGEB_MAX_POINTS,
+        },
+    )
+    _ensure_stageb_defaults(
+        offset_opt_cfg,
+        {
+            "thr_anchor": DEFAULT_OFFSET_THR_ANCHOR,
+            "thr_add_delta": DEFAULT_STAGEB_ADD_DELTA,
+            "thr_add_steps": DEFAULT_STAGEB_ADD_STEPS,
+            "thr_mul_ratio": DEFAULT_STAGEB_MUL_RATIO,
+            "thr_mul_orders": DEFAULT_STAGEB_MUL_ORDERS,
+            "thr_min_prob": DEFAULT_STAGEB_MIN_PROB,
+            "thr_max_prob": DEFAULT_STAGEB_MAX_PROB,
+            "thr_low_guard": DEFAULT_OFFSET_STAGEB_LOW_GUARD,
+            "thr_high_guard": DEFAULT_OFFSET_STAGEB_HIGH_GUARD,
+            "thr_min_points": DEFAULT_STAGEB_MIN_POINTS,
+            "thr_max_points": DEFAULT_STAGEB_MAX_POINTS,
+        },
     )
     resolved_strategy = args.fast_strategy or DEFAULT_FAST_STRATEGY
     if autop_cfg_root.get("fast_strategy") != resolved_strategy:
@@ -2003,6 +2559,7 @@ def main() -> int:
                 calibration_count=calibration_count,
                 seed=seed,
                 deterministic=deterministic,
+                round_index=round_idx,
             )
             if selection_result is None:
                 print("Calibration failed", file=sys.stderr)
@@ -2120,6 +2677,7 @@ def main() -> int:
                     calibration_count=calibration_count,
                     seed=seed,
                     deterministic=deterministic,
+                    round_index=round_idx,
                 )
                 if selection_result is None:
                     print("Calibration failed", file=sys.stderr)
