@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ DEFAULT_LOW_GUARD = 0.10
 EVAL_SCRIPT = Path("scripts") / "calib" / "eval_thresholds.py"
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 FLOAT_PREFIX_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+EXPLICIT_EPS = 1e-9
 
 
 class SelectionError(RuntimeError):
@@ -82,7 +84,7 @@ class SweepSpec:
 
     def onset_candidates(self) -> Tuple[float, ...]:
         if self.onset_explicit is not None:
-            return tuple(_clamp_fast_result(v) for v in self.onset_explicit)
+            return _normalize_explicit_candidates(self.onset_explicit)
         return _bounded_candidates(
             self.onset_center,
             self.delta,
@@ -94,7 +96,7 @@ class SweepSpec:
 
     def offset_candidates(self) -> Tuple[float, ...]:
         if self.offset_explicit is not None:
-            return tuple(_clamp_fast_result(v) for v in self.offset_explicit)
+            return _normalize_explicit_candidates(self.offset_explicit)
         return _bounded_candidates(
             self.offset_center,
             self.delta,
@@ -640,3 +642,23 @@ def tolerance_snapshot_from_config(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     dataset_cfg = cfg.get("dataset", {}) if isinstance(cfg, Mapping) else {}
     frame_cfg = dataset_cfg.get("frame_targets", {}) if isinstance(dataset_cfg, Mapping) else {}
     return copy.deepcopy(frame_cfg) if isinstance(frame_cfg, Mapping) else {}
+
+def _normalize_explicit_candidates(values: Sequence[float]) -> Tuple[float, ...]:
+    processed: List[float] = []
+    for raw in values or ():
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        val = max(0.0, min(1.0, val))
+        processed.append(val)
+    if not processed:
+        return tuple()
+    processed.sort()
+    deduped: List[float] = [processed[0]]
+    for val in processed[1:]:
+        if abs(val - deduped[-1]) > EXPLICIT_EPS:
+            deduped.append(val)
+    return tuple(deduped)

@@ -89,7 +89,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 6
+  epochs: 10
   learning_rate: 1e-4
   weight_decay: 0.01
   eval_freq: 1
@@ -209,9 +209,9 @@ autopilot:
     thr_add_steps: 5
     thr_mul_ratio: 1.1
     thr_mul_orders: 1
-    thr_min_prob: 0.005   # was 0.02 — allow ~0.01 from thorough
+    thr_min_prob: 0.005
     thr_max_prob: 0.98
-    thr_low_guard: 0.01   # was 0.10 — don’t block tiny thresholds
+    thr_low_guard: 0.01
     thr_high_guard: 0.6
     thr_min_points: 5
     thr_max_points: 11
