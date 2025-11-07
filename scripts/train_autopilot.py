@@ -492,6 +492,8 @@ DEFAULT_STAGEB_LOW_GUARD = 0.05
 DEFAULT_STAGEB_HIGH_GUARD = 0.95
 DEFAULT_STAGEB_MIN_POINTS = 5
 DEFAULT_STAGEB_MAX_POINTS = 11
+STAGEB_PROB_FMT = "{:.4f}"
+STAGEB_PROB_TOL = 1e-6
 
 DEFAULT_ONSET_STAGEB_LOW_GUARD = ONSET_THR_MIN
 DEFAULT_ONSET_STAGEB_HIGH_GUARD = 0.60
@@ -528,6 +530,16 @@ class StageBAnchor:
     prob: float
     source: str
     details: Dict[str, Any]
+    raw_prob: float
+
+    def __post_init__(self) -> None:
+        try:
+            raw_val = float(self.raw_prob)
+        except (TypeError, ValueError):
+            raw_val = float(self.prob)
+        if not math.isfinite(raw_val):
+            raw_val = float(self.prob)
+        self.raw_prob = raw_val
 
 
 def _normalize_probability_list(values: Iterable[float], *, lo: float, hi: float) -> List[float]:
@@ -704,7 +716,7 @@ def _build_anchor_from_entry(entry: Mapping[str, Any] | None, *, params: StageBP
         if coerced is not None:
             details[key] = coerced
     source = str(entry.get("source") or "unknown")
-    return StageBAnchor(prob=bounded_prob, source=source, details=details)
+    return StageBAnchor(prob=bounded_prob, source=source, details=details, raw_prob=raw_prob)
 
 
 def _resolve_stageb_anchor(
@@ -729,17 +741,21 @@ def _resolve_stageb_anchor(
         anchor.details.setdefault("origin", "thorough_log")
         return anchor
     if previous_best is not None:
-        prob = max(params.min_prob, min(params.max_prob, float(previous_best)))
+        raw_prev = float(previous_best)
+        prob = max(params.min_prob, min(params.max_prob, raw_prev))
         return StageBAnchor(
             prob=prob,
             source="previous",
-            details={"previous_round": previous_best},
+            details={"previous_round": previous_best, "raw_prob": raw_prev},
+            raw_prob=raw_prev,
         )
-    prob = max(params.min_prob, min(params.max_prob, float(config_anchor)))
+    raw_cfg = float(config_anchor)
+    prob = max(params.min_prob, min(params.max_prob, raw_cfg))
     return StageBAnchor(
         prob=prob,
         source="config",
-        details={"config_anchor": config_anchor},
+        details={"config_anchor": config_anchor, "raw_prob": raw_cfg},
+        raw_prob=raw_cfg,
     )
 
 
@@ -825,6 +841,7 @@ def _trim_candidates(candidates: List[float], anchor: float, max_points: Optiona
     picked = {anchor_idx}
     left = anchor_idx - 1
     right = anchor_idx + 1
+    prefer_high_extra = limit % 2 == 0
     while len(picked) < limit and (left >= 0 or right < len(ordered)):
         options = []
         if left >= 0:
@@ -833,8 +850,17 @@ def _trim_candidates(candidates: List[float], anchor: float, max_points: Optiona
             options.append(("right", abs(ordered[right] - anchor), ordered[right]))
         if not options:
             break
-        options.sort(key=lambda item: (item[1], -item[2]))
-        side = options[0][0]
+        force_high_side = prefer_high_extra and len(picked) == limit - 1
+        chosen = None
+        if force_high_side:
+            for option in options:
+                if option[0] == "right":
+                    chosen = option
+                    break
+        if chosen is None:
+            options.sort(key=lambda item: (item[1], -item[2]))
+            chosen = options[0]
+        side = chosen[0]
         if side == "left":
             picked.add(left)
             left -= 1
@@ -848,7 +874,8 @@ def _trim_candidates(candidates: List[float], anchor: float, max_points: Optiona
 
 def _generate_stageb_candidates(anchor: StageBAnchor, params: StageBParams) -> Tuple[List[float], float, float, float]:
     base_values: List[float] = []
-    anchor_prob = float(anchor.prob)
+    anchor_raw = _anchor_raw_probability(anchor)
+    anchor_used = max(params.min_prob, min(params.max_prob, float(anchor.prob)))
     if params.explicit:
         base_values = [float(val) for val in params.explicit]
     else:
@@ -857,19 +884,19 @@ def _generate_stageb_candidates(anchor: StageBAnchor, params: StageBParams) -> T
             steps += 1
         half = steps // 2
         for idx in range(-half, half + 1):
-            base_values.append(anchor_prob + idx * params.add_delta)
+            base_values.append(anchor_used + idx * params.add_delta)
         ratio = params.mul_ratio if params.mul_ratio and params.mul_ratio > 0 else 1.0
         if params.mul_orders > 0 and abs(ratio - 1.0) > 1e-9:
             for order in range(-params.mul_orders, params.mul_orders + 1):
-                base_values.append(anchor_prob * (ratio ** order))
-    base_values.append(anchor_prob)
+                base_values.append(anchor_used * (ratio ** order))
+    base_values.append(anchor_used)
     candidates, guard_min, guard_max = _clamp_and_filter_candidates(base_values, params)
-    anchor_clamped = max(guard_min, min(guard_max, anchor_prob))
-    if not any(abs(anchor_clamped - val) <= 1e-6 for val in candidates):
-        candidates.append(anchor_clamped)
-    candidates = _pad_candidates(candidates, anchor_clamped, params, guard_min, guard_max)
-    candidates = _trim_candidates(candidates, anchor_clamped, params.max_points)
-    return candidates, anchor_clamped, guard_min, guard_max
+    if not any(abs(anchor_used - val) <= STAGEB_PROB_TOL for val in candidates):
+        candidates.append(anchor_used)
+    candidates = _dedupe_probabilities(candidates)
+    candidates = _pad_candidates(candidates, anchor_used, params, guard_min, guard_max)
+    candidates = _trim_candidates(candidates, anchor_used, params.max_points)
+    return candidates, anchor_used, guard_min, guard_max
 
 
 def _round_state_path(stdout_dir: Path, round_idx: int) -> Path:
@@ -906,8 +933,27 @@ def _extract_offset_gates(decoder_snapshot: Mapping[str, Any] | None) -> Dict[st
     }
 
 
+def _format_prob(value: float) -> str:
+    return STAGEB_PROB_FMT.format(float(value))
+
+
 def _format_candidates(values: Sequence[float]) -> str:
-    return "[" + ",".join(f"{val:.4f}" for val in values) + "]"
+    return "[" + ",".join(_format_prob(val) for val in values) + "]"
+
+
+def _contains_probability(values: Sequence[float], target: float, *, tol: float = STAGEB_PROB_TOL) -> bool:
+    for val in values:
+        if abs(float(val) - float(target)) <= tol:
+            return True
+    return False
+
+
+def _anchor_raw_probability(anchor: StageBAnchor) -> float:
+    raw_value = getattr(anchor, "raw_prob", None)
+    try:
+        return float(raw_value) if raw_value is not None else float(anchor.prob)
+    except (TypeError, ValueError):
+        return float(anchor.prob)
 
 
 def _write_stageb_artifacts(
@@ -919,11 +965,14 @@ def _write_stageb_artifacts(
     candidates: Dict[str, Sequence[float]],
     tie_break: Optional[str],
     winner_row: Mapping[str, Any],
+    gates: Mapping[str, Any],
+    anchor_retained: Mapping[str, bool],
 ) -> None:
     timestamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
     anchors_payload = {
         head: {
             "prob": anchor.prob,
+            "raw_prob": _anchor_raw_probability(anchor),
             "source": anchor.source,
             "details": anchor.details,
         }
@@ -951,6 +1000,8 @@ def _write_stageb_artifacts(
         "ev_f1_mean": _coerce_optional_float(winner_row.get("ev_f1_mean")),
     }
     base_payload["winner_row"] = winner_payload
+    base_payload["gates"] = copy.deepcopy(gates)
+    base_payload["anchor_retained"] = {head: bool(flag) for head, flag in anchor_retained.items()}
 
     candidates_path = stdout_dir / STAGEB_CANDIDATES_TEMPLATE.format(round=round_idx, calib=calib_index)
     state_path = stdout_dir / STAGEB_STATE_TEMPLATE.format(round=round_idx, calib=calib_index)
@@ -1959,15 +2010,18 @@ def perform_calibration(
             )
             return True
 
-        onset_candidates, onset_candidates_center, onset_guard_min, onset_guard_max = _generate_stageb_candidates(
+        onset_candidates, onset_anchor_used, onset_guard_min, onset_guard_max = _generate_stageb_candidates(
             onset_anchor, onset_stageb_params
         )
-        offset_candidates, offset_candidates_center, offset_guard_min, offset_guard_max = _generate_stageb_candidates(
+        offset_candidates, offset_anchor_used, offset_guard_min, offset_guard_max = _generate_stageb_candidates(
             offset_anchor, offset_stageb_params
         )
+        onset_anchor_raw = _anchor_raw_probability(onset_anchor)
+        offset_anchor_raw = _anchor_raw_probability(offset_anchor)
         print(
-            "[Stage-B] onset anchor={:.4f} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
-                onset_anchor.prob,
+            "[Stage-B] onset anchor_raw={} anchor_used={} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
+                _format_prob(onset_anchor_raw),
+                _format_prob(onset_anchor_used),
                 onset_anchor.source,
                 onset_guard_min,
                 onset_guard_max,
@@ -1976,8 +2030,9 @@ def perform_calibration(
             )
         )
         print(
-            "[Stage-B] offset anchor={:.4f} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
-                offset_anchor.prob,
+            "[Stage-B] offset anchor_raw={} anchor_used={} source={} guard=[{:.3f},{:.3f}] candidates={} (n={})".format(
+                _format_prob(offset_anchor_raw),
+                _format_prob(offset_anchor_used),
                 offset_anchor.source,
                 offset_guard_min,
                 offset_guard_max,
@@ -1985,6 +2040,23 @@ def perform_calibration(
                 len(offset_candidates),
             )
         )
+        kept_anchor_onset = _contains_probability(onset_candidates, onset_anchor_used, tol=STAGEB_PROB_TOL)
+        kept_anchor_offset = _contains_probability(offset_candidates, offset_anchor_used, tol=STAGEB_PROB_TOL)
+        print(
+            "stageB: anchor_raw_onset={} anchor_used_onset={} kept_anchor_onset={} "
+            "anchor_raw_offset={} anchor_used_offset={} kept_anchor_offset={} "
+            "list_onset={} list_offset={}".format(
+                _format_prob(onset_anchor_raw),
+                _format_prob(onset_anchor_used),
+                "true" if kept_anchor_onset else "false",
+                _format_prob(offset_anchor_raw),
+                _format_prob(offset_anchor_used),
+                "true" if kept_anchor_offset else "false",
+                _format_candidates(onset_candidates),
+                _format_candidates(offset_candidates),
+            )
+        )
+        anchor_retained_flags = {"onset": kept_anchor_onset, "offset": kept_anchor_offset}
 
         stage_b_log = f"{_stage_log_prefix()}_stageB.txt"
         stage_b_context: Optional[SelectionContext] = None
@@ -2004,6 +2076,14 @@ def perform_calibration(
                 str(int(current_onset_merge_gap)),
             ]
             print(
+                "stageB: gates onset(open={:.3f}, hold={:.3f}, min_on={}, gap={}) source=stageA_winner".format(
+                    current_onset_open,
+                    current_onset_hold,
+                    current_onset_min_on,
+                    current_onset_merge_gap,
+                )
+            )
+            print(
                 "[Stage-B] using Stage-A gates open={:.3f} hold={:.3f} min_on={} merge_gap={} (source={})".format(
                     current_onset_open,
                     current_onset_hold,
@@ -2015,8 +2095,8 @@ def perform_calibration(
             _mark_stage_b_started(stage_a_state_source)
             try:
                 request = _build_request(
-                    onset_candidates_center,
-                    offset_candidates_center,
+                    onset_anchor_used,
+                    offset_anchor_used,
                     log_name=stage_b_log,
                     sweep_override=(onset_candidates, offset_candidates),
                     extras=stage_b_extras,
@@ -2140,12 +2220,21 @@ def perform_calibration(
             )
         )
 
-        onset_anchor.details["sweep_center"] = onset_candidates_center
+        onset_anchor.details["sweep_center"] = onset_anchor_used
         onset_anchor.details["guard"] = [onset_guard_min, onset_guard_max]
         onset_anchor.details["candidate_count"] = len(onset_candidates)
-        offset_anchor.details["sweep_center"] = offset_candidates_center
+        offset_anchor.details["sweep_center"] = offset_anchor_used
         offset_anchor.details["guard"] = [offset_guard_min, offset_guard_max]
         offset_anchor.details["candidate_count"] = len(offset_candidates)
+        stage_b_gates_payload = {
+            "onset": {
+                "open": float(onset_open),
+                "hold": float(onset_hold),
+                "min_on": int(onset_min_on),
+                "merge_gap": int(onset_merge_gap),
+            },
+            "offset": copy.deepcopy(stage_a_state_payload.get("offset") or {}),
+        }
         _write_stageb_artifacts(
             stdout_dir,
             round_idx=round_index,
@@ -2154,6 +2243,8 @@ def perform_calibration(
             candidates={"onset": onset_candidates, "offset": offset_candidates},
             tie_break=tie_break_note,
             winner_row=best_row,
+            gates=stage_b_gates_payload,
+            anchor_retained=anchor_retained_flags,
         )
 
         stage_b_summary = {
