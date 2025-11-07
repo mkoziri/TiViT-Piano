@@ -9,6 +9,8 @@ Key Functions/Classes:
       including gradient scaling, logging, and checkpointing helpers.
     - main(): Parses CLI arguments, initializes logging, and kicks off training
       using the selected configuration.
+    - decoder.decode helpers: Shared decoder normalization/pooling utilities
+      imported here so training matches eval/calibration behavior.
 
 CLI:
     Run ``python scripts/train.py --config configs/config.yaml`` with optional
@@ -60,6 +62,12 @@ from utils.selection import (
     decoder_snapshot_from_config,
     tolerance_snapshot_from_config,
     read_selection_metadata,
+)
+from decoder.decode import (
+    DECODER_DEFAULTS,
+    pool_roll_BT,
+    resolve_decoder_from_config,
+    resolve_decoder_thresholds,
 )
 
 logger = get_logger(__name__)
@@ -345,13 +353,6 @@ def _print_head_grad_norms(model, step_tag=""):
             "[GRAD%s] no onset/offset grads found",
             f":{step_tag}" if step_tag else "",
         )
-
-def _pool_roll_BT(x_btP, Tprime):
-    # (B,T,P) -> (B,T',P) with "any positive in window" preserved via max
-    # used for pitch/onset/offset rolls when aligning T -> T'
-    x = x_btP.permute(0, 2, 1)            # (B,P,T)
-    x = F.adaptive_max_pool1d(x, Tprime)  # (B,P,T')
-    return x.permute(0, 2, 1).contiguous() # (B,T',P)
 
 def _interp_labels_BT(x_bt, Tprime):
     # (B,T) -> (B,T') for integer class labels (nearest)
@@ -692,9 +693,9 @@ def compute_loss_frame(
 
     # --- time alignment: T -> T' (keep your repo behavior) ---
     if T_targets != T_logits:
-        pitch_roll  = _pool_roll_BT(pitch_roll,  T_logits)
-        onset_roll  = _pool_roll_BT(onset_roll,  T_logits)
-        offset_roll = _pool_roll_BT(offset_roll, T_logits)
+        pitch_roll  = pool_roll_BT(pitch_roll,  T_logits)
+        onset_roll  = pool_roll_BT(onset_roll,  T_logits)
+        offset_roll = pool_roll_BT(offset_roll, T_logits)
         hand_frame  = _interp_labels_BT(hand_frame, T_logits)
         clef_frame  = _interp_labels_BT(clef_frame, T_logits)
     # (this matches the alignment already used elsewhere in your code). :contentReference[oaicite:2]{index=2}
@@ -1122,200 +1123,6 @@ def _median_filter_time_proxy(clip_probs: torch.Tensor, kernel_size: int) -> tor
     return filtered.squeeze(1).transpose(0, 1).contiguous()
 
 
-_DECODER_DEFAULTS = {
-    "onset": {
-        "open": 0.36,
-        "hold": 0.28,
-        "min_on": 2,
-        "min_off": 2,
-        "merge_gap": 1,
-        "median": 3,
-    },
-    "offset": {
-        "open": 0.32,
-        "hold": 0.24,
-        "min_on": 2,
-        "min_off": 2,
-        "merge_gap": 1,
-        "median": 3,
-    },
-}
-
-
-def _apply_decoder_values(
-    target: dict[str, dict[str, Any]],
-    heads: Iterable[str],
-    source: Mapping[str, Any] | None,
-) -> None:
-    if not isinstance(source, Mapping):
-        return
-    for key, value in source.items():
-        if value is None:
-            continue
-        key_str = str(key)
-        norm_key = "merge_gap" if key_str == "gap_merge" else key_str
-        if norm_key not in {
-            "open",
-            "hold",
-            "low_ratio",
-            "min_on",
-            "min_off",
-            "merge_gap",
-            "median",
-        }:
-            continue
-        for head in heads:
-            target.setdefault(head, {})[norm_key] = value
-
-
-def _normalize_decoder_config(
-    raw: Mapping[str, dict[str, Any]],
-    *,
-    fallback_open: Optional[Mapping[str, float]] = None,
-) -> dict[str, dict[str, Any]]:
-    normalized: dict[str, dict[str, Any]] = {}
-    for head in ("onset", "offset"):
-        defaults = _DECODER_DEFAULTS[head]
-        source = raw.get(head, {}) if isinstance(raw, Mapping) else {}
-        entry: dict[str, Any] = {}
-
-        open_defined = "open" in source and source.get("open") is not None
-        hold_defined = "hold" in source and source.get("hold") is not None
-
-        open_candidate = source.get("open")
-        if open_candidate is None and fallback_open:
-            open_candidate = fallback_open.get(head)
-        if open_candidate is None:
-            open_candidate = defaults["open"]
-        try:
-            open_val = float(open_candidate)
-        except (TypeError, ValueError):
-            open_val = defaults["open"]
-        if not math.isfinite(open_val):
-            open_val = defaults["open"]
-        open_val = max(0.0, min(open_val, 1.0))
-
-        ratio_candidate = source.get("low_ratio")
-        ratio_val: Optional[float] = None
-        if ratio_candidate is not None:
-            try:
-                ratio_val = float(ratio_candidate)
-            except (TypeError, ValueError):
-                ratio_val = None
-            else:
-                if not math.isfinite(ratio_val):
-                    ratio_val = None
-                elif ratio_val < 0.0:
-                    ratio_val = 0.0
-
-        hold_candidate = source.get("hold")
-        if hold_candidate is None and ratio_val is not None and open_val > 0.0:
-            hold_candidate = ratio_val * open_val
-        if hold_candidate is None:
-            hold_candidate = defaults["hold"]
-        try:
-            hold_val = float(hold_candidate)
-        except (TypeError, ValueError):
-            hold_val = defaults["hold"]
-        if not math.isfinite(hold_val):
-            hold_val = defaults["hold"]
-        if hold_val < 0.0:
-            hold_val = 0.0
-        if hold_val > open_val and open_val > 0.0:
-            hold_val = open_val
-
-        for key in ("min_on", "min_off", "merge_gap"):
-            default_val = defaults[key]
-            src_val = source.get(key, default_val)
-            try:
-                int_val = int(src_val)
-            except (TypeError, ValueError):
-                int_val = default_val
-            if int_val < 0:
-                int_val = 0
-            entry[key] = int_val
-
-        median_default = defaults["median"]
-        median_candidate = source.get("median", median_default)
-        try:
-            median_val = int(median_candidate)
-        except (TypeError, ValueError):
-            median_val = median_default
-        if median_val < 1:
-            median_val = 1
-        if median_val % 2 == 0:
-            median_val += 1
-
-        if ratio_val is None:
-            if open_val > 0.0:
-                ratio_val = hold_val / open_val if open_val > 0.0 else 0.0
-            else:
-                ratio_val = 0.0
-
-        entry.update(
-            {
-                "open": open_val,
-                "hold": hold_val,
-                "low_ratio": max(0.0, ratio_val or 0.0),
-                "median": median_val,
-                "open_defined": bool(open_defined),
-                "hold_defined": bool(hold_defined),
-            }
-        )
-        normalized[head] = entry
-    return normalized
-
-
-def _resolve_temporal_decoder_config(
-    metrics_cfg: Mapping[str, Any],
-    *,
-    fallback_open: Optional[Mapping[str, float]] = None,
-) -> dict[str, dict[str, Any]]:
-    collected: dict[str, dict[str, Any]] = {"onset": {}, "offset": {}}
-
-    if not isinstance(metrics_cfg, Mapping):
-        metrics_cfg = {}
-
-    legacy_global: dict[str, Any] = {}
-    legacy_map = {
-        "open": metrics_cfg.get("decoder_open"),
-        "hold": metrics_cfg.get("decoder_hold"),
-        "low_ratio": metrics_cfg.get("decoder_low_ratio"),
-        "min_on": metrics_cfg.get("decoder_min_on"),
-        "min_off": metrics_cfg.get("decoder_min_off"),
-        "merge_gap": metrics_cfg.get("decoder_merge_gap"),
-        "gap_merge": metrics_cfg.get("decoder_gap_merge"),
-        "median": metrics_cfg.get("decoder_median"),
-    }
-    for key, value in legacy_map.items():
-        if value is not None:
-            legacy_global[key] = value
-    if legacy_global:
-        _apply_decoder_values(collected, ("onset", "offset"), legacy_global)
-
-    for section_key in ("temporal_decoder", "proxy_decoder"):
-        section = metrics_cfg.get(section_key)
-        if not isinstance(section, Mapping):
-            continue
-        _apply_decoder_values(collected, ("onset", "offset"), section)
-        shared = section.get("shared")
-        _apply_decoder_values(collected, ("onset", "offset"), shared)
-        for head in ("onset", "offset"):
-            head_cfg = section.get(head)
-            _apply_decoder_values(collected, (head,), head_cfg)
-
-    decoder_cfg = metrics_cfg.get("decoder")
-    if isinstance(decoder_cfg, Mapping):
-        _apply_decoder_values(collected, ("onset", "offset"), decoder_cfg)
-        shared = decoder_cfg.get("shared")
-        _apply_decoder_values(collected, ("onset", "offset"), shared)
-        for head in ("onset", "offset"):
-            head_cfg = decoder_cfg.get(head)
-            _apply_decoder_values(collected, (head,), head_cfg)
-
-    return _normalize_decoder_config(collected, fallback_open=fallback_open)
-
-
 def _proxy_decode_mask(
     probs: torch.Tensor,
     *,
@@ -1404,67 +1211,6 @@ def _proxy_decode_mask(
     if not decoded:
         return torch.zeros_like(probs, dtype=torch.bool)
     return torch.stack(decoded, dim=0)
-
-
-def _resolve_decoder_thresholds(
-    entry: Mapping[str, Any],
-    *,
-    fallback_open: float,
-    default_hold: float,
-) -> Tuple[float, float]:
-    """Return (open, hold) thresholds, honoring config overrides and fallbacks."""
-
-    fallback = float(fallback_open)
-    if not math.isfinite(fallback):
-        fallback = 0.5
-    elif fallback < 0.0:
-        fallback = 0.0
-    elif fallback > 1.0:
-        fallback = 1.0
-
-    open_defined = bool(entry.get("open_defined"))
-    open_candidate = entry.get("open", fallback)
-    try:
-        open_val = float(open_candidate)
-    except (TypeError, ValueError):
-        open_val = fallback
-    if not math.isfinite(open_val):
-        open_val = fallback
-    if not open_defined:
-        open_val = fallback
-    open_val = max(0.0, min(open_val, 1.0))
-
-    hold_defined = bool(entry.get("hold_defined"))
-    hold_candidate = entry.get("hold", default_hold)
-    ratio_candidate = entry.get("low_ratio")
-    if not hold_defined:
-        ratio_val: Optional[float] = None
-        if ratio_candidate is not None:
-            try:
-                ratio_val = float(ratio_candidate)
-            except (TypeError, ValueError):
-                ratio_val = None
-            else:
-                if not math.isfinite(ratio_val):
-                    ratio_val = None
-                elif ratio_val < 0.0:
-                    ratio_val = 0.0
-        if ratio_val is not None and open_val > 0.0:
-            hold_candidate = ratio_val * open_val
-        else:
-            hold_candidate = default_hold
-    try:
-        hold_val = float(hold_candidate)
-    except (TypeError, ValueError):
-        hold_val = float(default_hold)
-    if not math.isfinite(hold_val):
-        hold_val = float(default_hold)
-    if hold_val < 0.0:
-        hold_val = 0.0
-    if hold_val > open_val:
-        hold_val = open_val
-
-    return open_val, hold_val
 
 
 def _event_f1_clip(
@@ -2276,21 +2022,21 @@ def evaluate_one_epoch(
         hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
-    temporal_decoder_cfg = _resolve_temporal_decoder_config(
+    temporal_decoder_cfg = resolve_decoder_from_config(
         metrics_cfg,
         fallback_open={"onset": thr_on, "offset": thr_off},
     )
     decoder_onset = temporal_decoder_cfg["onset"]
     decoder_offset = temporal_decoder_cfg["offset"]
-    onset_open_thr, onset_hold_thr = _resolve_decoder_thresholds(
+    onset_open_thr, onset_hold_thr = resolve_decoder_thresholds(
         decoder_onset,
         fallback_open=thr_on,
-        default_hold=_DECODER_DEFAULTS["onset"]["hold"],
+        default_hold=DECODER_DEFAULTS["onset"]["hold"],
     )
-    offset_open_thr, offset_hold_thr = _resolve_decoder_thresholds(
+    offset_open_thr, offset_hold_thr = resolve_decoder_thresholds(
         decoder_offset,
         fallback_open=thr_off,
-        default_hold=_DECODER_DEFAULTS["offset"]["hold"],
+        default_hold=DECODER_DEFAULTS["offset"]["hold"],
     )
     decoder_onset["open_effective"] = onset_open_thr
     decoder_onset["hold_effective"] = onset_hold_thr
