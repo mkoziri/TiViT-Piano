@@ -79,6 +79,9 @@ CLI Arguments:
         Radius around the anchor used for the Stage-B micro-sweep.
     --onset_thr_steps INT (default: 5)
         Number of samples evaluated in the Stage-B micro-sweep.
+    --decoder-impl {new,legacy} (default: new)
+        Choose the decoder/evaluation stack; ``legacy`` toggles the rollback
+        flags to run the pre-refactor calibrate/eval scripts.
 
 Usage:
     python scripts/train_autopilot.py --mode fresh --first_step train --burst_epochs 3
@@ -391,11 +394,14 @@ def run_calibration(
     verbose: Optional[str] = None,
     seed: Optional[int] = None,
     deterministic: Optional[bool] = None,
+    use_legacy_decoder: bool = False,
 ) -> int:
     log_name = f"calibration_{kind}.txt"
     log_path = log_dir / log_name
     dataset_cli = _build_dataset_cli(split, frames, max_clips)
     cmd = [sys.executable, "-u", str(CALIBRATE_THRESH), *dataset_cli, "--ckpt", str(ckpt)]
+    if use_legacy_decoder:
+        cmd.append("--legacy-calibrate-thresholds")
     cmd = _append_determinism_flags(cmd, seed=seed, deterministic=deterministic)
     cmd = _with_verbose(cmd, verbose)
     if kind == "thorough":
@@ -1526,6 +1532,7 @@ def perform_calibration(
     tolerance_snapshot = tolerance_snapshot_from_config(cfg_snapshot)
     exp_name = cfg_snapshot.get("experiment", {}).get("name", "")
     prob_delta = 0.05
+    legacy_decoder = args.decoder_impl == "legacy"
 
     def _build_request(
         onset_center: float,
@@ -1549,6 +1556,8 @@ def perform_calibration(
             offset_explicit=offset_explicit,
         )
         eval_extras = list(args.eval_extras_tokens or [])
+        if legacy_decoder and "--legacy-eval-thresholds" not in eval_extras:
+            eval_extras.append("--legacy-eval-thresholds")
         if extras:
             eval_extras.extend(extras)
         frames = args.calib_frames if args.calib_frames is not None else 96
@@ -1891,9 +1900,12 @@ def perform_calibration(
 
         if not stage_a_state_valid or not isinstance(stage_a_state_payload, Mapping):
             raise SelectionError("Stage-A state unavailable for Stage-B evaluation")
+        stage_a_state_payload = dict(stage_a_state_payload)
         stage_a_onset_state = stage_a_state_payload.get("onset")
         if not isinstance(stage_a_onset_state, Mapping):
             raise SelectionError("Stage-A onset gates missing from state")
+        stage_a_onset_state = dict(stage_a_onset_state)
+        stage_a_state_payload["onset"] = stage_a_onset_state
         onset_open_val = _coerce_optional_float(stage_a_onset_state.get("open"))
         onset_hold_val = _coerce_optional_float(stage_a_onset_state.get("hold"))
         onset_min_on_val = _coerce_positive_int(stage_a_onset_state.get("min_on"))
@@ -1945,6 +1957,7 @@ def perform_calibration(
                 },
                 "resume": "reused" if stage_a_reused else "fresh",
                 "attempt": source_label,
+                "decoder_impl": args.decoder_impl,
             }
             new_state = dict(round_state) if isinstance(round_state, Mapping) else {}
             new_state.update(
@@ -2250,6 +2263,7 @@ def perform_calibration(
         stage_b_summary = {
             "status": "completed",
             "timestamp": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
+            "decoder_impl": args.decoder_impl,
             "winner": {
                 "onset_thr": _coerce_optional_float(best_row.get("onset_thr")),
                 "offset_thr": _coerce_optional_float(best_row.get("offset_thr")),
@@ -2280,6 +2294,7 @@ def perform_calibration(
         summary_payload = {
             "round": round_index,
             "calibration_index": calibration_count,
+            "decoder_impl": args.decoder_impl,
             "stageA": copy.deepcopy(stage_a_state_payload),
             "stageB": copy.deepcopy(stage_b_summary),
         }
@@ -2398,6 +2413,7 @@ def perform_calibration(
             verbose=args.verbose,
             seed=seed,
             deterministic=deterministic,
+            use_legacy_decoder=legacy_decoder,
         )
         if ret != 0:
             return _run_fast_grid("thorough calibration failed")
@@ -2448,6 +2464,7 @@ RESULT_HEADER = [
     "offset_ev_f1",
     "ev_f1_mean",
     "decoder_kind",
+    "decoder_impl",
     "decoder_onset_open",
     "decoder_onset_hold",
     "decoder_offset_open",
@@ -2619,6 +2636,7 @@ def append_results(
         _fmt_float(metrics.get("offset_event_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("ev_f1_mean"), ".4f", "0.0000"),
         str(metrics.get("decoder_kind") or ""),
+        str(metrics.get("decoder_impl") or ""),
         _fmt_float(metrics.get("decoder_onset_open"), ".4f"),
         _fmt_float(metrics.get("decoder_onset_hold"), ".4f"),
         _fmt_float(metrics.get("decoder_offset_open"), ".4f"),
@@ -2680,6 +2698,12 @@ def main() -> int:
         type=str,
         default="",
         help="Extra CLI arguments appended to eval_thresholds.py during fast evaluation",
+    )
+    ap.add_argument(
+        "--decoder-impl",
+        choices=["new", "legacy"],
+        default="new",
+        help="Select decoder/calibration implementation; 'legacy' toggles rollback flags",
     )
     ap.add_argument(
         "--fast_strategy",
@@ -3075,6 +3099,7 @@ def main() -> int:
                 return eval_ret or 1
             calibration_count += 1
             metrics = _result_to_metrics(selection_result)
+            metrics["decoder_impl"] = args.decoder_impl
             apply_metrics_to_config(metrics)
 
         skip_training = (
@@ -3193,6 +3218,7 @@ def main() -> int:
                     return eval_ret or 1
                 calibration_count += 1
                 metrics = _result_to_metrics(selection_result)
+                metrics["decoder_impl"] = args.decoder_impl
                 apply_metrics_to_config(metrics)
 
         if metrics is None:
