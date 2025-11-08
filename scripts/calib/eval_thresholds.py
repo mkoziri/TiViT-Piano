@@ -25,11 +25,11 @@ CLI:
     execute the frozen pre-refactor implementation when needed.
 """
 
-import sys, json, time, math, os, torch, logging
+import sys, json, time, math, os, torch, logging, copy
 from collections import Counter
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Mapping, Dict, Any
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -44,6 +44,7 @@ from decoder.decode import (
     pool_roll_BT,
     resolve_decoder_from_config,
     resolve_decoder_thresholds,
+    apply_postprocessing,
 )
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.logging_utils import QUIET_INFO_FLAG
@@ -202,6 +203,55 @@ def _event_f1(pred, target, hop_seconds: float, tol_sec: float, eps=1e-8):
     precision = tp / (tp + fp + eps)
     recall = tp / (tp + fn + eps)
     return 2 * precision * recall / (precision + recall + eps)
+
+
+def _compute_ece(probs: torch.Tensor, targets: torch.Tensor, bins: int = 15) -> float:
+    if probs.numel() == 0:
+        return 0.0
+    probs_flat = probs.reshape(-1).detach().cpu().numpy()
+    targets_flat = targets.reshape(-1).detach().cpu().numpy()
+    if probs_flat.size == 0:
+        return 0.0
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    total = probs_flat.size
+    for idx in range(bins):
+        low = edges[idx]
+        high = edges[idx + 1]
+        if idx == bins - 1:
+            mask = (probs_flat >= low) & (probs_flat <= high)
+        else:
+            mask = (probs_flat >= low) & (probs_flat < high)
+        count = mask.sum()
+        if count == 0:
+            continue
+        prob_mean = probs_flat[mask].mean()
+        true_mean = targets_flat[mask].mean()
+        ece += abs(prob_mean - true_mean) * (count / total)
+    return float(ece)
+
+
+def _collect_onset_metrics(
+    pred_mask: torch.Tensor,
+    true_mask: torch.Tensor,
+    hop_seconds: float,
+    loose_tol: float,
+    probs: torch.Tensor,
+) -> dict:
+    strict_tol = max(loose_tol * 0.5, hop_seconds / 2.0)
+    frame_f1 = _binary_f1(pred_mask.reshape(-1).float(), true_mask.reshape(-1).float()) or 0.0
+    ev_loose = _event_f1(pred_mask, true_mask, hop_seconds, loose_tol) or 0.0
+    ev_strict = _event_f1(pred_mask, true_mask, hop_seconds, strict_tol) or 0.0
+    return {
+        "frame_f1": float(frame_f1),
+        "event_f1_loose": float(ev_loose),
+        "event_f1_strict": float(ev_strict),
+        "pred_rate": float(pred_mask.float().mean().item()),
+        "pos_rate": float(true_mask.float().mean().item()),
+        "ece": _compute_ece(probs, true_mask),
+        "tolerance_loose": float(loose_tol),
+        "tolerance_strict": float(strict_tol),
+    }
 
 
 def main():
@@ -1447,6 +1497,11 @@ def main():
     decoder_logits_warned = False
     decoder_settings_summary = format_decoder_settings(decoder_kind, decoder_params)
     print(f"[decoder-settings] {decoder_settings_summary}")
+    decoder_post_cfg = cfg.get("decoder", {}).get("post", {}) or {}
+    snap_enabled_cfg = bool(decoder_post_cfg.get("snap", {}).get("enabled", False))
+    dp_enabled_cfg = bool(decoder_post_cfg.get("dp", {}).get("enabled", False))
+    postproc_debug = bool(cfg.get("logging", {}).get("postproc_debug", False))
+    post_logs_dir = Path(cfg.get("logging", {}).get("log_dir", "logs") or "logs") / "post"
 
     def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None):
         nonlocal decoder_notice_printed, decoder_logits_warned
@@ -1462,6 +1517,8 @@ def main():
         base_offset_tensor = offset_logits if use_logits else offset_probs
         base_onset = torch.as_tensor(base_onset_tensor) if not torch.is_tensor(base_onset_tensor) else base_onset_tensor
         base_offset = torch.as_tensor(base_offset_tensor) if not torch.is_tensor(base_offset_tensor) else base_offset_tensor
+        prob_tensor_for_post = (torch.sigmoid(base_onset) if use_logits else base_onset).detach()
+        fps_eval = 1.0 / hop_seconds if hop_seconds > 0 else decode_fps
 
         onset_mask_bool = build_threshold_mask(
             base_onset,
@@ -1530,6 +1587,21 @@ def main():
                 decoder_logits_warned = True
             onset_pred_bin = onset_mask_bool.float()
             offset_pred_bin = offset_mask_bool.float()
+        post_stats = {}
+        baseline_onset_mask = None
+        if snap_enabled_cfg or dp_enabled_cfg or postproc_debug:
+            baseline_onset_mask = onset_pred_mask.clone()
+            onset_post_mask, stage_stats = apply_postprocessing(
+                onset_pred_mask,
+                prob_tensor_for_post,
+                fps=fps_eval,
+                cfg=cfg,
+                require_stats=postproc_debug,
+            )
+            onset_pred_mask = onset_post_mask
+            if stage_stats:
+                post_stats.update(stage_stats)
+        onset_pred_bin = onset_pred_mask.to(prob_tensor_for_post.dtype)
         
         f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
         f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
@@ -1543,7 +1615,14 @@ def main():
         ev_f1_on = 0.0 if ev_f1_on is None else ev_f1_on
         ev_f1_off = 0.0 if ev_f1_off is None else ev_f1_off
 
-        return {
+        if postproc_debug:
+            pre_mask = baseline_onset_mask if baseline_onset_mask is not None else onset_pred_mask
+            metrics_payload = {
+                "post": _collect_onset_metrics(onset_pred_mask.float(), onset_true_bin, hop_seconds, event_tolerance, prob_tensor_for_post),
+                "pre": _collect_onset_metrics(pre_mask.float(), onset_true_bin, hop_seconds, event_tolerance, prob_tensor_for_post),
+            }
+            post_stats.setdefault("metrics", metrics_payload)
+        result_payload = {
             "onset_thr": float(on_thr),
             "offset_thr": float(off_thr),
             "decoder_onset_open": float(onset_open_thr) if onset_open_thr is not None else None,
@@ -1560,7 +1639,8 @@ def main():
             "k_onset": int(k_onset),
             "use_logits": bool(use_logits),
         }
-    
+        return result_payload, post_stats
+
     printed_header = False
 
     def _header():
@@ -1602,21 +1682,69 @@ def main():
         print("\t".join(values))
 
     best_result = None
+    best_post_stats = None
     total_evals = 0
 
-    def _update_best(res: dict):
+    def _update_best(res: dict, stats: dict):
         nonlocal best_result
+        nonlocal best_post_stats
         nonlocal total_evals
         total_evals += 1
         ev_mean = 0.5 * (res["ev_f1_on"] + res["ev_f1_off"])
         if best_result is None:
             best_result = {**res, "ev_mean": ev_mean}
+            best_post_stats = copy.deepcopy(stats) if stats else None
             return
         best_mean = best_result.get("ev_mean", -1.0)
         if ev_mean > best_mean + 1e-9:
             best_result = {**res, "ev_mean": ev_mean}
+            best_post_stats = copy.deepcopy(stats) if stats else None
         elif abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
             best_result = {**res, "ev_mean": ev_mean}
+            best_post_stats = copy.deepcopy(stats) if stats else None
+
+    def _write_post_logs(best_row: Mapping[str, Any], stats: Mapping[str, Any] | None) -> None:
+        if not stats:
+            return
+        try:
+            post_logs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        summary_payload = {
+            "onset_thr": best_row.get("onset_thr"),
+            "offset_thr": best_row.get("offset_thr"),
+            "k_onset": best_row.get("k_onset"),
+            "decoder": {
+                "kind": best_row.get("decoder_kind"),
+                "onset_open": best_row.get("decoder_onset_open"),
+                "onset_hold": best_row.get("decoder_onset_hold"),
+                "offset_open": best_row.get("decoder_offset_open"),
+                "offset_hold": best_row.get("decoder_offset_hold"),
+            },
+            "metrics": stats.get("metrics"),
+            "snap": stats.get("snap"),
+            "dp": stats.get("dp"),
+            "context": {
+                "split": split,
+                "frames": frames_display,
+                "max_clips": max_clips_display,
+                "decoder_notice": decoder_settings_summary,
+            },
+        }
+        summary_path = post_logs_dir / "post_summary.json"
+        per_key_payload: Dict[str, Any] = {}
+        snap_stats = stats.get("snap") if isinstance(stats, Mapping) else None
+        if isinstance(snap_stats, Mapping) and snap_stats.get("per_key"):
+            per_key_payload["snap"] = snap_stats["per_key"]
+        dp_stats = stats.get("dp") if isinstance(stats, Mapping) else None
+        if isinstance(dp_stats, Mapping) and dp_stats.get("per_key"):
+            per_key_payload["dp"] = dp_stats["per_key"]
+        try:
+            summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True))
+            if per_key_payload:
+                (post_logs_dir / "per_key_stats.json").write_text(json.dumps(per_key_payload, indent=2, sort_keys=True))
+        except OSError:
+            pass
     
     combo_idx = 0
     t_grid0 = time.time()
@@ -1626,9 +1754,9 @@ def main():
     def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None):
         nonlocal combo_idx
         nonlocal last_grid_print
-        res = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset)
+        res, post_stats = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset)
         _print_row(res)
-        _update_best(res)
+        _update_best(res, post_stats)
         combo_idx += 1
         if args.progress and num_combos > 0:
             now = time.time()
@@ -1824,6 +1952,8 @@ def main():
                     offset_decoder["merge_gap"],
                 )
             )
+        if postproc_debug and best_post_stats:
+            _write_post_logs(best_result, best_post_stats)
 
 if __name__ == "__main__":
     main()

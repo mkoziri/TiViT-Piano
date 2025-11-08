@@ -17,8 +17,6 @@ import sys
 from types import ModuleType
 from typing import Final, TYPE_CHECKING
 
-__path__: list[str] = []  # type: ignore[assignment]
-
 
 def _import_theory() -> ModuleType:
     """Load the underlying :mod:`theory` package and register it."""

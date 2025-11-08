@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_preT3_autopilot_t2_sw_5ff2db23_auto
+  name: TiViT-Piano_PianoYT_MT_B1
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -183,10 +183,32 @@ optim:
 train:
   accumulate_steps: 12
   freeze_backbone_epochs: 0
+decoder:
+  post:
+    snap:
+      enabled: true
+      bpm_min: 40
+      bpm_max: 240
+      bpm_step: 1
+      local_window_beats: 4
+      max_dev_ms: 35
+      blend: 0.5
+      min_support_notes: 12
+      confidence_floor: 0.15
+    dp:
+      enabled: false
+      min_on_beats: 0.5
+      min_off_beats: 0.5
+      penalty_on: 1.0
+      penalty_off: 1.0
+      keep_gates: true
+      per_key: true
+      beam: 5
 logging:
   log_dir: logs
   checkpoint_dir: checkpoints
   tensorboard: true
+  postproc_debug: true
 autopilot:
   best_selection:
     owner: autopilot
