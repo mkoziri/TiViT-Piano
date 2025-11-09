@@ -184,16 +184,33 @@ def _update_selection_in_config(
     if _coerce_positive_int(k_cfg.get("offset")) is None:
         k_cfg["offset"] = 1
 
-    if context.temperature is not None:
-        temp_val = float(context.temperature)
-        metrics_cfg["prob_temperature_onset"] = temp_val
-        metrics_cfg["prob_temperature_offset"] = temp_val
-        metrics_cfg["prob_temperature"] = temp_val
-    if context.bias is not None:
-        bias_val = float(context.bias)
-        metrics_cfg["prob_logit_bias_onset"] = bias_val
-        metrics_cfg["prob_logit_bias_offset"] = bias_val
-        metrics_cfg["prob_logit_bias"] = bias_val
+    temp_on = context.temperature_onset if context.temperature_onset is not None else context.temperature
+    temp_off = context.temperature_offset if context.temperature_offset is not None else context.temperature
+    if temp_on is not None:
+        metrics_cfg["prob_temperature_onset"] = float(temp_on)
+    if temp_off is not None:
+        metrics_cfg["prob_temperature_offset"] = float(temp_off)
+    temp_scalar = (
+        float(temp_on)
+        if temp_on is not None
+        else (float(temp_off) if temp_off is not None else None)
+    )
+    if temp_scalar is not None:
+        metrics_cfg["prob_temperature"] = temp_scalar
+
+    bias_on = context.bias_onset if context.bias_onset is not None else context.bias
+    bias_off = context.bias_offset if context.bias_offset is not None else context.bias
+    if bias_on is not None:
+        metrics_cfg["prob_logit_bias_onset"] = float(bias_on)
+    if bias_off is not None:
+        metrics_cfg["prob_logit_bias_offset"] = float(bias_off)
+    bias_scalar = (
+        float(bias_on)
+        if bias_on is not None
+        else (float(bias_off) if bias_off is not None else None)
+    )
+    if bias_scalar is not None:
+        metrics_cfg["prob_logit_bias"] = bias_scalar
 
     config_path = CONFIG_PATH
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3847,6 +3864,10 @@ def main():
                     },
                     temperature=selection_temperature,
                     bias=selection_bias,
+                    temperature_onset=selection_temperature,
+                    temperature_offset=selection_temperature,
+                    bias_onset=selection_bias,
+                    bias_offset=selection_bias,
                     run_id=run_id,
                     start_time=timestamp_now,
                     end_time=timestamp_now,

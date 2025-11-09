@@ -674,6 +674,23 @@ def _update_stageb_cache_from_calib(stdout_dir: Path, calib: Mapping[str, Any]) 
     return existing
 
 
+def _extract_anchor_platt(anchor: StageBAnchor) -> Tuple[Optional[float], Optional[float]]:
+    details = anchor.details if isinstance(anchor.details, Mapping) else {}
+    temp_val: Optional[float] = None
+    bias_val: Optional[float] = None
+    for key in ("temperature", "platt_scale", "scale"):
+        candidate = details.get(key)
+        temp_val = _coerce_optional_float(candidate)
+        if temp_val is not None:
+            break
+    for key in ("bias", "platt_bias", "logit_bias"):
+        candidate = details.get(key)
+        bias_val = _coerce_optional_float(candidate)
+        if bias_val is not None:
+            break
+    return temp_val, bias_val
+
+
 _THOROUGH_LINE_RE = re.compile(
     r"^(Onset|Offset):.*best_prob=(?P<prob>[0-9]*\.?[0-9]+).*temp=(?P<temp>[+-]?\d+(?:\.\d+)?).*bias=(?P<bias>[+-]?\d+(?:\.\d+)?)",
     re.IGNORECASE,
@@ -1472,6 +1489,20 @@ def _extract_platt_from_mapping(mapping: dict) -> Optional[Dict[str, float]]:
     return {"temp": float(temp_val), "bias": float(bias_val)}
 
 
+def _extract_partial_platt(mapping: Mapping[str, Any] | None) -> Tuple[Optional[float], Optional[float]]:
+    if not isinstance(mapping, Mapping):
+        return None, None
+    temp_val = (
+        _coerce_optional_float(mapping.get("temperature"))
+        or _coerce_optional_float(mapping.get("platt_scale"))
+    )
+    bias_val = (
+        _coerce_optional_float(mapping.get("logit_bias"))
+        or _coerce_optional_float(mapping.get("platt_bias"))
+    )
+    return temp_val, bias_val
+
+
 def read_platt_params(calibration_json: Path) -> Dict[str, Dict[str, float]]:
     data = load_calibration(calibration_json)
     if not isinstance(data, dict):
@@ -1547,6 +1578,7 @@ def perform_calibration(
         sweep_override: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
         extras: Optional[Sequence[str]] = None,
         low_guard: float = 0.10,
+        platt_overrides: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None,
     ) -> SelectionRequest:
         onset_explicit = sweep_override[0] if sweep_override else None
         offset_explicit = sweep_override[1] if sweep_override else None
@@ -1583,6 +1615,16 @@ def perform_calibration(
             eval_extras.extend(extras)
         frames = args.calib_frames if args.calib_frames is not None else 96
         max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
+        def _resolve_platt_tuple(head: str) -> Tuple[Optional[float], Optional[float]]:
+            if not platt_overrides:
+                return (None, None)
+            values = platt_overrides.get(head)
+            if isinstance(values, tuple):
+                return values
+            return (None, None)
+
+        onset_platt_vals = _resolve_platt_tuple("onset")
+        offset_platt_vals = _resolve_platt_tuple("offset")
         return SelectionRequest(
             ckpt=ckpt,
             split=split,
@@ -1593,6 +1635,10 @@ def perform_calibration(
             tolerances=tolerance_snapshot,
             temperature=args.temperature,
             bias=args.bias,
+            temperature_onset=onset_platt_vals[0],
+            bias_onset=onset_platt_vals[1],
+            temperature_offset=offset_platt_vals[0],
+            bias_offset=offset_platt_vals[1],
             seed=seed,
             deterministic=deterministic,
             eval_extras=eval_extras,
@@ -1630,6 +1676,40 @@ def perform_calibration(
             if onset_anchor.source == offset_anchor.source
             else f"onset:{onset_anchor.source},offset:{offset_anchor.source}"
         )
+
+        needs_temp = args.temperature is None
+        needs_bias = args.bias is None
+        platt_overrides: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None
+        onset_platt_temp: Optional[float] = None
+        onset_platt_bias: Optional[float] = None
+        offset_platt_temp: Optional[float] = None
+        offset_platt_bias: Optional[float] = None
+        if needs_temp or needs_bias:
+            onset_platt_temp, onset_platt_bias = _extract_anchor_platt(onset_anchor)
+            offset_platt_temp, offset_platt_bias = _extract_anchor_platt(offset_anchor)
+            missing_bits = []
+            if needs_temp and (onset_platt_temp is None or offset_platt_temp is None):
+                missing_bits.append("temperature")
+            if needs_bias and (onset_platt_bias is None or offset_platt_bias is None):
+                missing_bits.append("bias")
+            if missing_bits:
+                raise SelectionError(
+                    "Stage-B requires Platt {} from thorough calibration (anchor sources onset={} offset={}); rerun thorough to refresh stageB cache".format(
+                        "/".join(missing_bits),
+                        onset_anchor.source,
+                        offset_anchor.source,
+                    )
+                )
+            platt_overrides = {
+                "onset": (
+                    onset_platt_temp if needs_temp else None,
+                    onset_platt_bias if needs_bias else None,
+                ),
+                "offset": (
+                    offset_platt_temp if needs_temp else None,
+                    offset_platt_bias if needs_bias else None,
+                ),
+            }
 
         LOGGER.info(
             "[autopilot:two-stage] anchors onset=%.4f offset=%.4f (source=%s)",
@@ -1791,6 +1871,7 @@ def perform_calibration(
                                 sweep_override=([onset_prob], [offset_prob]),
                                 extras=extras,
                                 low_guard=ONSET_THR_MIN,
+                                platt_overrides=platt_overrides or None,
                             )
                             stage_result, stage_context, stage_lines = calibrate_and_score(request)
                             rows = parse_eval_rows(stage_lines)
@@ -2095,6 +2176,11 @@ def perform_calibration(
         )
         anchor_retained_flags = {"onset": kept_anchor_onset, "offset": kept_anchor_offset}
 
+        effective_onset_temp = float(args.temperature) if args.temperature is not None else onset_platt_temp
+        effective_offset_temp = float(args.temperature) if args.temperature is not None else offset_platt_temp
+        effective_onset_bias = float(args.bias) if args.bias is not None else onset_platt_bias
+        effective_offset_bias = float(args.bias) if args.bias is not None else offset_platt_bias
+
         stage_b_log = f"{_stage_log_prefix()}_stageB.txt"
         stage_b_context: Optional[SelectionContext] = None
         stage_b_lines: List[str] = []
@@ -2112,12 +2198,22 @@ def perform_calibration(
                 "--decoder-onset-merge-gap",
                 str(int(current_onset_merge_gap)),
             ]
+            onset_thr_display = "[" + ",".join(_format_prob(val) for val in onset_candidates) + "]"
+            offset_thr_display = "[" + ",".join(_format_prob(val) for val in offset_candidates) + "]"
             print(
-                "stageB: gates onset(open={:.3f}, hold={:.3f}, min_on={}, gap={}) source=stageA_winner".format(
+                "stageB: gates on(open={:.3f},hold={:.3f},min_on={},gap={}) | "
+                "T_on={:.4f}, b_on={:.4f}, T_off={:.4f}, b_off={:.4f} | "
+                "thr_onset={} thr_offset={}".format(
                     current_onset_open,
                     current_onset_hold,
                     current_onset_min_on,
                     current_onset_merge_gap,
+                    float(effective_onset_temp) if effective_onset_temp is not None else 1.0,
+                    float(effective_onset_bias) if effective_onset_bias is not None else 0.0,
+                    float(effective_offset_temp) if effective_offset_temp is not None else 1.0,
+                    float(effective_offset_bias) if effective_offset_bias is not None else 0.0,
+                    onset_thr_display,
+                    offset_thr_display,
                 )
             )
             print(
@@ -2138,6 +2234,7 @@ def perform_calibration(
                     sweep_override=(onset_candidates, offset_candidates),
                     extras=stage_b_extras,
                     low_guard=onset_stageb_params.low_guard or onset_stageb_params.min_prob,
+                    platt_overrides=platt_overrides or None,
                 )
                 _, stage_b_context, stage_b_lines = calibrate_and_score(request)
                 rows_b = parse_eval_rows(stage_b_lines)
@@ -2324,6 +2421,16 @@ def perform_calibration(
             "status": "completed",
             "timestamp": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
             "decoder_impl": args.decoder_impl,
+            "platt": {
+                "onset": {
+                    "temperature": _coerce_optional_float(effective_onset_temp),
+                    "bias": _coerce_optional_float(effective_onset_bias),
+                },
+                "offset": {
+                    "temperature": _coerce_optional_float(effective_offset_temp),
+                    "bias": _coerce_optional_float(effective_offset_bias),
+                },
+            },
             "winner": {
                 "onset_thr": _coerce_optional_float(best_row.get("onset_thr")),
                 "offset_thr": _coerce_optional_float(best_row.get("offset_thr")),
@@ -2412,6 +2519,25 @@ def perform_calibration(
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
         log_fallback = _parse_thorough_log(stdout_dir)
+        needs_temp = args.temperature is None
+        needs_bias = args.bias is None
+        platt_overrides_calib: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None
+        if needs_temp or needs_bias:
+            platt_overrides_calib = {}
+            missing_heads: List[str] = []
+            for head in ("onset", "offset"):
+                head_entry = calib.get(head) if isinstance(calib, Mapping) else None
+                temp_val, bias_val = _extract_partial_platt(head_entry)
+                if (needs_temp and temp_val is None) or (needs_bias and bias_val is None):
+                    missing_heads.append(head)
+                platt_overrides_calib[head] = (
+                    temp_val if needs_temp else None,
+                    bias_val if needs_bias else None,
+                )
+            if missing_heads:
+                raise SelectionError(
+                    "Calibration missing Platt parameters for heads: {}".format(", ".join(missing_heads))
+                )
         onset_anchor = _resolve_stageb_anchor(
             "onset",
             params=onset_stageb_params,
@@ -2441,7 +2567,12 @@ def perform_calibration(
             anchor_source,
             extra=QUIET_EXTRA,
         )
-        request = _build_request(onset_prob, offset_prob, log_name=log_name)
+        request = _build_request(
+            onset_prob,
+            offset_prob,
+            log_name=log_name,
+            platt_overrides=platt_overrides_calib or None,
+        )
         result, context, lines = calibrate_and_score(request)
         _write_calibration_json(result)
         return result, context, lines
@@ -2451,6 +2582,27 @@ def perform_calibration(
             print(f"[autopilot] WARNING: {reason} → falling back to fast grid calibration")
         banner = "NOTICE: Running FAST calibration — this may take a while"
         log_banner(results_path, banner)
+        needs_temp = args.temperature is None
+        needs_bias = args.bias is None
+        platt_overrides_grid: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None
+        if needs_temp or needs_bias:
+            calib_stub = load_calibration(CALIB_JSON)
+            if calib_stub:
+                platt_overrides_grid = {}
+                missing_heads: List[str] = []
+                for head in ("onset", "offset"):
+                    head_entry = calib_stub.get(head) if isinstance(calib_stub, Mapping) else None
+                    temp_val, bias_val = _extract_partial_platt(head_entry)
+                    if (needs_temp and temp_val is None) or (needs_bias and bias_val is None):
+                        missing_heads.append(head)
+                    platt_overrides_grid[head] = (
+                        temp_val if needs_temp else None,
+                        bias_val if needs_bias else None,
+                    )
+                if missing_heads:
+                    raise SelectionError(
+                        "Fast grid requires Platt parameters for heads: {}".format(", ".join(missing_heads))
+                    )
         try:
             request = _build_request(
                 0.5,
@@ -2459,6 +2611,7 @@ def perform_calibration(
                 sweep_override=(FAST_GRID_THRESHOLDS, FAST_GRID_THRESHOLDS),
                 extras=["--grid_prob_thresholds"],
                 low_guard=0.02,
+                platt_overrides=platt_overrides_grid or None,
             )
             result, context, lines = calibrate_and_score(request)
         except SelectionError as exc:

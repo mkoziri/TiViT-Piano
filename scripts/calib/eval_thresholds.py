@@ -32,7 +32,7 @@ from collections import Counter
 from datetime import datetime
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Tuple, Mapping, Dict, Any, Sequence, cast
+from typing import Optional, List, Tuple, Mapping, MutableMapping, Dict, Any, Sequence, cast
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -215,6 +215,58 @@ def _assert_monotonic_rates(
     )
 
 
+def _platt_stats_enabled(temp: float, bias: float, tol: float = 1e-9) -> bool:
+    return abs(float(temp) - 1.0) > tol or abs(float(bias)) > tol
+
+
+def _init_platt_stats(enabled: bool) -> Dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "count": 0,
+        "sum": 0.0,
+        "min": float("inf"),
+        "max": float("-inf"),
+    }
+
+
+def _update_platt_stats(stats: MutableMapping[str, Any], delta: torch.Tensor) -> None:
+    if not stats.get("enabled"):
+        return
+    if delta is None or delta.numel() == 0:
+        return
+    delta_cpu = delta.detach().cpu()
+    count = int(delta_cpu.numel())
+    if count == 0:
+        return
+    stats["count"] = int(stats.get("count", 0)) + count
+    stats["sum"] = float(stats.get("sum", 0.0)) + float(delta_cpu.sum().item())
+    delta_min = float(delta_cpu.min().item())
+    delta_max = float(delta_cpu.max().item())
+    stats["min"] = float(min(float(stats.get("min", float("inf"))), delta_min))
+    stats["max"] = float(max(float(stats.get("max", float("-inf"))), delta_max))
+
+
+def _report_platt_stats(label: str, stats: Mapping[str, Any]) -> None:
+    if not stats.get("enabled"):
+        return
+    count = int(stats.get("count", 0))
+    if count == 0:
+        return
+    total = float(stats.get("sum", 0.0))
+    mean = total / count if count else 0.0
+    delta_min = float(stats.get("min", 0.0))
+    delta_max = float(stats.get("max", 0.0))
+    print(
+        "[platt-shift] {label} Δprob min={min_val:.6f} mean={mean:.6f} max={max_val:.6f}".format(
+            label=label,
+            min_val=delta_min,
+            mean=mean,
+            max_val=delta_max,
+        ),
+        flush=True,
+    )
+
+
 def _format_summary_lines(
     best_result: Mapping[str, Any],
     *,
@@ -275,16 +327,22 @@ def _format_summary_lines(
         )
     temp_val = float(args.temperature) if args.temperature is not None else 1.0
     bias_val = float(args.bias) if args.bias is not None else 0.0
+    temp_on_val = float(args.temperature_onset) if args.temperature_onset is not None else temp_val
+    temp_off_val = float(args.temperature_offset) if args.temperature_offset is not None else temp_val
+    bias_on_val = float(args.bias_onset) if args.bias_onset is not None else bias_val
+    bias_off_val = float(args.bias_offset) if args.bias_offset is not None else bias_val
     compare_line = (
         "[compare-config] onset_thr_used={:.4f} offset_thr_used={:.4f} "
-        "T={:.4f} b={:.4f} "
+        "T_on={:.4f} b_on={:.4f} T_off={:.4f} b_off={:.4f} "
         "onset_gate(open={:.4f}, hold={:.4f}, min_on={}, gap={}, median={}) "
         "offset_gate(open={:.4f}, hold={:.4f}, min_off={}, gap={}, median={})"
     ).format(
         best_result["onset_thr"],
         best_result["offset_thr"],
-        temp_val,
-        bias_val,
+        temp_on_val,
+        bias_on_val,
+        temp_off_val,
+        bias_off_val,
         float(onset_open_best if onset_open_best is not None else onset_decoder.get("open", 0.0)),
         float(onset_hold_best if onset_hold_best is not None else onset_decoder.get("hold", 0.0)),
         int(onset_min_on),
@@ -494,6 +552,7 @@ def main():
         prob_thrs = _parse_list(argv, "prob_thresholds")
         offset_logit_thrs = _parse_list(argv, "offset_thresholds")
         offset_prob_thrs = _parse_list(argv, "offset_prob_thresholds")
+        sanity_prob_thrs = _parse_list(argv, "sanity_thresholds")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return
@@ -526,6 +585,12 @@ def main():
     ap.add_argument("--fixed_offset_logit", type=float)
     ap.add_argument("--fixed_onset_prob", type=float)
     ap.add_argument("--fixed_onset_logit", type=float)
+    ap.add_argument(
+        "--sanity_thresholds",
+        metavar="P",
+        nargs="*",
+        help="Optional onset probability thresholds for monotonic sanity verification",
+    )
     # Optional temperature and bias parameters for logit calibration
     ap.add_argument(
         "--temperature",
@@ -538,6 +603,26 @@ def main():
         type=float,
         default=0.0,
         help="Additive bias applied to logits before sigmoid",
+    )
+    ap.add_argument(
+        "--temperature-onset",
+        type=float,
+        help="Override onset head temperature prior to sigmoid",
+    )
+    ap.add_argument(
+        "--temperature-offset",
+        type=float,
+        help="Override offset head temperature prior to sigmoid",
+    )
+    ap.add_argument(
+        "--bias-onset",
+        type=float,
+        help="Override onset head logit bias prior to sigmoid",
+    )
+    ap.add_argument(
+        "--bias-offset",
+        type=float,
+        help="Override offset head logit bias prior to sigmoid",
     )
     ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
@@ -700,6 +785,7 @@ def main():
     args.prob_thresholds = prob_thrs
     args.offset_thresholds = offset_logit_thrs
     args.offset_prob_thresholds = offset_prob_thrs
+    args.sanity_thresholds = sanity_prob_thrs
 
     if args.thresholds is not None and args.prob_thresholds is not None:
         print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
@@ -758,6 +844,15 @@ def main():
     if args.min_off is not None and args.min_off < 0:
         print("error: --min_off must be >= 0", file=sys.stderr)
         return
+
+    base_temperature = args.temperature if args.temperature is not None else 1.0
+    base_bias = args.bias if args.bias is not None else 0.0
+    onset_temperature = float(args.temperature_onset if args.temperature_onset is not None else base_temperature)
+    offset_temperature = float(args.temperature_offset if args.temperature_offset is not None else base_temperature)
+    onset_bias = float(args.bias_onset if args.bias_onset is not None else base_bias)
+    offset_bias = float(args.bias_offset if args.bias_offset is not None else base_bias)
+    onset_platt_stats = _init_platt_stats(_platt_stats_enabled(onset_temperature, onset_bias))
+    offset_platt_stats = _init_platt_stats(_platt_stats_enabled(offset_temperature, offset_bias))
     if args.gap_merge is not None and args.gap_merge < 0:
         print("error: --gap_merge must be >= 0", file=sys.stderr)
         return
@@ -1309,15 +1404,33 @@ def main():
                 out = model(x)
 
                 # prefer *_logits if present; fallback to old naming
-                onset_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
-                offset_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+                onset_logits_raw = out["onset_logits"] if "onset_logits" in out else out.get("onset")
+                offset_logits_raw = out["offset_logits"] if "offset_logits" in out else out.get("offset")
                 pitch_logits = out.get("pitch_logits")
-                
-                # Apply temperature scaling and bias for calibration
-                onset_logits = onset_logits / args.temperature + args.bias
-                offset_logits = offset_logits / args.temperature + args.bias
+
+                if onset_logits_raw is None or offset_logits_raw is None:
+                    raise RuntimeError("Model output missing onset/offset logits")
+                onset_logits_neutral = onset_logits_raw.detach()
+                offset_logits_neutral = offset_logits_raw.detach()
+
+                if onset_platt_stats["enabled"]:
+                    onset_prob_neutral = torch.sigmoid(onset_logits_neutral)
+                else:
+                    onset_prob_neutral = None
+                if offset_platt_stats["enabled"]:
+                    offset_prob_neutral = torch.sigmoid(offset_logits_neutral)
+                else:
+                    offset_prob_neutral = None
+
+                onset_logits = onset_logits_neutral / onset_temperature + onset_bias
+                offset_logits = offset_logits_neutral / offset_temperature + offset_bias
                 onset_prob = torch.sigmoid(onset_logits)
                 offset_prob = torch.sigmoid(offset_logits)
+
+                if onset_prob_neutral is not None:
+                    _update_platt_stats(onset_platt_stats, onset_prob.detach() - onset_prob_neutral)
+                if offset_prob_neutral is not None:
+                    _update_platt_stats(offset_platt_stats, offset_prob.detach() - offset_prob_neutral)
 
                 onset_logits_list.append(onset_logits.detach().cpu())
                 offset_logits_list.append(offset_logits.detach().cpu())
@@ -1514,6 +1627,8 @@ def main():
     # diagnostic prints
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
+    _report_platt_stats("onset", onset_platt_stats)
+    _report_platt_stats("offset", offset_platt_stats)
 
     _assert_monotonic_rates(
         onset_probs,
@@ -1801,6 +1916,18 @@ def main():
 
         onset_thr_prob = _resolve_prob_thr(on_thr)
         offset_thr_prob = _resolve_prob_thr(off_thr)
+        print(
+            "[apply-thr] onset_thr={:.4f} offset_thr={:.4f} "
+            "T_on={:.4f} b_on={:.4f} T_off={:.4f} b_off={:.4f}".format(
+                onset_thr_prob,
+                offset_thr_prob,
+                onset_temperature,
+                onset_bias,
+                offset_temperature,
+                offset_bias,
+            ),
+            flush=True,
+        )
 
         onset_mask_bool = build_threshold_mask(
             onset_probs_tensor,
@@ -1964,6 +2091,73 @@ def main():
         )
         print("\t".join(values))
 
+    def _run_sanity_thresholds() -> None:
+        sanity_vals = args.sanity_thresholds or []
+        if not sanity_vals:
+            return
+        unique_vals = sorted({round(float(v), 6) for v in sanity_vals})
+        if not unique_vals:
+            return
+
+        def _clamp_prob(value: float) -> float:
+            return max(0.0, min(1.0, float(value)))
+
+        offset_ref: Optional[float] = None
+        if args.offset_prob_thresholds:
+            offset_ref = float(args.offset_prob_thresholds[0])
+        elif args.fixed_offset_prob is not None:
+            offset_ref = float(args.fixed_offset_prob)
+        elif args.prob_thresholds:
+            offset_ref = float(args.prob_thresholds[0])
+        elif args.thresholds:
+            offset_ref = _logit_to_probability(float(args.thresholds[0]))
+        if offset_ref is None:
+            offset_ref = 0.5
+        offset_ref = _clamp_prob(offset_ref)
+        onset_fmt = "[" + ",".join(f"{_clamp_prob(val):.4f}" for val in unique_vals) + "]"
+        print(
+            "[sanity] verifying monotonic onset_pred_rate thresholds={} offset_ref={:.4f}".format(
+                onset_fmt,
+                offset_ref,
+            ),
+            flush=True,
+        )
+        prev_rate: Optional[float] = None
+        prev_thr: Optional[float] = None
+        for idx, thr in enumerate(unique_vals, start=1):
+            prob_thr = _clamp_prob(thr)
+            res_payload, _ = _eval_pair(
+                prob_thr,
+                offset_ref,
+                use_logits=False,
+                k_onset=default_k_onset,
+                apply_postproc=sweep_apply_postproc,
+            )
+            rate = float(res_payload["onset_pred_rate"])
+            print(
+                "[sanity] #{idx} onset_thr={thr:.4f} onset_pred_rate={rate:.6f}".format(
+                    idx=idx,
+                    thr=prob_thr,
+                    rate=rate,
+                ),
+                flush=True,
+            )
+            if prev_rate is not None and rate > prev_rate + 1e-9:
+                message = (
+                    "[sanity] ERROR: onset_pred_rate increased "
+                    "thr_prev={prev:.4f} rate_prev={rate_prev:.6f} "
+                    "thr_curr={curr:.4f} rate_curr={rate_curr:.6f}".format(
+                        prev=prev_thr if prev_thr is not None else float("nan"),
+                        rate_prev=prev_rate,
+                        curr=prob_thr,
+                        rate_curr=rate,
+                    )
+                )
+                print(message, file=sys.stderr, flush=True)
+                raise RuntimeError(message)
+            prev_rate = rate
+            prev_thr = prob_thr
+
     def _replay_cache(entry: Mapping[str, Any]) -> None:
         rows = entry.get("rows") or []
         saved_at = entry.get("timestamp") or "unknown"
@@ -1985,7 +2179,10 @@ def main():
         for line in summary:
             print(line)
 
-    eval_cache_enabled = not args.no_eval_cache
+    sanity_requested = bool(args.sanity_thresholds)
+    eval_cache_enabled = not args.no_eval_cache and not sanity_requested
+    if sanity_requested and not args.no_eval_cache:
+        print("[cache] disabled because --sanity_thresholds requires fresh evaluation", flush=True)
     cache_db: Optional[Dict[str, Any]] = None
     cache_path: Optional[Path] = None
     cache_key: Optional[str] = None
@@ -2012,6 +2209,10 @@ def main():
             "agg_tau_sum": round(float(agg_tau_sum), 6),
             "temperature": round(float(args.temperature), 6) if args.temperature is not None else 1.0,
             "bias": round(float(args.bias), 6) if args.bias is not None else 0.0,
+            "temperature_onset": round(float(args.temperature_onset), 6) if args.temperature_onset is not None else None,
+            "temperature_offset": round(float(args.temperature_offset), 6) if args.temperature_offset is not None else None,
+            "bias_onset": round(float(args.bias_onset), 6) if args.bias_onset is not None else None,
+            "bias_offset": round(float(args.bias_offset), 6) if args.bias_offset is not None else None,
             "decoder": _snapshot_decoder_gates(decoder_params),
             "postproc_mode": args.postproc_mode,
             "postproc_modules": postproc_modules,
@@ -2020,6 +2221,7 @@ def main():
             "only": only_id,
             "calibration": args.calibration,
             "no_avlag": bool(args.no_avlag),
+            "sanity_thresholds": _normalize_threshold_list(args.sanity_thresholds),
         }
         cache_fingerprint = cast(Dict[str, Any], _json_sanitize(fingerprint_payload))
         cache_key = _hash_cache_fingerprint(fingerprint_payload)
@@ -2313,6 +2515,8 @@ def main():
             print(line)
         if postproc_debug and best_post_stats:
             _write_post_logs(best_result, best_post_stats)
+
+    _run_sanity_thresholds()
 
     if (
         eval_cache_enabled

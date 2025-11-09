@@ -125,6 +125,10 @@ class SelectionContext:
     sweep: Dict[str, Any]
     temperature: Optional[float]
     bias: Optional[float]
+    temperature_onset: Optional[float]
+    temperature_offset: Optional[float]
+    bias_onset: Optional[float]
+    bias_offset: Optional[float]
     run_id: Optional[str]
     start_time: float
     end_time: float
@@ -335,6 +339,10 @@ class SelectionRequest:
     tolerances: Mapping[str, Any] = field(default_factory=dict)
     temperature: Optional[float] = None
     bias: Optional[float] = None
+    temperature_onset: Optional[float] = None
+    temperature_offset: Optional[float] = None
+    bias_onset: Optional[float] = None
+    bias_offset: Optional[float] = None
     seed: Optional[int] = None
     deterministic: Optional[bool] = None
     eval_extras: Sequence[str] = field(default_factory=tuple)
@@ -372,9 +380,23 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         f"delta={sweep.delta:.3f}",
         f"guard≥{sweep.low_guard:.2f}",
     ]
-    if request.temperature is not None:
+    temp_line: List[str] = []
+    if request.temperature_onset is not None:
+        temp_line.append(f"T_on={request.temperature_onset:.3f}")
+    if request.temperature_offset is not None:
+        temp_line.append(f"T_off={request.temperature_offset:.3f}")
+    if temp_line:
+        banner_bits.extend(temp_line)
+    elif request.temperature is not None:
         banner_bits.append(f"temp={request.temperature:.3f}")
-    if request.bias is not None:
+    bias_line: List[str] = []
+    if request.bias_onset is not None:
+        bias_line.append(f"b_on={request.bias_onset:.3f}")
+    if request.bias_offset is not None:
+        bias_line.append(f"b_off={request.bias_offset:.3f}")
+    if bias_line:
+        banner_bits.extend(bias_line)
+    elif request.bias is not None:
         banner_bits.append(f"bias={request.bias:.3f}")
     print("[selection] " + " ".join(banner_bits), flush=True)
 
@@ -404,9 +426,21 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
                 ",".join(f"{v:.4f}" for v in offset_candidates),
             ]
         )
-    if request.temperature is not None:
+    temp_override = request.temperature_onset is not None or request.temperature_offset is not None
+    if temp_override:
+        if request.temperature_onset is not None:
+            cmd.extend(["--temperature-onset", str(request.temperature_onset)])
+        if request.temperature_offset is not None:
+            cmd.extend(["--temperature-offset", str(request.temperature_offset)])
+    elif request.temperature is not None:
         cmd.extend(["--temperature", str(request.temperature)])
-    if request.bias is not None:
+    bias_override = request.bias_onset is not None or request.bias_offset is not None
+    if bias_override:
+        if request.bias_onset is not None:
+            cmd.extend(["--bias-onset", str(request.bias_onset)])
+        if request.bias_offset is not None:
+            cmd.extend(["--bias-offset", str(request.bias_offset)])
+    elif request.bias is not None:
         cmd.extend(["--bias", str(request.bias)])
     if len(tuple(sweep.k_onset_candidates)) > 1:
         cmd.append("--sweep_k_onset")
@@ -553,6 +587,10 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         sweep=sweep_payload,
         temperature=request.temperature,
         bias=request.bias,
+        temperature_onset=request.temperature_onset,
+        temperature_offset=request.temperature_offset,
+        bias_onset=request.bias_onset,
+        bias_offset=request.bias_offset,
         run_id=request.run_id,
         start_time=t_start,
         end_time=time.time(),
@@ -638,6 +676,10 @@ def record_best(
             "deterministic": context.deterministic,
             "temperature": context.temperature,
             "bias": context.bias,
+            "temperature_onset": context.temperature_onset,
+            "temperature_offset": context.temperature_offset,
+            "bias_onset": context.bias_onset,
+            "bias_offset": context.bias_offset,
             "tolerances": dict(context.tolerances),
             "sweep": dict(context.sweep),
             "run_id": context.run_id,
