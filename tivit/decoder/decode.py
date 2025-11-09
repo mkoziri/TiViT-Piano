@@ -6,7 +6,7 @@ Key Functions/Classes:
     - DECODER_DEFAULTS: Canonical onset/offset decoder hyperparameters.
     - resolve_decoder_from_config(): Merge legacy + structured config overrides
       into normalized per-head decoder settings.
-    - resolve_decoder_thresholds(): Convert normalized settings into concrete
+    - resolve_decoder_gates(): Convert normalized settings into concrete
       open/hold thresholds using fallbacks when overrides are missing.
     - decode_hysteresis(): Apply hysteresis with duration smoothing to
       pianoroll probabilities; helpers like pool_roll_BT() and
@@ -221,7 +221,7 @@ def resolve_decoder_from_config(
     return normalize_decoder_params(collected, fallback_open=fallback_open)
 
 
-def resolve_decoder_thresholds(
+def resolve_decoder_gates(
     entry: Mapping[str, Any],
     *,
     fallback_open: float,
@@ -503,7 +503,7 @@ __all__ = [
     "apply_decoder_values",
     "normalize_decoder_params",
     "resolve_decoder_from_config",
-    "resolve_decoder_thresholds",
+    "resolve_decoder_gates",
     "format_decoder_settings",
     "decoder_notice_text",
     "topk_mask",

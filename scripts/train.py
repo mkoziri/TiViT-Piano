@@ -67,7 +67,7 @@ from decoder.decode import (
     DECODER_DEFAULTS,
     pool_roll_BT,
     resolve_decoder_from_config,
-    resolve_decoder_thresholds,
+    resolve_decoder_gates,
 )
 
 logger = get_logger(__name__)
@@ -2028,12 +2028,12 @@ def evaluate_one_epoch(
     )
     decoder_onset = temporal_decoder_cfg["onset"]
     decoder_offset = temporal_decoder_cfg["offset"]
-    onset_open_thr, onset_hold_thr = resolve_decoder_thresholds(
+    onset_open_thr, onset_hold_thr = resolve_decoder_gates(
         decoder_onset,
         fallback_open=thr_on,
         default_hold=DECODER_DEFAULTS["onset"]["hold"],
     )
-    offset_open_thr, offset_hold_thr = resolve_decoder_thresholds(
+    offset_open_thr, offset_hold_thr = resolve_decoder_gates(
         decoder_offset,
         fallback_open=thr_off,
         default_hold=DECODER_DEFAULTS["offset"]["hold"],

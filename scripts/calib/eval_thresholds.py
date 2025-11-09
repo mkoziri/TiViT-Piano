@@ -27,11 +27,12 @@ CLI:
     execute the frozen pre-refactor implementation when needed.
 """
 
-import sys, json, time, math, os, torch, logging, copy
+import sys, json, time, math, os, torch, logging, copy, hashlib
 from collections import Counter
+from datetime import datetime
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Tuple, Mapping, Dict, Any
+from typing import Optional, List, Tuple, Mapping, Dict, Any, Sequence, cast
 
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "src"))
@@ -45,7 +46,7 @@ from decoder.decode import (
     normalize_decoder_params,
     pool_roll_BT,
     resolve_decoder_from_config,
-    resolve_decoder_thresholds,
+    resolve_decoder_gates,
     apply_postprocessing,
 )
 from utils import load_config, align_pitch_dim, configure_verbosity
@@ -87,6 +88,216 @@ DEFAULT_THRESHOLDS = [
     0.95,
     1.00,
 ]
+
+EVAL_CACHE_VERSION = 1
+EVAL_CACHE_FILENAME = "eval_cache.json"
+_MONO_PROB_LOW = 5e-4
+_MONO_PROB_HIGH = 0.99
+
+
+def _json_sanitize(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return float(value.item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _normalize_threshold_list(values):
+    if values is None:
+        return None
+    return [round(float(v), 6) for v in values]
+
+
+def _snapshot_decoder_gates(params: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for head, cfg in params.items():
+        if not isinstance(cfg, Mapping):
+            continue
+        snapshot[head] = {
+            "open": round(float(cfg.get("open", 0.0)), 6),
+            "hold": round(float(cfg.get("hold", 0.0)), 6),
+            "min_on": int(cfg.get("min_on", 0)),
+            "min_off": int(cfg.get("min_off", cfg.get("min_on", 0))),
+            "merge_gap": int(cfg.get("merge_gap", 0)),
+            "median": int(cfg.get("median", 1)),
+        }
+    return snapshot
+
+
+def _hash_cache_fingerprint(fingerprint: Mapping[str, Any]) -> str:
+    payload = json.dumps(_json_sanitize(fingerprint), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _load_eval_cache_db(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {"version": EVAL_CACHE_VERSION, "entries": {}}
+    except json.JSONDecodeError:
+        return {"version": EVAL_CACHE_VERSION, "entries": {}}
+    if not isinstance(data, dict):
+        return {"version": EVAL_CACHE_VERSION, "entries": {}}
+    if data.get("version") != EVAL_CACHE_VERSION:
+        return {"version": EVAL_CACHE_VERSION, "entries": {}}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    data["entries"] = entries
+    return data
+
+
+def _persist_eval_cache_db(path: Path, db: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(db, handle, indent=2, sort_keys=True, default=_json_sanitize)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    tmp.replace(path)
+
+
+def _assert_monotonic_rates(
+    probs: torch.Tensor,
+    *,
+    label: str,
+    agg_mode: str,
+    cap_count: int,
+    top_k: int,
+) -> None:
+    if probs.numel() == 0:
+        raise RuntimeError(f"[sanity] {label} probability tensor is empty; cannot verify monotonicity")
+    low_mask = build_threshold_mask(
+        probs,
+        _MONO_PROB_LOW,
+        mode=agg_mode,
+        cap_count=cap_count,
+        top_k=top_k,
+    )
+    high_mask = build_threshold_mask(
+        probs,
+        _MONO_PROB_HIGH,
+        mode=agg_mode,
+        cap_count=cap_count,
+        top_k=top_k,
+    )
+    low_rate = float(low_mask.float().mean().item())
+    high_rate = float(high_mask.float().mean().item())
+    if low_rate <= high_rate + 1e-9:
+        raise RuntimeError(
+            "[sanity] {} pred_rate did not decrease as threshold increased "
+            "(low_thr={:.6f} rate={:.6f}, high_thr={:.2f} rate={:.6f})".format(
+                label,
+                _MONO_PROB_LOW,
+                low_rate,
+                _MONO_PROB_HIGH,
+                high_rate,
+            )
+        )
+    print(
+        "[sanity] {} monotonic check passed: rate_low={:.6f} > rate_high={:.6f}".format(
+            label, low_rate, high_rate
+        ),
+        flush=True,
+    )
+
+
+def _format_summary_lines(
+    best_result: Mapping[str, Any],
+    *,
+    final_postproc_applied: bool,
+    postproc_modules: Sequence[str],
+    args,
+    onset_decoder: Mapping[str, Any],
+    offset_decoder: Mapping[str, Any],
+) -> List[str]:
+    lines: List[str] = []
+    modules_label = ",".join(postproc_modules) if postproc_modules else "none"
+    status = "RAN" if final_postproc_applied else "SKIPPED"
+    lines.append(f"POSTPROC: {status} during final eval (mode={args.postproc_mode}) modules={modules_label}")
+    lines.append(
+        "[best-event] mean_event_f1={:.3f} onset_event_f1={:.3f} offset_event_f1={:.3f} k_onset={}".format(
+            best_result["ev_mean"],
+            best_result["ev_f1_on"],
+            best_result["ev_f1_off"],
+            best_result.get("k_onset", 1),
+        )
+    )
+    if not best_result.get("use_logits", False):
+        lines.append(
+            "[best-yaml] onset_prob_threshold={:.2f}, offset_prob_threshold={:.2f}, k_onset={}".format(
+                best_result["onset_thr"],
+                best_result["offset_thr"],
+                best_result.get("k_onset", 1),
+            )
+        )
+    onset_open_best = best_result.get("decoder_onset_open")
+    onset_hold_best = best_result.get("decoder_onset_hold")
+    onset_min_on = best_result.get("decoder_onset_min_on", onset_decoder.get("min_on", 0))
+    onset_merge_gap = best_result.get("decoder_onset_merge_gap", onset_decoder.get("merge_gap", 0))
+    onset_median = best_result.get("decoder_onset_median", onset_decoder.get("median", 1))
+    offset_open_best = best_result.get("decoder_offset_open")
+    offset_hold_best = best_result.get("decoder_offset_hold")
+    offset_min_off = best_result.get("decoder_offset_min_off", offset_decoder.get("min_off", 0))
+    offset_merge_gap = best_result.get("decoder_offset_merge_gap", offset_decoder.get("merge_gap", 0))
+    offset_median = best_result.get("decoder_offset_median", offset_decoder.get("median", 1))
+    if (
+        onset_open_best is not None
+        and onset_hold_best is not None
+        and offset_open_best is not None
+        and offset_hold_best is not None
+    ):
+        lines.append(
+            "[best-decoder] onset_open={:.3f} hold={:.3f} min_on={} merge_gap={} | "
+            "offset_open={:.3f} hold={:.3f} min_off={} merge_gap={}".format(
+                onset_open_best,
+                onset_hold_best,
+                int(onset_min_on),
+                int(onset_merge_gap),
+                offset_open_best,
+                offset_hold_best,
+                int(offset_min_off),
+                int(offset_merge_gap),
+            )
+        )
+    temp_val = float(args.temperature) if args.temperature is not None else 1.0
+    bias_val = float(args.bias) if args.bias is not None else 0.0
+    compare_line = (
+        "[compare-config] onset_thr_used={:.4f} offset_thr_used={:.4f} "
+        "T={:.4f} b={:.4f} "
+        "onset_gate(open={:.4f}, hold={:.4f}, min_on={}, gap={}, median={}) "
+        "offset_gate(open={:.4f}, hold={:.4f}, min_off={}, gap={}, median={})"
+    ).format(
+        best_result["onset_thr"],
+        best_result["offset_thr"],
+        temp_val,
+        bias_val,
+        float(onset_open_best if onset_open_best is not None else onset_decoder.get("open", 0.0)),
+        float(onset_hold_best if onset_hold_best is not None else onset_decoder.get("hold", 0.0)),
+        int(onset_min_on),
+        int(onset_merge_gap),
+        int(onset_median),
+        float(offset_open_best if offset_open_best is not None else offset_decoder.get("open", 0.0)),
+        float(offset_hold_best if offset_hold_best is not None else offset_decoder.get("hold", 0.0)),
+        int(offset_min_off),
+        int(offset_merge_gap),
+        int(offset_median),
+    )
+    lines.append(compare_line)
+    return lines
 
 def _prepare_logits_for_dump(tensor: torch.Tensor) -> np.ndarray:
     """Flatten a tensor to (T,P) and return a contiguous float64 numpy array."""
@@ -156,6 +367,23 @@ def _resolve_threshold_lists(onset_vals, offset_vals):
         offset_vals = list(offset_vals)
 
     return onset_vals, offset_vals, reuse_flags
+
+
+def _logit_to_probability(value: float) -> float:
+    """Convert an arbitrary logit to its probability-domain equivalent."""
+
+    val = float(value)
+    if math.isnan(val):
+        return 0.5
+    if val >= 0.0:
+        z = math.exp(-val)
+        prob = 1.0 / (1.0 + z)
+    else:
+        z = math.exp(val)
+        prob = z / (1.0 + z)
+    if not math.isfinite(prob):
+        return 0.5
+    return max(0.0, min(prob, 1.0))
 
 
 def _binary_f1(pred, target, eps=1e-8):
@@ -330,6 +558,11 @@ def main():
         "--grid_prob_thresholds",
         action="store_true",
         help="Evaluate the Cartesian product of onset/offset probability thresholds",
+    )
+    ap.add_argument(
+        "--no_eval_cache",
+        action="store_true",
+        help="Disable eval cache reuse and force fresh evaluation",
     )
     ap.add_argument(
         "--sweep_k_onset",
@@ -1282,6 +1515,21 @@ def main():
     print(f"[OVERALL onset probs] mean={onset_probs.mean():.3f} min={onset_probs.min():.3f} max={onset_probs.max():.3f}")
     print(f"[OVERALL offset probs] mean={offset_probs.mean():.3f} min={offset_probs.min():.3f} max={offset_probs.max():.3f}")
 
+    _assert_monotonic_rates(
+        onset_probs,
+        label="onset",
+        agg_mode=agg_mode,
+        cap_count=default_k_onset,
+        top_k=agg_top_k,
+    )
+    _assert_monotonic_rates(
+        offset_probs,
+        label="offset",
+        agg_mode=agg_mode,
+        cap_count=default_k_offset,
+        top_k=agg_top_k,
+    )
+
     def _percentile(flat: torch.Tensor, q: float) -> float:
         if flat.numel() == 0:
             return 0.0
@@ -1504,7 +1752,6 @@ def main():
         print("[decoder] requested decoder=none -> forcing hysteresis with config defaults", flush=True)
     decoder_kind = "hysteresis" if decoder_choice in {"auto", "none"} else decoder_choice
     decoder_notice_printed = False
-    decoder_logits_warned = False
     decoder_settings_summary = format_decoder_settings(decoder_kind, decoder_params)
     print(f"[decoder-settings] {decoder_settings_summary}")
     decoder_post_cfg = cfg.get("decoder", {}).get("post", {}) or {}
@@ -1520,9 +1767,10 @@ def main():
     sweep_apply_postproc = _SWEEP_POSTPROC_MAP[args.postproc_mode]
     final_apply_postproc = args.postproc_mode in ("eval_only", "always")
     post_logs_dir = Path(cfg.get("logging", {}).get("log_dir", "logs") or "logs") / "post"
+    row_records: List[Dict[str, Any]] = []
 
     def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None, apply_postproc=True):
-        nonlocal decoder_notice_printed, decoder_logits_warned
+        nonlocal decoder_notice_printed
         if k_onset is None:
             k_onset = default_k_onset
         k_onset = max(1, int(k_onset))
@@ -1531,23 +1779,39 @@ def main():
         onset_hold_thr: Optional[float] = None
         offset_open_thr: Optional[float] = None
         offset_hold_thr: Optional[float] = None
-        base_onset_tensor = onset_logits if use_logits else onset_probs
-        base_offset_tensor = offset_logits if use_logits else offset_probs
-        base_onset = torch.as_tensor(base_onset_tensor) if not torch.is_tensor(base_onset_tensor) else base_onset_tensor
-        base_offset = torch.as_tensor(base_offset_tensor) if not torch.is_tensor(base_offset_tensor) else base_offset_tensor
-        prob_tensor_for_post = (torch.sigmoid(base_onset) if use_logits else base_onset).detach()
+        onset_probs_tensor = onset_probs if torch.is_tensor(onset_probs) else torch.as_tensor(onset_probs)
+        offset_probs_tensor = offset_probs if torch.is_tensor(offset_probs) else torch.as_tensor(offset_probs)
+        onset_probs_tensor = onset_probs_tensor.contiguous()
+        offset_probs_tensor = offset_probs_tensor.contiguous()
+        prob_tensor_for_post = onset_probs_tensor.detach()
+        if not prob_tensor_for_post.is_floating_point():
+            prob_tensor_for_post = prob_tensor_for_post.float()
+        prob_tensor_for_post = prob_tensor_for_post.contiguous()
         fps_eval = 1.0 / hop_seconds if hop_seconds > 0 else decode_fps
 
+        def _resolve_prob_thr(raw_value: float) -> float:
+            try:
+                raw_float = float(raw_value)
+            except (TypeError, ValueError):
+                raw_float = float("nan")
+            prob_val = _logit_to_probability(raw_float) if use_logits else raw_float
+            if not math.isfinite(prob_val):
+                prob_val = 0.5
+            return max(0.0, min(prob_val, 1.0))
+
+        onset_thr_prob = _resolve_prob_thr(on_thr)
+        offset_thr_prob = _resolve_prob_thr(off_thr)
+
         onset_mask_bool = build_threshold_mask(
-            base_onset,
-            on_thr,
+            onset_probs_tensor,
+            onset_thr_prob,
             mode=agg_mode,
             cap_count=k_onset,
             top_k=agg_top_k,
         )
         offset_mask_bool = build_threshold_mask(
-            base_offset,
-            off_thr,
+            offset_probs_tensor,
+            offset_thr_prob,
             mode=agg_mode,
             cap_count=k_offset,
             top_k=agg_top_k,
@@ -1555,25 +1819,25 @@ def main():
 
         onset_mask_float = onset_mask_bool.float()
         offset_mask_float = offset_mask_bool.float()
+        onset_pred_mask = onset_mask_bool.clone()
+        offset_pred_mask = offset_mask_bool.clone()
         onset_pred_bin = onset_mask_float
         offset_pred_bin = offset_mask_float
 
-        if decoder_kind == "hysteresis" and not use_logits:
+        if decoder_kind == "hysteresis":
             if not decoder_notice_printed:
                 print(f"[decoder] {decoder_notice_text(decoder_kind, decoder_params)}", flush=True)
                 decoder_notice_printed = True
-            onset_open_thr, onset_hold_thr = resolve_decoder_thresholds(
+            onset_open_thr, onset_hold_thr = resolve_decoder_gates(
                 onset_decoder,
-                fallback_open=on_thr,
+                fallback_open=onset_thr_prob,
                 default_hold=DECODER_DEFAULTS["onset"]["hold"],
             )
-            offset_open_thr, offset_hold_thr = resolve_decoder_thresholds(
+            offset_open_thr, offset_hold_thr = resolve_decoder_gates(
                 offset_decoder,
-                fallback_open=off_thr,
+                fallback_open=offset_thr_prob,
                 default_hold=DECODER_DEFAULTS["offset"]["hold"],
             )
-            onset_probs_tensor = torch.as_tensor(onset_probs) if not torch.is_tensor(onset_probs) else onset_probs
-            offset_probs_tensor = torch.as_tensor(offset_probs) if not torch.is_tensor(offset_probs) else offset_probs
             masked_onset_probs = (onset_probs_tensor * onset_mask_float).contiguous()
             masked_offset_probs = (offset_probs_tensor * offset_mask_float).contiguous()
             onset_pred_mask = decode_hysteresis(
@@ -1596,15 +1860,6 @@ def main():
             )
             onset_pred_bin = onset_pred_mask.to(onset_probs_tensor.dtype)
             offset_pred_bin = offset_pred_mask.to(offset_probs_tensor.dtype)
-        elif use_logits:
-            if decoder_kind == "hysteresis" and not decoder_logits_warned:
-                LOGGER.warning(
-                    "Hysteresis decoder requires probability thresholds; falling back to simple logit thresholding.",
-                    extra=QUIET_EXTRA,
-                )
-                decoder_logits_warned = True
-            onset_pred_bin = onset_mask_bool.float()
-            offset_pred_bin = offset_mask_bool.float()
         post_stats: Dict[str, Any] = {}
         postproc_applied = False
         should_postprocess = apply_postproc and bool(postproc_modules)
@@ -1651,6 +1906,12 @@ def main():
             "decoder_offset_open": float(offset_open_thr) if offset_open_thr is not None else None,
             "decoder_offset_hold": float(offset_hold_thr) if offset_hold_thr is not None else None,
             "decoder_kind": decoder_kind,
+            "decoder_onset_min_on": int(onset_decoder["min_on"]),
+            "decoder_onset_merge_gap": int(onset_decoder["merge_gap"]),
+            "decoder_onset_median": int(onset_decoder["median"]),
+            "decoder_offset_min_off": int(offset_decoder["min_off"]),
+            "decoder_offset_merge_gap": int(offset_decoder["merge_gap"]),
+            "decoder_offset_median": int(offset_decoder["median"]),
             "f1_on": float(f1_on),
             "f1_off": float(f1_off),
             "onset_pred_rate": float(onset_pred_rate),
@@ -1703,9 +1964,76 @@ def main():
         )
         print("\t".join(values))
 
+    def _replay_cache(entry: Mapping[str, Any]) -> None:
+        rows = entry.get("rows") or []
+        saved_at = entry.get("timestamp") or "unknown"
+        key_hint = entry.get("key", "")
+        if isinstance(rows, list):
+            print(
+                "[cache] eval cache hit key={key} combos={count} saved={stamp}".format(
+                    key=key_hint[:8] if isinstance(key_hint, str) else "n/a",
+                    count=len(rows),
+                    stamp=saved_at,
+                ),
+                flush=True,
+            )
+            if rows:
+                _header()
+                for cached_row in rows:
+                    _print_row(cached_row)
+        summary = entry.get("summary_lines") or []
+        for line in summary:
+            print(line)
+
+    eval_cache_enabled = not args.no_eval_cache
+    cache_db: Optional[Dict[str, Any]] = None
+    cache_path: Optional[Path] = None
+    cache_key: Optional[str] = None
+    cache_fingerprint: Optional[Dict[str, Any]] = None
+    if eval_cache_enabled:
+        cache_dir = Path(cfg.get("logging", {}).get("log_dir", "logs") or "logs")
+        cache_path = cache_dir / EVAL_CACHE_FILENAME
+        fingerprint_payload = {
+            "ckpt": str(Path(args.ckpt).expanduser().resolve()),
+            "split": split,
+            "frames_cfg": dataset_cfg.get("frames") if isinstance(dataset_cfg, Mapping) else None,
+            "frames_arg": args.frames,
+            "max_clips_cfg": dataset_cfg.get("max_clips") if isinstance(dataset_cfg, Mapping) else None,
+            "max_clips_arg": args.max_clips,
+            "prob_thresholds": _normalize_threshold_list(args.prob_thresholds),
+            "offset_prob_thresholds": _normalize_threshold_list(args.offset_prob_thresholds),
+            "logit_thresholds": _normalize_threshold_list(args.thresholds),
+            "offset_logit_thresholds": _normalize_threshold_list(args.offset_thresholds),
+            "grid_prob_thresholds": bool(args.grid_prob_thresholds),
+            "k_candidates": [int(k) for k in k_candidates],
+            "default_k": {"onset": int(default_k_onset), "offset": int(default_k_offset)},
+            "agg_mode": agg_mode,
+            "agg_top_k": int(agg_top_k),
+            "agg_tau_sum": round(float(agg_tau_sum), 6),
+            "temperature": round(float(args.temperature), 6) if args.temperature is not None else 1.0,
+            "bias": round(float(args.bias), 6) if args.bias is not None else 0.0,
+            "decoder": _snapshot_decoder_gates(decoder_params),
+            "postproc_mode": args.postproc_mode,
+            "postproc_modules": postproc_modules,
+            "head": args.head,
+            "sweep_k_onset": bool(args.sweep_k_onset),
+            "only": only_id,
+            "calibration": args.calibration,
+            "no_avlag": bool(args.no_avlag),
+        }
+        cache_fingerprint = cast(Dict[str, Any], _json_sanitize(fingerprint_payload))
+        cache_key = _hash_cache_fingerprint(fingerprint_payload)
+        cache_db = _load_eval_cache_db(cache_path)
+        entries = cache_db.get("entries", {})
+        cached_entry = entries.get(cache_key)
+        if cached_entry and cached_entry.get("fingerprint") == cache_fingerprint:
+            _replay_cache(cached_entry)
+            return
+
     best_result = None
     best_post_stats = None
     total_evals = 0
+    summary_lines: List[str] = []
 
     def _update_best(res: dict, stats: dict):
         nonlocal best_result
@@ -1778,6 +2106,7 @@ def main():
         nonlocal last_grid_print
         res, post_stats = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset, apply_postproc=apply_postproc)
         _print_row(res)
+        row_records.append(dict(res))
         _update_best(res, post_stats)
         combo_idx += 1
         if args.progress and num_combos > 0:
@@ -1972,50 +2301,42 @@ def main():
             final_postproc_applied = bool(final_res.get("_postproc_applied", False))
 
     if best_result is not None and total_evals > 0:
-        modules_label = ",".join(postproc_modules) if postproc_modules else "none"
-        status = "RAN" if final_postproc_applied else "SKIPPED"
-        print(f"POSTPROC: {status} during final eval (mode={args.postproc_mode}) modules={modules_label}")
-        print(
-            "[best-event] mean_event_f1={:.3f} onset_event_f1={:.3f} offset_event_f1={:.3f} k_onset={}".format(
-                best_result["ev_mean"],
-                best_result["ev_f1_on"],
-                best_result["ev_f1_off"],
-                best_result["k_onset"],
-            )
+        summary_lines = _format_summary_lines(
+            best_result,
+            final_postproc_applied=final_postproc_applied,
+            postproc_modules=postproc_modules,
+            args=args,
+            onset_decoder=onset_decoder,
+            offset_decoder=offset_decoder,
         )
-        if not best_result.get("use_logits", False):
-            print(
-                "[best-yaml] onset_prob_threshold={:.2f}, offset_prob_threshold={:.2f}, k_onset={}".format(
-                    best_result["onset_thr"],
-                    best_result["offset_thr"],
-                    best_result["k_onset"],
-                )
-            )
-        onset_open_best = best_result.get("decoder_onset_open")
-        onset_hold_best = best_result.get("decoder_onset_hold")
-        offset_open_best = best_result.get("decoder_offset_open")
-        offset_hold_best = best_result.get("decoder_offset_hold")
-        if (
-            onset_open_best is not None
-            and onset_hold_best is not None
-            and offset_open_best is not None
-            and offset_hold_best is not None
-        ):
-            print(
-                "[best-decoder] onset_open={:.3f} hold={:.3f} min_on={} merge_gap={} | "
-                "offset_open={:.3f} hold={:.3f} min_off={} merge_gap={}".format(
-                    onset_open_best,
-                    onset_hold_best,
-                    onset_decoder["min_on"],
-                    onset_decoder["merge_gap"],
-                    offset_open_best,
-                    offset_hold_best,
-                    offset_decoder["min_off"],
-                    offset_decoder["merge_gap"],
-                )
-            )
+        for line in summary_lines:
+            print(line)
         if postproc_debug and best_post_stats:
             _write_post_logs(best_result, best_post_stats)
+
+    if (
+        eval_cache_enabled
+        and cache_db is not None
+        and cache_path is not None
+        and cache_key
+        and cache_fingerprint is not None
+        and summary_lines
+        and row_records
+    ):
+        cache_entry_payload = {
+            "fingerprint": cache_fingerprint,
+            "rows": row_records,
+            "summary_lines": summary_lines,
+            "best_result": best_result,
+            "best_post_stats": best_post_stats,
+            "final_postproc_applied": final_postproc_applied,
+            "decoder_notice": decoder_settings_summary,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "key": cache_key,
+        }
+        cache_db.setdefault("entries", {})[cache_key] = _json_sanitize(cache_entry_payload)
+        cache_db["version"] = EVAL_CACHE_VERSION
+        _persist_eval_cache_db(cache_path, cache_db)
 
 if __name__ == "__main__":
     main()

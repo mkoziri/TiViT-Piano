@@ -75,7 +75,7 @@ from decoder.decode import (
     format_decoder_settings,
     pool_roll_BT,
     resolve_decoder_from_config,
-    resolve_decoder_thresholds,
+    resolve_decoder_gates,
 )
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.time_grid import frame_to_sec
@@ -662,7 +662,7 @@ def _compute_metrics(
         fallback_prob = 1.0 / (1.0 + math.exp(-thr_val))
         pred_bin = mask_float
         if decoder_kind == "hysteresis":
-            open_thr, hold_thr = resolve_decoder_thresholds(
+            open_thr, hold_thr = resolve_decoder_gates(
                 decoder_params,
                 fallback_open=fallback_prob,
                 default_hold=DECODER_DEFAULTS[name]["hold"],
@@ -702,7 +702,7 @@ def _compute_metrics(
         mask_float = mask_bool.float()
         pred_bin = mask_float
         if decoder_kind == "hysteresis":
-            open_thr, hold_thr = resolve_decoder_thresholds(
+            open_thr, hold_thr = resolve_decoder_gates(
                 decoder_params,
                 fallback_open=thr_val,
                 default_hold=DECODER_DEFAULTS[name]["hold"],
