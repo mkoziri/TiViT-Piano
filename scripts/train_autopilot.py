@@ -69,6 +69,9 @@ CLI Arguments:
         Additional CLI tokens appended to ``eval_thresholds.py`` during fast evaluation.
     --fast_strategy {classic,two_stage} (default: two_stage)
         Select the fast calibration routine (legacy sweep or two-stage onset optimizer).
+    --postproc-mode {never,eval_only,always} (default: eval_only)
+        Forward decoder post-processing strategy to ``eval_thresholds.py`` so
+        sweeps can skip DP/snap while final evals still apply them.
     --onset_open_grid FLOAT [FLOAT ...]
         Candidate onset decoder open gates explored during Stage-A (default: 0.22–0.28).
     --onset_min_on_grid INT [INT ...]
@@ -1556,6 +1559,22 @@ def perform_calibration(
             offset_explicit=offset_explicit,
         )
         eval_extras = list(args.eval_extras_tokens or [])
+        def _strip_eval_flag(flag: str) -> None:
+            needle = f"{flag}="
+            idx = 0
+            while idx < len(eval_extras):
+                token = eval_extras[idx]
+                if token == flag:
+                    del eval_extras[idx]
+                    if idx < len(eval_extras) and not eval_extras[idx].startswith("--"):
+                        del eval_extras[idx]
+                    continue
+                if token.startswith(needle):
+                    del eval_extras[idx]
+                    continue
+                idx += 1
+        _strip_eval_flag("--postproc-mode")
+        eval_extras.extend(["--postproc-mode", args.postproc_mode])
         if legacy_decoder and "--legacy-eval-thresholds" not in eval_extras:
             eval_extras.append("--legacy-eval-thresholds")
         if extras:
@@ -2698,6 +2717,12 @@ def main() -> int:
         type=str,
         default="",
         help="Extra CLI arguments appended to eval_thresholds.py during fast evaluation",
+    )
+    ap.add_argument(
+        "--postproc-mode",
+        choices=["never", "eval_only", "always"],
+        default="eval_only",
+        help="Forward to eval_thresholds.py --postproc-mode (default: eval_only)",
     )
     ap.add_argument(
         "--decoder-impl",

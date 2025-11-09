@@ -19,6 +19,8 @@ CLI:
     ``--thresholds``/``--prob_thresholds`` lists, ``--split`` to choose a
     dataset split, and ``--dump_logits`` to save logits to NPZ. Determinism
     controls are available via ``--seed`` and ``--deterministic``.
+    ``--postproc-mode`` controls whether decoder post-processing (snap/DP)
+    runs during sweeps, only for final best evals, or is fully disabled.
     Decoder hysteresis overrides (for example ``--decoder-onset-open``,
     ``--decoder-onset-min-on``) let callers evaluate per-head gate sweeps
     while keeping offset settings fixed. Use ``--legacy-eval-thresholds`` to
@@ -431,6 +433,12 @@ def main():
         type=int,
         default=None,
         help="Odd window size for optional time-axis median smoothing (default: config or 3)",
+    )
+    ap.add_argument(
+        "--postproc-mode",
+        choices=["never", "eval_only", "always"],
+        default="eval_only",
+        help="Control decoder post-processing: never=disable, eval_only=skip sweeps but run on final eval, always=run everywhere",
     )
     ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
     ap.add_argument(
@@ -1000,6 +1008,8 @@ def main():
         k_sweep_state = "off"
 
     target_display = str(target_clips) if target_clips is not None else "?"
+    if args.postproc_mode == "eval_only" and num_combos:
+        print("POSTPROC: SKIPPED during sweeps (mode=eval_only)")
     _log_progress(
         f"[progress] starting: clips={target_display} combos={num_combos} (thr={thr_desc}, k_sweep={k_sweep_state})",
         force=True,
@@ -1500,10 +1510,18 @@ def main():
     decoder_post_cfg = cfg.get("decoder", {}).get("post", {}) or {}
     snap_enabled_cfg = bool(decoder_post_cfg.get("snap", {}).get("enabled", False))
     dp_enabled_cfg = bool(decoder_post_cfg.get("dp", {}).get("enabled", False))
+    postproc_modules: List[str] = []
+    if snap_enabled_cfg:
+        postproc_modules.append("snap")
+    if dp_enabled_cfg:
+        postproc_modules.append("dp")
     postproc_debug = bool(cfg.get("logging", {}).get("postproc_debug", False))
+    _SWEEP_POSTPROC_MAP = {"never": False, "eval_only": False, "always": True}
+    sweep_apply_postproc = _SWEEP_POSTPROC_MAP[args.postproc_mode]
+    final_apply_postproc = args.postproc_mode in ("eval_only", "always")
     post_logs_dir = Path(cfg.get("logging", {}).get("log_dir", "logs") or "logs") / "post"
 
-    def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None):
+    def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None, apply_postproc=True):
         nonlocal decoder_notice_printed, decoder_logits_warned
         if k_onset is None:
             k_onset = default_k_onset
@@ -1587,10 +1605,12 @@ def main():
                 decoder_logits_warned = True
             onset_pred_bin = onset_mask_bool.float()
             offset_pred_bin = offset_mask_bool.float()
-        post_stats = {}
-        baseline_onset_mask = None
-        if snap_enabled_cfg or dp_enabled_cfg or postproc_debug:
-            baseline_onset_mask = onset_pred_mask.clone()
+        post_stats: Dict[str, Any] = {}
+        postproc_applied = False
+        should_postprocess = apply_postproc and bool(postproc_modules)
+        need_baseline = should_postprocess or postproc_debug
+        baseline_onset_mask = onset_pred_mask.clone() if need_baseline else None
+        if should_postprocess:
             onset_post_mask, stage_stats = apply_postprocessing(
                 onset_pred_mask,
                 prob_tensor_for_post,
@@ -1599,6 +1619,7 @@ def main():
                 require_stats=postproc_debug,
             )
             onset_pred_mask = onset_post_mask
+            postproc_applied = True
             if stage_stats:
                 post_stats.update(stage_stats)
         onset_pred_bin = onset_pred_mask.to(prob_tensor_for_post.dtype)
@@ -1639,6 +1660,7 @@ def main():
             "k_onset": int(k_onset),
             "use_logits": bool(use_logits),
         }
+        result_payload["_postproc_applied"] = postproc_applied
         return result_payload, post_stats
 
     printed_header = False
@@ -1751,10 +1773,10 @@ def main():
     last_grid_print = t_grid0
     _log_progress(f"[progress] grid sweep start: combos={num_combos}", force=True)
 
-    def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None):
+    def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None, apply_postproc=True):
         nonlocal combo_idx
         nonlocal last_grid_print
-        res, post_stats = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset)
+        res, post_stats = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset, apply_postproc=apply_postproc)
         _print_row(res)
         _update_best(res, post_stats)
         combo_idx += 1
@@ -1790,6 +1812,7 @@ def main():
                     off_cal["best_logit"],
                     True,
                     k_onset=default_k_onset,
+                    apply_postproc=sweep_apply_postproc,
                 )
             elif "best_prob" in on_cal and "best_prob" in off_cal:
                 _header()
@@ -1798,6 +1821,7 @@ def main():
                     off_cal["best_prob"],
                     False,
                     k_onset=default_k_onset,
+                    apply_postproc=sweep_apply_postproc,
                 )
             else:
                 print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
@@ -1810,7 +1834,7 @@ def main():
                 print("error: offset logit threshold count must match onset count", file=sys.stderr)
                 return
             for on_thr, off_thr in zip(args.thresholds, offset_list):
-                _run_eval(on_thr, off_thr, True, k_onset=default_k_onset)
+                _run_eval(on_thr, off_thr, True, k_onset=default_k_onset, apply_postproc=sweep_apply_postproc)
         if args.prob_thresholds:
             _header()
             onset_list = args.prob_thresholds
@@ -1819,14 +1843,26 @@ def main():
                 if args.grid_prob_thresholds:
                     for on_thr in onset_list:
                         for off_thr in offset_list:
-                            _run_eval(on_thr, off_thr, False, k_onset=k_val)
+                            _run_eval(
+                                on_thr,
+                                off_thr,
+                                False,
+                                k_onset=k_val,
+                                apply_postproc=sweep_apply_postproc,
+                            )
                 else:
                     if len(onset_list) != len(offset_list):
                         print("error: offset probability thresholds must match onset count", file=sys.stderr)
                         return
                     for idx, on_thr in enumerate(onset_list):
                         off_thr = offset_list[idx]
-                        _run_eval(on_thr, off_thr, False, k_onset=k_val)
+                        _run_eval(
+                            on_thr,
+                            off_thr,
+                            False,
+                            k_onset=k_val,
+                            apply_postproc=sweep_apply_postproc,
+                        )
     else:
         # Per-head sweep
         sweep_vals = per_head_sweep_vals
@@ -1884,7 +1920,13 @@ def main():
                 on_thr, off_thr = t, fixed_thr
             else:
                 on_thr, off_thr = fixed_thr, t
-            _run_eval(on_thr, off_thr, use_logits, k_onset=default_k_onset)
+            _run_eval(
+                on_thr,
+                off_thr,
+                use_logits,
+                k_onset=default_k_onset,
+                apply_postproc=sweep_apply_postproc,
+            )
 
     grid_elapsed = time.time() - t_grid0
     stage_durations["grid_pass"] = grid_elapsed
@@ -1912,7 +1954,27 @@ def main():
         force=True,
     )
 
+    final_postproc_applied = False
+    if best_result is not None:
+        final_postproc_applied = bool(best_result.get("_postproc_applied", False))
+        need_final_eval = final_apply_postproc and bool(postproc_modules) and not final_postproc_applied
+        if need_final_eval:
+            final_res, final_stats = _eval_pair(
+                best_result["onset_thr"],
+                best_result["offset_thr"],
+                best_result.get("use_logits", False),
+                k_onset=best_result.get("k_onset", default_k_onset),
+                apply_postproc=True,
+            )
+            final_ev_mean = 0.5 * (final_res["ev_f1_on"] + final_res["ev_f1_off"])
+            best_result = {**final_res, "ev_mean": final_ev_mean}
+            best_post_stats = copy.deepcopy(final_stats) if final_stats else None
+            final_postproc_applied = bool(final_res.get("_postproc_applied", False))
+
     if best_result is not None and total_evals > 0:
+        modules_label = ",".join(postproc_modules) if postproc_modules else "none"
+        status = "RAN" if final_postproc_applied else "SKIPPED"
+        print(f"POSTPROC: {status} during final eval (mode={args.postproc_mode}) modules={modules_label}")
         print(
             "[best-event] mean_event_f1={:.3f} onset_event_f1={:.3f} offset_event_f1={:.3f} k_onset={}".format(
                 best_result["ev_mean"],
