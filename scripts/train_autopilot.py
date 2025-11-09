@@ -151,6 +151,7 @@ from utils.selection import (
     tolerance_snapshot_from_config,
     parse_eval_rows,
 )
+from utils.tie_break import OnsetTieBreakContext, TIE_BREAK_EPS_F1, log_tie_break_eps, select_best_onset_row
 
 LOGGER = logging.getLogger("autopilot")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
@@ -489,7 +490,7 @@ ONSET_THR_MIN = 0.10
 ONSET_THR_MAX = 0.40
 ONSET_PRED_RATE_MIN_FACTOR = 0.5
 ONSET_PRED_RATE_MAX_FACTOR = 3.0
-ONSET_TIE_TOL = 1e-4
+ONSET_TIE_TOL = TIE_BREAK_EPS_F1
 
 DEFAULT_STAGEB_ADD_DELTA = 0.01
 DEFAULT_STAGEB_ADD_STEPS = 5
@@ -1495,6 +1496,7 @@ def perform_calibration(
     results_path: Path,
     stdout_dir: Path,
     split: str,
+    target_metric_field: str,
     calibration_count: int,
     seed: int,
     deterministic: bool,
@@ -1597,6 +1599,9 @@ def perform_calibration(
             verbose=args.verbose,
             log_path=stdout_dir / log_name,
             run_id=exp_name,
+            target_metric=target_metric_field,
+            onset_anchor_used=onset_center,
+            prev_onset_threshold=prev_onset_best,
         )
 
     def _run_two_stage(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
@@ -2193,40 +2198,76 @@ def perform_calibration(
 
         valid_stage_b = [cand for cand in stage_b_candidates if cand["valid"]]
         stage_b_pool = valid_stage_b or stage_b_candidates
+        if not stage_b_pool:
+            raise SelectionError("Stage-B evaluation produced no candidates")
         stage_b_winner = stage_b_pool[0]
         tie_break_note = ""
-        for cand in stage_b_pool[1:]:
-            cur_f1 = float(cand["row"]["onset_event_f1"])
-            best_f1 = float(stage_b_winner["row"]["onset_event_f1"])
-            if cur_f1 > best_f1 + ONSET_TIE_TOL:
-                stage_b_winner = cand
-                tie_break_note = ""
-                continue
-            if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
-                prev_threshold = prev_onset_best
-                cand_thr = float(cand["row"]["onset_thr"])
-                best_thr = float(stage_b_winner["row"]["onset_thr"])
-                cand_prev = prev_threshold is not None and abs(cand_thr - prev_threshold) <= 1e-5
-                best_prev = prev_threshold is not None and abs(best_thr - prev_threshold) <= 1e-5
-                if cand_prev and not best_prev:
+        tie_break_reason = ""
+        target_is_onset_metric = target_metric_field == "onset_event_f1"
+        if target_is_onset_metric:
+            log_tie_break_eps()
+            ctx = OnsetTieBreakContext(anchor_used=onset_anchor_used, prev_threshold=prev_onset_best)
+            ranked_rows = [cand["row"] for cand in stage_b_pool]
+            best_row_obj, tie_break_reason = select_best_onset_row(ranked_rows, ctx)
+            for cand in stage_b_pool:
+                if cand["row"] is best_row_obj:
                     stage_b_winner = cand
-                    tie_break_note = "tie→prev_threshold"
+                    break
+            if not tie_break_reason:
+                tie_break_reason = "metric"
+        else:
+            for cand in stage_b_pool[1:]:
+                cur_f1 = float(cand["row"]["onset_event_f1"])
+                best_f1 = float(stage_b_winner["row"]["onset_event_f1"])
+                if cur_f1 > best_f1 + ONSET_TIE_TOL:
+                    stage_b_winner = cand
+                    tie_break_note = ""
                     continue
-                if cand_prev == best_prev:
-                    if cand_thr > best_thr + 1e-6:
+                if abs(cur_f1 - best_f1) <= ONSET_TIE_TOL:
+                    prev_threshold = prev_onset_best
+                    cand_thr = float(cand["row"]["onset_thr"])
+                    best_thr = float(stage_b_winner["row"]["onset_thr"])
+                    cand_prev = prev_threshold is not None and abs(cand_thr - prev_threshold) <= 1e-5
+                    best_prev = prev_threshold is not None and abs(best_thr - prev_threshold) <= 1e-5
+                    if cand_prev and not best_prev:
                         stage_b_winner = cand
-                        tie_break_note = "tie→higher_threshold"
+                        tie_break_note = "tie→prev_threshold"
                         continue
-                    if abs(cand_thr - best_thr) <= 1e-6:
-                        cand_diff = abs(float(cand["row"]["onset_pred_rate"]) - float(cand["row"]["onset_pos_rate"]))
-                        best_diff = abs(float(stage_b_winner["row"]["onset_pred_rate"]) - float(stage_b_winner["row"]["onset_pos_rate"]))
-                        if cand_diff < best_diff - 1e-6:
+                    if cand_prev == best_prev:
+                        if cand_thr > best_thr + 1e-6:
                             stage_b_winner = cand
-                            tie_break_note = "tie→pred_rate_balance"
+                            tie_break_note = "tie→higher_threshold"
                             continue
+                        if abs(cand_thr - best_thr) <= 1e-6:
+                            cand_diff = abs(float(cand["row"]["onset_pred_rate"]) - float(cand["row"]["onset_pos_rate"]))
+                            best_diff = abs(float(stage_b_winner["row"]["onset_pred_rate"]) - float(stage_b_winner["row"]["onset_pos_rate"]))
+                            if cand_diff < best_diff - 1e-6:
+                                stage_b_winner = cand
+                                tie_break_note = "tie→pred_rate_balance"
+                                continue
         if not tie_break_note and not stage_b_winner["valid"]:
             tie_break_note = "guard-fallback"
+        if target_is_onset_metric:
+            tie_break_reason = tie_break_reason or "metric"
+        else:
+            tie_break_reason = tie_break_note or ""
         best_row = stage_b_winner["row"]
+        if target_is_onset_metric:
+            anchor_label = "--" if onset_anchor_used is None else f"{float(onset_anchor_used):.4f}"
+            prev_label = "--" if prev_onset_best is None else f"{float(prev_onset_best):.4f}"
+            print(
+                "target={target} | best_onset_f1={f1:.4f} | tie_break={reason} | "
+                "pred={pred:.4f} pos={pos:.4f} | thr={thr:.4f} | anchor_used={anchor} | prev_thr={prev}".format(
+                    target=target_metric_field,
+                    f1=float(best_row["onset_event_f1"]),
+                    reason=tie_break_reason,
+                    pred=float(best_row["onset_pred_rate"]),
+                    pos=float(best_row["onset_pos_rate"]),
+                    thr=float(best_row["onset_thr"]),
+                    anchor=anchor_label,
+                    prev=prev_label,
+                )
+            )
         print(
             "[Stage-B] winner thr={:.4f} onset_event_f1={:.4f} pred_rate={:.4f} pos_rate={:.4f} open={:.4f} hold={:.4f} min_on={} {}".format(
                 float(best_row["onset_thr"]),
@@ -2236,10 +2277,10 @@ def perform_calibration(
                 float(onset_open),
                 float(onset_hold),
                 int(onset_min_on),
-                tie_break_note,
+                tie_break_note or tie_break_reason,
             )
         )
-        summary_tie = tie_break_note or "none"
+        summary_tie = tie_break_note or tie_break_reason or "none"
         print(
             "stageB: gates(open={:.3f}, hold={:.3f}, min_on={}, gap={}) -> best onset_thr={:.4f} onset_event_f1={:.4f} (tie: {})".format(
                 float(onset_open),
@@ -2289,7 +2330,12 @@ def perform_calibration(
                 "onset_event_f1": _coerce_optional_float(best_row.get("onset_event_f1")),
                 "offset_event_f1": _coerce_optional_float(best_row.get("offset_event_f1")),
                 "ev_f1_mean": _coerce_optional_float(best_row.get("ev_f1_mean")),
-                "tie_break": tie_break_note,
+                "tie_break": tie_break_note or tie_break_reason,
+                "tie_break_reason": tie_break_reason or tie_break_note,
+                "anchor_used": _coerce_optional_float(onset_anchor_used),
+                "prev_onset_thr": _coerce_optional_float(prev_onset_best),
+                "onset_pred_rate": _coerce_optional_float(best_row.get("onset_pred_rate")),
+                "onset_pos_rate": _coerce_optional_float(best_row.get("onset_pos_rate")),
             },
             "metrics": {
                 "onset_pred_rate": _coerce_optional_float(best_row.get("onset_pred_rate")),
@@ -2333,8 +2379,13 @@ def perform_calibration(
                 "decoder_onset_merge_gap": int(onset_merge_gap),
             }
         )
-        if tie_break_note:
-            decoder_payload["tie_break_note"] = tie_break_note
+        if tie_break_reason == "metric":
+            winner_reason_for_payload = ""
+        else:
+            winner_reason_for_payload = tie_break_reason
+        winner_tie_label = tie_break_note or winner_reason_for_payload
+        if winner_tie_label:
+            decoder_payload["tie_break_note"] = winner_tie_label
 
         selection = SelectionResult(
             onset_threshold=float(best_row["onset_thr"]),
@@ -3114,6 +3165,7 @@ def main() -> int:
                 results_path=results_path,
                 stdout_dir=stdout_dir,
                 split=args.split_eval,
+                target_metric_field=target_metric_field,
                 calibration_count=calibration_count,
                 seed=seed,
                 deterministic=deterministic,
@@ -3233,6 +3285,7 @@ def main() -> int:
                     results_path=results_path,
                     stdout_dir=stdout_dir,
                     split=args.split_eval,
+                    target_metric_field=target_metric_field,
                     calibration_count=calibration_count,
                     seed=seed,
                     deterministic=deterministic,

@@ -13,6 +13,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .tie_break import (
+    OnsetTieBreakContext,
+    log_tie_break_eps,
+    select_best_onset_row,
+)
+
 
 FAST_SWEEP_CLIP_MIN = 0.02
 FAST_SWEEP_CLIP_MAX = 0.98
@@ -335,6 +341,9 @@ class SelectionRequest:
     verbose: Optional[str] = None
     log_path: Optional[Path] = None
     run_id: Optional[str] = None
+    target_metric: str = "ev_f1_mean"
+    onset_anchor_used: Optional[float] = None
+    prev_onset_threshold: Optional[float] = None
 
 
 def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, SelectionContext, List[str]]:
@@ -473,13 +482,50 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
             "Could not parse evaluation table from eval_thresholds output. "
             f"Last lines:\n{tail}"
         )
-    best = rows[0]
-    for row in rows[1:]:
-        if row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
-            best = row
-        elif abs(row["ev_f1_mean"] - best["ev_f1_mean"]) <= 1e-9 and row["onset_event_f1"] > best["onset_event_f1"] + 1e-9:
-            best = row
+    tie_break_reason: Optional[str] = None
+    target_metric = request.target_metric or "ev_f1_mean"
+    if target_metric == "onset_event_f1":
+        log_tie_break_eps()
+        anchor_used = (
+            request.onset_anchor_used
+            if request.onset_anchor_used is not None
+            else request.sweep.onset_center
+        )
+        ctx = OnsetTieBreakContext(
+            anchor_used=anchor_used,
+            prev_threshold=request.prev_onset_threshold,
+        )
+        best, tie_break_reason = select_best_onset_row(rows, ctx)
+        anchor_label = "--" if anchor_used is None else f"{float(anchor_used):.4f}"
+        prev_label = (
+            "--"
+            if request.prev_onset_threshold is None
+            else f"{float(request.prev_onset_threshold):.4f}"
+        )
+        print(
+            "target={target} | best_onset_f1={f1:.4f} | tie_break={reason} | "
+            "pred={pred:.4f} pos={pos:.4f} | thr={thr:.4f} | anchor_used={anchor} | "
+            "prev_thr={prev}".format(
+                target=target_metric,
+                f1=float(best["onset_event_f1"]),
+                reason=tie_break_reason,
+                pred=float(best["onset_pred_rate"]),
+                pos=float(best["onset_pos_rate"]),
+                thr=float(best["onset_thr"]),
+                anchor=anchor_label,
+                prev=prev_label,
+            )
+        )
+    else:
+        best = rows[0]
+        for row in rows[1:]:
+            if row["ev_f1_mean"] > best["ev_f1_mean"] + 1e-9:
+                best = row
+            elif abs(row["ev_f1_mean"] - best["ev_f1_mean"]) <= 1e-9 and row["onset_event_f1"] > best["onset_event_f1"] + 1e-9:
+                best = row
     decoder_payload = {k: best[k] for k in best.keys() if k.startswith("decoder_")}
+    if tie_break_reason and tie_break_reason != "metric":
+        decoder_payload["tie_break_note"] = tie_break_reason
 
     result = SelectionResult(
         onset_threshold=float(best["onset_thr"]),
