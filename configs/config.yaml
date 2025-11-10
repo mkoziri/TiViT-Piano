@@ -140,13 +140,13 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.22  # default
-        hold: 0.16  # default
+        open: 0.02  # default
+        hold: 0.015  # default
         min_on: 2  # default
         merge_gap: 1  # default
       offset:
-        open: 0.11  # default
-        hold: 0.07  # default
+        open: 0.015  # default
+        hold: 0.01  # default
         min_off: 2  # default
         merge_gap: 1  # default
     temporal_decoder:
@@ -215,16 +215,17 @@ autopilot:
   fast_strategy: two_stage
   onset_optimizer:
     open_grid:
-    - 0.22
-    - 0.24
-    - 0.26
-    - 0.28
+    - 0.018
+    - 0.02
+    - 0.022
+    - 0.024
     min_on_grid:
     - 2
     - 3
-    hold_mode: fixed_delta
+    hold_mode: fixed_ratio
     hold_delta: 0.06
-    hold_min: 0.04
+    hold_min: 0.015
+    hold_ratio: 0.75
     merge_gap: 1
     thr_anchor: 0.2
     thr_add_delta: 0.01

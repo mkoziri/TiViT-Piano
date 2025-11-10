@@ -474,18 +474,19 @@ FAST_RESULT_MIN = 0.02
 FAST_RESULT_MAX = 0.98
 
 DEFAULT_FAST_STRATEGY = "two_stage"
-DEFAULT_ONSET_OPEN_GRID = [0.22, 0.24, 0.26, 0.28]
+DEFAULT_ONSET_OPEN_GRID = [0.018, 0.020, 0.022, 0.024]
 DEFAULT_ONSET_MIN_ON_GRID = [2, 3]
-DEFAULT_ONSET_HOLD_MODE = "fixed_delta"
+DEFAULT_ONSET_HOLD_MODE = "fixed_ratio"
 DEFAULT_ONSET_HOLD_DELTA = 0.06
-DEFAULT_ONSET_HOLD_MIN = 0.04
+DEFAULT_ONSET_HOLD_MIN = 0.015
+DEFAULT_ONSET_HOLD_RATIO = 0.75
 DEFAULT_ONSET_MERGE_GAP = 1
 DEFAULT_ONSET_THR_ANCHOR = 0.20
 DEFAULT_ONSET_THR_DELTA = 0.05
 DEFAULT_ONSET_THR_STEPS = 5
 DEFAULT_OFFSET_THR_ANCHOR = 0.30
-ONSET_OPEN_MIN = 0.16
-ONSET_OPEN_MAX = 0.36
+ONSET_OPEN_MIN = 0.01
+ONSET_OPEN_MAX = 0.08
 ONSET_THR_MIN = 0.10
 ONSET_THR_MAX = 0.40
 ONSET_PRED_RATE_MIN_FACTOR = 0.5
@@ -1730,13 +1731,18 @@ def perform_calibration(
         hold_mode = (args.onset_hold_mode or DEFAULT_ONSET_HOLD_MODE).lower()
         hold_delta = float(args.onset_hold_delta)
         hold_min = float(args.onset_hold_min)
+        hold_ratio = float(args.onset_hold_ratio)
 
         def _compute_hold(open_val: float) -> float:
             if hold_mode == "config" and prev_hold_cfg is not None:
-                return max(0.0, min(open_val, prev_hold_cfg))
-            hold = open_val - hold_delta
-            if hold_min > 0.0:
-                hold = max(hold, hold_min)
+                hold = prev_hold_cfg
+            elif hold_mode == "fixed_ratio":
+                ratio_hold = open_val * hold_ratio
+                hold = max(hold_min, min(open_val, ratio_hold))
+            else:
+                hold = open_val - hold_delta
+                if hold_min > 0.0:
+                    hold = max(hold, hold_min)
             return max(0.0, min(open_val, hold))
 
         def _is_prev_candidate(open_val: float, min_on_val: int) -> bool:
@@ -2954,8 +2960,8 @@ def main() -> int:
     )
     ap.add_argument(
         "--onset_hold_mode",
-        choices=["fixed_delta", "config"],
-        help="Hold calculation strategy for Stage-A search (default: fixed_delta → open - hold_delta)",
+        choices=["fixed_delta", "config", "fixed_ratio"],
+        help="Hold calculation strategy for Stage-A search (default: fixed_ratio → open * hold_ratio)",
     )
     ap.add_argument(
         "--onset_hold_delta",
@@ -2965,7 +2971,12 @@ def main() -> int:
     ap.add_argument(
         "--onset_hold_min",
         type=float,
-        help="Minimum hold gate enforced when hold_mode=fixed_delta (default: 0.04)",
+        help="Minimum hold gate enforced when hold_mode=fixed_delta/fixed_ratio (default: 0.015)",
+    )
+    ap.add_argument(
+        "--onset_hold_ratio",
+        type=float,
+        help="Hold ratio applied when hold_mode=fixed_ratio (default: 0.75)",
     )
     ap.add_argument(
         "--onset_merge_gap",
@@ -3106,6 +3117,13 @@ def main() -> int:
         default=DEFAULT_ONSET_HOLD_MIN,
         transform=lambda val: max(0.0, float(val)),
         attr_name="onset_hold_min",
+    )
+    _assign_setting(
+        args.onset_hold_ratio,
+        cfg_key="hold_ratio",
+        default=DEFAULT_ONSET_HOLD_RATIO,
+        transform=lambda val: max(0.0, min(1.0, float(val))),
+        attr_name="onset_hold_ratio",
     )
     _assign_setting(
         args.onset_merge_gap,
