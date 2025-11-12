@@ -30,13 +30,16 @@ _EPS = 1e-4
 @dataclass
 class DPOptions:
     enabled: bool = False
-    min_on_beats: float = 0.5
-    min_off_beats: float = 0.5
-    penalty_on: float = 1.0
-    penalty_off: float = 1.0
-    keep_gates: bool = True
+    min_on_beats: float = 0.25
+    min_off_beats: float = 0.25
+    penalty_on: float = 0.5
+    penalty_off: float = 0.5
+    keep_gates: bool = False
     per_key: bool = True
     beam: int = 5
+    emission_mode: str = "logit"
+    emission_gain: float = 4.0
+    emission_bias: float = 0.0
 
 
 def apply(event_set: DecoderEventSet, cfg: Mapping[str, Any], snap_cfg: Mapping[str, Any] | None = None) -> DecoderEventSet:
@@ -44,6 +47,7 @@ def apply(event_set: DecoderEventSet, cfg: Mapping[str, Any], snap_cfg: Mapping[
     if not options.enabled or not options.per_key:
         return event_set
     baseline_events = event_set.clone_events()
+    baseline_mask = event_set.mask.clone()
     tempo = _resolve_tempo(event_set, snap_cfg or {})
     bpm = tempo.bpm or _DEFAULT_BPM
     frames_per_beat = (event_set.fps * 60.0) / max(bpm, 1e-6)
@@ -64,10 +68,17 @@ def apply(event_set: DecoderEventSet, cfg: Mapping[str, Any], snap_cfg: Mapping[
                 options.penalty_off,
                 options.beam,
                 base_count,
+                options.emission_mode,
+                options.emission_gain,
+                options.emission_bias,
             )
             if adjusted:
                 penalty_adjustments += 1
-            new_mask[clip_idx, :, key] = dp_mask
+            if options.keep_gates:
+                gated = torch.logical_and(dp_mask, baseline_mask[clip_idx, :, key])
+            else:
+                gated = dp_mask
+            new_mask[clip_idx, :, key] = gated
             post_count = _count_mask_events(dp_mask)
             stats = per_key.setdefault(key, {
                 "baseline_events": 0,
@@ -92,6 +103,9 @@ def apply(event_set: DecoderEventSet, cfg: Mapping[str, Any], snap_cfg: Mapping[
         "beam": options.beam,
         "bpm": bpm,
         "tempo_confidence": tempo.confidence,
+        "emission_mode": options.emission_mode,
+        "emission_gain": options.emission_gain,
+        "emission_bias": options.emission_bias,
         "latency_mean_abs_ms": latency,
         "per_key": per_key,
         "penalty_reductions": penalty_adjustments,
@@ -108,13 +122,36 @@ def _dp_with_guard(
     penalty_off: float,
     beam: int,
     base_count: int,
+    emission_mode: str,
+    emission_gain: float,
+    emission_bias: float,
 ) -> Tuple[torch.Tensor, float, bool]:
-    best_mask = _run_viterbi(prob_seq, min_on_frames, min_off_frames, penalty_on, penalty_off, beam)
+    best_mask = _run_viterbi(
+        prob_seq,
+        min_on_frames,
+        min_off_frames,
+        penalty_on,
+        penalty_off,
+        beam,
+        emission_mode,
+        emission_gain,
+        emission_bias,
+    )
     base_count = max(base_count, 0)
     merged_ratio = _merge_ratio(base_count, _count_mask_events(best_mask))
     adjusted = False
     if merged_ratio > _MERGE_THRESHOLD:
-        best_mask = _run_viterbi(prob_seq, min_on_frames, min_off_frames, penalty_on * 0.5, penalty_off * 0.5, beam)
+        best_mask = _run_viterbi(
+            prob_seq,
+            min_on_frames,
+            min_off_frames,
+            penalty_on * 0.5,
+            penalty_off * 0.5,
+            beam,
+            emission_mode,
+            emission_gain,
+            emission_bias,
+        )
         new_ratio = _merge_ratio(base_count, _count_mask_events(best_mask))
         if new_ratio < merged_ratio:
             merged_ratio = new_ratio
@@ -152,6 +189,9 @@ def _run_viterbi(
     penalty_on: float,
     penalty_off: float,
     beam: int,
+    emission_mode: str,
+    emission_gain: float,
+    emission_bias: float,
 ) -> torch.Tensor:
     probs = prob_seq.detach().cpu().to(torch.float32)
     T = probs.shape[0]
@@ -173,10 +213,22 @@ def _run_viterbi(
         next_idx = min(idx + 1, cap - 1)
         return next_idx if is_off(state) else next_idx + off_states
 
+    emission_mode_norm = (emission_mode or "logit").strip().lower()
+    if emission_mode_norm not in {"logit", "log_prob", "log"}:
+        emission_mode_norm = "logit"
+    gain = emission_gain if math.isfinite(emission_gain) else 1.0
+    bias = emission_bias if math.isfinite(emission_bias) else 0.0
+
     def emission(state: int, t: int) -> float:
         p = float(probs[t].item())
         p = min(max(p, _EPS), 1.0 - _EPS)
-        return math.log(1.0 - p) if is_off(state) else math.log(p)
+        is_on_state = not is_off(state)
+        if emission_mode_norm == "logit":
+            logit = math.log(p + _EPS) - math.log(1.0 - p + _EPS)
+            signed = logit if is_on_state else -logit
+            return gain * signed + bias
+        log_val = math.log(p) if is_on_state else math.log(1.0 - p)
+        return gain * log_val + (bias if is_on_state else -bias)
 
     def transitions(state: int) -> List[Tuple[int, float]]:
         out: List[Tuple[int, float]] = [(stay_state(state), 0.0)]
@@ -275,15 +327,21 @@ def _resolve_tempo(event_set: DecoderEventSet, snap_cfg: Mapping[str, Any]) -> T
 def _parse_options(cfg: Mapping[str, Any] | None) -> DPOptions:
     if not isinstance(cfg, Mapping):
         return DPOptions()
+    mode = str(cfg.get("emission_mode", "logit")).strip().lower()
+    if not mode:
+        mode = "logit"
     return DPOptions(
         enabled=bool(cfg.get("enabled", False)),
-        min_on_beats=float(cfg.get("min_on_beats", 0.5)),
-        min_off_beats=float(cfg.get("min_off_beats", 0.5)),
-        penalty_on=float(cfg.get("penalty_on", 1.0)),
-        penalty_off=float(cfg.get("penalty_off", 1.0)),
-        keep_gates=bool(cfg.get("keep_gates", True)),
+        min_on_beats=float(cfg.get("min_on_beats", 0.25)),
+        min_off_beats=float(cfg.get("min_off_beats", 0.25)),
+        penalty_on=float(cfg.get("penalty_on", 0.5)),
+        penalty_off=float(cfg.get("penalty_off", 0.5)),
+        keep_gates=bool(cfg.get("keep_gates", False)),
         per_key=bool(cfg.get("per_key", True)),
         beam=int(cfg.get("beam", 5)),
+        emission_mode=mode,
+        emission_gain=float(cfg.get("emission_gain", 4.0)),
+        emission_bias=float(cfg.get("emission_bias", 0.0)),
     )
 
 

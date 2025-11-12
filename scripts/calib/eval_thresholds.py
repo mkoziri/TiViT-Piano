@@ -2487,6 +2487,9 @@ def main():
 
     final_postproc_applied = False
     if best_result is not None:
+        pre_dp_result = best_result
+        pre_post_stats = copy.deepcopy(best_post_stats) if best_post_stats else None
+        pre_ev_mean = pre_dp_result.get("ev_mean")
         final_postproc_applied = bool(best_result.get("_postproc_applied", False))
         need_final_eval = final_apply_postproc and bool(postproc_modules) and not final_postproc_applied
         if need_final_eval:
@@ -2498,9 +2501,20 @@ def main():
                 apply_postproc=True,
             )
             final_ev_mean = 0.5 * (final_res["ev_f1_on"] + final_res["ev_f1_off"])
-            best_result = {**final_res, "ev_mean": final_ev_mean}
-            best_post_stats = copy.deepcopy(final_stats) if final_stats else None
-            final_postproc_applied = bool(final_res.get("_postproc_applied", False))
+            degrade = (
+                pre_ev_mean is not None
+                and math.isfinite(pre_ev_mean)
+                and final_ev_mean < pre_ev_mean - 0.02
+            )
+            if degrade:
+                print("[warn] DP hurt metrics; disabling for this round and returning pre-DP events.", flush=True)
+                best_result = pre_dp_result
+                best_post_stats = pre_post_stats
+                final_postproc_applied = False
+            else:
+                best_result = {**final_res, "ev_mean": final_ev_mean}
+                best_post_stats = copy.deepcopy(final_stats) if final_stats else None
+                final_postproc_applied = bool(final_res.get("_postproc_applied", False))
 
     if best_result is not None and total_evals > 0:
         summary_lines = _format_summary_lines(
