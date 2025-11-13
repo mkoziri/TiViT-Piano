@@ -13,5 +13,17 @@ CLI:
 """
 
 from .key_prior import KeyAwarePrior, KeyPriorConfig, build_key_profiles
+from .key_prior_runtime import (
+    KeyPriorRuntimeSettings,
+    resolve_key_prior_settings,
+    apply_key_prior_to_logits,
+)
 
-__all__ = ["KeyAwarePrior", "KeyPriorConfig", "build_key_profiles"]
+__all__ = [
+    "KeyAwarePrior",
+    "KeyPriorConfig",
+    "build_key_profiles",
+    "KeyPriorRuntimeSettings",
+    "resolve_key_prior_settings",
+    "apply_key_prior_to_logits",
+]

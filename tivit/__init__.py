@@ -30,20 +30,39 @@ if TYPE_CHECKING:  # pragma: no cover - typing helper
     from theory.key_prior import KeyAwarePrior as _KeyAwarePrior
     from theory.key_prior import KeyPriorConfig as _KeyPriorConfig
     from theory.key_prior import build_key_profiles as _build_key_profiles
+    from theory.key_prior_runtime import (
+        KeyPriorRuntimeSettings as _KeyPriorRuntimeSettings,
+        resolve_key_prior_settings as _resolve_key_prior_settings,
+        apply_key_prior_to_logits as _apply_key_prior_to_logits,
+    )
 
     _THEORY: Final[ModuleType] = import_module("theory")
     theory: ModuleType = _THEORY
     KeyAwarePrior = _KeyAwarePrior
     KeyPriorConfig = _KeyPriorConfig
     build_key_profiles = _build_key_profiles
+    KeyPriorRuntimeSettings = _KeyPriorRuntimeSettings
+    resolve_key_prior_settings = _resolve_key_prior_settings
+    apply_key_prior_to_logits = _apply_key_prior_to_logits
 else:
     _THEORY: Final[ModuleType] = _import_theory()
     theory: ModuleType = _THEORY
     KeyAwarePrior = _THEORY.KeyAwarePrior
     KeyPriorConfig = _THEORY.KeyPriorConfig
     build_key_profiles = _THEORY.build_key_profiles
+    KeyPriorRuntimeSettings = _THEORY.KeyPriorRuntimeSettings
+    resolve_key_prior_settings = _THEORY.resolve_key_prior_settings
+    apply_key_prior_to_logits = _THEORY.apply_key_prior_to_logits
 
-__all__ = ["theory", "KeyAwarePrior", "KeyPriorConfig", "build_key_profiles"]
+__all__ = [
+    "theory",
+    "KeyAwarePrior",
+    "KeyPriorConfig",
+    "build_key_profiles",
+    "KeyPriorRuntimeSettings",
+    "resolve_key_prior_settings",
+    "apply_key_prior_to_logits",
+]
 
 
 def __getattr__(name: str) -> object:

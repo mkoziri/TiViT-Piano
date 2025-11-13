@@ -198,6 +198,20 @@ decoder:
     dp:
       enabled: true
       min_on_beats: 0.25
+  key_prior:
+    enabled: false
+    ref_head: onset
+    apply_to:
+    - onset
+    - offset
+    window_sec: 3.0
+    beta: 4.0
+    rho_uniform: 0.8
+    prior_strength: 0.5
+    epsilon: 1.0e-08
+    fps: null
+    midi_low: 21
+    midi_high: null
       min_off_beats: 0.25
       penalty_on: 0.5
       penalty_off: 0.5

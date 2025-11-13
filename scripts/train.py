@@ -69,6 +69,10 @@ from decoder.decode import (
     resolve_decoder_from_config,
     resolve_decoder_gates,
 )
+from theory.key_prior_runtime import (
+    resolve_key_prior_settings,
+    apply_key_prior_to_logits,
+)
 
 logger = get_logger(__name__)
 
@@ -2033,12 +2037,28 @@ def evaluate_one_epoch(
     thr_off = offset_cal["threshold"]
     agg_cfg = _get_aggregation_config(cfg)
     dataset_cfg = cfg.get("dataset", {}) or {}
+    decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
     hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    if hop_seconds <= 0.0 and decode_fps > 0.0:
+        hop_seconds = 1.0 / decode_fps
+    if decode_fps <= 0.0 and hop_seconds > 0.0:
+        decode_fps = 1.0 / hop_seconds
+    if decode_fps <= 0.0:
+        decode_fps = 30.0
     if hop_seconds <= 0.0:
-        decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
-        hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
+        hop_seconds = 1.0 / decode_fps
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
+    if key_prior_settings.enabled:
+        logger.info(
+            "[decoder] key prior active (ref_head=%s, apply_to=%s)",
+            key_prior_settings.ref_head,
+            ",".join(key_prior_settings.apply_to),
+        )
+    midi_low_cfg = frame_targets_cfg.get("note_min")
+    key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
     temporal_decoder_cfg = resolve_decoder_from_config(
         metrics_cfg,
         fallback_open={"onset": thr_on, "offset": thr_off},
@@ -2431,6 +2451,47 @@ def evaluate_one_epoch(
                 else:
                     tgt = fabricate_dummy_targets(valid_count)
 
+                metrics_out: Dict[str, Any] = out
+                heads_for_prior = cast(dict[str, torch.Tensor], {})
+                onset_logits_for_prior = out.get("onset_logits")
+                offset_logits_for_prior = out.get("offset_logits")
+                pitch_logits_for_prior = out.get("pitch_logits")
+                if torch.is_tensor(onset_logits_for_prior):
+                    heads_for_prior["onset"] = onset_logits_for_prior
+                if torch.is_tensor(offset_logits_for_prior):
+                    heads_for_prior["offset"] = offset_logits_for_prior
+                if torch.is_tensor(pitch_logits_for_prior):
+                    heads_for_prior["pitch"] = pitch_logits_for_prior
+                prior_logits = cast(dict[str, torch.Tensor], {})
+                if len(heads_for_prior) > 0:
+                    prior_logits = apply_key_prior_to_logits(
+                        heads_for_prior,
+                        key_prior_settings,
+                        fps=decode_fps,
+                        midi_low=key_prior_midi_low,
+                        midi_high=None,
+                    )
+                if prior_logits:
+                    metrics_out = dict(out)
+                    for head_name, tensor in prior_logits.items():
+                        metrics_out[f"{head_name}_logits"] = tensor
+                    if torch.is_tensor(onset_probs_valid) and "onset" in prior_logits:
+                        onset_probs_valid = _apply_sigmoid_calibration(
+                            metrics_out["onset_logits"],
+                            temperature=onset_cal["temperature"],
+                            bias=onset_cal["bias"],
+                        )
+                    if torch.is_tensor(offset_probs_valid) and "offset" in prior_logits:
+                        offset_probs_valid = _apply_sigmoid_calibration(
+                            metrics_out["offset_logits"],
+                            temperature=offset_cal["temperature"],
+                            bias=offset_cal["bias"],
+                        )
+
+                onset_logits_eval = metrics_out.get("onset_logits")
+                offset_logits_eval = metrics_out.get("offset_logits")
+                pitch_logits_eval = metrics_out.get("pitch_logits")
+
                 use_frame = (
                     getattr(model, "head_mode", "clip") == "frame"
                     and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
@@ -2512,14 +2573,12 @@ def evaluate_one_epoch(
                         lag_timeouts += 1
 
                 if DEBUG_EVAL_METRICS and valid_count > 0:
-                    onset_logits = out.get("onset_logits")
-                    offset_logits = out.get("offset_logits")
-                    if onset_logits is not None and onset_logit_stats is not None and onset_prob_stats is not None:
-                        _update_stats(onset_logit_stats, onset_logits)
+                    if onset_logits_eval is not None and onset_logit_stats is not None and onset_prob_stats is not None:
+                        _update_stats(onset_logit_stats, onset_logits_eval)
                         onset_probs_stats = onset_probs_valid if torch.is_tensor(onset_probs_valid) else None
-                        if onset_probs_stats is None and onset_logits is not None:
+                        if onset_probs_stats is None:
                             onset_probs_stats = _apply_sigmoid_calibration(
-                                onset_logits,
+                                onset_logits_eval,
                                 temperature=onset_cal["temperature"],
                                 bias=onset_cal["bias"],
                             )
@@ -2527,14 +2586,14 @@ def evaluate_one_epoch(
                                 onset_probs_stats = None
                         _update_stats(onset_prob_stats, onset_probs_stats)
                         if onset_k_effective is None:
-                            onset_dim = onset_logits.shape[-1] if onset_logits.ndim > 0 else 1
+                            onset_dim = onset_logits_eval.shape[-1] if onset_logits_eval.ndim > 0 else 1
                             onset_k_effective = max(1, min(int(agg_cfg["k_onset"]), onset_dim))
-                    if offset_logits is not None and offset_logit_stats is not None and offset_prob_stats is not None:
-                        _update_stats(offset_logit_stats, offset_logits)
+                    if offset_logits_eval is not None and offset_logit_stats is not None and offset_prob_stats is not None:
+                        _update_stats(offset_logit_stats, offset_logits_eval)
                         offset_probs_stats = offset_probs_valid if torch.is_tensor(offset_probs_valid) else None
-                        if offset_probs_stats is None and offset_logits is not None:
+                        if offset_probs_stats is None:
                             offset_probs_stats = _apply_sigmoid_calibration(
-                                offset_logits,
+                                offset_logits_eval,
                                 temperature=offset_cal["temperature"],
                                 bias=offset_cal["bias"],
                             )
@@ -2542,7 +2601,7 @@ def evaluate_one_epoch(
                                 offset_probs_stats = None
                         _update_stats(offset_prob_stats, offset_probs_stats)
                         if offset_k_effective is None:
-                            offset_dim = offset_logits.shape[-1] if offset_logits.ndim > 0 else 1
+                            offset_dim = offset_logits_eval.shape[-1] if offset_logits_eval.ndim > 0 else 1
                             offset_k_effective = max(1, min(int(agg_cfg["k_offset"]), offset_dim))
 
                 # --- metrics ---
@@ -2551,7 +2610,10 @@ def evaluate_one_epoch(
                     if frame_batch is None:
                         logger.warning("[eval] Frame batch missing despite frame_mode; skipping batch for metrics.")
                         continue
-                    B, T_logits, P = out["onset_logits"].shape
+                    if onset_logits_eval is None or offset_logits_eval is None:
+                        logger.warning("[eval] Missing logits for frame-mode evaluation; skipping batch.")
+                        continue
+                    B, T_logits, P = onset_logits_eval.shape
 
                     onset_roll = frame_batch["onset_roll"]
                     offset_roll = frame_batch["offset_roll"]
@@ -2579,7 +2641,7 @@ def evaluate_one_epoch(
                     offset_any = (offset_roll > 0).any(dim=-1).float()
 
                     loose_onset_pred, loose_onset_counts = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_onset"],
@@ -2589,7 +2651,7 @@ def evaluate_one_epoch(
                         bias=onset_cal["bias"],
                     )
                     loose_offset_pred, loose_offset_counts = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_offset"],
@@ -2599,7 +2661,7 @@ def evaluate_one_epoch(
                         bias=offset_cal["bias"],
                     )
                     strict_onset_pred, strict_onset_counts, strict_onset_mask = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_onset"],
@@ -2611,7 +2673,7 @@ def evaluate_one_epoch(
                         return_mask=True,
                     )
                     strict_offset_pred, strict_offset_counts, strict_offset_mask = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_offset"],
@@ -2632,9 +2694,9 @@ def evaluate_one_epoch(
                     offset_event_mask = strict_offset_mask.bool()
 
                     onset_probs_proxy = onset_probs_valid if torch.is_tensor(onset_probs_valid) else None
-                    if onset_probs_proxy is None and "onset_logits" in out:
+                    if onset_probs_proxy is None and "onset_logits" in metrics_out:
                         maybe_proxy = _apply_sigmoid_calibration(
-                            out["onset_logits"],
+                            metrics_out["onset_logits"],
                             temperature=onset_cal["temperature"],
                             bias=onset_cal["bias"],
                         )
@@ -2656,9 +2718,9 @@ def evaluate_one_epoch(
                             onset_event_mask = strict_onset_mask.bool()
 
                     offset_probs_proxy = offset_probs_valid if torch.is_tensor(offset_probs_valid) else None
-                    if offset_probs_proxy is None and "offset_logits" in out:
+                    if offset_probs_proxy is None and "offset_logits" in metrics_out:
                         maybe_proxy_off = _apply_sigmoid_calibration(
-                            out["offset_logits"],
+                            metrics_out["offset_logits"],
                             temperature=offset_cal["temperature"],
                             bias=offset_cal["bias"],
                         )
@@ -2680,7 +2742,7 @@ def evaluate_one_epoch(
                             offset_event_mask = strict_offset_mask.bool()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode="any",
                         k=1,
@@ -2690,7 +2752,7 @@ def evaluate_one_epoch(
                         bias=onset_cal["bias"],
                     )
                     offset_pred_legacy, _ = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode="any",
                         k=1,
@@ -2796,12 +2858,17 @@ def evaluate_one_epoch(
 
 
                 else:
-                    pitch_pred = (torch.sigmoid(out["pitch_logits"]) >= thr_pitch).float()
-                    pitch_gt = (tgt["pitch"] >= 0.5).float()
-                    f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
-                    if f1_pitch is not None:
-                        loose_counts["pitch_acc"] += f1_pitch
-                        strict_counts["pitch_acc"] += f1_pitch
+                    if onset_logits_eval is None or offset_logits_eval is None:
+                        logger.warning("[eval] Missing logits for clip-mode evaluation; skipping batch.")
+                        continue
+                    pitch_head_eval = pitch_logits_eval
+                    if torch.is_tensor(pitch_head_eval):
+                        pitch_pred = (torch.sigmoid(pitch_head_eval) >= thr_pitch).float()
+                        pitch_gt = (tgt["pitch"] >= 0.5).float()
+                        f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
+                        if f1_pitch is not None:
+                            loose_counts["pitch_acc"] += f1_pitch
+                            strict_counts["pitch_acc"] += f1_pitch
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
@@ -2813,7 +2880,7 @@ def evaluate_one_epoch(
                     strict_counts["clef_acc"] += clef_acc_val
 
                     loose_onset_pred, _ = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_onset"],
@@ -2823,7 +2890,7 @@ def evaluate_one_epoch(
                         bias=onset_cal["bias"],
                     )
                     loose_offset_pred, _ = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_offset"],
@@ -2833,7 +2900,7 @@ def evaluate_one_epoch(
                         bias=offset_cal["bias"],
                     )
                     strict_onset_pred, _, strict_onset_mask = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_onset"],
@@ -2845,7 +2912,7 @@ def evaluate_one_epoch(
                         return_mask=True,
                     )
                     strict_offset_pred, _, strict_offset_mask = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode=agg_cfg["mode"],
                         k=agg_cfg["k_offset"],
@@ -2864,7 +2931,7 @@ def evaluate_one_epoch(
                     strict_offset_mask_float = strict_offset_mask.float()
 
                     onset_pred_legacy, _ = _aggregate_onoff_predictions(
-                        out["onset_logits"],
+                        onset_logits_eval,
                         thr_on,
                         mode="any",
                         k=1,
@@ -2874,7 +2941,7 @@ def evaluate_one_epoch(
                         bias=onset_cal["bias"],
                     )
                     offset_pred_legacy, _ = _aggregate_onoff_predictions(
-                        out["offset_logits"],
+                        offset_logits_eval,
                         thr_off,
                         mode="any",
                         k=1,

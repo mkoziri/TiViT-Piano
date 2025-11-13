@@ -52,7 +52,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping, Optional, List
+from typing import Any, Mapping, Optional, List, Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -82,6 +82,11 @@ from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
+from theory.key_prior_runtime import (
+    KeyPriorRuntimeSettings,
+    resolve_key_prior_settings,
+    apply_key_prior_to_logits,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -463,7 +468,17 @@ def _format_seconds(seconds: float) -> str:
     minutes, secs = divmod(int(seconds), 60)
     return f"{minutes:02d}:{secs:02d}"
 
-def _collect(model, loader, target_clips: Optional[int], timeout_secs: float):
+def _collect(
+    model,
+    loader,
+    target_clips: Optional[int],
+    timeout_secs: float,
+    *,
+    key_prior: KeyPriorRuntimeSettings,
+    key_prior_fps: float,
+    key_prior_midi_low: int | None,
+    key_prior_midi_high: int | None,
+):
     onset_logits_list, offset_logits_list = [], []
     onset_probs_list, offset_probs_list = [], []
     onset_tgts_list, offset_tgts_list = [], []
@@ -495,8 +510,29 @@ def _collect(model, loader, target_clips: Optional[int], timeout_secs: float):
             x = x[idx]
             out = model(x)
 
-            on_logits = out["onset_logits"] if "onset_logits" in out else out.get("onset")
-            off_logits = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+            raw_heads: Dict[str, torch.Tensor] = {}
+            onset_entry = out["onset_logits"] if "onset_logits" in out else out.get("onset")
+            offset_entry = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+            if torch.is_tensor(onset_entry):
+                raw_heads["onset"] = onset_entry
+            if torch.is_tensor(offset_entry):
+                raw_heads["offset"] = offset_entry
+            adjusted: Dict[str, torch.Tensor] = {}
+            if raw_heads:
+                adjusted = apply_key_prior_to_logits(
+                    raw_heads,
+                    key_prior,
+                    fps=key_prior_fps,
+                    midi_low=key_prior_midi_low,
+                    midi_high=key_prior_midi_high,
+                )
+            if "onset" in adjusted:
+                onset_entry = adjusted["onset"]
+            if "offset" in adjusted:
+                offset_entry = adjusted["offset"]
+
+            on_logits = onset_entry
+            off_logits = offset_entry
 
             onset_probs = torch.sigmoid(on_logits)
             offset_probs = torch.sigmoid(off_logits)
@@ -832,6 +868,14 @@ def main():
     decoder_settings_summary = format_decoder_settings(decoder_kind, decoder_params)
     print(f"[decoder-settings] {decoder_settings_summary}")
     print(f"[decoder] {decoder_notice_text(decoder_kind, decoder_params)}")
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
+    if key_prior_settings.enabled:
+        applied = ", ".join(key_prior_settings.apply_to)
+        print(
+            f"[decoder] key prior enabled (ref_head={key_prior_settings.ref_head}, apply_to={applied})",
+            flush=True,
+        )
 
     dataset_cfg = dict(cfg.get("dataset", {}) or {})
     cfg["dataset"] = dataset_cfg
@@ -854,8 +898,14 @@ def main():
     hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
     if hop_seconds <= 0.0:
         hop_seconds = 1.0 / decode_fps if decode_fps > 0 else 1.0
+    if decode_fps <= 0.0 and hop_seconds > 0.0:
+        decode_fps = 1.0 / hop_seconds
+    if decode_fps <= 0.0:
+        decode_fps = 30.0
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
+    midi_low_cfg = frame_targets_cfg.get("note_min")
+    key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
 
     split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
     frames_display = dataset_cfg.get("frames")
@@ -1053,7 +1103,16 @@ def main():
         timeout_hit,
         lag_ms_samples,
         lag_source_counts,
-    ) = _collect(model, loader, target_clips, timeout_secs)
+    ) = _collect(
+        model,
+        loader,
+        target_clips,
+        timeout_secs,
+        key_prior=key_prior_settings,
+        key_prior_fps=decode_fps,
+        key_prior_midi_low=key_prior_midi_low,
+        key_prior_midi_high=None,
+    )
     data_elapsed = time.time() - t_data0
     stage_durations["data_pass"] = data_elapsed
 

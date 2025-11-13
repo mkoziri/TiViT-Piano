@@ -57,6 +57,10 @@ from data import make_dataloader
 from models import build_model
 from torch.utils.data import DataLoader, Subset
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
+from theory.key_prior_runtime import (
+    resolve_key_prior_settings,
+    apply_key_prior_to_logits,
+)
 
 LOGGER = logging.getLogger("eval_thresholds")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
@@ -1076,11 +1080,20 @@ def main():
         dataset_cfg["persistent_workers"] = False
         dataset_cfg["pin_memory"] = False
         print("[debug] num_workers=0, persistent_workers=False, pin_memory=False", flush=True)
-    decode_fps = float(dataset_cfg.get("decode_fps", 1.0))
-    hop_seconds = float(dataset_cfg.get("hop_seconds", 1.0 / decode_fps))
-    event_tolerance = float(
-        dataset_cfg.get("frame_targets", {}).get("tolerance", hop_seconds)
-    )
+    decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    if hop_seconds <= 0.0 and decode_fps > 0.0:
+        hop_seconds = 1.0 / decode_fps
+    if decode_fps <= 0.0 and hop_seconds > 0.0:
+        decode_fps = 1.0 / hop_seconds
+    if decode_fps <= 0.0:
+        decode_fps = 30.0
+    if hop_seconds <= 0.0:
+        hop_seconds = 1.0 / decode_fps
+    frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
+    event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
+    midi_low_cfg = frame_targets_cfg.get("note_min")
+    key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
     split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
 
     frames_display = dataset_cfg.get("frames")
@@ -1121,6 +1134,14 @@ def main():
             floor_band.append(val)
     if not floor_band:
         floor_band = [0.20, 0.30, 0.40]
+
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
+    if key_prior_settings.enabled:
+        print(
+            f"[decoder] key prior enabled (ref_head={key_prior_settings.ref_head}, apply_to={', '.join(key_prior_settings.apply_to)})",
+            flush=True,
+        )
 
     calibration_data = None
     if args.calibration:
@@ -1424,6 +1445,33 @@ def main():
 
                 onset_logits = onset_logits_neutral / onset_temperature + onset_bias
                 offset_logits = offset_logits_neutral / offset_temperature + offset_bias
+
+                pitch_prior_tensor = None
+                pitch_was_2d = False
+                if torch.is_tensor(pitch_logits):
+                    pitch_prior_tensor = pitch_logits
+                    if pitch_prior_tensor.dim() == 2:
+                        pitch_prior_tensor = pitch_prior_tensor.unsqueeze(1)
+                        pitch_was_2d = True
+
+                prior_inputs = {"onset": onset_logits, "offset": offset_logits}
+                if torch.is_tensor(pitch_prior_tensor):
+                    prior_inputs["pitch"] = pitch_prior_tensor
+                prior_outputs = apply_key_prior_to_logits(
+                    prior_inputs,
+                    key_prior_settings,
+                    fps=decode_fps,
+                    midi_low=key_prior_midi_low,
+                    midi_high=None,
+                )
+                if "onset" in prior_outputs:
+                    onset_logits = prior_outputs["onset"]
+                if "offset" in prior_outputs:
+                    offset_logits = prior_outputs["offset"]
+                if pitch_prior_tensor is not None and "pitch" in prior_outputs:
+                    pitch_prior_tensor = prior_outputs["pitch"]
+                    pitch_logits = pitch_prior_tensor.squeeze(1) if pitch_was_2d else pitch_prior_tensor
+
                 onset_prob = torch.sigmoid(onset_logits)
                 offset_prob = torch.sigmoid(offset_logits)
 

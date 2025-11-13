@@ -2941,6 +2941,12 @@ def main() -> int:
         help="Select decoder/calibration implementation; 'legacy' toggles rollback flags",
     )
     ap.add_argument(
+        "--key-prior-mode",
+        choices=["config", "enabled", "disabled"],
+        default="config",
+        help="Override decoder.key_prior.enabled before running child scripts (default: respect config.yaml)",
+    )
+    ap.add_argument(
         "--fast_strategy",
         choices=["classic", "two_stage"],
         default=DEFAULT_FAST_STRATEGY,
@@ -3036,6 +3042,19 @@ def main() -> int:
         print(f"[autopilot] fresh mode → experiment name set to {new_name}")
     else:
         print(f"[autopilot] resume mode → keeping experiment name {exp_cfg.get('name', base_name)}")
+
+    decoder_root = cfg.setdefault("decoder", {})
+    key_prior_cfg: Dict[str, Any] = decoder_root.setdefault("key_prior", {})
+    if "enabled" not in key_prior_cfg:
+        key_prior_cfg["enabled"] = False
+        changed = True
+    if args.key_prior_mode != "config":
+        desired = args.key_prior_mode == "enabled"
+        if bool(key_prior_cfg.get("enabled")) != desired:
+            key_prior_cfg["enabled"] = desired
+            changed = True
+            state = "enabled" if desired else "disabled"
+            print(f"[autopilot] key prior override → {state}")
 
     autop_cfg_root = cfg.setdefault("autopilot", {})
     onset_opt_cfg = autop_cfg_root.setdefault("onset_optimizer", {})
