@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_MT_B1B2_v4_on
+  name: TiViT-Piano_PianoYT_MT_key_prior
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -186,7 +186,7 @@ train:
 decoder:
   post:
     snap:
-      enabled: true
+      enabled: false
       bpm_min: 40
       bpm_max: 240
       bpm_step: 1
@@ -196,10 +196,19 @@ decoder:
       min_support_notes: 12
       confidence_floor: 0.15
     dp:
-      enabled: true
+      enabled: false
       min_on_beats: 0.25
-  key_prior:
-    enabled: false
+      min_off_beats: 0.25
+      penalty_on: 0.5
+      penalty_off: 0.5
+      keep_gates: false
+      per_key: true
+      beam: 5
+      emission_mode: logit
+      emission_gain: 4.0
+      emission_bias: 0.0
+    key_prior:
+    enabled: true
     ref_head: onset
     apply_to:
     - onset
@@ -212,15 +221,6 @@ decoder:
     fps: null
     midi_low: 21
     midi_high: null
-      min_off_beats: 0.25
-      penalty_on: 0.5
-      penalty_off: 0.5
-      keep_gates: false
-      per_key: true
-      beam: 5
-      emission_mode: logit
-      emission_gain: 4.0
-      emission_bias: 0.0
 logging:
   log_dir: logs
   checkpoint_dir: checkpoints
