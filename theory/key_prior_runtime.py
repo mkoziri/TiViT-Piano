@@ -19,7 +19,7 @@ CLI:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, MutableMapping, Sequence
+from typing import Dict, Mapping, MutableMapping, Sequence, cast, List
 
 import numpy as np
 import torch
@@ -74,17 +74,38 @@ def resolve_key_prior_settings(raw_cfg: Mapping[str, object] | None) -> KeyPrior
     if not isinstance(raw_cfg, Mapping):
         return KeyPriorRuntimeSettings()
 
-    def _coerce_float(value: object, default: float | None = None) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
+    def _coerce_float(value: object | None, default: float | None = None) -> float | None:
+        """Return ``float(value)`` when possible, otherwise ``default``."""
 
-    def _coerce_int(value: object, default: int | None = None) -> int | None:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
+        if value is None:
             return default
+        if isinstance(value, (float, int)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return default
+        return default
+
+    def _coerce_int(value: object | None, default: int | None = None) -> int | None:
+        """Return ``int(value)`` when possible, otherwise ``default``."""
+
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            try:
+                return int(value)
+            except ValueError:
+                return default
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return default
+        return default
 
     enabled = bool(raw_cfg.get("enabled", False))
     ref_head = str(raw_cfg.get("ref_head", "onset") or "onset")
@@ -195,24 +216,27 @@ def apply_key_prior_to_logits(
             key_posteriors, key_names = prior.estimate_key_posteriors(ref_np)
             pc_prior = prior.pc_prior_from_keys(key_posteriors, key_names)
 
-            for head, meta in head_views.items():
-                view = meta["view"]
-                head_np = np.asarray(view[batch_idx].numpy(), dtype=np.float64)
+            for head, meta_obj in head_views.items():
+                meta = cast(dict[str, object], meta_obj)
+                view_tensor = cast(torch.Tensor, meta["view"])
+                head_np = np.asarray(view_tensor[batch_idx].numpy(), dtype=np.float64)
                 rescored = prior.rescore_logits_with_pc_prior(head_np, pc_prior)
                 clip_tensor = torch.from_numpy(rescored.astype(np.float32))
-                updated.setdefault(head, []).append(clip_tensor)
+                clip_list = cast(List[torch.Tensor], updated.setdefault(head, []))  # type: ignore[arg-type]
+                clip_list.append(clip_tensor)
 
-        for head, clips in updated.items():
-            stacked = torch.stack(clips, dim=0)
-            meta = head_views[head]
-            if meta["squeezed"]:
-                stacked = stacked.squeeze(0)
-            stacked = stacked.to(
-                device=meta["device"],
-                dtype=meta["dtype"],
-                non_blocking=False,
-            )
-            updated[head] = stacked
+    for head, clips_obj in updated.items():
+        clips = cast(List[torch.Tensor], clips_obj)
+        stacked = torch.stack(clips, dim=0)
+        meta = cast(dict[str, object], head_views[head])
+        if bool(meta["squeezed"]):
+            stacked = stacked.squeeze(0)
+        stacked = stacked.to(
+            device=cast(torch.device, meta["device"]),
+            dtype=cast(torch.dtype, meta["dtype"]),
+            non_blocking=False,
+        )
+        updated[head] = stacked
 
     return updated
 
