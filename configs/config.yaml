@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_MT_key_prior
+  name: TiViT-Piano_PianoYT_MT_onset_balanced_sampler
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -52,6 +52,12 @@ dataset:
   batch_size: 2
   num_workers: 4
   shuffle: true
+  sampler:
+    mode: onset_balanced          # set to "onset_balanced" to enable optional sampler or "null" for default
+    onset_frac: 0.5
+    nearmiss_frac: 0.25
+    bg_frac: 0.25
+    nearmiss_radius: 6
   require_labels: true
   frame_targets:
     enable: true
@@ -90,7 +96,7 @@ tiling:
   overlap_tokens: 0
 training:
   epochs: 4
-  learning_rate: 1e-4
+  learning_rate: 3e-5
   weight_decay: 0.01
   eval_freq: 1
   debug_dummy_labels: false
@@ -100,21 +106,21 @@ training:
   resume: false
   reset_head_bias: true
   bias_seed:
-    onoff_prior_mean: 0.02
+    onoff_prior_mean: 0.012
   loss_weights:
     onoff_loss: bce_pos
-    onoff_pos_weight_mode: fixed
+    onoff_pos_weight_mode: adaptive  #it was fixed
     onoff_pos_weight: 16.0
     onoff_pos_weight_ema_alpha: 0.05
     onoff_neg_smooth: 0.0
-    focal_gamma: 2.0
+    focal_gamma: 4.0
     focal_alpha: 0.25
     onoff_prior_mean: 0.012
     onoff_prior_weight: 0.15
     onoff_heads:
       onset:
-        loss: bce_pos
-        pos_weight_mode: fixed
+        loss: focal #was bce_pos
+        pos_weight_mode: adaptive  #was fixed
         prior_mean: 0.012
         prior_weight: 0.15
       offset:
@@ -178,7 +184,7 @@ training:
       max_prob: 0.98
 optim:
   grad_clip: 1.0
-  head_lr_multiplier: 5.0
+  head_lr_multiplier: 10.0 #was 5.0
   offset_weight_decay_multiplier: 4.0
 train:
   accumulate_steps: 12

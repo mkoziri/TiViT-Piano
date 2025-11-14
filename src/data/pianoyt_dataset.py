@@ -11,6 +11,9 @@ Key Functions/Classes:
       which wires runtime configuration, per-clip targets, and collate logic.
     - _read_midi_events(): Utility that converts a MIDI file into the ``(N,3)``
       event tensor used by downstream code (onset, offset, pitch).
+    - Supports the same opt-in onset-balanced sampling mode exposed via
+      ``dataset.sampler``; when metadata is missing the loader reverts to the
+      default shuffling strategy so the change is safe to ship.
 
 CLI:
     Not a standalone CLI; access through :mod:`scripts.train` or diagnostic
@@ -60,6 +63,7 @@ from .omaps_dataset import (  # reuse established helpers for identical behaviou
     apply_global_augment,
     apply_registration_crop,
 )
+from .sampler_utils import build_onset_balanced_sampler
 LOGGER = logging.getLogger(__name__)
 
 
@@ -774,6 +778,74 @@ class PianoYTDataset(Dataset):
         if snapshot:
             return len(snapshot)
         return len(self._valid_entries)
+
+    def build_onset_sampler_metadata(self, *, nearmiss_radius: int = 0) -> Mapping[str, Any]:
+        """Return onset/background metadata for the opt-in sampler.
+
+        ``nearmiss_radius`` is accepted for interface parity; we expose
+        ``start_frames`` so the shared helper can derive near-miss indices in a
+        backend-agnostic manner.
+        """
+
+        if self._uses_eval_snapshot():
+            return self._build_eval_sampler_metadata()
+        return self._build_train_sampler_metadata()
+
+    def _build_train_sampler_metadata(self) -> Mapping[str, Any]:
+        snapshot = self._ensure_train_snapshot()
+        if not snapshot:
+            self._rebuild_valid_index_cache(log_summary=False)
+            snapshot = self._ensure_train_snapshot()
+            if not snapshot:
+                return {}
+
+        onset_indices: List[int] = []
+        background_indices: List[int] = []
+        start_frames: Dict[int, int] = {}
+
+        for idx, entry in enumerate(snapshot):
+            start_idx = entry.start_idx if entry.start_idx is not None else 0
+            start_frames[idx] = int(start_idx)
+            if entry.has_events:
+                onset_indices.append(idx)
+            else:
+                background_indices.append(idx)
+
+        return {
+            "onset": tuple(onset_indices),
+            "background": tuple(background_indices),
+            "start_frames": start_frames,
+        }
+
+    def _build_eval_sampler_metadata(self) -> Mapping[str, Any]:
+        entries = list(self.eval_indices_snapshot)
+        if not entries:
+            try:
+                self.materialize_eval_entries_from_labels()
+            except Exception as exc:  # pragma: no cover - best effort
+                LOGGER.debug("eval sampler metadata fallback failed: %s", exc)
+            entries = list(self.eval_indices_snapshot)
+            if not entries:
+                return {}
+
+        flags = self._eval_snapshot_flags
+        onset_indices: List[int] = []
+        background_indices: List[int] = []
+        start_frames: Dict[int, int] = {}
+
+        for idx, (_, start_idx) in enumerate(entries):
+            start_frames[idx] = int(start_idx if start_idx is not None else 0)
+            has_events = bool(flags[idx]) if idx < len(flags) else True
+            if has_events:
+                onset_indices.append(idx)
+            else:
+                background_indices.append(idx)
+
+        return {
+            "onset": tuple(onset_indices),
+            "background": tuple(background_indices),
+            "start_frames": start_frames,
+        }
 
     def _log_snapshot_fallback(
         self,
@@ -2385,10 +2457,20 @@ def make_dataloader(
         int(base_seed), namespace=f"{dataset.__class__.__name__}:{split}"
     )
 
+    sampler = build_onset_balanced_sampler(
+        dataset,
+        dcfg.get("sampler"),
+        base_seed=int(base_seed),
+    )
+    shuffle_flag = bool(dcfg.get("shuffle", True)) if split == "train" else False
+    if sampler is not None:
+        shuffle_flag = False
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
-        shuffle=bool(dcfg.get("shuffle", True)) if split == "train" else False,
+        shuffle=shuffle_flag,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,

@@ -9,6 +9,9 @@ Key Functions/Classes:
       collate functions for clip or frame objectives.
     - Helper utilities such as ``_load_clip_decord`` and ``_build_frame_targets``
       perform decoding, tiling, and pianoroll construction.
+    - Opt-in onset-balanced sampling can be enabled through
+      ``dataset.sampler.mode: onset_balanced``; when the dataset does not expose
+      sampler metadata the loader falls back to uniform sampling automatically.
 
 CLI:
     Not a standalone CLI; consume via :mod:`scripts.train`, evaluation helpers,
@@ -44,6 +47,8 @@ from utils.frame_targets import (
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
 from utils.registration_refinement import RegistrationRefiner
+
+from .sampler_utils import build_onset_balanced_sampler
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1165,10 +1170,20 @@ def make_dataloader(
         int(base_seed), namespace=f"{dataset.__class__.__name__}:{split}"
     )
 
+    sampler = build_onset_balanced_sampler(
+        dataset,
+        dcfg.get("sampler"),
+        base_seed=int(base_seed),
+    )
+    shuffle_flag = bool(dcfg.get("shuffle", True)) if split == "train" else False
+    if sampler is not None:
+        shuffle_flag = False
+
     loader = DataLoader(
         dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
-        shuffle=bool(dcfg.get("shuffle", True)) if split == "train" else False,
+        shuffle=shuffle_flag,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,

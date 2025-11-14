@@ -136,6 +136,21 @@ TARGET_METRIC_FIELDS = {
     "offset_ev_f1": "offset_event_f1",
 }
 
+# Flags from eval_thresholds.py that never take an explicit value.  When users
+# pass extras without the leading "--" (for example "no_eval_cache"), we only
+# auto-prefix them when they are not acting as a value for one of these.
+EVAL_THRESHOLD_VALUELESS_FLAGS = {
+    "--grid_prob_thresholds",
+    "--no_eval_cache",
+    "--sweep_k_onset",
+    "--no-avlag",
+    "--legacy-eval-thresholds",
+    "--progress",
+    "--no-progress",
+    "--deterministic",
+    "--no-deterministic",
+}
+
 sys.path.insert(0, str(REPO / "src"))
 from utils.logging_utils import QUIET_INFO_FLAG, configure_verbosity
 from utils.determinism import resolve_deterministic_flag, resolve_seed
@@ -164,6 +179,32 @@ QUIET_EXTRA = {QUIET_INFO_FLAG: True}
 def load_cfg() -> dict:
     with CONFIG.open("r") as f:
         return yaml.safe_load(f)
+
+
+def _normalize_eval_extras(tokens: Sequence[str]) -> List[str]:
+    """Ensure eval extras look like CLI flags, but keep flag values untouched."""
+    normalized: List[str] = []
+    expecting_value = False
+    for token in tokens:
+        stripped = token.strip()
+        if not stripped:
+            continue
+        if expecting_value:
+            normalized.append(stripped)
+            expecting_value = False
+            continue
+        if stripped.startswith("-"):
+            normalized.append(stripped)
+            takes_value = (
+                stripped.startswith("--")
+                and "=" not in stripped
+                and stripped not in EVAL_THRESHOLD_VALUELESS_FLAGS
+            )
+            expecting_value = takes_value
+            continue
+        normalized.append(f"--{stripped}")
+        expecting_value = False
+    return normalized
 
 
 def _inject_decoder_comments(text: str) -> str:
@@ -2926,7 +2967,10 @@ def main() -> int:
         "--eval_extras",
         type=str,
         default="",
-        help="Extra CLI arguments appended to eval_thresholds.py during fast evaluation",
+        help=(
+            "Extra CLI arguments appended to eval_thresholds.py during fast evaluation "
+            '(tokens without a leading "-" are auto-prefixed, e.g. "no_eval_cache")'
+        ),
     )
     ap.add_argument(
         "--postproc-mode",
@@ -3007,10 +3051,11 @@ def main() -> int:
     args = ap.parse_args()
     args.verbose = configure_verbosity(args.verbose)
     try:
-        args.eval_extras_tokens = shlex.split(args.eval_extras) if args.eval_extras else []
+        raw_eval_extras = shlex.split(args.eval_extras) if args.eval_extras else []
     except ValueError as exc:
         print(f"error: could not parse --eval_extras: {exc}", file=sys.stderr)
         return 1
+    args.eval_extras_tokens = _normalize_eval_extras(raw_eval_extras)
     patience_budget = max(args.patience, 0)
 
     target_metric_field = TARGET_METRIC_FIELDS[args.target_metric]

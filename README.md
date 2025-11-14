@@ -84,6 +84,27 @@ If split text files are missing, the loader infers clip IDs by scanning the
 split directories. Configure `dataset.manifest.*` or `split_*` keys in
 `configs/config.yaml` to select subsets during training, validation, or testing.
 
+### Onset-balanced sampling
+
+Both dataset factories now accept an optional sampler block that biases the
+training loader toward clips with annotated onsets (with a configurable mix of
+near-miss and background windows). Enable it in the dataset section of your
+configuration:
+
+```yaml
+dataset:
+  sampler:
+    mode: onset_balanced
+    onset_frac: 0.50
+    nearmiss_frac: 0.25
+    bg_frac: 0.25
+    nearmiss_radius: 6  # frames
+```
+
+When the dataset exposes onset/near-miss indices the helper wires up a
+`WeightedRandomSampler`; otherwise the loader falls back to the default uniform
+shuffle, so leaving the block in place is safe even on older manifests.
+
 ## Quick start
 
 1. Update `configs/config.yaml` with your dataset paths and experiment metadata.
