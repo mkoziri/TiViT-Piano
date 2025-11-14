@@ -382,11 +382,14 @@ class TiViTPiano(nn.Module):
         return int(Tprime), int(Hprime * Wprime)
 
 
-    def forward(self, x):
+    def forward(self, x, return_per_tile: bool = False, **kwargs):
         """
         x: (B, T, tiles, C, H, W)  OR  (B, T, C, H, W)
         Returns dict of logits; shapes depend on head_mode ("clip" or "frame").
         """
+        if return_per_tile and getattr(self, "head_mode", "clip") != "frame":
+            raise ValueError("return_per_tile=True is only supported when head_mode=='frame'")
+
         # Normalize input to a list of per-tile tensors with shape (B, T, C, H, W)
         if x.dim() == 6:
             B, T, M, C, H, W = x.shape
@@ -423,23 +426,44 @@ class TiViTPiano(nn.Module):
 
         # ----- Frame mode: per-time features and time-distributed heads -----
         if getattr(self, "head_mode", "clip") == "frame":
-            # Avg over tiles and spatial positions -> (B, T', D)
-            g_t = enc_5d.mean(dim=(1, 3))  # mean over tiles (m) and spatial (s)
+            # Avg over spatial tokens to get per-tile temporal features
+            tile_feats = enc_5d.mean(dim=3)  # (B, tiles, T', D)
+            # Global path averages over tiles to preserve existing behavior
+            g_t = tile_feats.mean(dim=1)  # (B, T', D)
 
             # Heads accept (B,T,D) thanks to LayerNorm -> Linear on last dim
-            pitch_logits  = self.head_pitch(g_t)              # (B, T', 88)
-            onset_logits  = self.head_onset(g_t)             # (B, T', 88)
-            offset_logits = self.head_offset(g_t)            # (B, T', 88)
-            hand_logits   = self.head_hand(g_t)              # (B, T', 2)
-            clef_logits   = self.head_clef(g_t)              # (B, T', 3)
+            pitch_global  = self.head_pitch(g_t)   # (B, T', 88)
+            onset_global  = self.head_onset(g_t)   # (B, T', 88)
+            offset_global = self.head_offset(g_t)  # (B, T', 88)
+            hand_global   = self.head_hand(g_t)    # (B, T', 2)
+            clef_global   = self.head_clef(g_t)    # (B, T', 3)
 
-            return {
-                "pitch_logits":  pitch_logits,
-                "onset_logits":  onset_logits,
-                "offset_logits": offset_logits,
-                "hand_logits":   hand_logits,
-                "clef_logits":   clef_logits,
+            outputs = {
+                "pitch_logits":  pitch_global,
+                "onset_logits":  onset_global,
+                "offset_logits": offset_global,
+                "hand_logits":   hand_global,
+                "clef_logits":   clef_global,
+                "pitch_global":  pitch_global,
+                "onset_global":  onset_global,
+                "offset_global": offset_global,
+                "hand_global":   hand_global,
+                "clef_global":   clef_global,
             }
+
+            if return_per_tile:
+                pitch_tile  = self.head_pitch(tile_feats)   # (B, tiles, T', 88)
+                onset_tile  = self.head_onset(tile_feats)   # (B, tiles, T', 88)
+                offset_tile = self.head_offset(tile_feats)  # (B, tiles, T', 88)
+                outputs.update(
+                    {
+                        "pitch_tile":  pitch_tile,
+                        "onset_tile":  onset_tile,
+                        "offset_tile": offset_tile,
+                    }
+                )
+
+            return outputs
 
         # ----- Clip mode: global mean-pool over all tokens -----
         g = enc.mean(dim=1)  # (B, D)
@@ -451,5 +475,4 @@ class TiViTPiano(nn.Module):
             "clef_logits":   self.head_clef(g),                  # (B, 3)
         }
         return out
-
 

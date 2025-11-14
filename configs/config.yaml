@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_MT_onset_balanced_sampler
+  name: TiViT-Piano_PianoYT_per_tile
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -121,6 +121,8 @@ training:
       onset:
         loss: focal #was bce_pos
         pos_weight_mode: adaptive  #was fixed
+        focal_gamma: 4.0
+        focal_alpha: 0.25
         prior_mean: 0.012
         prior_weight: 0.15
       offset:

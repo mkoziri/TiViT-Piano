@@ -1,34 +1,66 @@
 #!/usr/bin/env python3
-"""Purpose:
-    Sweep onset/offset thresholds and evaluate frame- and event-level metrics,
-    optionally dumping logits for further analysis while delegating decoder
-    plumbing to ``decoder.decode``.
+"""TiViT-Piano threshold sweeper and evaluator.
+
+Purpose:
+    - Load a checkpoint, sweep onset/offset thresholds (optionally per-head),
+      and report frame/event metrics plus Platt-calibrated stats.
+    - Optionally dump logits, enforce monotonic sanity checks, and reuse
+      cached results when the configuration matches a previous run.
+    - Provide decoder/snapping overrides so downstream calibration scripts can
+      experiment with gate settings without editing configs.
 
 Key Functions/Classes:
-    - _parse_list(): Custom parser that supports comma- or space-separated CLI
-      threshold lists.
-    - _event_f1(): Computes event-level F1 scores using tolerance-aware
-      matching on the time grid.
-    - --legacy-eval-thresholds: One-flag rollback that defers to
-      ``scripts/calib/eval_thresholds_legacy.py`` if the refactor misbehaves.
-    - main(): Parses CLI options, loads a checkpoint, iterates over the
-      dataloader, and prints metric summaries for each threshold.
+    - ``RuntimeContext`` / ``LoaderContext`` / ``EvalPairContext``: capture
+      immutable state needed across the multi-stage evaluation pipeline.
+    - ``evaluate_threshold_pair()``: shared core that applies thresholds,
+      hysteresis, optional post-processing, and returns metric payloads.
+    - ``run_eval_combo()``: drives grid/per-head sweeps, progress logging,
+      best-result tracking, and row recording for cache dumps.
+    - ``main()``: CLI entry point that orchestrates config loading, model exec,
+      sweeps, sanity checks, cache replay, and result persistence.
 
-CLI:
-    Run ``python scripts/eval_thresholds.py --ckpt <path>`` with optional
-    ``--thresholds``/``--prob_thresholds`` lists, ``--split`` to choose a
-    dataset split, and ``--dump_logits`` to save logits to NPZ. Determinism
-    controls are available via ``--seed`` and ``--deterministic``.
-    ``--postproc-mode`` controls whether decoder post-processing (snap/DP)
-    runs during sweeps, only for final best evals, or is fully disabled.
-    Decoder hysteresis overrides (for example ``--decoder-onset-open``,
-    ``--decoder-onset-min-on``) let callers evaluate per-head gate sweeps
-    while keeping offset settings fixed. Use ``--legacy-eval-thresholds`` to
-    execute the frozen pre-refactor implementation when needed.
+CLI Arguments:
+    --ckpt PATH (default: checkpoints/tivit_best.pt)
+        Checkpoint whose state_dict supplies model weights.
+    --split {train,val,test} / --max-clips INT / --frames INT / --only ID
+        Dataset slice controls passed through to ``make_dataloader``.
+    --thresholds FLOAT [FLOAT ...] / --prob_thresholds FLOAT [FLOAT ...]
+        Explicit onset thresholds (logit or prob). Use matching ``--offset_*``
+        flags to decouple the heads. ``--grid_prob_thresholds`` evaluates the
+        Cartesian product; otherwise indices pair up.
+    --head {onset,offset}
+        Restrict sweeps to one head; requires a fixed threshold (``--fixed_*``)
+        or a calibration file for the opposite head.
+    --temperature[/-onset/-offset] FLOAT, --bias[/-onset/-offset] FLOAT
+        Apply Platt-style calibration scalars before sigmoid; defaults to 1.0/0.0.
+    --sanity_thresholds FLOAT [...]
+        Verify monotonic onset prediction rates at the provided probability
+        thresholds (forces fresh evaluation, bypasses cache).
+    --model-return-per-tile / --dump_logits PATH
+        Request per-tile logits from the model and/or persist frame logits to
+        NPZ for later analysis.
+    --decoder {auto,none,hysteresis} plus ``--low_ratio``, ``--min_on``,
+        ``--gap_merge``, ``--decoder-<head>-open/hold/min_{on,off}/merge_gap``,
+        ``--postproc-mode {never,eval_only,always}``
+        Control hysteresis gates and snap/DP post-processing during sweeps and
+        the final verification pass.
+    --sweep_k_onset, --grid_prob_thresholds, --no_eval_cache,
+    --legacy-eval-thresholds
+        Additional sweep/caching toggles. Legacy flag routes to the frozen
+        pre-refactor implementation for quick regression triage.
+    --seed INT / --deterministic / --verbose {quiet,info,debug} / --log-file PATH
+        Usual reproducibility and logging controls shared with other TiViT
+        scripts.
+
+Usage:
+    python scripts/calib/eval_thresholds.py --ckpt checkpoints/tivit_best.pt --split val \\
+        --prob_thresholds 0.15 0.2 0.25 --postproc-mode eval_only
 """
 
+import argparse
 import sys, json, time, math, os, torch, logging, copy, hashlib
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 import numpy as np
 from pathlib import Path
@@ -49,6 +81,7 @@ from decoder.decode import (
     resolve_decoder_gates,
     apply_postprocessing,
 )
+from tivit.decoder.tile_keymap import build_tile_key_mask
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.logging_utils import QUIET_INFO_FLAG
 from utils.identifiers import canonical_video_id
@@ -58,6 +91,7 @@ from models import build_model
 from torch.utils.data import DataLoader, Subset
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 from theory.key_prior_runtime import (
+    KeyPriorRuntimeSettings,
     resolve_key_prior_settings,
     apply_key_prior_to_logits,
 )
@@ -97,6 +131,103 @@ EVAL_CACHE_VERSION = 1
 EVAL_CACHE_FILENAME = "eval_cache.json"
 _MONO_PROB_LOW = 5e-4
 _MONO_PROB_HIGH = 0.99
+BAD_CLIP_RETRY_LIMIT = 3
+
+
+@dataclass
+class RuntimeContext:
+    """Container for configuration and derived runtime flags."""
+
+    cfg: Dict[str, Any]
+    dataset_cfg: Dict[str, Any]
+    model_cfg: Dict[str, Any]
+    seed: int
+    deterministic: bool
+    split: str
+    decode_fps: float
+    hop_seconds: float
+    event_tolerance: float
+    key_prior_midi_low: int
+    key_prior_settings: "KeyPriorRuntimeSettings"
+    agg_mode: str
+    agg_top_k: int
+    agg_tau_sum: float
+    default_k_onset: int
+    default_k_offset: int
+    include_k_column: bool
+    k_candidates: List[int]
+    preview_prob_threshold: float
+    debug_mode: bool
+    avlag_disabled: bool
+    model_tiles: int
+    return_per_tile_requested: bool
+    stage_durations: Dict[str, float]
+    only_id: Optional[str]
+
+
+@dataclass
+class LoaderContext:
+    """Data loader wrapper capturing dataset metadata for progress logs."""
+
+    val_loader: DataLoader
+    dataset: Any
+    target_clips: Optional[int]
+    target_display: str
+
+
+@dataclass
+class EvalResults:
+    """Outputs from the forward pass loop."""
+
+    onset_logits_list: List[torch.Tensor]
+    offset_logits_list: List[torch.Tensor]
+    pitch_logits_list: List[torch.Tensor]
+    onset_probs: List[torch.Tensor]
+    offset_probs: List[torch.Tensor]
+    onset_tgts: List[torch.Tensor]
+    offset_tgts: List[torch.Tensor]
+    clips_done: int
+    elapsed_data: float
+    throughput: float
+    lag_ms_samples: List[float]
+    lag_source_counter: Counter[str]
+    skip_paths: set[str]
+    bad_clip_counts: Dict[str, int]
+    skipped_batches: int
+    tile_preview_stats: Dict[str, Any]
+    tile_boundary_hist: Counter[int]
+
+
+@dataclass
+class EvalPairContext:
+    """Holds immutable sweep-time tensors and decoder settings."""
+
+    agg_mode: str
+    agg_top_k: int
+    default_k_onset: int
+    default_k_offset: int
+    hop_seconds: float
+    decode_fps: float
+    event_tolerance: float
+    onset_temperature: float
+    offset_temperature: float
+    onset_bias: float
+    offset_bias: float
+    onset_probs: torch.Tensor
+    offset_probs: torch.Tensor
+    onset_true_bin: torch.Tensor
+    offset_true_bin: torch.Tensor
+    decoder_kind: str
+    decoder_params: Mapping[str, Any]
+    onset_decoder: Mapping[str, Any]
+    offset_decoder: Mapping[str, Any]
+    postproc_modules: Sequence[str]
+    postproc_debug: bool
+    cfg: Mapping[str, Any]
+    decoder_notice_printed: bool = False
+
+    def mark_decoder_notice_printed(self) -> None:
+        self.decoder_notice_printed = True
 
 
 def _json_sanitize(value):
@@ -172,6 +303,1672 @@ def _persist_eval_cache_db(path: Path, db: Mapping[str, Any]) -> None:
         except OSError:
             pass
     tmp.replace(path)
+
+
+def _load_registration_metadata(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            result[canonical_video_id(str(key))] = value
+    return result
+
+
+def _init_progress_logger(args):
+    """Return a log-handle (if any) and a closure for consistent progress prints."""
+
+    log_handle = None
+    if args.log_file:
+        log_path = Path(args.log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(log_path, "a", encoding="utf-8")
+        import atexit
+
+        atexit.register(log_handle.close)
+
+    def _log_progress(msg: str, *, force: bool = False) -> None:
+        should_print = force or bool(args.progress)
+        if should_print:
+            print(msg, flush=True)
+        if log_handle is not None:
+            log_handle.write(msg + "\n")
+            log_handle.flush()
+
+    return log_handle, _log_progress
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _dataset_video_count(ds) -> str:
+    if ds is None:
+        return "?"
+    try:
+        if hasattr(ds, "samples"):
+            return str(len(getattr(ds, "samples")))
+        if hasattr(ds, "videos"):
+            videos_attr = getattr(ds, "videos")
+            try:
+                return str(len(videos_attr))
+            except TypeError:
+                pass
+        return str(len(ds))
+    except Exception:
+        return "?"
+
+
+def _filter_batch(batch, keep_indices):
+    """Clone ``batch`` keeping only entries at ``keep_indices`` for tensor/list fields."""
+
+    if not keep_indices:
+        return None
+    paths_field = batch.get("path")
+    total = len(paths_field) if isinstance(paths_field, list) else None
+    filtered = {}
+    for key, value in batch.items():
+        if key == "path" and isinstance(paths_field, list):
+            filtered[key] = [paths_field[i] for i in keep_indices]
+            continue
+        if total is not None:
+            if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == total:
+                idx_tensor = torch.as_tensor(keep_indices, dtype=torch.long, device=value.device)
+                filtered[key] = value.index_select(0, idx_tensor)
+                continue
+            if isinstance(value, list) and len(value) == total:
+                filtered[key] = [value[i] for i in keep_indices]
+                continue
+            if isinstance(value, tuple) and len(value) == total:
+                filtered[key] = [value[i] for i in keep_indices]
+                continue
+        filtered[key] = value
+    return filtered
+
+
+def _handle_bad_batch(
+    paths,
+    exc: Exception,
+    *,
+    skip_paths: set[str],
+    bad_clip_counts: Dict[str, int],
+    skipped_batches: int,
+    log_progress,
+) -> int:
+    """Update retry bookkeeping for batches that raised during inference."""
+
+    skipped_batches += 1
+    safe_paths = [str(p) for p in (paths or []) if p]
+    if safe_paths:
+        first = Path(safe_paths[0]).name
+        extra = len(safe_paths) - 1
+        clip_desc = f"{first}+{extra} more" if extra > 0 else first
+    else:
+        clip_desc = "<unknown>"
+    err_type = type(exc).__name__
+    log_progress(
+        f"[warn] batch failed ({err_type}): clip={clip_desc} error={exc}",
+        force=True,
+    )
+    for path in set(safe_paths):
+        bad_clip_counts[path] += 1
+        if bad_clip_counts[path] >= BAD_CLIP_RETRY_LIMIT and path not in skip_paths:
+            skip_paths.add(path)
+            log_progress(
+                f"[progress] marked clip as bad after {BAD_CLIP_RETRY_LIMIT} failures: {Path(path).name}",
+                force=True,
+    )
+    return skipped_batches
+
+
+def _percentile_tensor(flat: torch.Tensor, q: float) -> float:
+    if flat.numel() == 0:
+        return 0.0
+    try:
+        return float(torch.quantile(flat, q).item())
+    except (RuntimeError, AttributeError):
+        return float(np.quantile(flat.numpy(), q))
+
+
+def _summarize_probs(
+    name: str,
+    tensor: torch.Tensor,
+    log_progress,
+) -> Tuple[float, Dict[float, float]]:
+    flat = tensor.reshape(-1).float()
+    max_prob = float(flat.max().item()) if flat.numel() else 0.0
+    stats = {
+        0.95: _percentile_tensor(flat, 0.95),
+        0.99: _percentile_tensor(flat, 0.99),
+        0.995: _percentile_tensor(flat, 0.995),
+    }
+    log_progress(
+        "[sweep] %s prob stats: max=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
+        % (name, max_prob, stats[0.95], stats[0.99], stats[0.995]),
+        force=True,
+    )
+    return max_prob, stats
+
+
+def _format_float_list(vals: Sequence[float]) -> str:
+    return "[" + ",".join(f"{v:.3f}" for v in vals) + "]"
+
+
+def evaluate_threshold_pair(
+    on_thr: float,
+    off_thr: float,
+    use_logits: bool,
+    *,
+    ctx: EvalPairContext,
+    k_onset: Optional[int] = None,
+    apply_postproc: bool = True,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if k_onset is None:
+        k_onset = ctx.default_k_onset
+    k_onset = max(1, int(k_onset))
+    k_offset = max(1, int(ctx.default_k_offset))
+    onset_open_thr: Optional[float] = None
+    onset_hold_thr: Optional[float] = None
+    offset_open_thr: Optional[float] = None
+    offset_hold_thr: Optional[float] = None
+
+    onset_probs_tensor = ctx.onset_probs if torch.is_tensor(ctx.onset_probs) else torch.as_tensor(ctx.onset_probs)
+    offset_probs_tensor = ctx.offset_probs if torch.is_tensor(ctx.offset_probs) else torch.as_tensor(ctx.offset_probs)
+    onset_probs_tensor = onset_probs_tensor.contiguous()
+    offset_probs_tensor = offset_probs_tensor.contiguous()
+    prob_tensor_for_post = onset_probs_tensor.detach()
+    if not prob_tensor_for_post.is_floating_point():
+        prob_tensor_for_post = prob_tensor_for_post.float()
+    prob_tensor_for_post = prob_tensor_for_post.contiguous()
+    fps_eval = 1.0 / ctx.hop_seconds if ctx.hop_seconds > 0 else ctx.decode_fps
+
+    def _resolve_prob_thr(raw_value: float) -> float:
+        try:
+            raw_float = float(raw_value)
+        except (TypeError, ValueError):
+            raw_float = float("nan")
+        prob_val = _logit_to_probability(raw_float) if use_logits else raw_float
+        if not math.isfinite(prob_val):
+            prob_val = 0.5
+        return max(0.0, min(prob_val, 1.0))
+
+    onset_thr_prob = _resolve_prob_thr(on_thr)
+    offset_thr_prob = _resolve_prob_thr(off_thr)
+    print(
+        "[apply-thr] onset_thr={:.4f} offset_thr={:.4f} "
+        "T_on={:.4f} b_on={:.4f} T_off={:.4f} b_off={:.4f}".format(
+            onset_thr_prob,
+            offset_thr_prob,
+            ctx.onset_temperature,
+            ctx.onset_bias,
+            ctx.offset_temperature,
+            ctx.offset_bias,
+        ),
+        flush=True,
+    )
+
+    onset_mask_bool = build_threshold_mask(
+        onset_probs_tensor,
+        onset_thr_prob,
+        mode=ctx.agg_mode,
+        cap_count=k_onset,
+        top_k=ctx.agg_top_k,
+    )
+    offset_mask_bool = build_threshold_mask(
+        offset_probs_tensor,
+        offset_thr_prob,
+        mode=ctx.agg_mode,
+        cap_count=k_offset,
+        top_k=ctx.agg_top_k,
+    )
+
+    onset_mask_float = onset_mask_bool.float()
+    offset_mask_float = offset_mask_bool.float()
+    onset_pred_mask = onset_mask_bool.clone()
+    offset_pred_mask = offset_mask_bool.clone()
+    onset_pred_bin = onset_mask_float
+    offset_pred_bin = offset_mask_float
+
+    if ctx.decoder_kind == "hysteresis":
+        if not ctx.decoder_notice_printed:
+            print(f"[decoder] {decoder_notice_text(ctx.decoder_kind, ctx.decoder_params)}", flush=True)
+            ctx.mark_decoder_notice_printed()
+        onset_open_thr, onset_hold_thr = resolve_decoder_gates(
+            ctx.onset_decoder,
+            fallback_open=onset_thr_prob,
+            default_hold=DECODER_DEFAULTS["onset"]["hold"],
+        )
+        offset_open_thr, offset_hold_thr = resolve_decoder_gates(
+            ctx.offset_decoder,
+            fallback_open=offset_thr_prob,
+            default_hold=DECODER_DEFAULTS["offset"]["hold"],
+        )
+        masked_onset_probs = (onset_probs_tensor * onset_mask_float).contiguous()
+        masked_offset_probs = (offset_probs_tensor * offset_mask_float).contiguous()
+        onset_pred_mask = decode_hysteresis(
+            masked_onset_probs,
+            onset_open_thr,
+            onset_hold_thr,
+            ctx.onset_decoder["min_on"],
+            ctx.onset_decoder["min_off"],
+            ctx.onset_decoder["merge_gap"],
+            ctx.onset_decoder["median"],
+        )
+        offset_pred_mask = decode_hysteresis(
+            masked_offset_probs,
+            offset_open_thr,
+            offset_hold_thr,
+            ctx.offset_decoder["min_on"],
+            ctx.offset_decoder["min_off"],
+            ctx.offset_decoder["merge_gap"],
+            ctx.offset_decoder["median"],
+        )
+        onset_pred_bin = onset_pred_mask.to(onset_probs_tensor.dtype)
+        offset_pred_bin = offset_pred_mask.to(offset_probs_tensor.dtype)
+
+    post_stats: Dict[str, Any] = {}
+    postproc_applied = False
+    should_postprocess = apply_postproc and bool(ctx.postproc_modules)
+    need_baseline = should_postprocess or ctx.postproc_debug
+    baseline_onset_mask = onset_pred_mask.clone() if need_baseline else None
+    if should_postprocess:
+        onset_post_mask, stage_stats = apply_postprocessing(
+            onset_pred_mask,
+            prob_tensor_for_post,
+            fps=fps_eval,
+            cfg=ctx.cfg,
+            require_stats=ctx.postproc_debug,
+        )
+        onset_pred_mask = onset_post_mask
+        postproc_applied = True
+        if stage_stats:
+            post_stats.update(stage_stats)
+    onset_pred_bin = onset_pred_mask.to(prob_tensor_for_post.dtype)
+
+    f1_on = _binary_f1(onset_pred_bin.reshape(-1), ctx.onset_true_bin.reshape(-1))
+    f1_off = _binary_f1(offset_pred_bin.reshape(-1), ctx.offset_true_bin.reshape(-1))
+    ev_f1_on = _event_f1(onset_pred_bin, ctx.onset_true_bin, ctx.hop_seconds, ctx.event_tolerance)
+    ev_f1_off = _event_f1(offset_pred_bin, ctx.offset_true_bin, ctx.hop_seconds, ctx.event_tolerance)
+    onset_pred_rate = onset_pred_bin.mean().item()
+    onset_pos_rate = ctx.onset_true_bin.mean().item()
+
+    f1_on = 0.0 if f1_on is None else f1_on
+    f1_off = 0.0 if f1_off is None else f1_off
+    ev_f1_on = 0.0 if ev_f1_on is None else ev_f1_on
+    ev_f1_off = 0.0 if ev_f1_off is None else ev_f1_off
+
+    if ctx.postproc_debug:
+        pre_mask = baseline_onset_mask if baseline_onset_mask is not None else onset_pred_mask
+        metrics_payload = {
+            "post": _collect_onset_metrics(
+                onset_pred_mask.float(),
+                ctx.onset_true_bin,
+                ctx.hop_seconds,
+                ctx.event_tolerance,
+                prob_tensor_for_post,
+            ),
+            "pre": _collect_onset_metrics(
+                pre_mask.float(),
+                ctx.onset_true_bin,
+                ctx.hop_seconds,
+                ctx.event_tolerance,
+                prob_tensor_for_post,
+            ),
+        }
+        post_stats.setdefault("metrics", metrics_payload)
+    result_payload = {
+        "onset_thr": float(on_thr),
+        "offset_thr": float(off_thr),
+        "decoder_onset_open": float(onset_open_thr) if onset_open_thr is not None else None,
+        "decoder_onset_hold": float(onset_hold_thr) if onset_hold_thr is not None else None,
+        "decoder_offset_open": float(offset_open_thr) if offset_open_thr is not None else None,
+        "decoder_offset_hold": float(offset_hold_thr) if offset_hold_thr is not None else None,
+        "decoder_kind": ctx.decoder_kind,
+        "decoder_onset_min_on": int(ctx.onset_decoder["min_on"]),
+        "decoder_onset_merge_gap": int(ctx.onset_decoder["merge_gap"]),
+        "decoder_onset_median": int(ctx.onset_decoder["median"]),
+        "decoder_offset_min_off": int(ctx.offset_decoder["min_off"]),
+        "decoder_offset_merge_gap": int(ctx.offset_decoder["merge_gap"]),
+        "decoder_offset_median": int(ctx.offset_decoder["median"]),
+        "f1_on": float(f1_on),
+        "f1_off": float(f1_off),
+        "onset_pred_rate": float(onset_pred_rate),
+        "onset_pos_rate": float(onset_pos_rate),
+        "ev_f1_on": float(ev_f1_on),
+        "ev_f1_off": float(ev_f1_off),
+        "k_onset": int(k_onset),
+        "use_logits": bool(use_logits),
+    }
+    result_payload["_postproc_applied"] = postproc_applied
+    return result_payload, post_stats
+
+
+def print_sweep_header(include_k_column: bool, printed_header: bool) -> bool:
+    if printed_header:
+        return True
+    cols = ["onset_thr", "offset_thr"]
+    if include_k_column:
+        cols.append("k_onset")
+    cols.extend(
+        [
+            "onset_f1",
+            "offset_f1",
+            "onset_pred_rate",
+            "onset_pos_rate",
+            "onset_event_f1",
+            "offset_event_f1",
+        ]
+    )
+    print("\t".join(cols))
+    return True
+
+
+def print_sweep_row(res: Mapping[str, Any], include_k_column: bool) -> None:
+    values = [f"{res['onset_thr']:.2f}", f"{res['offset_thr']:.2f}"]
+    if include_k_column:
+        values.append(str(res["k_onset"]))
+    values.extend(
+        [
+            f"{res['f1_on']:0.3f}",
+            f"{res['f1_off']:0.3f}",
+            f"{res['onset_pred_rate']:0.3f}",
+            f"{res['onset_pos_rate']:0.3f}",
+            f"{res['ev_f1_on']:0.3f}",
+            f"{res['ev_f1_off']:0.3f}",
+        ]
+    )
+    print("\t".join(values))
+
+
+def run_sanity_thresholds(
+    args,
+    *,
+    default_k_onset: int,
+    sweep_apply_postproc: bool,
+    onset_peak: float,
+    offset_peak: float,
+    onset_lower_hint: float,
+    offset_lower_hint: float,
+    eval_ctx: EvalPairContext,
+) -> None:
+    sanity_vals = args.sanity_thresholds or []
+    if not sanity_vals:
+        return
+    unique_vals = sorted({round(float(v), 6) for v in sanity_vals})
+    if not unique_vals:
+        return
+
+    def _clamp_prob(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    offset_ref: Optional[float] = None
+    if args.offset_prob_thresholds:
+        offset_ref = float(args.offset_prob_thresholds[0])
+    elif args.fixed_offset_prob is not None:
+        offset_ref = float(args.fixed_offset_prob)
+    elif args.prob_thresholds:
+        offset_ref = float(args.prob_thresholds[0])
+    elif args.thresholds:
+        offset_ref = _logit_to_probability(float(args.thresholds[0]))
+    if offset_ref is None:
+        offset_ref = 0.5
+    offset_ref = _clamp_prob(offset_ref)
+    onset_fmt = "[" + ",".join(f"{_clamp_prob(val):.4f}" for val in unique_vals) + "]"
+    print(
+        "[sanity] verifying monotonic onset_pred_rate thresholds={} offset_ref={:.4f}".format(
+            onset_fmt,
+            offset_ref,
+        ),
+        flush=True,
+    )
+    prev_rate: Optional[float] = None
+    prev_thr: Optional[float] = None
+    for idx, thr in enumerate(unique_vals, start=1):
+        prob_thr = _clamp_prob(thr)
+        res_payload, _ = evaluate_threshold_pair(
+            prob_thr,
+            offset_ref,
+            False,
+            ctx=eval_ctx,
+            k_onset=default_k_onset,
+            apply_postproc=sweep_apply_postproc,
+        )
+        rate = float(res_payload["onset_pred_rate"])
+        print(
+            "[sanity] #{idx} onset_thr={thr:.4f} onset_pred_rate={rate:.6f}".format(
+                idx=idx,
+                thr=prob_thr,
+                rate=rate,
+            ),
+            flush=True,
+        )
+        if prev_rate is not None and rate > prev_rate + 1e-9:
+            message = (
+                "[sanity] ERROR: onset_pred_rate increased "
+                "thr_prev={prev:.4f} rate_prev={rate_prev:.6f} "
+                "thr_curr={curr:.4f} rate_curr={rate_curr:.6f}".format(
+                    prev=prev_thr if prev_thr is not None else float("nan"),
+                    rate_prev=prev_rate,
+                    curr=prob_thr,
+                    rate_curr=rate,
+                )
+            )
+            print(message, file=sys.stderr, flush=True)
+            raise RuntimeError(message)
+        prev_rate = rate
+        prev_thr = prob_thr
+
+
+def replay_cache_entry(
+    entry: Mapping[str, Any],
+    *,
+    include_k_column: bool,
+    printed_header: bool,
+) -> bool:
+    rows = entry.get("rows") or []
+    saved_at = entry.get("timestamp") or "unknown"
+    key_hint = entry.get("key", "")
+    if isinstance(rows, list):
+        print(
+            "[cache] eval cache hit key={key} combos={count} saved={stamp}".format(
+                key=key_hint[:8] if isinstance(key_hint, str) else "n/a",
+                count=len(rows),
+                stamp=saved_at,
+            ),
+            flush=True,
+        )
+        if rows:
+            printed_header = print_sweep_header(include_k_column, printed_header)
+            for cached_row in rows:
+                print_sweep_row(cached_row, include_k_column)
+    summary = entry.get("summary_lines") or []
+    for line in summary:
+        print(line)
+    return printed_header
+
+
+def update_best_result(
+    best_result: Optional[dict],
+    best_post_stats: Optional[dict],
+    *,
+    res: Mapping[str, Any],
+    stats: Optional[dict],
+) -> Tuple[dict | None, dict | None]:
+    ev_mean = 0.5 * (res["ev_f1_on"] + res["ev_f1_off"])
+    if best_result is None:
+        return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+    best_mean = best_result.get("ev_mean", -1.0)
+    if ev_mean > best_mean + 1e-9:
+        return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+    if abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
+        return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+    return best_result, best_post_stats
+
+
+def write_post_logs(
+    post_logs_dir: Path,
+    *,
+    best_row: Mapping[str, Any],
+    stats: Mapping[str, Any] | None,
+    split: str,
+    frames_display: Any,
+    max_clips_display: Any,
+    decoder_settings_summary: str,
+) -> None:
+    if not stats:
+        return
+    try:
+        post_logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    summary_payload = {
+        "onset_thr": best_row.get("onset_thr"),
+        "offset_thr": best_row.get("offset_thr"),
+        "k_onset": best_row.get("k_onset"),
+        "decoder": {
+            "kind": best_row.get("decoder_kind"),
+            "onset_open": best_row.get("decoder_onset_open"),
+            "onset_hold": best_row.get("decoder_onset_hold"),
+            "offset_open": best_row.get("decoder_offset_open"),
+            "offset_hold": best_row.get("decoder_offset_hold"),
+        },
+        "metrics": stats.get("metrics"),
+        "snap": stats.get("snap"),
+        "dp": stats.get("dp"),
+        "context": {
+            "split": split,
+            "frames": frames_display,
+            "max_clips": max_clips_display,
+            "decoder_notice": decoder_settings_summary,
+        },
+    }
+    summary_path = post_logs_dir / "post_summary.json"
+    per_key_payload: Dict[str, Any] = {}
+    snap_stats = stats.get("snap") if isinstance(stats, Mapping) else None
+    if isinstance(snap_stats, Mapping) and snap_stats.get("per_key"):
+        per_key_payload["snap"] = snap_stats["per_key"]
+    dp_stats = stats.get("dp") if isinstance(stats, Mapping) else None
+    if isinstance(dp_stats, Mapping) and dp_stats.get("per_key"):
+        per_key_payload["dp"] = dp_stats["per_key"]
+    try:
+        summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True))
+        if per_key_payload:
+            (post_logs_dir / "per_key_stats.json").write_text(
+                json.dumps(per_key_payload, indent=2, sort_keys=True)
+            )
+    except OSError:
+        pass
+
+
+def run_eval_combo(
+    on_thr: float,
+    off_thr: float,
+    use_logits: bool,
+    *,
+    k_onset: Optional[int],
+    apply_postproc: bool,
+    eval_ctx: EvalPairContext,
+    include_k_column: bool,
+    row_records: List[Dict[str, Any]],
+    best_result: Optional[dict],
+    best_post_stats: Optional[dict],
+    total_evals: int,
+    combo_state: Dict[str, Any],
+    args,
+    log_progress,
+) -> Tuple[dict | None, dict | None, int]:
+    res, post_stats = evaluate_threshold_pair(
+        on_thr,
+        off_thr,
+        use_logits,
+        ctx=eval_ctx,
+        k_onset=k_onset,
+        apply_postproc=apply_postproc,
+    )
+    print_sweep_row(res, include_k_column)
+    row_records.append(dict(res))
+    best_result, best_post_stats = update_best_result(best_result, best_post_stats, res=res, stats=post_stats)
+    total_evals += 1
+    combo_state["combo_idx"] += 1
+    combo_idx = combo_state["combo_idx"]
+    num_combos = combo_state.get("num_combos", 0)
+    if args.progress and num_combos > 0:
+        now = time.time()
+        last_grid_print = combo_state.get("last_grid_print", combo_state.get("start_time", now))
+        progress_force = combo_idx == 1 or combo_idx == num_combos
+        if progress_force or now - last_grid_print >= args.progress_interval:
+            elapsed = now - combo_state.get("start_time", now)
+            if combo_idx > 0 and num_combos:
+                remaining = max(num_combos - combo_idx, 0)
+                eta_seconds = (elapsed / combo_idx) * remaining if combo_idx else 0.0
+                eta_display = _format_seconds(eta_seconds)
+            else:
+                eta_display = "??:??"
+            k_display = k_onset if k_onset is not None else eval_ctx.default_k_onset
+            log_progress(
+                f"[progress] grid {combo_idx}/{num_combos}  onset_thr={on_thr:.3f}  offset_thr={off_thr:.3f}  k_onset={k_display}  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
+                force=progress_force,
+            )
+            combo_state["last_grid_print"] = now
+    return best_result, best_post_stats, total_evals
+
+
+def _extract_lag_values(value):
+    """Flatten heterogeneous lag_ms structures into a list of floats."""
+
+    vals: List[float] = []
+    if value is None:
+        return vals
+    if torch.is_tensor(value):
+        flat = value.detach().cpu().reshape(-1).tolist()
+        for item in flat:
+            try:
+                fval = float(item)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fval):
+                vals.append(fval)
+        return vals
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            vals.extend(_extract_lag_values(item))
+        return vals
+    try:
+        fval = float(value)
+    except (TypeError, ValueError):
+        return vals
+    if math.isfinite(fval):
+        vals.append(fval)
+    return vals
+
+
+def _extract_lag_sources(value):
+    """Normalize lag source annotations into a flat list of strings."""
+
+    sources: List[str] = []
+    if value is None:
+        return sources
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str) and item:
+                sources.append(item)
+    elif isinstance(value, str) and value:
+        sources.append(value)
+    return sources
+
+
+def _parse_cli_args(argv: Sequence[str]):
+    """Parse CLI args plus derived settings used throughout evaluation."""
+
+    try:
+        logit_thrs = _parse_list(argv, "thresholds")
+        prob_thrs = _parse_list(argv, "prob_thresholds")
+        offset_logit_thrs = _parse_list(argv, "offset_thresholds")
+        offset_prob_thrs = _parse_list(argv, "offset_prob_thresholds")
+        sanity_prob_thrs = _parse_list(argv, "sanity_thresholds")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
+    ap.add_argument("--thresholds", metavar="T", nargs="*", help="Logit threshold values")
+    ap.add_argument(
+        "--offset_thresholds",
+        metavar="T",
+        nargs="*",
+        help="Logit threshold values for the offset head (default: reuse onset thresholds)",
+    )
+    ap.add_argument(
+        "--prob_thresholds",
+        metavar="P",
+        nargs="*",
+        help="Probability threshold values",
+    )
+    ap.add_argument(
+        "--offset_prob_thresholds",
+        metavar="P",
+        nargs="*",
+        help="Probability threshold values for the offset head (default: reuse onset thresholds)",
+    )
+    ap.add_argument("--calibration", help="JSON file with calibrated thresholds")
+    ap.add_argument("--head", choices=["onset", "offset"], help="Sweep thresholds for only one head")
+    ap.add_argument("--fixed_offset_prob", type=float)
+    ap.add_argument("--fixed_offset_logit", type=float)
+    ap.add_argument("--fixed_onset_prob", type=float)
+    ap.add_argument("--fixed_onset_logit", type=float)
+    ap.add_argument(
+        "--sanity_thresholds",
+        metavar="P",
+        nargs="*",
+        help="Optional onset probability thresholds for monotonic sanity verification",
+    )
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Scale logits by this temperature before sigmoid; >1 softens predictions",
+    )
+    ap.add_argument(
+        "--bias",
+        type=float,
+        default=0.0,
+        help="Additive bias applied to logits before sigmoid",
+    )
+    ap.add_argument(
+        "--temperature-onset",
+        type=float,
+        help="Override onset head temperature prior to sigmoid",
+    )
+    ap.add_argument(
+        "--temperature-offset",
+        type=float,
+        help="Override offset head temperature prior to sigmoid",
+    )
+    ap.add_argument(
+        "--bias-onset",
+        type=float,
+        help="Override onset head logit bias prior to sigmoid",
+    )
+    ap.add_argument(
+        "--bias-offset",
+        type=float,
+        help="Override offset head logit bias prior to sigmoid",
+    )
+    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument("--max-clips", type=int)
+    ap.add_argument("--frames", type=int)
+    ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
+    ap.add_argument(
+        "--model-return-per-tile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Request per-tile logits from the model during eval (default: config model.return_per_tile or False)",
+    )
+    ap.add_argument(
+        "--verbose",
+        choices=["quiet", "info", "debug"],
+        help="Logging verbosity (default: quiet or $TIVIT_VERBOSE)",
+    )
+    ap.add_argument("--no-avlag", action="store_true", help="Disable audio/video lag estimation for isolation")
+    ap.add_argument(
+        "--dump_logits",
+        default="",
+        help="Optional path to save per-frame logits as a compressed NPZ",
+    )
+    ap.add_argument(
+        "--grid_prob_thresholds",
+        action="store_true",
+        help="Evaluate the Cartesian product of onset/offset probability thresholds",
+    )
+    ap.add_argument(
+        "--no_eval_cache",
+        action="store_true",
+        help="Disable eval cache reuse and force fresh evaluation",
+    )
+    ap.add_argument(
+        "--sweep_k_onset",
+        action="store_true",
+        help="When aggregation mode is k_of_p, sweep k_onset over {1,2,3}",
+    )
+    ap.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable periodic progress logging",
+    )
+    ap.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Minimum number of seconds between progress prints",
+    )
+    ap.add_argument(
+        "--log-file",
+        type=str,
+        help="Optional file path to tee progress logs",
+    )
+    ap.add_argument(
+        "--legacy-eval-thresholds",
+        action="store_true",
+        help="Route execution through scripts/calib/eval_thresholds_legacy.py",
+    )
+    ap.add_argument(
+        "--decoder",
+        choices=["auto", "none", "hysteresis"],
+        default="auto",
+        help="Temporal decoder applied during evaluation (default: auto → hysteresis using config)",
+    )
+    ap.add_argument(
+        "--low_ratio",
+        type=float,
+        default=None,
+        help="Multiplier to derive the low hysteresis threshold (default: config or 0.6)",
+    )
+    ap.add_argument(
+        "--min_on",
+        type=int,
+        default=None,
+        help="Drop predicted on-segments shorter than this many frames (default: config or 2)",
+    )
+    ap.add_argument(
+        "--min_off",
+        type=int,
+        default=None,
+        help="Merge gaps shorter than this many frames between ons (default: config or 2)",
+    )
+    ap.add_argument(
+        "--gap_merge",
+        type=int,
+        default=None,
+        help="Merge on-segments separated by gaps <= this many frames (default: config or 1)",
+    )
+    ap.add_argument(
+        "--decoder-onset-open",
+        type=float,
+        help="Override onset decoder open gate (probability, default: config)",
+    )
+    ap.add_argument(
+        "--decoder-onset-hold",
+        type=float,
+        help="Override onset decoder hold gate (probability, default: config or derived from low_ratio)",
+    )
+    ap.add_argument(
+        "--decoder-onset-min-on",
+        type=int,
+        help="Override onset decoder minimum on length in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-onset-merge-gap",
+        type=int,
+        help="Override onset decoder merge gap in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-open",
+        type=float,
+        help="Override offset decoder open gate (probability, default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-hold",
+        type=float,
+        help="Override offset decoder hold gate (probability, default: config or derived from low_ratio)",
+    )
+    ap.add_argument(
+        "--decoder-offset-min-off",
+        type=int,
+        help="Override offset decoder minimum off length in frames (default: config)",
+    )
+    ap.add_argument(
+        "--decoder-offset-merge-gap",
+        type=int,
+        help="Override offset decoder merge gap in frames (default: config)",
+    )
+    ap.add_argument(
+        "--median",
+        type=int,
+        default=None,
+        help="Odd window size for optional time-axis median smoothing (default: config or 3)",
+    )
+    ap.add_argument(
+        "--postproc-mode",
+        choices=["never", "eval_only", "always"],
+        default="eval_only",
+        help="Control decoder post-processing: never=disable, eval_only=skip sweeps but run on final eval, always=run everywhere",
+    )
+    ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
+    ap.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle deterministic torch backends (default: config or enabled)",
+    )
+    args = ap.parse_args(argv)
+
+    if args.legacy_eval_thresholds:
+        from scripts.calib import eval_thresholds_legacy as legacy_eval
+
+        legacy_argv = [arg for arg in argv if arg != "--legacy-eval-thresholds"]
+        prev_argv = sys.argv
+        try:
+            sys.argv = [sys.argv[0], *legacy_argv]
+            legacy_eval.main()
+        finally:
+            sys.argv = prev_argv
+        sys.exit(0)
+
+    args.verbose = configure_verbosity(args.verbose)
+    debug_mode = args.verbose == "debug"
+    args.thresholds = logit_thrs
+    args.prob_thresholds = prob_thrs
+    args.offset_thresholds = offset_logit_thrs
+    args.offset_prob_thresholds = offset_prob_thrs
+    args.sanity_thresholds = sanity_prob_thrs
+
+    if args.thresholds is not None and args.prob_thresholds is not None:
+        print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    if args.offset_thresholds is not None and args.offset_prob_thresholds is not None:
+        print(
+            "error: --offset_thresholds and --offset_prob_thresholds are mutually exclusive",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    onset_logit_list, offset_logit_list, logit_reuse = _resolve_threshold_lists(
+        args.thresholds, args.offset_thresholds
+    )
+    onset_prob_list, offset_prob_list, prob_reuse = _resolve_threshold_lists(
+        args.prob_thresholds, args.offset_prob_thresholds
+    )
+
+    args.thresholds = onset_logit_list
+    args.offset_thresholds = offset_logit_list
+    args.prob_thresholds = onset_prob_list
+    args.offset_prob_thresholds = offset_prob_list
+
+    if args.head is None:
+        has_logit_lists = args.thresholds is not None or args.offset_thresholds is not None
+        has_prob_lists = args.prob_thresholds is not None or args.offset_prob_thresholds is not None
+        if has_logit_lists and has_prob_lists:
+            print(
+                "error: specify only logit or probability threshold lists when sweeping both heads",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.thresholds is not None and args.offset_thresholds is not None:
+        if len(args.thresholds) != len(args.offset_thresholds):
+            print(
+                "error: --thresholds and --offset_thresholds must contain the same number of values",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.prob_thresholds is not None and args.offset_prob_thresholds is not None:
+        if not args.grid_prob_thresholds and len(args.prob_thresholds) != len(args.offset_prob_thresholds):
+            print(
+                "error: probability lists must match lengths unless --grid_prob_thresholds is enabled",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.low_ratio is not None and args.low_ratio < 0.0:
+        print("error: --low_ratio must be non-negative", file=sys.stderr)
+        sys.exit(1)
+    if args.min_on is not None and args.min_on < 0:
+        print("error: --min_on must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.min_off is not None and args.min_off < 0:
+        print("error: --min_off must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.gap_merge is not None and args.gap_merge < 0:
+        print("error: --gap_merge must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if args.median is not None and (args.median < 1 or args.median % 2 == 0):
+        print("error: --median must be an odd integer >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    base_temperature = args.temperature if args.temperature is not None else 1.0
+    base_bias = args.bias if args.bias is not None else 0.0
+    onset_temperature = float(args.temperature_onset if args.temperature_onset is not None else base_temperature)
+    offset_temperature = float(args.temperature_offset if args.temperature_offset is not None else base_temperature)
+    onset_bias = float(args.bias_onset if args.bias_onset is not None else base_bias)
+    offset_bias = float(args.bias_offset if args.bias_offset is not None else base_bias)
+    onset_platt_stats = _init_platt_stats(_platt_stats_enabled(onset_temperature, onset_bias))
+    offset_platt_stats = _init_platt_stats(_platt_stats_enabled(offset_temperature, offset_bias))
+
+    if args.thresholds is None and args.prob_thresholds is None:
+        if args.head is not None or not args.calibration:
+            args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+
+    return (
+        args,
+        debug_mode,
+        onset_temperature,
+        offset_temperature,
+        onset_bias,
+        offset_bias,
+        onset_platt_stats,
+        offset_platt_stats,
+        prob_reuse,
+        logit_reuse,
+    )
+
+
+def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) -> RuntimeContext:
+    """Load config, resolve dataset/model settings, and capture derived fields."""
+
+    cfg = dict(load_config("configs/config.yaml"))
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        cfg["model"] = model_cfg
+    if args.model_return_per_tile is not None:
+        model_cfg["return_per_tile"] = bool(args.model_return_per_tile)
+    return_per_tile_requested = bool(model_cfg.get("return_per_tile"))
+
+    dataset_raw = cfg.get("dataset")
+    dataset_cfg = dict(dataset_raw) if isinstance(dataset_raw, dict) else {}
+    cfg["dataset"] = dataset_cfg
+
+    if args.max_clips is not None:
+        dataset_cfg["max_clips"] = args.max_clips
+    if args.frames is not None:
+        dataset_cfg["frames"] = args.frames
+
+    only_id = canonical_video_id(args.only) if args.only else None
+    if only_id:
+        dataset_cfg["only_video"] = only_id
+
+    env_disable = str(os.environ.get("AVSYNC_DISABLE", "")).strip().lower()
+    avlag_disabled = bool(args.no_avlag) or env_disable in {"1", "true", "yes", "on"}
+    if avlag_disabled:
+        dataset_cfg["avlag_disabled"] = True
+
+    if debug_mode:
+        dataset_cfg["num_workers"] = 0
+        dataset_cfg["persistent_workers"] = False
+        dataset_cfg["pin_memory"] = False
+        print("[debug] num_workers=0, persistent_workers=False, pin_memory=False", flush=True)
+
+    seed = resolve_seed(args.seed, cfg)
+    deterministic = resolve_deterministic_flag(args.deterministic, cfg)
+    cfg.setdefault("experiment", {})
+    cfg["experiment"]["seed"] = seed
+    cfg["experiment"]["deterministic"] = deterministic
+    configure_determinism(seed, deterministic)
+    print(
+        f"[determinism] seed={seed} deterministic={'on' if deterministic else 'off'}",
+        flush=True,
+    )
+
+    try:
+        model_tiles = int(model_cfg.get("tiles", dataset_cfg.get("tiles", 3)))
+    except Exception:
+        model_tiles = 3
+
+    decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
+    hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    if hop_seconds <= 0.0 and decode_fps > 0.0:
+        hop_seconds = 1.0 / decode_fps
+    if decode_fps <= 0.0 and hop_seconds > 0.0:
+        decode_fps = 1.0 / hop_seconds
+    if decode_fps <= 0.0:
+        decode_fps = 30.0
+    if hop_seconds <= 0.0:
+        hop_seconds = 1.0 / decode_fps
+
+    frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
+    event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
+    midi_low_cfg = frame_targets_cfg.get("note_min")
+    key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+
+    frames_display = dataset_cfg.get("frames")
+    max_clips_display = dataset_cfg.get("max_clips")
+    only_display = only_id or "-"
+    frame_text = frames_display if frames_display is not None else "?"
+    max_clips_text = max_clips_display if max_clips_display is not None else "?"
+    print(
+        f"[progress] starting (split={split}, frames={frame_text}, max_clips={max_clips_text}, only={only_display})",
+        flush=True,
+    )
+
+    metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
+    agg_cfg = metrics_cfg.get("aggregation", {}) or {}
+    preview_prob_threshold = metrics_cfg.get("prob_threshold_onset", metrics_cfg.get("prob_threshold", 0.5))
+    try:
+        preview_prob_threshold = float(preview_prob_threshold)
+    except (TypeError, ValueError):
+        preview_prob_threshold = 0.5
+    agg_mode = str(agg_cfg.get("mode", "any")).lower()
+    agg_top_k = int(agg_cfg.get("top_k", 0) or 0)
+    agg_tau_sum = float(agg_cfg.get("tau_sum", 0.0) or 0.0)
+    agg_k_cfg = agg_cfg.get("k", {}) or {}
+    default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
+    default_k_offset = int(agg_k_cfg.get("offset", 1) or 1)
+
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
+    if key_prior_settings.enabled:
+        print(
+            f"[decoder] key prior enabled (ref_head={key_prior_settings.ref_head}, apply_to={', '.join(key_prior_settings.apply_to)})",
+            flush=True,
+        )
+
+    include_k_column = agg_mode == "k_of_p"
+    if include_k_column and args.sweep_k_onset and args.head is None:
+        k_candidates = sorted({default_k_onset, 1, 2, 3})
+    else:
+        k_candidates = [default_k_onset]
+
+    return RuntimeContext(
+        cfg=cfg,
+        dataset_cfg=dataset_cfg,
+        model_cfg=model_cfg,
+        seed=seed,
+        deterministic=deterministic,
+        split=split,
+        decode_fps=decode_fps,
+        hop_seconds=hop_seconds,
+        event_tolerance=event_tolerance,
+        key_prior_midi_low=key_prior_midi_low,
+        key_prior_settings=key_prior_settings,
+        agg_mode=agg_mode,
+        agg_top_k=agg_top_k,
+        agg_tau_sum=agg_tau_sum,
+        default_k_onset=default_k_onset,
+        default_k_offset=default_k_offset,
+        include_k_column=include_k_column,
+        k_candidates=k_candidates,
+        preview_prob_threshold=preview_prob_threshold,
+        debug_mode=debug_mode,
+        avlag_disabled=avlag_disabled,
+        model_tiles=model_tiles,
+        return_per_tile_requested=return_per_tile_requested,
+        stage_durations=stage_durations,
+        only_id=only_id,
+    )
+
+
+def _build_eval_loader(args, runtime: RuntimeContext, log_progress) -> LoaderContext:
+    """Materialize the evaluation dataloader and compute target clip counts."""
+
+    cfg = runtime.cfg
+    split = runtime.split
+    seed = runtime.seed
+    stage_durations = runtime.stage_durations
+
+    t_dataset_build0 = time.time()
+    val_loader = make_dataloader(cfg, split=split, seed=seed)
+    if isinstance(val_loader, dict):
+        val_loader = val_loader.get(split, next(iter(val_loader.values())))
+    if isinstance(val_loader, (list, tuple)):
+        val_loader = val_loader[0]
+
+    dataset = getattr(val_loader, "dataset", None)
+    dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
+    ds_len: Optional[int] = None
+    dataset_count = "?"
+    ok_videos = 0
+    materialize_duration = 0.0
+    if dataset is not None:
+        materialize_stats = getattr(dataset, "_eval_materialize_stats", {}) or {}
+        if isinstance(materialize_stats, dict):
+            try:
+                ok_videos = int(materialize_stats.get("videos") or 0)
+            except (TypeError, ValueError):
+                ok_videos = 0
+            try:
+                materialize_duration = float(materialize_stats.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                materialize_duration = 0.0
+        if materialize_duration == 0.0:
+            try:
+                materialize_duration = float(getattr(dataset, "_last_materialize_duration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                materialize_duration = 0.0
+        try:
+            ds_len = len(dataset)
+            dataset_count = str(ds_len)
+        except TypeError:
+            ds_len = None
+            dataset_count = "?"
+    dataset_elapsed = time.time() - t_dataset_build0
+    stage_durations["dataset_init"] = dataset_elapsed
+    batch_size_val = getattr(val_loader, "batch_size", None)
+    batch_display = str(batch_size_val) if batch_size_val is not None else "?"
+    worker_count = getattr(val_loader, "num_workers", None)
+    worker_display = str(worker_count) if worker_count is not None else "?"
+    video_count_display = _dataset_video_count(dataset)
+    print(
+        f"[progress] dataset ready (videos={video_count_display}, workers={worker_display})",
+        flush=True,
+    )
+    log_progress(
+        f"[progress] dataset ready in {_format_seconds(dataset_elapsed)} ({dataset_elapsed:.2f}s) "
+        f"backend={dataset_name} len={dataset_count} batch={batch_display}",
+        force=True,
+    )
+    frame_summary = getattr(dataset, "frame_target_summary", None)
+    if frame_summary:
+        frame_summary_display = frame_summary
+        if runtime.avlag_disabled and "lag_source=" in frame_summary_display:
+            prefix, suffix = frame_summary_display.split("lag_source=", 1)
+            if "," in suffix:
+                _, tail = suffix.split(",", 1)
+                frame_summary_display = f"{prefix}lag_source=no_avlag,{tail}"
+            else:
+                frame_summary_display = f"{prefix}lag_source=no_avlag"
+        log_progress(f"[progress] {frame_summary_display}", force=True)
+
+    if ds_len == 0 and ok_videos > 0:
+        print("[error] dataset len is 0 after audit ok>0 – eval entries were not materialized", flush=True)
+        sys.exit(1)
+
+    if ds_len is not None:
+        resolved_cap = args.max_clips if args.max_clips is not None else ds_len
+        target_clips = int(min(ds_len, int(resolved_cap)))
+    else:
+        target_clips = int(args.max_clips) if args.max_clips is not None else None
+
+    if dataset is not None and target_clips is not None:
+        try:
+            base_len = len(dataset)
+        except TypeError:
+            base_len = None
+        if base_len is not None:
+            subset_cap = min(base_len, int(target_clips))
+            subset_indices = list(range(subset_cap))
+            dataset = Subset(dataset, subset_indices)
+            num_workers = getattr(val_loader, "num_workers", 0)
+            persistent_workers = getattr(val_loader, "persistent_workers", False)
+            if num_workers <= 0:
+                persistent_workers = False
+            loader_kwargs = {
+                "batch_size": getattr(val_loader, "batch_size", 1),
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": getattr(val_loader, "pin_memory", False),
+                "drop_last": getattr(val_loader, "drop_last", False),
+                "collate_fn": getattr(val_loader, "collate_fn", None),
+                "persistent_workers": persistent_workers,
+                "timeout": getattr(val_loader, "timeout", 0),
+            }
+            prefetch_factor = getattr(val_loader, "prefetch_factor", None)
+            if num_workers > 0 and prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = prefetch_factor
+            pin_memory_device = getattr(val_loader, "pin_memory_device", None)
+            if pin_memory_device:
+                loader_kwargs["pin_memory_device"] = pin_memory_device
+            worker_init_fn = getattr(val_loader, "worker_init_fn", None)
+            if worker_init_fn is not None:
+                loader_kwargs["worker_init_fn"] = worker_init_fn
+            generator = getattr(val_loader, "generator", None)
+            if generator is not None:
+                loader_kwargs["generator"] = generator
+            multiprocessing_context = getattr(val_loader, "multiprocessing_context", None)
+            if multiprocessing_context is not None:
+                loader_kwargs["multiprocessing_context"] = multiprocessing_context
+            val_loader = DataLoader(dataset, **loader_kwargs)
+
+    if materialize_duration > 0:
+        stage_durations["materialize"] = materialize_duration
+
+    target_display = str(target_clips) if target_clips is not None else "?"
+    return LoaderContext(
+        val_loader=val_loader,
+        dataset=dataset,
+        target_clips=target_clips,
+        target_display=target_display,
+    )
+
+
+def _setup_model(args, cfg: Mapping[str, Any]):
+    """Instantiate TiViT-Piano and load checkpoint weights."""
+
+    model = build_model(cfg)
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
+    model.eval()
+    return model
+
+
+def _collect_logits(
+    *,
+    model: torch.nn.Module,
+    loader_ctx: LoaderContext,
+    args,
+    runtime: RuntimeContext,
+    onset_platt_stats: Dict[str, Any],
+    offset_platt_stats: Dict[str, Any],
+    onset_temperature: float,
+    offset_temperature: float,
+    onset_bias: float,
+    offset_bias: float,
+    log_progress,
+) -> EvalResults:
+    """Run the forward pass over the eval loader and collect logits/targets."""
+
+    val_loader = loader_ctx.val_loader
+    dataset = loader_ctx.dataset
+    target_clips = loader_ctx.target_clips
+    target_display = loader_ctx.target_display
+    decode_fps = runtime.decode_fps
+    hop_seconds = runtime.hop_seconds
+    key_prior_midi_low = runtime.key_prior_midi_low
+    key_prior_settings = runtime.key_prior_settings
+    stage_durations = runtime.stage_durations
+    avlag_disabled = runtime.avlag_disabled
+    preview_prob_threshold = runtime.preview_prob_threshold
+    model_tiles = runtime.model_tiles
+    return_per_tile_requested = runtime.return_per_tile_requested
+
+    onset_logits_list, offset_logits_list = [], []
+    pitch_logits_list: List[torch.Tensor] = []
+    onset_probs, offset_probs = [], []
+    onset_tgts, offset_tgts = [], []
+    lag_ms_samples: List[float] = []
+    lag_source_counter: Counter[str] = Counter()
+    skip_paths: set[str] = set()
+    bad_clip_counts: Dict[str, int] = Counter()
+    skipped_batches = 0
+
+    tile_boundary_hist: Counter[int] = Counter()
+    tile_key_mask_cache: Dict[str, np.ndarray] = {}
+    tile_preview_stats = {"max_abs_diff": 0.0, "max_f1_delta": 0.0, "count": 0}
+    tile_key_mask_cushion = 2
+    per_tile_shape_logged = False
+    reg_meta_cache: Dict[str, Dict[str, Any]] = {}
+    if return_per_tile_requested:
+        reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
+        reg_cache_path = Path(reg_cache_env) if reg_cache_env else repo / "reg_refined.json"
+        reg_meta_cache = _load_registration_metadata(reg_cache_path)
+        if not reg_meta_cache:
+            LOGGER.debug("per-tile: registration cache %s unavailable or empty", reg_cache_path)
+
+    onset_temperature = float(onset_temperature)
+    offset_temperature = float(offset_temperature)
+    onset_bias = float(onset_bias)
+    offset_bias = float(offset_bias)
+
+    heartbeat_interval = max(10.0, float(args.progress_interval or 10.0))
+    t_data0 = time.time()
+    last_clip_print = t_data0
+    last_heartbeat = t_data0
+    last_clip_name = "-"
+    first_batch_time = None
+    clips_done = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if target_clips is not None and clips_done >= target_clips:
+                break
+            raw_paths = batch.get("path")
+            if isinstance(raw_paths, (list, tuple)):
+                paths = [str(p) for p in raw_paths]
+            elif raw_paths is None:
+                paths = []
+            else:
+                paths = [str(raw_paths)]
+            if skip_paths and paths:
+                keep_indices = [idx for idx, p in enumerate(paths) if p not in skip_paths]
+                if len(keep_indices) != len(paths):
+                    filtered_batch = _filter_batch(batch, keep_indices)
+                    if filtered_batch is None:
+                        blocked = ", ".join(Path(p).name for p in paths if p) or "<unknown>"
+                        log_progress(
+                            f"[progress] skipped batch (all blocked clips): {blocked}",
+                            force=True,
+                        )
+                        continue
+                    batch = filtered_batch
+                    raw_paths = batch.get("path")
+                    if isinstance(raw_paths, (list, tuple)):
+                        paths = [str(p) for p in raw_paths]
+                    elif raw_paths is None:
+                        paths = []
+                    else:
+                        paths = [str(raw_paths)]
+            try:
+                x = batch["video"]
+                if first_batch_time is None:
+                    first_batch_time = time.time()
+                    first_wait = first_batch_time - t_data0
+                    stage_durations["first_batch"] = first_wait
+                    log_progress(
+                        f"[progress] first batch ready in {_format_seconds(first_wait)} ({first_wait:.2f}s) – includes decode/A/V lag warmup",
+                        force=True,
+                    )
+                out = model(x, return_per_tile=return_per_tile_requested)
+
+                onset_logits_raw = out["onset_logits"] if "onset_logits" in out else out.get("onset")
+                offset_logits_raw = out["offset_logits"] if "offset_logits" in out else out.get("offset")
+                pitch_logits = out.get("pitch_logits")
+
+                if onset_logits_raw is None or offset_logits_raw is None:
+                    raise RuntimeError("Model output missing onset/offset logits")
+                onset_logits_neutral = onset_logits_raw.detach()
+                offset_logits_neutral = offset_logits_raw.detach()
+
+                if return_per_tile_requested:
+                    onset_tile = out.get("onset_tile")
+                    offset_tile = out.get("offset_tile")
+                    pitch_tile = out.get("pitch_tile")
+                    if onset_tile is None or offset_tile is None or pitch_tile is None:
+                        raise RuntimeError("return_per_tile enabled but model did not return per-tile logits")
+                    if not per_tile_shape_logged:
+                        print(
+                            "[per-tile] onset_tile={} offset_tile={} pitch_tile={}".format(
+                                tuple(onset_tile.shape),
+                                tuple(offset_tile.shape),
+                                tuple(pitch_tile.shape),
+                            ),
+                            flush=True,
+                        )
+                        per_tile_shape_logged = True
+                    tile_preview_neutral = onset_tile.detach().mean(dim=1)
+                    preview_abs = (tile_preview_neutral - onset_logits_neutral).abs().max().item()
+                    tile_preview_stats["max_abs_diff"] = max(
+                        tile_preview_stats["max_abs_diff"],
+                        float(preview_abs),
+                    )
+                    onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
+                    preview_probs = torch.sigmoid(tile_preview_neutral)
+                    global_probs_neutral = torch.sigmoid(onset_logits_neutral)
+                    preview_preds = (preview_probs >= preview_prob_threshold).float()
+                    global_preds = (global_probs_neutral >= preview_prob_threshold).float()
+                    preview_f1 = _binary_f1(preview_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+                    global_f1 = _binary_f1(global_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+                    tile_preview_stats["max_f1_delta"] = max(
+                        tile_preview_stats["max_f1_delta"],
+                        abs(float(preview_f1) - float(global_f1)),
+                    )
+                    tile_preview_stats["count"] += 1
+                    if paths:
+                        for clip_path in paths:
+                            clip_id = canonical_video_id(Path(clip_path).stem)
+                            if not clip_id:
+                                continue
+                            if clip_id not in tile_key_mask_cache:
+                                reg_entry = reg_meta_cache.get(clip_id)
+                                tile_key_mask_cache[clip_id] = build_tile_key_mask(
+                                    reg_entry,
+                                    num_tiles=model_tiles,
+                                    cushion_keys=tile_key_mask_cushion,
+                                    n_keys=int(onset_tile.shape[-1]),
+                                )
+                            mask = tile_key_mask_cache[clip_id]
+                            overlap = mask.sum(axis=0)
+                            boundary_count = int(np.count_nonzero(overlap > 1))
+                            tile_boundary_hist[boundary_count] += 1
+
+                if onset_platt_stats["enabled"]:
+                    onset_prob_neutral = torch.sigmoid(onset_logits_neutral)
+                else:
+                    onset_prob_neutral = None
+                if offset_platt_stats["enabled"]:
+                    offset_prob_neutral = torch.sigmoid(offset_logits_neutral)
+                else:
+                    offset_prob_neutral = None
+
+                onset_logits = onset_logits_neutral / onset_temperature + onset_bias
+                offset_logits = offset_logits_neutral / offset_temperature + offset_bias
+
+                pitch_prior_tensor = None
+                pitch_was_2d = False
+                if torch.is_tensor(pitch_logits):
+                    pitch_prior_tensor = pitch_logits
+                    if pitch_prior_tensor.dim() == 2:
+                        pitch_prior_tensor = pitch_prior_tensor.unsqueeze(1)
+                        pitch_was_2d = True
+
+                prior_inputs = {"onset": onset_logits, "offset": offset_logits}
+                if torch.is_tensor(pitch_prior_tensor):
+                    prior_inputs["pitch"] = pitch_prior_tensor
+                prior_outputs = apply_key_prior_to_logits(
+                    prior_inputs,
+                    key_prior_settings,
+                    fps=decode_fps,
+                    midi_low=key_prior_midi_low,
+                    midi_high=None,
+                )
+                if "onset" in prior_outputs:
+                    onset_logits = prior_outputs["onset"]
+                if "offset" in prior_outputs:
+                    offset_logits = prior_outputs["offset"]
+                if pitch_prior_tensor is not None and "pitch" in prior_outputs:
+                    pitch_prior_tensor = prior_outputs["pitch"]
+                    pitch_logits = pitch_prior_tensor.squeeze(1) if pitch_was_2d else pitch_prior_tensor
+
+                onset_prob = torch.sigmoid(onset_logits)
+                offset_prob = torch.sigmoid(offset_logits)
+
+                if onset_prob_neutral is not None:
+                    _update_platt_stats(onset_platt_stats, onset_prob.detach() - onset_prob_neutral)
+                if offset_prob_neutral is not None:
+                    _update_platt_stats(offset_platt_stats, offset_prob.detach() - offset_prob_neutral)
+
+                onset_logits_list.append(onset_logits.detach().cpu())
+                offset_logits_list.append(offset_logits.detach().cpu())
+                onset_probs.append(onset_prob.detach().cpu())
+                offset_probs.append(offset_prob.detach().cpu())
+
+                if pitch_logits is not None:
+                    if pitch_logits.dim() == 2:
+                        pitch_logits = pitch_logits.unsqueeze(1)
+                    pitch_logits_list.append(pitch_logits.detach().cpu())
+
+                onset_tgts.append(batch["onset_roll"].float().cpu())
+                offset_tgts.append(batch["offset_roll"].float().cpu())
+
+                lag_vals = _extract_lag_values(batch.get("lag_ms"))
+                if lag_vals:
+                    lag_ms_samples.extend(lag_vals)
+                if not avlag_disabled:
+                    lag_sources = _extract_lag_sources(batch.get("lag_source"))
+                    if lag_sources:
+                        lag_source_counter.update(lag_sources)
+
+                if runtime.debug_mode and len(onset_logits_list) == 1:
+                    print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
+                    print(
+                        "[DEBUG] onset_roll nonzero=",
+                        int(batch["onset_roll"].sum().item()),
+                        "offset_roll nonzero=",
+                        int(batch["offset_roll"].sum().item()),
+                    )
+
+                batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
+                clips_done += batch_size
+                now = time.time()
+                if paths:
+                    candidate_id = canonical_video_id(Path(paths[-1]).name)
+                    last_clip_name = candidate_id or Path(paths[-1]).name
+                if now - last_heartbeat >= heartbeat_interval:
+                    elapsed = now - t_data0
+                    log_progress(
+                        f"[progress] data pass heartbeat: processed_clips={clips_done} skips={len(skip_paths)} last_clip={last_clip_name} elapsed={_format_seconds(elapsed)}",
+                        force=True,
+                    )
+                    last_heartbeat = now
+                if args.progress:
+                    progress_force = i == 0 or (target_clips is not None and clips_done >= target_clips)
+                    if progress_force or now - last_clip_print >= args.progress_interval:
+                        elapsed = now - t_data0
+                        if target_clips is not None and target_clips > 0:
+                            pct = min(100.0, 100.0 * clips_done / float(target_clips))
+                            pct_display = f"{pct:5.1f}"
+                        else:
+                            pct_display = "?"
+                        if clips_done == 0:
+                            eta_display = "--:--"
+                        elif target_clips is None or target_clips <= 0:
+                            eta_display = "--:--"
+                        else:
+                            remaining = max(target_clips - clips_done, 0)
+                            if remaining == 0:
+                                eta_display = "00:00"
+                            else:
+                                eta_seconds = (elapsed / clips_done) * remaining
+                                eta_display = _format_seconds(eta_seconds)
+                        processed_display = clips_done if target_clips is None else min(clips_done, target_clips)
+                        log_progress(
+                            f"[progress] clips {processed_display}/{target_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
+                            force=progress_force,
+                        )
+                        last_clip_print = now
+                if target_clips is not None and clips_done >= target_clips:
+                    break
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                skipped_batches = _handle_bad_batch(
+                    paths,
+                    exc,
+                    skip_paths=skip_paths,
+                    bad_clip_counts=bad_clip_counts,
+                    skipped_batches=skipped_batches,
+                    log_progress=log_progress,
+                )
+                continue
+
+    elapsed_data = time.time() - t_data0
+    stage_durations["data_pass"] = elapsed_data
+    throughput = clips_done / elapsed_data if elapsed_data > 0 else 0.0
+
+    return EvalResults(
+        onset_logits_list=onset_logits_list,
+        offset_logits_list=offset_logits_list,
+        pitch_logits_list=pitch_logits_list,
+        onset_probs=onset_probs,
+        offset_probs=offset_probs,
+        onset_tgts=onset_tgts,
+        offset_tgts=offset_tgts,
+        clips_done=clips_done,
+        elapsed_data=elapsed_data,
+        throughput=throughput,
+        lag_ms_samples=lag_ms_samples,
+        lag_source_counter=lag_source_counter,
+        skip_paths=skip_paths,
+        bad_clip_counts=bad_clip_counts,
+        skipped_batches=skipped_batches,
+        tile_preview_stats=tile_preview_stats,
+        tile_boundary_hist=tile_boundary_hist,
+    )
+
+
+def _summarize_data_pass(
+    results: EvalResults,
+    runtime: RuntimeContext,
+    target_clips: Optional[int],
+    log_progress,
+):
+    """Emit post-pass summaries including throughput, lag stats, and per-tile checks."""
+
+    if runtime.return_per_tile_requested:
+        stats = results.tile_preview_stats
+        if stats["count"] > 0:
+            print(
+                "[per-tile] preview max_abs_diff={:.3e} max_f1_delta={:.3e} batches={}".format(
+                    stats["max_abs_diff"],
+                    stats["max_f1_delta"],
+                    stats["count"],
+                ),
+                flush=True,
+            )
+        if results.tile_boundary_hist:
+            hist_desc = ", ".join(f"{k}:{v}" for k, v in sorted(results.tile_boundary_hist.items()))
+            print(f"[per-tile] boundary-keys histogram {{{hist_desc}}}", flush=True)
+
+    processed_display = results.clips_done if target_clips is None else min(results.clips_done, target_clips or 0)
+    skipped_display = len(results.skip_paths)
+    elapsed_display = _format_seconds(results.elapsed_data)
+    expected_display = target_clips if target_clips is not None else "?"
+    log_progress(
+        f"[progress] data pass done: clips={processed_display}, expected={expected_display}, skipped={skipped_display}, elapsed={elapsed_display}",
+        force=True,
+    )
+    log_progress(
+        f"[progress] throughput: {results.throughput:.2f} clips/s ({results.elapsed_data:.2f}s)",
+        force=True,
+    )
+    if runtime.avlag_disabled:
+        log_progress("[progress] A/V lag ms stats: disabled (all zero).", force=True)
+    elif results.lag_ms_samples:
+        lag_arr = np.asarray(results.lag_ms_samples, dtype=np.float32)
+        lag_mean = float(lag_arr.mean())
+        lag_median = float(np.median(lag_arr))
+        lag_p95 = float(np.percentile(lag_arr, 95))
+        log_progress(
+            "[progress] A/V lag ms stats: mean={:.1f} median={:.1f} p95={:.1f} samples={}".format(
+                lag_mean,
+                lag_median,
+                lag_p95,
+                lag_arr.size,
+            ),
+            force=True,
+        )
+    if results.lag_source_counter and not runtime.avlag_disabled:
+        top_sources = ", ".join(f"{src}:{cnt}" for src, cnt in results.lag_source_counter.most_common(3))
+        log_progress(f"[progress] lag sources top: {top_sources}", force=True)
+    if results.skipped_batches:
+        log_progress(f"[progress] batches skipped due to errors: {results.skipped_batches}", force=True)
+    if results.bad_clip_counts:
+        summary_bits = ", ".join(f"{Path(p).name}:{count}" for p, count in results.bad_clip_counts.items())
+        log_progress(f"[progress] bad clip retries: {summary_bits}", force=True)
+    if results.skip_paths:
+        skip_names = ", ".join(Path(p).name for p in sorted(results.skip_paths))
+        log_progress(f"[progress] permanently skipped clips: {skip_names}", force=True)
 
 
 def _assert_monotonic_rates(
@@ -547,346 +2344,25 @@ def _collect_onset_metrics(
 
 
 def main():
-    import argparse
-
     argv = sys.argv[1:]
     t_main_start = time.time()
-    try:
-        logit_thrs = _parse_list(argv, "thresholds")
-        prob_thrs = _parse_list(argv, "prob_thresholds")
-        offset_logit_thrs = _parse_list(argv, "offset_thresholds")
-        offset_prob_thrs = _parse_list(argv, "offset_prob_thresholds")
-        sanity_prob_thrs = _parse_list(argv, "sanity_thresholds")
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return
+    (
+        args,
+        debug_mode,
+        onset_temperature,
+        offset_temperature,
+        onset_bias,
+        offset_bias,
+        onset_platt_stats,
+        offset_platt_stats,
+        prob_reuse,
+        logit_reuse,
+    ) = _parse_cli_args(argv)
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
-    ap.add_argument("--thresholds", metavar="T", nargs="*", help="Logit threshold values")
-    ap.add_argument(
-        "--offset_thresholds",
-        metavar="T",
-        nargs="*",
-        help="Logit threshold values for the offset head (default: reuse onset thresholds)",
-    )
-    ap.add_argument(
-        "--prob_thresholds",
-        metavar="P",
-        nargs="*",
-        help="Probability threshold values",
-    )
-    ap.add_argument(
-        "--offset_prob_thresholds",
-        metavar="P",
-        nargs="*",
-        help="Probability threshold values for the offset head (default: reuse onset thresholds)",
-    )
-    ap.add_argument("--calibration", help="JSON file with calibrated thresholds")
-    ap.add_argument("--head", choices=["onset", "offset"], help="Sweep thresholds for only one head")
-    # Explicit thresholds for the non-swept head when no calibration is provided
-    ap.add_argument("--fixed_offset_prob", type=float)
-    ap.add_argument("--fixed_offset_logit", type=float)
-    ap.add_argument("--fixed_onset_prob", type=float)
-    ap.add_argument("--fixed_onset_logit", type=float)
-    ap.add_argument(
-        "--sanity_thresholds",
-        metavar="P",
-        nargs="*",
-        help="Optional onset probability thresholds for monotonic sanity verification",
-    )
-    # Optional temperature and bias parameters for logit calibration
-    ap.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Scale logits by this temperature before sigmoid; >1 softens predictions",
-    )
-    ap.add_argument(
-        "--bias",
-        type=float,
-        default=0.0,
-        help="Additive bias applied to logits before sigmoid",
-    )
-    ap.add_argument(
-        "--temperature-onset",
-        type=float,
-        help="Override onset head temperature prior to sigmoid",
-    )
-    ap.add_argument(
-        "--temperature-offset",
-        type=float,
-        help="Override offset head temperature prior to sigmoid",
-    )
-    ap.add_argument(
-        "--bias-onset",
-        type=float,
-        help="Override onset head logit bias prior to sigmoid",
-    )
-    ap.add_argument(
-        "--bias-offset",
-        type=float,
-        help="Override offset head logit bias prior to sigmoid",
-    )
-    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
-    ap.add_argument("--max-clips", type=int)
-    ap.add_argument("--frames", type=int)
-    ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
-    ap.add_argument(
-        "--verbose",
-        choices=["quiet", "info", "debug"],
-        help="Logging verbosity (default: quiet or $TIVIT_VERBOSE)",
-    )
-    ap.add_argument("--no-avlag", action="store_true", help="Disable audio/video lag estimation for isolation")
-    ap.add_argument(
-        "--dump_logits",
-        default="",
-        help="Optional path to save per-frame logits as a compressed NPZ",
-    )
-    ap.add_argument(
-        "--grid_prob_thresholds",
-        action="store_true",
-        help="Evaluate the Cartesian product of onset/offset probability thresholds",
-    )
-    ap.add_argument(
-        "--no_eval_cache",
-        action="store_true",
-        help="Disable eval cache reuse and force fresh evaluation",
-    )
-    ap.add_argument(
-        "--sweep_k_onset",
-        action="store_true",
-        help="When aggregation mode is k_of_p, sweep k_onset over {1,2,3}",
-    )
-    ap.add_argument(
-        "--progress",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable or disable periodic progress logging",
-    )
-    ap.add_argument(
-        "--progress-interval",
-        type=float,
-        default=5.0,
-        help="Minimum number of seconds between progress prints",
-    )
-    ap.add_argument(
-        "--log-file",
-        type=str,
-        help="Optional file path to tee progress logs",
-    )
-    ap.add_argument(
-        "--legacy-eval-thresholds",
-        action="store_true",
-        help="Route execution through scripts/calib/eval_thresholds_legacy.py",
-    )
-    ap.add_argument(
-        "--decoder",
-        choices=["auto", "none", "hysteresis"],
-        default="auto",
-        help="Temporal decoder applied during evaluation (default: auto → hysteresis using config)",
-    )
-    ap.add_argument(
-        "--low_ratio",
-        type=float,
-        default=None,
-        help="Multiplier to derive the low hysteresis threshold (default: config or 0.6)",
-    )
-    ap.add_argument(
-        "--min_on",
-        type=int,
-        default=None,
-        help="Drop predicted on-segments shorter than this many frames (default: config or 2)",
-    )
-    ap.add_argument(
-        "--min_off",
-        type=int,
-        default=None,
-        help="Merge gaps shorter than this many frames between ons (default: config or 2)",
-    )
-    ap.add_argument(
-        "--gap_merge",
-        type=int,
-        default=None,
-        help="Merge on-segments separated by gaps <= this many frames (default: config or 1)",
-    )
-    ap.add_argument(
-        "--decoder-onset-open",
-        type=float,
-        help="Override onset decoder open gate (probability, default: config)",
-    )
-    ap.add_argument(
-        "--decoder-onset-hold",
-        type=float,
-        help="Override onset decoder hold gate (probability, default: config or derived from low_ratio)",
-    )
-    ap.add_argument(
-        "--decoder-onset-min-on",
-        type=int,
-        help="Override onset decoder minimum on length in frames (default: config)",
-    )
-    ap.add_argument(
-        "--decoder-onset-merge-gap",
-        type=int,
-        help="Override onset decoder merge gap in frames (default: config)",
-    )
-    ap.add_argument(
-        "--decoder-offset-open",
-        type=float,
-        help="Override offset decoder open gate (probability, default: config)",
-    )
-    ap.add_argument(
-        "--decoder-offset-hold",
-        type=float,
-        help="Override offset decoder hold gate (probability, default: config or derived from low_ratio)",
-    )
-    ap.add_argument(
-        "--decoder-offset-min-off",
-        type=int,
-        help="Override offset decoder minimum off length in frames (default: config)",
-    )
-    ap.add_argument(
-        "--decoder-offset-merge-gap",
-        type=int,
-        help="Override offset decoder merge gap in frames (default: config)",
-    )
-    ap.add_argument(
-        "--median",
-        type=int,
-        default=None,
-        help="Odd window size for optional time-axis median smoothing (default: config or 3)",
-    )
-    ap.add_argument(
-        "--postproc-mode",
-        choices=["never", "eval_only", "always"],
-        default="eval_only",
-        help="Control decoder post-processing: never=disable, eval_only=skip sweeps but run on final eval, always=run everywhere",
-    )
-    ap.add_argument("--seed", type=int, help="Seed for RNGs and dataloader shuffling")
-    ap.add_argument(
-        "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Toggle deterministic torch backends (default: config or enabled)",
-    )
-    args = ap.parse_args(argv)
-
-    if args.legacy_eval_thresholds:
-        from scripts.calib import eval_thresholds_legacy as legacy_eval
-
-        legacy_argv = [arg for arg in argv if arg != "--legacy-eval-thresholds"]
-        prev_argv = sys.argv
-        try:
-            sys.argv = [sys.argv[0], *legacy_argv]
-            legacy_eval.main()
-        finally:
-            sys.argv = prev_argv
-        return
-
-    args.verbose = configure_verbosity(args.verbose)
-    debug_mode = args.verbose == "debug"
-    args.thresholds = logit_thrs
-    args.prob_thresholds = prob_thrs
-    args.offset_thresholds = offset_logit_thrs
-    args.offset_prob_thresholds = offset_prob_thrs
-    args.sanity_thresholds = sanity_prob_thrs
-
-    if args.thresholds is not None and args.prob_thresholds is not None:
-        print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
-        return
-    if args.offset_thresholds is not None and args.offset_prob_thresholds is not None:
-        print(
-            "error: --offset_thresholds and --offset_prob_thresholds are mutually exclusive",
-            file=sys.stderr,
-        )
-        return
-
-    onset_logit_list, offset_logit_list, logit_reuse = _resolve_threshold_lists(
-        args.thresholds, args.offset_thresholds
-    )
-    onset_prob_list, offset_prob_list, prob_reuse = _resolve_threshold_lists(
-        args.prob_thresholds, args.offset_prob_thresholds
-    )
-
-    args.thresholds = onset_logit_list
-    args.offset_thresholds = offset_logit_list
-    args.prob_thresholds = onset_prob_list
-    args.offset_prob_thresholds = offset_prob_list
-
-    if args.head is None:
-        has_logit_lists = args.thresholds is not None or args.offset_thresholds is not None
-        has_prob_lists = args.prob_thresholds is not None or args.offset_prob_thresholds is not None
-        if has_logit_lists and has_prob_lists:
-            print(
-                "error: specify only logit or probability threshold lists when sweeping both heads",
-                file=sys.stderr,
-            )
-            return
-
-    if args.thresholds is not None and args.offset_thresholds is not None:
-        if len(args.thresholds) != len(args.offset_thresholds):
-            print(
-                "error: --thresholds and --offset_thresholds must contain the same number of values",
-                file=sys.stderr,
-            )
-            return
-
-    if args.prob_thresholds is not None and args.offset_prob_thresholds is not None:
-        if not args.grid_prob_thresholds and len(args.prob_thresholds) != len(args.offset_prob_thresholds):
-            print(
-                "error: probability lists must match lengths unless --grid_prob_thresholds is enabled",
-                file=sys.stderr,
-            )
-            return
-
-    if args.low_ratio is not None and args.low_ratio < 0.0:
-        print("error: --low_ratio must be non-negative", file=sys.stderr)
-        return
-    if args.min_on is not None and args.min_on < 0:
-        print("error: --min_on must be >= 0", file=sys.stderr)
-        return
-    if args.min_off is not None and args.min_off < 0:
-        print("error: --min_off must be >= 0", file=sys.stderr)
-        return
-
-    base_temperature = args.temperature if args.temperature is not None else 1.0
-    base_bias = args.bias if args.bias is not None else 0.0
-    onset_temperature = float(args.temperature_onset if args.temperature_onset is not None else base_temperature)
-    offset_temperature = float(args.temperature_offset if args.temperature_offset is not None else base_temperature)
-    onset_bias = float(args.bias_onset if args.bias_onset is not None else base_bias)
-    offset_bias = float(args.bias_offset if args.bias_offset is not None else base_bias)
-    onset_platt_stats = _init_platt_stats(_platt_stats_enabled(onset_temperature, onset_bias))
-    offset_platt_stats = _init_platt_stats(_platt_stats_enabled(offset_temperature, offset_bias))
-    if args.gap_merge is not None and args.gap_merge < 0:
-        print("error: --gap_merge must be >= 0", file=sys.stderr)
-        return
-    if args.median is not None and (args.median < 1 or args.median % 2 == 0):
-        print("error: --median must be an odd integer >= 1", file=sys.stderr)
-        return
-    decoder_prob_fields = [
-        ("--decoder-onset-open", args.decoder_onset_open),
-        ("--decoder-onset-hold", args.decoder_onset_hold),
-        ("--decoder-offset-open", args.decoder_offset_open),
-        ("--decoder-offset-hold", args.decoder_offset_hold),
-    ]
-    for flag, value in decoder_prob_fields:
-        if value is None:
-            continue
-        if not (0.0 <= value <= 1.0):
-            print(f"error: {flag} must be within [0, 1]", file=sys.stderr)
-            return
-    decoder_int_fields = [
-        ("--decoder-onset-min-on", args.decoder_onset_min_on),
-        ("--decoder-onset-merge-gap", args.decoder_onset_merge_gap),
-        ("--decoder-offset-min-off", args.decoder_offset_min_off),
-        ("--decoder-offset-merge-gap", args.decoder_offset_merge_gap),
-    ]
-    for flag, value in decoder_int_fields:
-        if value is None:
-            continue
-        if value < 0:
-            print(f"error: {flag} must be >= 0", file=sys.stderr)
-            return
+    stage_durations: Dict[str, float] = {}
+    runtime = _prepare_runtime(args, debug_mode, stage_durations)
+    log_handle, _log_progress = _init_progress_logger(args)
+    _ = log_handle  # handle kept alive for atexit cleanup
 
     onset_probs_final = list(args.prob_thresholds) if args.prob_thresholds is not None else []
     offset_probs_final = list(args.offset_prob_thresholds) if args.offset_prob_thresholds is not None else []
@@ -904,142 +2380,72 @@ def main():
         extra=QUIET_EXTRA,
     )
 
-    log_handle = None
-
     if args.head is None and args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):
         print("[eval] offset probability thresholds not provided; reusing onset list", flush=True)
     if args.head is None and args.thresholds is not None and logit_reuse.get("offset_from_onset"):
         print("[eval] offset logit thresholds not provided; reusing onset list", flush=True)
-    if args.log_file:
-        log_path = Path(args.log_file).expanduser()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_handle = open(log_path, "a", encoding="utf-8")
-        import atexit
 
-        atexit.register(log_handle.close)
+    loader_ctx = _build_eval_loader(args, runtime, _log_progress)
+    if loader_ctx.target_clips == 0:
+        _log_progress("[progress] target_clips resolved to 0; exiting early.", force=True)
+        return
 
-    def _log_progress(msg: str, *, force: bool = False) -> None:
-        should_print = force or bool(args.progress)
-        if should_print:
-            print(msg, flush=True)
-        if log_handle is not None:
-            log_handle.write(msg + "\n")
-            log_handle.flush()
+    model = _setup_model(args, runtime.cfg)
 
-    def _format_seconds(seconds: float) -> str:
-        seconds = max(0.0, float(seconds))
-        minutes, secs = divmod(int(seconds), 60)
-        return f"{minutes:02d}:{secs:02d}"
+    eval_results = _collect_logits(
+        model=model,
+        loader_ctx=loader_ctx,
+        args=args,
+        runtime=runtime,
+        onset_platt_stats=onset_platt_stats,
+        offset_platt_stats=offset_platt_stats,
+        onset_temperature=onset_temperature,
+        offset_temperature=offset_temperature,
+        onset_bias=onset_bias,
+        offset_bias=offset_bias,
+        log_progress=_log_progress,
+    )
 
-    def _dataset_video_count(ds) -> str:
-        if ds is None:
-            return "?"
-        try:
-            if hasattr(ds, "samples"):
-                return str(len(getattr(ds, "samples")))
-            if hasattr(ds, "videos"):
-                videos_attr = getattr(ds, "videos")
-                try:
-                    return str(len(videos_attr))
-                except TypeError:
-                    pass
-            return str(len(ds))
-        except Exception:
-            return "?"
-    
-    stage_durations = {}
-    BAD_CLIP_RETRY_LIMIT = 3
-    bad_clip_counts = Counter()
-    skip_paths = set()
-    lag_ms_samples = []
-    lag_source_counter = Counter()
-    skipped_batches = 0
+    _summarize_data_pass(eval_results, runtime, loader_ctx.target_clips, _log_progress)
 
-    def _extract_lag_values(value):
-        vals = []
-        if value is None:
-            return vals
-        if torch.is_tensor(value):
-            flat = value.detach().cpu().reshape(-1).tolist()
-            for item in flat:
-                try:
-                    fval = float(item)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(fval):
-                    vals.append(fval)
-            return vals
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                vals.extend(_extract_lag_values(item))
-            return vals
-        try:
-            fval = float(value)
-        except (TypeError, ValueError):
-            return vals
-        if math.isfinite(fval):
-            vals.append(fval)
-        return vals
+    if not eval_results.onset_logits_list:
+        _log_progress("[progress] no valid clips processed; aborting.", force=True)
+        print("error: no valid clips processed; aborting.", file=sys.stderr)
+        return
 
-    def _extract_lag_sources(value):
-        sources = []
-        if value is None:
-            return sources
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                if isinstance(item, str) and item:
-                    sources.append(item)
-        elif isinstance(value, str) and value:
-            sources.append(value)
-        return sources
+    onset_logits_list = eval_results.onset_logits_list
+    offset_logits_list = eval_results.offset_logits_list
+    pitch_logits_list = eval_results.pitch_logits_list
+    onset_probs = eval_results.onset_probs
+    offset_probs = eval_results.offset_probs
+    onset_tgts = eval_results.onset_tgts
+    offset_tgts = eval_results.offset_tgts
+    skip_paths = eval_results.skip_paths
+    bad_clip_counts = eval_results.bad_clip_counts
+    lag_ms_samples = eval_results.lag_ms_samples
+    lag_source_counter = eval_results.lag_source_counter
+    skipped_batches = eval_results.skipped_batches
 
-    def _filter_batch(batch, keep_indices):
-        if not keep_indices:
-            return None
-        paths_field = batch.get("path")
-        total = len(paths_field) if isinstance(paths_field, list) else None
-        filtered = {}
-        for key, value in batch.items():
-            if key == "path" and isinstance(paths_field, list):
-                filtered[key] = [paths_field[i] for i in keep_indices]
-                continue
-            if total is not None:
-                if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == total:
-                    idx_tensor = torch.as_tensor(keep_indices, dtype=torch.long, device=value.device)
-                    filtered[key] = value.index_select(0, idx_tensor)
-                    continue
-                if isinstance(value, list) and len(value) == total:
-                    filtered[key] = [value[i] for i in keep_indices]
-                    continue
-                if isinstance(value, tuple) and len(value) == total:
-                    filtered[key] = [value[i] for i in keep_indices]
-                    continue
-            filtered[key] = value
-        return filtered
-
-    def _handle_bad_batch(paths, exc):
-        nonlocal skipped_batches
-        skipped_batches += 1
-        safe_paths = [str(p) for p in (paths or []) if p]
-        if safe_paths:
-            first = Path(safe_paths[0]).name
-            extra = len(safe_paths) - 1
-            clip_desc = f"{first}+{extra} more" if extra > 0 else first
-        else:
-            clip_desc = "<unknown>"
-        err_type = type(exc).__name__
-        _log_progress(
-            f"[warn] batch failed ({err_type}): clip={clip_desc} error={exc}",
-            force=True,
-        )
-        for path in set(safe_paths):
-            bad_clip_counts[path] += 1
-            if bad_clip_counts[path] >= BAD_CLIP_RETRY_LIMIT and path not in skip_paths:
-                skip_paths.add(path)
-                _log_progress(
-                    f"[progress] marked clip as bad after {BAD_CLIP_RETRY_LIMIT} failures: {Path(path).name}",
-                    force=True,
-                )
+    cfg = runtime.cfg
+    dataset_cfg = runtime.dataset_cfg
+    model_cfg = runtime.model_cfg
+    decode_fps = runtime.decode_fps
+    hop_seconds = runtime.hop_seconds
+    event_tolerance = runtime.event_tolerance
+    key_prior_midi_low = runtime.key_prior_midi_low
+    key_prior_settings = runtime.key_prior_settings
+    agg_mode = runtime.agg_mode
+    agg_top_k = runtime.agg_top_k
+    agg_tau_sum = runtime.agg_tau_sum
+    default_k_onset = runtime.default_k_onset
+    default_k_offset = runtime.default_k_offset
+    include_k_column = runtime.include_k_column
+    k_candidates = runtime.k_candidates
+    preview_prob_threshold = runtime.preview_prob_threshold
+    avlag_disabled = runtime.avlag_disabled
+    return_per_tile_requested = runtime.return_per_tile_requested
+    split = runtime.split
+    stage_durations = runtime.stage_durations
     # Unless a calibration file is provided and no head is specified, default to
     # sweeping over probability thresholds when none were specified explicitly.
     if args.thresholds is None and args.prob_thresholds is None:
@@ -1048,6 +2454,14 @@ def main():
 
 
     cfg = dict(load_config("configs/config.yaml"))
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        cfg["model"] = model_cfg
+    if args.model_return_per_tile is not None:
+        model_cfg["return_per_tile"] = bool(args.model_return_per_tile)
+    return_per_tile_requested = bool(model_cfg.get("return_per_tile"))
+
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)
     cfg.setdefault("experiment", {})
@@ -1064,6 +2478,10 @@ def main():
     else:
         dataset_cfg = {}
     cfg["dataset"] = dataset_cfg
+    try:
+        model_tiles = int(model_cfg.get("tiles", dataset_cfg.get("tiles", 3)))
+    except Exception:
+        model_tiles = 3
     if args.max_clips is not None:
         dataset_cfg["max_clips"] = args.max_clips
     if args.frames is not None:
@@ -1108,12 +2526,6 @@ def main():
 
     metrics_cfg = cfg.get("training", {}).get("metrics", {}) or {}
     agg_cfg = metrics_cfg.get("aggregation", {}) or {}
-    agg_mode = str(agg_cfg.get("mode", "any")).lower()
-    agg_top_k = int(agg_cfg.get("top_k", 0) or 0)
-    agg_tau_sum = float(agg_cfg.get("tau_sum", 0.0) or 0.0)
-    agg_k_cfg = agg_cfg.get("k", {}) or {}
-    default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
-    default_k_offset = int(agg_k_cfg.get("offset", 1) or 1)
     sweep_cfg = metrics_cfg.get("sweep", {}) or {}
     floor_band_raw = sweep_cfg.get("floor_band", [0.20, 0.30, 0.40])
     floor_band: List[float] = []
@@ -1135,152 +2547,12 @@ def main():
     if not floor_band:
         floor_band = [0.20, 0.30, 0.40]
 
-    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
-    key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
-    if key_prior_settings.enabled:
-        print(
-            f"[decoder] key prior enabled (ref_head={key_prior_settings.ref_head}, apply_to={', '.join(key_prior_settings.apply_to)})",
-            flush=True,
-        )
-
     calibration_data = None
     if args.calibration:
         with open(args.calibration) as f:
             calibration_data = json.load(f)
 
-    include_k_column = agg_mode == "k_of_p"
-    if include_k_column and args.sweep_k_onset and args.head is None:
-        k_candidates = sorted({default_k_onset, 1, 2, 3})
-    else:
-        k_candidates = [default_k_onset]
-
-    # build loader
-    t_dataset_build0 = time.time()
-    val_loader = make_dataloader(cfg, split=split, seed=seed)
-    if isinstance(val_loader, dict):
-        val_loader = val_loader.get(split, next(iter(val_loader.values())))
-    if isinstance(val_loader, (list, tuple)):
-        val_loader = val_loader[0]
-
-    dataset = getattr(val_loader, "dataset", None)
-    dataset_name = dataset.__class__.__name__ if dataset is not None else type(val_loader).__name__
-    ds_len: Optional[int] = None
-    dataset_count = "?"
-    ok_videos = 0
-    materialize_duration = 0.0
-    if dataset is not None:
-        materialize_stats = getattr(dataset, "_eval_materialize_stats", {}) or {}
-        if isinstance(materialize_stats, dict):
-            try:
-                ok_videos = int(materialize_stats.get("videos") or 0)
-            except (TypeError, ValueError):
-                ok_videos = 0
-            try:
-                materialize_duration = float(materialize_stats.get("duration") or 0.0)
-            except (TypeError, ValueError):
-                materialize_duration = 0.0
-        if materialize_duration == 0.0:
-            try:
-                materialize_duration = float(getattr(dataset, "_last_materialize_duration", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                materialize_duration = 0.0
-        try:
-            ds_len = len(dataset)
-            dataset_count = str(ds_len)
-        except TypeError:
-            ds_len = None
-            dataset_count = "?"
-    if ds_len == 0 and ok_videos > 0:
-        print("[error] dataset len is 0 after audit ok>0 – eval entries were not materialized", flush=True)
-        sys.exit(1)
-    dataset_elapsed = time.time() - t_dataset_build0
-    stage_durations["dataset_init"] = dataset_elapsed
-    batch_size_val = getattr(val_loader, "batch_size", None)
-    batch_display = str(batch_size_val) if batch_size_val is not None else "?"
-    worker_count = getattr(val_loader, "num_workers", None)
-    worker_display = str(worker_count) if worker_count is not None else "?"
-    video_count_display = _dataset_video_count(dataset)
-    print(
-        f"[progress] dataset ready (videos={video_count_display}, workers={worker_display})",
-        flush=True,
-    )
-    _log_progress(
-        f"[progress] dataset ready in {_format_seconds(dataset_elapsed)} ({dataset_elapsed:.2f}s) "
-        f"backend={dataset_name} len={dataset_count} batch={batch_display}",
-        force=True,
-    )
-    frame_summary = getattr(dataset, "frame_target_summary", None)
-    if frame_summary:
-        frame_summary_display = frame_summary
-        if avlag_disabled and "lag_source=" in frame_summary_display:
-            prefix, suffix = frame_summary_display.split("lag_source=", 1)
-            if "," in suffix:
-                _, tail = suffix.split(",", 1)
-                frame_summary_display = f"{prefix}lag_source=no_avlag,{tail}"
-            else:
-                frame_summary_display = f"{prefix}lag_source=no_avlag"
-        _log_progress(f"[progress] {frame_summary_display}", force=True)
-
-    if ds_len is not None:
-        resolved_cap = args.max_clips if args.max_clips is not None else ds_len
-        target_clips = int(min(ds_len, int(resolved_cap)))
-    else:
-        target_clips = int(args.max_clips) if args.max_clips is not None else None
-
-    if dataset is not None and target_clips is not None:
-        try:
-            base_len = len(dataset)
-        except TypeError:
-            base_len = None
-        if base_len is not None:
-            subset_cap = min(base_len, int(target_clips))
-            subset_indices = list(range(subset_cap))
-            dataset = Subset(dataset, subset_indices)
-            num_workers = getattr(val_loader, "num_workers", 0)
-            persistent_workers = getattr(val_loader, "persistent_workers", False)
-            if num_workers <= 0:
-                persistent_workers = False
-            loader_kwargs = {
-                "batch_size": getattr(val_loader, "batch_size", 1),
-                "shuffle": False,
-                "num_workers": num_workers,
-                "pin_memory": getattr(val_loader, "pin_memory", False),
-                "drop_last": getattr(val_loader, "drop_last", False),
-                "collate_fn": getattr(val_loader, "collate_fn", None),
-                "persistent_workers": persistent_workers,
-                "timeout": getattr(val_loader, "timeout", 0),
-            }
-            prefetch_factor = getattr(val_loader, "prefetch_factor", None)
-            if num_workers > 0 and prefetch_factor is not None:
-                loader_kwargs["prefetch_factor"] = prefetch_factor
-            pin_memory_device = getattr(val_loader, "pin_memory_device", None)
-            if pin_memory_device:
-                loader_kwargs["pin_memory_device"] = pin_memory_device
-            worker_init_fn = getattr(val_loader, "worker_init_fn", None)
-            if worker_init_fn is not None:
-                loader_kwargs["worker_init_fn"] = worker_init_fn
-            generator = getattr(val_loader, "generator", None)
-            if generator is not None:
-                loader_kwargs["generator"] = generator
-            multiprocessing_context = getattr(val_loader, "multiprocessing_context", None)
-            if multiprocessing_context is not None:
-                loader_kwargs["multiprocessing_context"] = multiprocessing_context
-            val_loader = DataLoader(dataset, **loader_kwargs)
-            dataset = getattr(val_loader, "dataset", dataset)
-            ds_len = len(dataset)
-            dataset_count = str(ds_len)
-            target_clips = ds_len
-            dataset_elapsed = time.time() - t_dataset_build0
-            stage_durations["dataset_init"] = dataset_elapsed
-
-    if materialize_duration > 0:
-        stage_durations["materialize"] = materialize_duration
-
-    if target_clips == 0:
-        _log_progress("[progress] target_clips resolved to 0; exiting early.", force=True)
-        return
-
-
+    k_candidates = runtime.k_candidates
     per_head_sweep_vals = None
     per_head_use_logits = False
     per_head_mode = "prob"
@@ -1356,7 +2628,7 @@ def main():
         thr_desc = str(sweep_len)
         k_sweep_state = "off"
 
-    target_display = str(target_clips) if target_clips is not None else "?"
+    target_display = loader_ctx.target_display
     if args.postproc_mode == "eval_only" and num_combos:
         print("POSTPROC: SKIPPED during sweeps (mode=eval_only)")
     _log_progress(
@@ -1364,247 +2636,6 @@ def main():
         force=True,
     )
 
-    # load model + ckpt
-    model = build_model(cfg)
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
-    model.eval()
-
-    # run model once to collect logits/probabilities and targets
-    onset_logits_list, offset_logits_list = [], []
-    pitch_logits_list = []
-    onset_probs, offset_probs = [], []
-    onset_tgts, offset_tgts = [], []
-    clips_done = 0
-    t_data0 = time.time()
-    last_clip_print = t_data0
-    heartbeat_interval = max(10.0, float(args.progress_interval or 10.0))
-    last_heartbeat = t_data0
-    last_clip_name = "-"
-    first_batch_time = None
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            if target_clips is not None and clips_done >= target_clips:
-                break
-            raw_paths = batch.get("path")
-            if isinstance(raw_paths, (list, tuple)):
-                paths = [str(p) for p in raw_paths]
-            elif raw_paths is None:
-                paths = []
-            else:
-                paths = [str(raw_paths)]
-            if skip_paths and paths:
-                keep_indices = [idx for idx, p in enumerate(paths) if p not in skip_paths]
-                if len(keep_indices) != len(paths):
-                    filtered_batch = _filter_batch(batch, keep_indices)
-                    if filtered_batch is None:
-                        blocked = ", ".join(Path(p).name for p in paths if p) or "<unknown>"
-                        _log_progress(
-                            f"[progress] skipped batch (all blocked clips): {blocked}",
-                            force=True,
-                        )
-                        continue
-                    batch = filtered_batch
-                    raw_paths = batch.get("path")
-                    if isinstance(raw_paths, (list, tuple)):
-                        paths = [str(p) for p in raw_paths]
-                    elif raw_paths is None:
-                        paths = []
-                    else:
-                        paths = [str(raw_paths)]
-            try:
-                x = batch["video"]
-                if first_batch_time is None:
-                    first_batch_time = time.time()
-                    first_wait = first_batch_time - t_data0
-                    stage_durations["first_batch"] = first_wait
-                    _log_progress(
-                        f"[progress] first batch ready in {_format_seconds(first_wait)} ({first_wait:.2f}s) – includes decode/A/V lag warmup",
-                        force=True,
-                    )
-                out = model(x)
-
-                # prefer *_logits if present; fallback to old naming
-                onset_logits_raw = out["onset_logits"] if "onset_logits" in out else out.get("onset")
-                offset_logits_raw = out["offset_logits"] if "offset_logits" in out else out.get("offset")
-                pitch_logits = out.get("pitch_logits")
-
-                if onset_logits_raw is None or offset_logits_raw is None:
-                    raise RuntimeError("Model output missing onset/offset logits")
-                onset_logits_neutral = onset_logits_raw.detach()
-                offset_logits_neutral = offset_logits_raw.detach()
-
-                if onset_platt_stats["enabled"]:
-                    onset_prob_neutral = torch.sigmoid(onset_logits_neutral)
-                else:
-                    onset_prob_neutral = None
-                if offset_platt_stats["enabled"]:
-                    offset_prob_neutral = torch.sigmoid(offset_logits_neutral)
-                else:
-                    offset_prob_neutral = None
-
-                onset_logits = onset_logits_neutral / onset_temperature + onset_bias
-                offset_logits = offset_logits_neutral / offset_temperature + offset_bias
-
-                pitch_prior_tensor = None
-                pitch_was_2d = False
-                if torch.is_tensor(pitch_logits):
-                    pitch_prior_tensor = pitch_logits
-                    if pitch_prior_tensor.dim() == 2:
-                        pitch_prior_tensor = pitch_prior_tensor.unsqueeze(1)
-                        pitch_was_2d = True
-
-                prior_inputs = {"onset": onset_logits, "offset": offset_logits}
-                if torch.is_tensor(pitch_prior_tensor):
-                    prior_inputs["pitch"] = pitch_prior_tensor
-                prior_outputs = apply_key_prior_to_logits(
-                    prior_inputs,
-                    key_prior_settings,
-                    fps=decode_fps,
-                    midi_low=key_prior_midi_low,
-                    midi_high=None,
-                )
-                if "onset" in prior_outputs:
-                    onset_logits = prior_outputs["onset"]
-                if "offset" in prior_outputs:
-                    offset_logits = prior_outputs["offset"]
-                if pitch_prior_tensor is not None and "pitch" in prior_outputs:
-                    pitch_prior_tensor = prior_outputs["pitch"]
-                    pitch_logits = pitch_prior_tensor.squeeze(1) if pitch_was_2d else pitch_prior_tensor
-
-                onset_prob = torch.sigmoid(onset_logits)
-                offset_prob = torch.sigmoid(offset_logits)
-
-                if onset_prob_neutral is not None:
-                    _update_platt_stats(onset_platt_stats, onset_prob.detach() - onset_prob_neutral)
-                if offset_prob_neutral is not None:
-                    _update_platt_stats(offset_platt_stats, offset_prob.detach() - offset_prob_neutral)
-
-                onset_logits_list.append(onset_logits.detach().cpu())
-                offset_logits_list.append(offset_logits.detach().cpu())
-                onset_probs.append(onset_prob.detach().cpu())
-                offset_probs.append(offset_prob.detach().cpu())
-
-                if pitch_logits is not None:
-                    if pitch_logits.dim() == 2:
-                        pitch_logits = pitch_logits.unsqueeze(1)
-                    pitch_logits_list.append(pitch_logits.detach().cpu())
-                
-                onset_tgts.append(batch["onset_roll"].float().cpu())
-                offset_tgts.append(batch["offset_roll"].float().cpu())
-
-                lag_vals = _extract_lag_values(batch.get("lag_ms"))
-                if lag_vals:
-                    lag_ms_samples.extend(lag_vals)
-                if not avlag_disabled:
-                    lag_sources = _extract_lag_sources(batch.get("lag_source"))
-                    if lag_sources:
-                        lag_source_counter.update(lag_sources)
-
-                if debug_mode and len(onset_logits_list) == 1:
-                    print("[DEBUG] batch video", x.shape, "onset_logits", onset_logits.shape)
-                    print(
-                        "[DEBUG] onset_roll nonzero=",
-                        int(batch["onset_roll"].sum().item()),
-                        "offset_roll nonzero=",
-                        int(batch["offset_roll"].sum().item()),
-                    )
-                
-                batch_size = int(x.shape[0]) if hasattr(x, "shape") and x.shape else 1
-                clips_done += batch_size
-                now = time.time()
-                if paths:
-                    candidate_id = canonical_video_id(Path(paths[-1]).name)
-                    last_clip_name = candidate_id or Path(paths[-1]).name
-                if now - last_heartbeat >= heartbeat_interval:
-                    elapsed = now - t_data0
-                    _log_progress(
-                        f"[progress] data pass heartbeat: processed_clips={clips_done} skips={len(skip_paths)} last_clip={last_clip_name} elapsed={_format_seconds(elapsed)}",
-                        force=True,
-                    )
-                    last_heartbeat = now
-                if args.progress:
-                    progress_force = i == 0 or (target_clips is not None and clips_done >= target_clips)
-                    if progress_force or now - last_clip_print >= args.progress_interval:
-                        elapsed = now - t_data0
-                        if target_clips is not None and target_clips > 0:
-                            pct = min(100.0, 100.0 * clips_done / float(target_clips))
-                            pct_display = f"{pct:5.1f}"
-                        else:
-                            pct_display = "?"
-                        if clips_done == 0:
-                            eta_display = "--:--"
-                        elif target_clips is None or target_clips <= 0:
-                            eta_display = "--:--"
-                        else:
-                            remaining = max(target_clips - clips_done, 0)
-                            if remaining == 0:
-                                eta_display = "00:00"
-                            else:
-                                eta_seconds = (elapsed / clips_done) * remaining
-                                eta_display = _format_seconds(eta_seconds)
-                        processed_display = clips_done if target_clips is None else min(clips_done, target_clips)
-                        clips_total_display = target_display
-                        _log_progress(
-                            f"[progress] clips {processed_display}/{clips_total_display}  ({pct_display}%)  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
-                            force=progress_force,
-                        )
-                        last_clip_print = now
-                if target_clips is not None and clips_done >= target_clips:
-                    break
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as exc:
-                _handle_bad_batch(paths, exc)
-                continue
-
-    elapsed_data = time.time() - t_data0
-    stage_durations["data_pass"] = elapsed_data
-    throughput = clips_done / elapsed_data if elapsed_data > 0 else 0.0
-    processed_display = clips_done if target_clips is None else min(clips_done, target_clips)
-    skipped_display = len(skip_paths)
-    elapsed_display = _format_seconds(elapsed_data)
-    expected_display = target_clips if target_clips is not None else "?"
-    _log_progress(
-        f"[progress] data pass done: clips={processed_display}, expected={expected_display}, skipped={skipped_display}, elapsed={elapsed_display}",
-        force=True,
-    )
-    _log_progress(
-        f"[progress] throughput: {throughput:.2f} clips/s ({elapsed_data:.2f}s)",
-        force=True,
-    )
-    if avlag_disabled:
-        _log_progress("[progress] A/V lag ms stats: disabled (all zero).", force=True)
-    elif lag_ms_samples:
-        lag_arr = np.asarray(lag_ms_samples, dtype=np.float32)
-        lag_mean = float(lag_arr.mean())
-        lag_median = float(np.median(lag_arr))
-        lag_p95 = float(np.percentile(lag_arr, 95))
-        _log_progress(
-            "[progress] A/V lag ms stats: mean={:.1f} median={:.1f} p95={:.1f} samples={}".format(
-                lag_mean,
-                lag_median,
-                lag_p95,
-                lag_arr.size,
-            ),
-            force=True,
-        )
-    if lag_source_counter and not avlag_disabled:
-        top_sources = ", ".join(f"{src}:{cnt}" for src, cnt in lag_source_counter.most_common(3))
-        _log_progress(f"[progress] lag sources top: {top_sources}", force=True)
-    if skipped_batches:
-        _log_progress(f"[progress] batches skipped due to errors: {skipped_batches}", force=True)
-    if bad_clip_counts:
-        summary_bits = ", ".join(f"{Path(p).name}:{count}" for p, count in bad_clip_counts.items())
-        _log_progress(f"[progress] bad clip retries: {summary_bits}", force=True)
-    if skip_paths:
-        skip_names = ", ".join(Path(p).name for p in sorted(skip_paths))
-        _log_progress(f"[progress] permanently skipped clips: {skip_names}", force=True)
-
-    if not onset_logits_list:
-        _log_progress("[progress] no valid clips processed; aborting.", force=True)
-        print("error: no valid clips processed; aborting.", file=sys.stderr)
-        return
 
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
@@ -1693,41 +2724,14 @@ def main():
         top_k=agg_top_k,
     )
 
-    def _percentile(flat: torch.Tensor, q: float) -> float:
-        if flat.numel() == 0:
-            return 0.0
-        try:
-            return float(torch.quantile(flat, q).item())
-        except (RuntimeError, AttributeError):
-            # Fallback for older torch – rely on numpy.
-            return float(np.quantile(flat.numpy(), q))
-
-    def _summarize_probs(name: str, tensor: torch.Tensor) -> Tuple[float, dict]:
-        flat = tensor.reshape(-1).float()
-        max_prob = float(flat.max().item()) if flat.numel() else 0.0
-        stats = {
-            0.95: _percentile(flat, 0.95),
-            0.99: _percentile(flat, 0.99),
-            0.995: _percentile(flat, 0.995),
-        }
-        _log_progress(
-            "[sweep] %s prob stats: max=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
-            % (name, max_prob, stats[0.95], stats[0.99], stats[0.995]),
-            force=True,
-        )
-        return max_prob, stats
-
     offset_lower_hint = 0.10  # base guardrail
 
-    onset_max_prob, onset_stats = _summarize_probs("onset", onset_probs)
-    offset_max_prob, offset_stats = _summarize_probs("offset", offset_probs)
+    onset_max_prob, onset_stats = _summarize_probs("onset", onset_probs, _log_progress)
+    offset_max_prob, offset_stats = _summarize_probs("offset", offset_probs, _log_progress)
     onset_peak = max(onset_max_prob, float(onset_stats.get(0.99, onset_max_prob)))
     offset_peak = max(offset_max_prob, float(offset_stats.get(0.99, offset_max_prob)))
     onset_lower_hint = float(max(0.0, min(onset_peak - 0.10, 0.95)))
     offset_lower_hint = float(max(0.0, min(offset_peak - 0.10, 0.95)))
-
-    def _format_list(vals: List[float]) -> str:
-        return "[" + ",".join(f"{v:.3f}" for v in vals) + "]"
 
     if args.head is None:
         if args.prob_thresholds:
@@ -1828,8 +2832,8 @@ def main():
             if calib_pairs:
                 thr_desc.append(f"calib:{calib_pairs}")
             _log_progress(
-                f"[sweep] updated probability grids → onset={_format_list(onset_list)} "
-                f"offset={_format_list(offset_list)} combos={num_combos}",
+                f"[sweep] updated probability grids → onset={_format_float_list(onset_list)} "
+                f"offset={_format_float_list(offset_list)} combos={num_combos}",
                 force=True,
             )
     else:
@@ -1859,7 +2863,7 @@ def main():
                     force=True,
                 )
             _log_progress(
-                f"[sweep] per-head sweep ({args.head}) values={_format_list(per_head_sweep_vals)} combos={num_combos}",
+                f"[sweep] per-head sweep ({args.head}) values={_format_float_list(per_head_sweep_vals)} combos={num_combos}",
                 force=True,
             )
 
@@ -1914,7 +2918,6 @@ def main():
     if decoder_choice == "none":
         print("[decoder] requested decoder=none -> forcing hysteresis with config defaults", flush=True)
     decoder_kind = "hysteresis" if decoder_choice in {"auto", "none"} else decoder_choice
-    decoder_notice_printed = False
     decoder_settings_summary = format_decoder_settings(decoder_kind, decoder_params)
     print(f"[decoder-settings] {decoder_settings_summary}")
     decoder_post_cfg = cfg.get("decoder", {}).get("post", {}) or {}
@@ -1932,300 +2935,32 @@ def main():
     post_logs_dir = Path(cfg.get("logging", {}).get("log_dir", "logs") or "logs") / "post"
     row_records: List[Dict[str, Any]] = []
 
-    def _eval_pair(on_thr, off_thr, use_logits, *, k_onset=None, apply_postproc=True):
-        nonlocal decoder_notice_printed
-        if k_onset is None:
-            k_onset = default_k_onset
-        k_onset = max(1, int(k_onset))
-        k_offset = max(1, int(default_k_offset))
-        onset_open_thr: Optional[float] = None
-        onset_hold_thr: Optional[float] = None
-        offset_open_thr: Optional[float] = None
-        offset_hold_thr: Optional[float] = None
-        onset_probs_tensor = onset_probs if torch.is_tensor(onset_probs) else torch.as_tensor(onset_probs)
-        offset_probs_tensor = offset_probs if torch.is_tensor(offset_probs) else torch.as_tensor(offset_probs)
-        onset_probs_tensor = onset_probs_tensor.contiguous()
-        offset_probs_tensor = offset_probs_tensor.contiguous()
-        prob_tensor_for_post = onset_probs_tensor.detach()
-        if not prob_tensor_for_post.is_floating_point():
-            prob_tensor_for_post = prob_tensor_for_post.float()
-        prob_tensor_for_post = prob_tensor_for_post.contiguous()
-        fps_eval = 1.0 / hop_seconds if hop_seconds > 0 else decode_fps
-
-        def _resolve_prob_thr(raw_value: float) -> float:
-            try:
-                raw_float = float(raw_value)
-            except (TypeError, ValueError):
-                raw_float = float("nan")
-            prob_val = _logit_to_probability(raw_float) if use_logits else raw_float
-            if not math.isfinite(prob_val):
-                prob_val = 0.5
-            return max(0.0, min(prob_val, 1.0))
-
-        onset_thr_prob = _resolve_prob_thr(on_thr)
-        offset_thr_prob = _resolve_prob_thr(off_thr)
-        print(
-            "[apply-thr] onset_thr={:.4f} offset_thr={:.4f} "
-            "T_on={:.4f} b_on={:.4f} T_off={:.4f} b_off={:.4f}".format(
-                onset_thr_prob,
-                offset_thr_prob,
-                onset_temperature,
-                onset_bias,
-                offset_temperature,
-                offset_bias,
-            ),
-            flush=True,
-        )
-
-        onset_mask_bool = build_threshold_mask(
-            onset_probs_tensor,
-            onset_thr_prob,
-            mode=agg_mode,
-            cap_count=k_onset,
-            top_k=agg_top_k,
-        )
-        offset_mask_bool = build_threshold_mask(
-            offset_probs_tensor,
-            offset_thr_prob,
-            mode=agg_mode,
-            cap_count=k_offset,
-            top_k=agg_top_k,
-        )
-
-        onset_mask_float = onset_mask_bool.float()
-        offset_mask_float = offset_mask_bool.float()
-        onset_pred_mask = onset_mask_bool.clone()
-        offset_pred_mask = offset_mask_bool.clone()
-        onset_pred_bin = onset_mask_float
-        offset_pred_bin = offset_mask_float
-
-        if decoder_kind == "hysteresis":
-            if not decoder_notice_printed:
-                print(f"[decoder] {decoder_notice_text(decoder_kind, decoder_params)}", flush=True)
-                decoder_notice_printed = True
-            onset_open_thr, onset_hold_thr = resolve_decoder_gates(
-                onset_decoder,
-                fallback_open=onset_thr_prob,
-                default_hold=DECODER_DEFAULTS["onset"]["hold"],
-            )
-            offset_open_thr, offset_hold_thr = resolve_decoder_gates(
-                offset_decoder,
-                fallback_open=offset_thr_prob,
-                default_hold=DECODER_DEFAULTS["offset"]["hold"],
-            )
-            masked_onset_probs = (onset_probs_tensor * onset_mask_float).contiguous()
-            masked_offset_probs = (offset_probs_tensor * offset_mask_float).contiguous()
-            onset_pred_mask = decode_hysteresis(
-                masked_onset_probs,
-                onset_open_thr,
-                onset_hold_thr,
-                onset_decoder["min_on"],
-                onset_decoder["min_off"],
-                onset_decoder["merge_gap"],
-                onset_decoder["median"],
-            )
-            offset_pred_mask = decode_hysteresis(
-                masked_offset_probs,
-                offset_open_thr,
-                offset_hold_thr,
-                offset_decoder["min_on"],
-                offset_decoder["min_off"],
-                offset_decoder["merge_gap"],
-                offset_decoder["median"],
-            )
-            onset_pred_bin = onset_pred_mask.to(onset_probs_tensor.dtype)
-            offset_pred_bin = offset_pred_mask.to(offset_probs_tensor.dtype)
-        post_stats: Dict[str, Any] = {}
-        postproc_applied = False
-        should_postprocess = apply_postproc and bool(postproc_modules)
-        need_baseline = should_postprocess or postproc_debug
-        baseline_onset_mask = onset_pred_mask.clone() if need_baseline else None
-        if should_postprocess:
-            onset_post_mask, stage_stats = apply_postprocessing(
-                onset_pred_mask,
-                prob_tensor_for_post,
-                fps=fps_eval,
-                cfg=cfg,
-                require_stats=postproc_debug,
-            )
-            onset_pred_mask = onset_post_mask
-            postproc_applied = True
-            if stage_stats:
-                post_stats.update(stage_stats)
-        onset_pred_bin = onset_pred_mask.to(prob_tensor_for_post.dtype)
-        
-        f1_on = _binary_f1(onset_pred_bin.reshape(-1), onset_true_bin.reshape(-1))
-        f1_off = _binary_f1(offset_pred_bin.reshape(-1), offset_true_bin.reshape(-1))
-        ev_f1_on = _event_f1(onset_pred_bin, onset_true_bin, hop_seconds, event_tolerance)
-        ev_f1_off = _event_f1(offset_pred_bin, offset_true_bin, hop_seconds, event_tolerance)
-        onset_pred_rate = onset_pred_bin.mean().item()
-        onset_pos_rate = onset_true_bin.mean().item()
-
-        f1_on = 0.0 if f1_on is None else f1_on
-        f1_off = 0.0 if f1_off is None else f1_off
-        ev_f1_on = 0.0 if ev_f1_on is None else ev_f1_on
-        ev_f1_off = 0.0 if ev_f1_off is None else ev_f1_off
-
-        if postproc_debug:
-            pre_mask = baseline_onset_mask if baseline_onset_mask is not None else onset_pred_mask
-            metrics_payload = {
-                "post": _collect_onset_metrics(onset_pred_mask.float(), onset_true_bin, hop_seconds, event_tolerance, prob_tensor_for_post),
-                "pre": _collect_onset_metrics(pre_mask.float(), onset_true_bin, hop_seconds, event_tolerance, prob_tensor_for_post),
-            }
-            post_stats.setdefault("metrics", metrics_payload)
-        result_payload = {
-            "onset_thr": float(on_thr),
-            "offset_thr": float(off_thr),
-            "decoder_onset_open": float(onset_open_thr) if onset_open_thr is not None else None,
-            "decoder_onset_hold": float(onset_hold_thr) if onset_hold_thr is not None else None,
-            "decoder_offset_open": float(offset_open_thr) if offset_open_thr is not None else None,
-            "decoder_offset_hold": float(offset_hold_thr) if offset_hold_thr is not None else None,
-            "decoder_kind": decoder_kind,
-            "decoder_onset_min_on": int(onset_decoder["min_on"]),
-            "decoder_onset_merge_gap": int(onset_decoder["merge_gap"]),
-            "decoder_onset_median": int(onset_decoder["median"]),
-            "decoder_offset_min_off": int(offset_decoder["min_off"]),
-            "decoder_offset_merge_gap": int(offset_decoder["merge_gap"]),
-            "decoder_offset_median": int(offset_decoder["median"]),
-            "f1_on": float(f1_on),
-            "f1_off": float(f1_off),
-            "onset_pred_rate": float(onset_pred_rate),
-            "onset_pos_rate": float(onset_pos_rate),
-            "ev_f1_on": float(ev_f1_on),
-            "ev_f1_off": float(ev_f1_off),
-            "k_onset": int(k_onset),
-            "use_logits": bool(use_logits),
-        }
-        result_payload["_postproc_applied"] = postproc_applied
-        return result_payload, post_stats
+    eval_ctx = EvalPairContext(
+        agg_mode=agg_mode,
+        agg_top_k=agg_top_k,
+        default_k_onset=default_k_onset,
+        default_k_offset=default_k_offset,
+        hop_seconds=hop_seconds,
+        decode_fps=decode_fps,
+        event_tolerance=event_tolerance,
+        onset_temperature=onset_temperature,
+        offset_temperature=offset_temperature,
+        onset_bias=onset_bias,
+        offset_bias=offset_bias,
+        onset_probs=torch.as_tensor(onset_probs),
+        offset_probs=torch.as_tensor(offset_probs),
+        onset_true_bin=onset_true_bin,
+        offset_true_bin=offset_true_bin,
+        decoder_kind=decoder_kind,
+        decoder_params=decoder_params,
+        onset_decoder=onset_decoder,
+        offset_decoder=offset_decoder,
+        postproc_modules=tuple(postproc_modules),
+        postproc_debug=postproc_debug,
+        cfg=cfg,
+    )
 
     printed_header = False
-
-    def _header():
-        nonlocal printed_header
-        if not printed_header:
-            cols = [
-                "onset_thr",
-                "offset_thr",
-            ]
-            if include_k_column:
-                cols.append("k_onset")
-            cols.extend(
-                [
-                    "onset_f1",
-                    "offset_f1",
-                    "onset_pred_rate",
-                    "onset_pos_rate",
-                    "onset_event_f1",
-                    "offset_event_f1",
-                ]
-            )
-            print("\t".join(cols))
-            printed_header = True
-    
-    def _print_row(res: dict):
-        values = [f"{res['onset_thr']:.2f}", f"{res['offset_thr']:.2f}"]
-        if include_k_column:
-            values.append(str(res["k_onset"]))
-        values.extend(
-            [
-                f"{res['f1_on']:0.3f}",
-                f"{res['f1_off']:0.3f}",
-                f"{res['onset_pred_rate']:0.3f}",
-                f"{res['onset_pos_rate']:0.3f}",
-                f"{res['ev_f1_on']:0.3f}",
-                f"{res['ev_f1_off']:0.3f}",
-            ]
-        )
-        print("\t".join(values))
-
-    def _run_sanity_thresholds() -> None:
-        sanity_vals = args.sanity_thresholds or []
-        if not sanity_vals:
-            return
-        unique_vals = sorted({round(float(v), 6) for v in sanity_vals})
-        if not unique_vals:
-            return
-
-        def _clamp_prob(value: float) -> float:
-            return max(0.0, min(1.0, float(value)))
-
-        offset_ref: Optional[float] = None
-        if args.offset_prob_thresholds:
-            offset_ref = float(args.offset_prob_thresholds[0])
-        elif args.fixed_offset_prob is not None:
-            offset_ref = float(args.fixed_offset_prob)
-        elif args.prob_thresholds:
-            offset_ref = float(args.prob_thresholds[0])
-        elif args.thresholds:
-            offset_ref = _logit_to_probability(float(args.thresholds[0]))
-        if offset_ref is None:
-            offset_ref = 0.5
-        offset_ref = _clamp_prob(offset_ref)
-        onset_fmt = "[" + ",".join(f"{_clamp_prob(val):.4f}" for val in unique_vals) + "]"
-        print(
-            "[sanity] verifying monotonic onset_pred_rate thresholds={} offset_ref={:.4f}".format(
-                onset_fmt,
-                offset_ref,
-            ),
-            flush=True,
-        )
-        prev_rate: Optional[float] = None
-        prev_thr: Optional[float] = None
-        for idx, thr in enumerate(unique_vals, start=1):
-            prob_thr = _clamp_prob(thr)
-            res_payload, _ = _eval_pair(
-                prob_thr,
-                offset_ref,
-                use_logits=False,
-                k_onset=default_k_onset,
-                apply_postproc=sweep_apply_postproc,
-            )
-            rate = float(res_payload["onset_pred_rate"])
-            print(
-                "[sanity] #{idx} onset_thr={thr:.4f} onset_pred_rate={rate:.6f}".format(
-                    idx=idx,
-                    thr=prob_thr,
-                    rate=rate,
-                ),
-                flush=True,
-            )
-            if prev_rate is not None and rate > prev_rate + 1e-9:
-                message = (
-                    "[sanity] ERROR: onset_pred_rate increased "
-                    "thr_prev={prev:.4f} rate_prev={rate_prev:.6f} "
-                    "thr_curr={curr:.4f} rate_curr={rate_curr:.6f}".format(
-                        prev=prev_thr if prev_thr is not None else float("nan"),
-                        rate_prev=prev_rate,
-                        curr=prob_thr,
-                        rate_curr=rate,
-                    )
-                )
-                print(message, file=sys.stderr, flush=True)
-                raise RuntimeError(message)
-            prev_rate = rate
-            prev_thr = prob_thr
-
-    def _replay_cache(entry: Mapping[str, Any]) -> None:
-        rows = entry.get("rows") or []
-        saved_at = entry.get("timestamp") or "unknown"
-        key_hint = entry.get("key", "")
-        if isinstance(rows, list):
-            print(
-                "[cache] eval cache hit key={key} combos={count} saved={stamp}".format(
-                    key=key_hint[:8] if isinstance(key_hint, str) else "n/a",
-                    count=len(rows),
-                    stamp=saved_at,
-                ),
-                flush=True,
-            )
-            if rows:
-                _header()
-                for cached_row in rows:
-                    _print_row(cached_row)
-        summary = entry.get("summary_lines") or []
-        for line in summary:
-            print(line)
 
     sanity_requested = bool(args.sanity_thresholds)
     eval_cache_enabled = not args.no_eval_cache and not sanity_requested
@@ -2277,7 +3012,11 @@ def main():
         entries = cache_db.get("entries", {})
         cached_entry = entries.get(cache_key)
         if cached_entry and cached_entry.get("fingerprint") == cache_fingerprint:
-            _replay_cache(cached_entry)
+            printed_header = replay_cache_entry(
+                cached_entry,
+                include_k_column=include_k_column,
+                printed_header=printed_header,
+            )
             return
 
     best_result = None
@@ -2285,99 +3024,13 @@ def main():
     total_evals = 0
     summary_lines: List[str] = []
 
-    def _update_best(res: dict, stats: dict):
-        nonlocal best_result
-        nonlocal best_post_stats
-        nonlocal total_evals
-        total_evals += 1
-        ev_mean = 0.5 * (res["ev_f1_on"] + res["ev_f1_off"])
-        if best_result is None:
-            best_result = {**res, "ev_mean": ev_mean}
-            best_post_stats = copy.deepcopy(stats) if stats else None
-            return
-        best_mean = best_result.get("ev_mean", -1.0)
-        if ev_mean > best_mean + 1e-9:
-            best_result = {**res, "ev_mean": ev_mean}
-            best_post_stats = copy.deepcopy(stats) if stats else None
-        elif abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
-            best_result = {**res, "ev_mean": ev_mean}
-            best_post_stats = copy.deepcopy(stats) if stats else None
-
-    def _write_post_logs(best_row: Mapping[str, Any], stats: Mapping[str, Any] | None) -> None:
-        if not stats:
-            return
-        try:
-            post_logs_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return
-        summary_payload = {
-            "onset_thr": best_row.get("onset_thr"),
-            "offset_thr": best_row.get("offset_thr"),
-            "k_onset": best_row.get("k_onset"),
-            "decoder": {
-                "kind": best_row.get("decoder_kind"),
-                "onset_open": best_row.get("decoder_onset_open"),
-                "onset_hold": best_row.get("decoder_onset_hold"),
-                "offset_open": best_row.get("decoder_offset_open"),
-                "offset_hold": best_row.get("decoder_offset_hold"),
-            },
-            "metrics": stats.get("metrics"),
-            "snap": stats.get("snap"),
-            "dp": stats.get("dp"),
-            "context": {
-                "split": split,
-                "frames": frames_display,
-                "max_clips": max_clips_display,
-                "decoder_notice": decoder_settings_summary,
-            },
-        }
-        summary_path = post_logs_dir / "post_summary.json"
-        per_key_payload: Dict[str, Any] = {}
-        snap_stats = stats.get("snap") if isinstance(stats, Mapping) else None
-        if isinstance(snap_stats, Mapping) and snap_stats.get("per_key"):
-            per_key_payload["snap"] = snap_stats["per_key"]
-        dp_stats = stats.get("dp") if isinstance(stats, Mapping) else None
-        if isinstance(dp_stats, Mapping) and dp_stats.get("per_key"):
-            per_key_payload["dp"] = dp_stats["per_key"]
-        try:
-            summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True))
-            if per_key_payload:
-                (post_logs_dir / "per_key_stats.json").write_text(json.dumps(per_key_payload, indent=2, sort_keys=True))
-        except OSError:
-            pass
-    
-    combo_idx = 0
-    t_grid0 = time.time()
-    last_grid_print = t_grid0
+    combo_state = {
+        "combo_idx": 0,
+        "num_combos": num_combos,
+        "start_time": time.time(),
+        "last_grid_print": time.time(),
+    }
     _log_progress(f"[progress] grid sweep start: combos={num_combos}", force=True)
-
-    def _run_eval(on_thr, off_thr, use_logits, *, k_onset=None, apply_postproc=True):
-        nonlocal combo_idx
-        nonlocal last_grid_print
-        res, post_stats = _eval_pair(on_thr, off_thr, use_logits, k_onset=k_onset, apply_postproc=apply_postproc)
-        _print_row(res)
-        row_records.append(dict(res))
-        _update_best(res, post_stats)
-        combo_idx += 1
-        if args.progress and num_combos > 0:
-            now = time.time()
-            progress_force = combo_idx == 1 or combo_idx == num_combos
-            if progress_force or now - last_grid_print >= args.progress_interval:
-                elapsed = now - t_grid0
-                if combo_idx > 0 and num_combos:
-                    remaining = max(num_combos - combo_idx, 0)
-                    eta_seconds = (elapsed / combo_idx) * remaining if combo_idx else 0.0
-                    eta_display = _format_seconds(eta_seconds)
-                else:
-                    eta_display = "??:??"
-                k_display = k_onset if k_onset is not None else default_k_onset
-                _log_progress(
-                    f"[progress] grid {combo_idx}/{num_combos}  onset_thr={on_thr:.3f}  offset_thr={off_thr:.3f}  k_onset={k_display}  elapsed={_format_seconds(elapsed)}  eta≈{eta_display}",
-                    force=progress_force,
-                )
-                last_grid_print = now
-        return res
-
 
     if args.head is None:
         # Evaluate at calibrated thresholds if provided.
@@ -2385,49 +3038,91 @@ def main():
             on_cal = calibration_data.get("onset", {})
             off_cal = calibration_data.get("offset", {})
             if "best_logit" in on_cal and "best_logit" in off_cal:
-                _header()
-                _run_eval(
+                printed_header = print_sweep_header(include_k_column, printed_header)
+                best_result, best_post_stats, total_evals = run_eval_combo(
                     on_cal["best_logit"],
                     off_cal["best_logit"],
                     True,
                     k_onset=default_k_onset,
                     apply_postproc=sweep_apply_postproc,
+                    eval_ctx=eval_ctx,
+                    include_k_column=include_k_column,
+                    row_records=row_records,
+                    best_result=best_result,
+                    best_post_stats=best_post_stats,
+                    total_evals=total_evals,
+                    combo_state=combo_state,
+                    args=args,
+                    log_progress=_log_progress,
                 )
             elif "best_prob" in on_cal and "best_prob" in off_cal:
-                _header()
-                _run_eval(
+                printed_header = print_sweep_header(include_k_column, printed_header)
+                best_result, best_post_stats, total_evals = run_eval_combo(
                     on_cal["best_prob"],
                     off_cal["best_prob"],
                     False,
                     k_onset=default_k_onset,
                     apply_postproc=sweep_apply_postproc,
+                    eval_ctx=eval_ctx,
+                    include_k_column=include_k_column,
+                    row_records=row_records,
+                    best_result=best_result,
+                    best_post_stats=best_post_stats,
+                    total_evals=total_evals,
+                    combo_state=combo_state,
+                    args=args,
+                    log_progress=_log_progress,
                 )
             else:
                 print("Calibration file missing best_logit/best_prob keys", file=sys.stderr)
 
         # Sweep over provided threshold grids.
         if args.thresholds:
-            _header()
+            printed_header = print_sweep_header(include_k_column, printed_header)
             offset_list = args.offset_thresholds if args.offset_thresholds else args.thresholds
             if len(offset_list) != len(args.thresholds):
                 print("error: offset logit threshold count must match onset count", file=sys.stderr)
                 return
             for on_thr, off_thr in zip(args.thresholds, offset_list):
-                _run_eval(on_thr, off_thr, True, k_onset=default_k_onset, apply_postproc=sweep_apply_postproc)
+                best_result, best_post_stats, total_evals = run_eval_combo(
+                    on_thr,
+                    off_thr,
+                    True,
+                    k_onset=default_k_onset,
+                    apply_postproc=sweep_apply_postproc,
+                    eval_ctx=eval_ctx,
+                    include_k_column=include_k_column,
+                    row_records=row_records,
+                    best_result=best_result,
+                    best_post_stats=best_post_stats,
+                    total_evals=total_evals,
+                    combo_state=combo_state,
+                    args=args,
+                    log_progress=_log_progress,
+                )
         if args.prob_thresholds:
-            _header()
+            printed_header = print_sweep_header(include_k_column, printed_header)
             onset_list = args.prob_thresholds
             offset_list = args.offset_prob_thresholds if args.offset_prob_thresholds else onset_list
             for k_val in k_candidates:
                 if args.grid_prob_thresholds:
                     for on_thr in onset_list:
                         for off_thr in offset_list:
-                            _run_eval(
+                            best_result, best_post_stats, total_evals = run_eval_combo(
                                 on_thr,
                                 off_thr,
                                 False,
                                 k_onset=k_val,
                                 apply_postproc=sweep_apply_postproc,
+                                eval_ctx=eval_ctx,
+                                include_k_column=include_k_column,
+                                row_records=row_records,
+                                best_result=best_result,
+                                best_post_stats=best_post_stats,
+                                total_evals=total_evals,
+                                combo_state=combo_state,
+                                args=args,
+                                log_progress=_log_progress,
                             )
                 else:
                     if len(onset_list) != len(offset_list):
@@ -2435,12 +3130,21 @@ def main():
                         return
                     for idx, on_thr in enumerate(onset_list):
                         off_thr = offset_list[idx]
-                        _run_eval(
+                        best_result, best_post_stats, total_evals = run_eval_combo(
                             on_thr,
                             off_thr,
                             False,
                             k_onset=k_val,
                             apply_postproc=sweep_apply_postproc,
+                            eval_ctx=eval_ctx,
+                            include_k_column=include_k_column,
+                            row_records=row_records,
+                            best_result=best_result,
+                            best_post_stats=best_post_stats,
+                            total_evals=total_evals,
+                            combo_state=combo_state,
+                            args=args,
+                            log_progress=_log_progress,
                         )
     else:
         # Per-head sweep
@@ -2493,21 +3197,41 @@ def main():
         print(
             f"Per-head sweep: head={args.head}, mode={mode}, fixed_{other_head}={fixed_thr:.3f} (source={source})"
         )
-        _header()
+        printed_header = print_sweep_header(include_k_column, printed_header)
         for t in sweep_vals:
             if args.head == "onset":
                 on_thr, off_thr = t, fixed_thr
             else:
                 on_thr, off_thr = fixed_thr, t
-            _run_eval(
+            best_result, best_post_stats, total_evals = run_eval_combo(
                 on_thr,
                 off_thr,
                 use_logits,
                 k_onset=default_k_onset,
                 apply_postproc=sweep_apply_postproc,
+                eval_ctx=eval_ctx,
+                include_k_column=include_k_column,
+                row_records=row_records,
+                best_result=best_result,
+                best_post_stats=best_post_stats,
+                total_evals=total_evals,
+                combo_state=combo_state,
+                args=args,
+                log_progress=_log_progress,
             )
 
-    grid_elapsed = time.time() - t_grid0
+    run_sanity_thresholds(
+        args,
+        default_k_onset=default_k_onset,
+        sweep_apply_postproc=sweep_apply_postproc,
+        onset_peak=onset_peak,
+        offset_peak=offset_peak,
+        onset_lower_hint=onset_lower_hint,
+        offset_lower_hint=offset_lower_hint,
+        eval_ctx=eval_ctx,
+    )
+
+    grid_elapsed = time.time() - combo_state["start_time"]
     stage_durations["grid_pass"] = grid_elapsed
     grid_rate = total_evals / grid_elapsed if grid_elapsed > 0 else 0.0
     _log_progress(
@@ -2541,10 +3265,11 @@ def main():
         final_postproc_applied = bool(best_result.get("_postproc_applied", False))
         need_final_eval = final_apply_postproc and bool(postproc_modules) and not final_postproc_applied
         if need_final_eval:
-            final_res, final_stats = _eval_pair(
+            final_res, final_stats = evaluate_threshold_pair(
                 best_result["onset_thr"],
                 best_result["offset_thr"],
                 best_result.get("use_logits", False),
+                ctx=eval_ctx,
                 k_onset=best_result.get("k_onset", default_k_onset),
                 apply_postproc=True,
             )
@@ -2576,9 +3301,15 @@ def main():
         for line in summary_lines:
             print(line)
         if postproc_debug and best_post_stats:
-            _write_post_logs(best_result, best_post_stats)
-
-    _run_sanity_thresholds()
+            write_post_logs(
+                post_logs_dir,
+                best_row=best_result,
+                stats=best_post_stats,
+                split=split,
+                frames_display=frame_text,
+                max_clips_display=max_clips_text,
+                decoder_settings_summary=decoder_settings_summary,
+            )
 
     if (
         eval_cache_enabled

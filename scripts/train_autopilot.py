@@ -72,6 +72,9 @@ CLI Arguments:
     --postproc-mode {never,eval_only,always} (default: eval_only)
         Forward decoder post-processing strategy to ``eval_thresholds.py`` so
         sweeps can skip DP/snap while final evals still apply them.
+    --model-return-per-tile / --no-model-return-per-tile (default: disabled)
+        When enabled, forward ``--model-return-per-tile`` to ``eval_thresholds.py`` so
+        per-tile logits and boundary diagnostics are emitted during eval.
     --onset_open_grid FLOAT [FLOAT ...]
         Candidate onset decoder open gates explored during Stage-A (default: 0.22–0.28).
     --onset_min_on_grid INT [INT ...]
@@ -145,6 +148,7 @@ EVAL_THRESHOLD_VALUELESS_FLAGS = {
     "--sweep_k_onset",
     "--no-avlag",
     "--legacy-eval-thresholds",
+    "--model-return-per-tile",
     "--progress",
     "--no-progress",
     "--deterministic",
@@ -1651,6 +1655,9 @@ def perform_calibration(
                 idx += 1
         _strip_eval_flag("--postproc-mode")
         eval_extras.extend(["--postproc-mode", args.postproc_mode])
+        if args.model_return_per_tile:
+            _strip_eval_flag("--model-return-per-tile")
+            eval_extras.append("--model-return-per-tile")
         if legacy_decoder and "--legacy-eval-thresholds" not in eval_extras:
             eval_extras.append("--legacy-eval-thresholds")
         if extras:
@@ -2977,6 +2984,12 @@ def main() -> int:
         choices=["never", "eval_only", "always"],
         default="eval_only",
         help="Forward to eval_thresholds.py --postproc-mode (default: eval_only)",
+    )
+    ap.add_argument(
+        "--model-return-per-tile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Forward to eval_thresholds.py --model-return-per-tile for per-tile logits",
     )
     ap.add_argument(
         "--decoder-impl",
