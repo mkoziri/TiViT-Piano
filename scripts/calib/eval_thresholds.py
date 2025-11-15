@@ -88,7 +88,7 @@ from tivit.decoder.global_fusion import (
     build_batch_tile_mask,
     fuse_tile_logits,
 )
-from tivit.decoder.tile_keymap import build_tile_key_mask
+from tivit.decoder.tile_keymap import TileMaskResult
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.logging_utils import QUIET_INFO_FLAG
 from utils.identifiers import canonical_video_id
@@ -374,7 +374,7 @@ def _process_per_tile_outputs(
     model_tiles: int,
     preview_prob_threshold: float,
     tile_preview_stats: Dict[str, Any],
-    tile_key_mask_cache: Dict[str, np.ndarray],
+    tile_key_mask_cache: Dict[str, TileMaskResult],
     tile_key_mask_cushion: int,
     reg_meta_cache: Mapping[str, Mapping[str, Any]],
     fusion_enabled: bool,
@@ -431,7 +431,7 @@ def _process_per_tile_outputs(
     if fusion_enabled or paths:
         clip_ids = _resolve_clip_ids(paths, onset_tile.shape[0])
         key_dim = int(onset_tile.shape[-1])
-        tile_mask_tensor = build_batch_tile_mask(
+        tile_mask_batch = build_batch_tile_mask(
             clip_ids,
             reg_meta_cache=reg_meta_cache,
             mask_cache=tile_key_mask_cache,
@@ -439,13 +439,13 @@ def _process_per_tile_outputs(
             cushion_keys=tile_key_mask_cushion,
             n_keys=key_dim,
         )
-        mask_np_batch = (tile_mask_tensor.detach().cpu().numpy() >= 0.5)
-        for mask_np in mask_np_batch:
-            overlap = mask_np.sum(axis=0)
-            boundary_count = int(np.count_nonzero(overlap > 1))
-            tile_boundary_hist[boundary_count] += 1
+        tile_mask_tensor = tile_mask_batch.tensor
+        records = tile_mask_batch.records
+        for idx, record in enumerate(records):
+            tile_boundary_hist[record.boundary_keys] += 1
             if fusion_debug_state is not None:
-                fusion_debug_state.record_mask(mask_np, boundary_count=boundary_count)
+                clip_ref = clip_ids[idx] if idx < len(clip_ids) else None
+                fusion_debug_state.record_mask_result(record, clip_id=clip_ref)
     fusion_targets: Dict[str, torch.Tensor] = {}
     if comparison_enabled:
         if preview_valid:
@@ -1813,7 +1813,7 @@ def _collect_logits(
     skipped_batches = 0
 
     tile_boundary_hist: Counter[int] = Counter()
-    tile_key_mask_cache: Dict[str, np.ndarray] = {}
+    tile_key_mask_cache: Dict[str, TileMaskResult] = {}
     tile_preview_stats = {"max_abs_diff": 0.0, "max_f1_delta": 0.0, "count": 0}
     tile_key_mask_cushion = fusion_cfg.cushion_keys if fusion_enabled else 2
     per_tile_shape_logged = False

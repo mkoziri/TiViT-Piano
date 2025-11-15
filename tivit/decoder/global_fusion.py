@@ -9,7 +9,7 @@ from collections import Counter
 import numpy as np
 import torch
 
-from .tile_keymap import build_tile_key_mask
+from .tile_keymap import TileMaskResult, build_tile_key_mask
 
 _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
 _FALLBACK_CACHE_KEY = "__fallback__"
@@ -46,8 +46,9 @@ class ComparisonAccumulator:
 class FusionDebugState:
     """Collects coverage/shape/comparison summaries for debug logging."""
 
-    def __init__(self, num_tiles: int) -> None:
+    def __init__(self, num_tiles: int, n_keys: int = 88) -> None:
         self.num_tiles = max(int(num_tiles), 0)
+        self.n_keys = max(int(n_keys), 0)
         self.coverage_sum: List[float] = [0.0 for _ in range(self.num_tiles)]
         self.coverage_min: List[float] = [float("inf") for _ in range(self.num_tiles)]
         self.coverage_max: List[float] = [0.0 for _ in range(self.num_tiles)]
@@ -55,6 +56,13 @@ class FusionDebugState:
         self.shape_lines: List[str] = []
         self.comparison: dict[str, ComparisonAccumulator] = {}
         self.boundary_hist: Counter[int] = Counter()
+        self.key_index_min: List[int] = [self.n_keys for _ in range(self.num_tiles)]
+        self.key_index_max: List[int] = [-1 for _ in range(self.num_tiles)]
+        self.registration_clips: int = 0
+        self.fallback_clips: int = 0
+        self.fallback_reasons: Counter[str] = Counter()
+        self.clip_reports: List[str] = []
+        self._clip_report_limit = 5
 
     def record_shape(self, head: str, tile_shape: Sequence[int], fused_shape: Sequence[int]) -> None:
         head_key = str(head)
@@ -75,10 +83,31 @@ class FusionDebugState:
             self.coverage_sum[idx] += float(count)
             self.coverage_min[idx] = min(self.coverage_min[idx], float(count))
             self.coverage_max[idx] = max(self.coverage_max[idx], float(count))
+            covered = np.flatnonzero(mask[idx])
+            if covered.size > 0:
+                self.key_index_min[idx] = min(self.key_index_min[idx], int(covered[0]))
+                self.key_index_max[idx] = max(self.key_index_max[idx], int(covered[-1]))
         if boundary_count is None:
             overlap = mask.sum(axis=0)
             boundary_count = int(np.count_nonzero(overlap > 1))
         self.boundary_hist[int(boundary_count)] += 1
+
+    def record_mask_result(self, record: TileMaskResult, clip_id: Optional[str] = None) -> None:
+        self.record_mask(record.mask, boundary_count=record.boundary_keys)
+        if record.registration_based:
+            self.registration_clips += 1
+        else:
+            self.fallback_clips += 1
+            reason = record.fallback_reason or "unknown"
+            self.fallback_reasons[reason] += 1
+        if len(self.clip_reports) >= self._clip_report_limit:
+            return
+        parts = []
+        for idx, (rng, count) in enumerate(zip(record.tile_key_ranges, record.tile_key_counts)):
+            parts.append(f"tile{idx}:keys={count} range=[{rng[0]},{rng[1]}]")
+        mode = "registration" if record.registration_based else f"fallback({record.fallback_reason or 'unknown'})"
+        clip_label = clip_id or "?"
+        self.clip_reports.append(f"clip {clip_label} {mode} " + ", ".join(parts))
 
     def record_comparison(
         self,
@@ -129,12 +158,27 @@ class FusionDebugState:
                 avg = self.coverage_sum[idx] / max(1, self.coverage_clips)
                 min_val = int(round(self.coverage_min[idx]))
                 max_val = int(round(self.coverage_max[idx]))
-                parts.append(f"tile{idx}:avg={avg:.1f}[{min_val},{max_val}]")
+                range_lo = self.key_index_min[idx]
+                range_hi = self.key_index_max[idx]
+                if range_lo > range_hi:
+                    range_desc = "range=[-, -]"
+                else:
+                    range_desc = f"range=[{range_lo},{range_hi}]"
+                parts.append(f"tile{idx}:avg={avg:.1f}[{min_val},{max_val}] {range_desc}")
             if parts:
                 lines.append(f"{prefix} tile coverage (clips={self.coverage_clips}): " + ", ".join(parts))
+        if self.registration_clips or self.fallback_clips:
+            lines.append(
+                f"{prefix} coverage sources registration={self.registration_clips} fallback={self.fallback_clips}"
+            )
+        if self.fallback_reasons:
+            reason_desc = ", ".join(f"{k}:{v}" for k, v in sorted(self.fallback_reasons.items()))
+            lines.append(f"{prefix} fallback reasons {{{reason_desc}}}")
         if self.boundary_hist:
             hist_desc = ", ".join(f"{k}:{v}" for k, v in sorted(self.boundary_hist.items()))
             lines.append(f"{prefix} boundary-keys {{{hist_desc}}}")
+        for report in self.clip_reports:
+            lines.append(f"{prefix} {report}")
         for head, stats in self.comparison.items():
             if stats.count <= 0:
                 continue
@@ -196,39 +240,50 @@ def resolve_tile_key_mask(
     clip_id: Optional[str],
     *,
     reg_meta_cache: Mapping[str, Mapping[str, Any]],
-    mask_cache: MutableMapping[str, np.ndarray],
+    mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
     n_keys: int,
-) -> np.ndarray:
+) -> TileMaskResult:
     cache_key = clip_id or f"{_FALLBACK_CACHE_KEY}_{n_keys}"
     if cache_key in mask_cache:
         return mask_cache[cache_key]
     reg_meta = reg_meta_cache.get(clip_id) if clip_id else None
-    mask = build_tile_key_mask(
+    result = build_tile_key_mask(
         reg_meta,
         num_tiles=num_tiles,
         cushion_keys=cushion_keys,
         n_keys=n_keys,
     )
-    mask_cache[cache_key] = mask
-    return mask
+    if (not result.registration_based) and clip_id:
+        reason = result.fallback_reason or "unknown"
+        print(f"[fusion] fallback coverage clip={clip_id} reason={reason}", flush=True)
+    mask_cache[cache_key] = result
+    return result
+
+
+@dataclass(frozen=True)
+class TileMaskBatch:
+    tensor: torch.Tensor
+    records: List[TileMaskResult]
 
 
 def build_batch_tile_mask(
     clip_ids: Sequence[Optional[str]],
     *,
     reg_meta_cache: Mapping[str, Mapping[str, Any]],
-    mask_cache: MutableMapping[str, np.ndarray],
+    mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
     n_keys: int,
-) -> torch.Tensor:
+) -> TileMaskBatch:
     if not clip_ids:
-        return torch.zeros((0, num_tiles, n_keys), dtype=torch.float32)
+        empty = torch.zeros((0, num_tiles, n_keys), dtype=torch.float32)
+        return TileMaskBatch(tensor=empty, records=[])
     masks: List[np.ndarray] = []
+    records: List[TileMaskResult] = []
     for clip_id in clip_ids:
-        mask = resolve_tile_key_mask(
+        record = resolve_tile_key_mask(
             clip_id,
             reg_meta_cache=reg_meta_cache,
             mask_cache=mask_cache,
@@ -236,9 +291,10 @@ def build_batch_tile_mask(
             cushion_keys=cushion_keys,
             n_keys=n_keys,
         )
-        masks.append(mask.astype(np.float32))
+        records.append(record)
+        masks.append(record.mask.astype(np.float32))
     stacked = np.stack(masks, axis=0)
-    return torch.from_numpy(stacked)
+    return TileMaskBatch(tensor=torch.from_numpy(stacked), records=records)
 
 
 def fuse_tile_logits(tile_logits: torch.Tensor, tile_mask: torch.Tensor, *, mode: str = "masked_mean") -> torch.Tensor:
@@ -279,4 +335,5 @@ __all__ = [
     "build_batch_tile_mask",
     "fuse_tile_logits",
     "resolve_tile_key_mask",
+    "TileMaskBatch",
 ]

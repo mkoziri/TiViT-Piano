@@ -84,6 +84,7 @@ from tivit.decoder.global_fusion import (
     build_batch_tile_mask,
     fuse_tile_logits,
 )
+from tivit.decoder.tile_keymap import TileMaskResult
 from utils import load_config, align_pitch_dim, configure_verbosity, canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
@@ -528,7 +529,7 @@ def _collect(
     fusion_debug_state = FusionDebugState(model_tiles) if fusion_enabled else None
     comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
     comparison_batches_used = 0
-    tile_mask_cache: Dict[str, np.ndarray] = {}
+    tile_mask_cache: Dict[str, TileMaskResult] = {}
     reg_meta_cache: Dict[str, Dict[str, Any]] = {}
     if fusion_enabled:
         reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
@@ -581,7 +582,7 @@ def _collect(
                 pitch_tile = out.get("pitch_tile")
                 if onset_tile is None or offset_tile is None:
                     raise RuntimeError("global fusion enabled but model did not return per-tile logits")
-                tile_mask_tensor = build_batch_tile_mask(
+                tile_mask_batch = build_batch_tile_mask(
                     clip_ids,
                     reg_meta_cache=reg_meta_cache,
                     mask_cache=tile_mask_cache,
@@ -589,12 +590,13 @@ def _collect(
                     cushion_keys=fusion_cfg.cushion_keys,
                     n_keys=int(onset_tile.shape[-1]),
                 )
+                tile_mask_tensor = tile_mask_batch.tensor
                 mask_device = onset_tile.device
                 mask_tensor_device = tile_mask_tensor.to(mask_device, dtype=onset_tile.dtype)
                 if fusion_debug_state is not None:
-                    mask_np_batch = (tile_mask_tensor.detach().cpu().numpy() >= 0.5)
-                    for mask_np in mask_np_batch:
-                        fusion_debug_state.record_mask(mask_np)
+                    for idx, record in enumerate(tile_mask_batch.records):
+                        clip_ref = clip_ids[idx] if idx < len(clip_ids) else None
+                        fusion_debug_state.record_mask_result(record, clip_id=clip_ref)
                 apply_heads = {head.lower() for head in fusion_cfg.apply_to}
                 if "onset" in apply_heads:
                     fused_onset = fuse_tile_logits(onset_tile, mask_tensor_device, mode=fusion_cfg.mode)

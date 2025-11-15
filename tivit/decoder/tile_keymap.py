@@ -2,169 +2,144 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
+from .registration_geometry import (
+    RectifiedKeyboardGeometry,
+    TileBounds,
+    resolve_rectified_keyboard_geometry,
+    resolve_tile_bounds,
+)
 
-def _uniform_bounds(num_tiles: int) -> List[Tuple[float, float]]:
-    edges = np.linspace(0.0, 1.0, num_tiles + 1, dtype=np.float32)
-    return [(float(edges[i]), float(edges[i + 1])) for i in range(num_tiles)]
+
+@dataclass(frozen=True)
+class TileMaskResult:
+    mask: np.ndarray
+    registration_based: bool
+    fallback_reason: Optional[str]
+    tile_bounds_px: np.ndarray
+    rectified_width: float
+    key_centers_px: np.ndarray
+    boundary_keys: int
+    tile_key_ranges: List[Tuple[int, int]]
+    tile_key_counts: List[int]
+    geometry_source: str
+    tile_source: str
 
 
-def _coerce_pair(value: Any) -> Optional[Tuple[float, float]]:
-    if isinstance(value, Mapping):
-        for left_key in ("left", "x0", "start", "min_x", "min", "lo", "low"):
-            if left_key in value:
-                left = value[left_key]
-                break
+def _uniform_key_mask(num_tiles: int, n_keys: int, cushion: int) -> np.ndarray:
+    mask = np.zeros((num_tiles, n_keys), dtype=bool)
+    edges = np.linspace(0.0, n_keys, num_tiles + 1, dtype=np.float32)
+    for idx in range(num_tiles):
+        start = int(np.floor(edges[idx]))
+        end = int(np.ceil(edges[idx + 1]) - 1)
+        start = max(0, start - cushion)
+        end = min(n_keys - 1, max(start, end + cushion))
+        mask[idx, start : end + 1] = True
+    return mask
+
+
+def _apply_cushion(mask: np.ndarray, cushion: int) -> np.ndarray:
+    if cushion <= 0:
+        return mask
+    expanded = mask.copy()
+    n_keys = mask.shape[1]
+    for idx in range(mask.shape[0]):
+        covered = np.flatnonzero(mask[idx])
+        if covered.size == 0:
+            continue
+        start = max(int(covered[0]) - cushion, 0)
+        end = min(int(covered[-1]) + cushion, n_keys - 1)
+        expanded[idx, start : end + 1] = True
+    return expanded
+
+
+def _mask_from_geometry(
+    geometry: RectifiedKeyboardGeometry,
+    tile_bounds: TileBounds,
+    *,
+    n_keys: int,
+) -> np.ndarray:
+    num_tiles = tile_bounds.pixels.shape[0]
+    mask = np.zeros((num_tiles, n_keys), dtype=bool)
+    key_centers = geometry.key_centers
+    bounds = tile_bounds.pixels
+    tile_centers = 0.5 * (bounds[:, 0] + bounds[:, 1])
+    for idx in range(num_tiles):
+        left = float(min(bounds[idx, 0], bounds[idx, 1]))
+        right = float(max(bounds[idx, 0], bounds[idx, 1]))
+        within = (key_centers >= left) & (key_centers <= right)
+        if idx == 0:
+            within |= key_centers < left
+        if idx == num_tiles - 1:
+            within |= key_centers > right
+        mask[idx, within] = True
+    missing = np.where(mask.sum(axis=0) == 0)[0]
+    if missing.size > 0 and tile_centers.size > 0:
+        kc = key_centers[missing].reshape(1, -1)
+        tc = tile_centers.reshape(-1, 1)
+        nearest = np.argmin(np.abs(tc - kc), axis=0)
+        for key_idx, tile_idx in zip(missing.tolist(), nearest.tolist()):
+            tile_idx = int(np.clip(tile_idx, 0, num_tiles - 1))
+            mask[tile_idx, int(key_idx)] = True
+    return mask
+
+
+def _mask_valid(mask: np.ndarray) -> bool:
+    if mask.ndim != 2 or mask.size == 0:
+        return False
+    if not np.all(mask.sum(axis=1) > 0):
+        return False
+    if not np.all(mask.sum(axis=0) > 0):
+        return False
+    return True
+
+
+def _count_boundary_keys(mask: np.ndarray) -> int:
+    overlap = mask.sum(axis=0)
+    return int(np.count_nonzero(overlap > 1))
+
+
+def _compute_ranges(mask: np.ndarray) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for row in mask:
+        covered = np.flatnonzero(row)
+        if covered.size == 0:
+            ranges.append((0, -1))
         else:
-            left = None
-        for right_key in ("right", "x1", "end", "max_x", "max", "hi", "high"):
-            if right_key in value:
-                right = value[right_key]
-                break
-        else:
-            right = None
-        if left is None or right is None:
-            return None
-        try:
-            return float(left), float(right)
-        except (TypeError, ValueError):
-            return None
-
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        if len(value) < 2:
-            return None
-        try:
-            return float(value[0]), float(value[1])
-        except (TypeError, ValueError):
-            return None
-    return None
+            ranges.append((int(covered[0]), int(covered[-1])))
+    return ranges
 
 
-def _coerce_bounds(candidate: Any, num_tiles: int) -> Optional[List[Tuple[float, float]]]:
-    if candidate is None:
-        return None
-
-    if isinstance(candidate, Mapping):
-        # Sometimes stored as {"0": [..], "1": [..]}
-        ordered = sorted(candidate.items(), key=lambda kv: kv[0])
-        parsed = [_coerce_pair(val) for _, val in ordered]
-        if all(pair is not None for pair in parsed) and len(parsed) == num_tiles:
-            return [pair for pair in parsed if pair is not None]
-        candidate = list(candidate.values())
-
-    if isinstance(candidate, np.ndarray):
-        candidate = candidate.tolist()
-
-    if not isinstance(candidate, Sequence) or isinstance(candidate, (str, bytes)):
-        return None
-
-    values: List[Any] = list(candidate)
-    if not values:
-        return None
-
-    # Case 1: list of explicit pairs
-    parsed_pairs = [_coerce_pair(item) for item in values]
-    if all(pair is not None for pair in parsed_pairs) and len(parsed_pairs) == num_tiles:
-        return [pair for pair in parsed_pairs if pair is not None]
-
-    # Case 2: boundary edges (len == num_tiles + 1)
-    if len(values) == num_tiles + 1:
-        try:
-            edges = [float(val) for val in values]
-        except (TypeError, ValueError):
-            edges = []
-        if len(edges) == num_tiles + 1:
-            return list(zip(edges[:-1], edges[1:]))
-
-    # Case 3: widths per tile (len == num_tiles)
-    if len(values) == num_tiles:
-        try:
-            widths = [float(val) for val in values]
-        except (TypeError, ValueError):
-            widths = []
-        if len(widths) == num_tiles and all(width >= 0.0 for width in widths):
-            edges = [0.0]
-            for width in widths:
-                edges.append(edges[-1] + width)
-            return list(zip(edges[:-1], edges[1:]))
-
-    return None
-
-
-def _resolve_width_hint(reg_meta: Any) -> Optional[float]:
-    if not isinstance(reg_meta, Mapping):
-        return None
-
-    for key in ("frame_width", "width", "rectified_width"):
-        val = reg_meta.get(key)
-        if isinstance(val, (int, float)) and val > 0:
-            return float(val)
-
-    target_hw = reg_meta.get("target_hw") or reg_meta.get("canonical_hw")
-    if isinstance(target_hw, Sequence) and len(target_hw) >= 2:
-        try:
-            width = float(target_hw[1])
-            if width > 0:
-                return width
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _normalize_bounds(bounds: Sequence[Tuple[float, float]], width_hint: Optional[float]) -> List[Tuple[float, float]]:
-    if not bounds:
-        return []
-    starts = np.asarray([b[0] for b in bounds], dtype=np.float32)
-    ends = np.asarray([b[1] for b in bounds], dtype=np.float32)
-    mask = np.isfinite(starts) & np.isfinite(ends)
-    if not np.all(mask):
-        raise ValueError("tile bounds contain non-finite values")
-    min_start = float(np.min(starts))
-    max_end = float(np.max(ends))
-    if width_hint is None or width_hint <= 0.0:
-        width = max(max_end - min_start, 1e-6)
-    else:
-        width = float(width_hint)
-    if not np.isfinite(width) or width <= 0.0:
-        width = max(max_end - min_start, 1e-6)
-    norm_bounds: List[Tuple[float, float]] = []
-    for start, end in zip(starts.tolist(), ends.tolist()):
-        if end < start:
-            start, end = end, start
-        start_norm = (start - min_start) / width
-        end_norm = (end - min_start) / width
-        norm_bounds.append((float(start_norm), float(end_norm)))
-    return norm_bounds
-
-
-def _extract_tile_bounds(reg_meta: Any, num_tiles: int) -> List[Tuple[float, float]]:
-    if isinstance(reg_meta, Mapping):
-        candidate_keys = [
-            "tile_bounds_norm",
-            "tile_bounds_normalized",
-            "tile_bounds",
-            "tile_bounds_px",
-            "tile_bounds_rect",
-        ]
-        for key in candidate_keys:
-            if key in reg_meta:
-                parsed = _coerce_bounds(reg_meta.get(key), num_tiles)
-                if parsed is not None and len(parsed) == num_tiles:
-                    return _normalize_bounds(parsed, _resolve_width_hint(reg_meta))
-        tiles_meta = reg_meta.get("tiles")
-        if isinstance(tiles_meta, Mapping):
-            for key in ("bounds", "bounds_px", "bounds_norm"):
-                parsed = _coerce_bounds(tiles_meta.get(key), num_tiles)
-                if parsed is not None and len(parsed) == num_tiles:
-                    return _normalize_bounds(parsed, _resolve_width_hint(reg_meta))
-        if "tile_tokens" in reg_meta:
-            parsed = _coerce_bounds(reg_meta["tile_tokens"], num_tiles)
-            if parsed is not None and len(parsed) == num_tiles:
-                return _normalize_bounds(parsed, _resolve_width_hint(reg_meta))
-    return _uniform_bounds(num_tiles)
+def _finalize_result(
+    mask: np.ndarray,
+    *,
+    registration_based: bool,
+    reason: Optional[str],
+    tile_bounds: TileBounds,
+    geometry: RectifiedKeyboardGeometry,
+    geometry_source: str,
+    tile_source: str,
+) -> TileMaskResult:
+    counts = mask.sum(axis=1).astype(int).tolist()
+    ranges = _compute_ranges(mask)
+    boundary = _count_boundary_keys(mask)
+    return TileMaskResult(
+        mask=mask,
+        registration_based=registration_based,
+        fallback_reason=reason,
+        tile_bounds_px=tile_bounds.pixels,
+        rectified_width=float(geometry.width),
+        key_centers_px=geometry.key_centers,
+        boundary_keys=boundary,
+        tile_key_ranges=ranges,
+        tile_key_counts=counts,
+        geometry_source=geometry_source,
+        tile_source=tile_source,
+    )
 
 
 def build_tile_key_mask(
@@ -172,49 +147,56 @@ def build_tile_key_mask(
     num_tiles: int,
     cushion_keys: int,
     n_keys: int = 88,
-) -> np.ndarray:
-    """
-    Build a boolean mask of shape (tiles, n_keys) indicating which MIDI keys each
-    tile is responsible for after rectification.
-
-    Args:
-        reg_meta: Registration metadata providing optional tile bounds (any shape).
-        num_tiles: Number of tiles used by the encoder.
-        cushion_keys: How many keys to expand on each side of a tile's span.
-        n_keys: Total number of keys (default: 88 for A0–C8).
-
-    Returns:
-        np.ndarray: Boolean mask with True where ``tile`` covers ``key``.
-    """
+) -> TileMaskResult:
+    """Compute tile-to-key coverage using registration metadata when available."""
 
     if num_tiles <= 0:
         raise ValueError("num_tiles must be positive")
     if n_keys <= 0:
         raise ValueError("n_keys must be positive")
 
-    bounds = _extract_tile_bounds(reg_meta, num_tiles)
     cushion = max(int(cushion_keys), 0)
-    mask = np.zeros((num_tiles, n_keys), dtype=bool)
+    geometry = resolve_rectified_keyboard_geometry(reg_meta, n_keys=n_keys)
+    tile_bounds = resolve_tile_bounds(reg_meta, num_tiles=num_tiles, width=geometry.width)
+    geometry_ready = geometry.source != "uniform" and geometry.valid
+    tile_ready = tile_bounds.source != "uniform" and tile_bounds.pixels.size > 0
 
-    key_min = 0
-    key_max = n_keys - 1
-    key_span = key_max - key_min + 1
+    if not geometry_ready or not tile_ready:
+        reason = "missing_key_geometry" if not geometry_ready else "missing_tile_bounds"
+        fallback_mask = _uniform_key_mask(num_tiles, n_keys, cushion)
+        return _finalize_result(
+            fallback_mask,
+            registration_based=False,
+            reason=reason,
+            tile_bounds=tile_bounds,
+            geometry=geometry,
+            geometry_source=geometry.source,
+            tile_source=tile_bounds.source,
+        )
 
-    for idx, (start_norm, end_norm) in enumerate(bounds):
-        start_norm = float(np.clip(min(start_norm, end_norm), 0.0, 1.0))
-        end_norm = float(np.clip(max(start_norm, end_norm), 0.0, 1.0))
-        start_key = key_min + start_norm * key_span
-        end_key = key_min + end_norm * key_span
-        start_idx = int(np.floor(start_key))
-        end_idx = int(np.ceil(end_key) - 1)
-        if end_idx < start_idx:
-            end_idx = start_idx
+    mask = _mask_from_geometry(geometry, tile_bounds, n_keys=n_keys)
+    mask = _apply_cushion(mask, cushion)
+    if not _mask_valid(mask):
+        fallback_mask = _uniform_key_mask(num_tiles, n_keys, cushion)
+        return _finalize_result(
+            fallback_mask,
+            registration_based=False,
+            reason="invalid_mask",
+            tile_bounds=tile_bounds,
+            geometry=geometry,
+            geometry_source=geometry.source,
+            tile_source=tile_bounds.source,
+        )
 
-        start_idx = max(key_min, start_idx - cushion)
-        end_idx = min(key_max, end_idx + cushion)
-        mask[idx, start_idx : end_idx + 1] = True
+    return _finalize_result(
+        mask,
+        registration_based=True,
+        reason=None,
+        tile_bounds=tile_bounds,
+        geometry=geometry,
+        geometry_source=geometry.source,
+        tile_source=tile_bounds.source,
+    )
 
-    return mask
 
-
-__all__ = ["build_tile_key_mask"]
+__all__ = ["TileMaskResult", "build_tile_key_mask"]
