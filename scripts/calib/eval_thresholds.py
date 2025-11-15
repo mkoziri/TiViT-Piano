@@ -1749,6 +1749,11 @@ def _collect_logits(
                         float(preview_abs),
                     )
                     onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
+                    # Collapse raw frame targets to the model's temporal resolution so the
+                    # preview metric compares like-for-like tensors.
+                    onset_targets_batch = pool_roll_BT(
+                        onset_targets_batch, tile_preview_neutral.shape[1]
+                    )
                     preview_probs = torch.sigmoid(tile_preview_neutral)
                     global_probs_neutral = torch.sigmoid(onset_logits_neutral)
                     preview_preds = (preview_probs >= preview_prob_threshold).float()
