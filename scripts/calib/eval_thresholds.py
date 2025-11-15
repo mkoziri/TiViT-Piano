@@ -1753,29 +1753,32 @@ def _collect_logits(
                     onset_targets_batch = pool_roll_BT(
                         onset_targets_batch, tile_preview_neutral.shape[1]
                     )
-                    if onset_targets_batch.shape != tile_preview_neutral.shape:
-                        if not per_tile_target_issue_logged:
-                            print(
-                                "[per-tile] skipping preview: target shape {} != preview {} (pooling mismatch)".format(
-                                    tuple(onset_targets_batch.shape),
-                                    tuple(tile_preview_neutral.shape),
-                                ),
-                                flush=True,
-                            )
-                            per_tile_target_issue_logged = True
-                        # Skip this batch; keep going to avoid blowing up calibration.
-                        continue
-                    preview_probs = torch.sigmoid(tile_preview_neutral)
-                    global_probs_neutral = torch.sigmoid(onset_logits_neutral)
-                    preview_preds = (preview_probs >= preview_prob_threshold).float()
-                    global_preds = (global_probs_neutral >= preview_prob_threshold).float()
-                    preview_f1 = _binary_f1(preview_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
-                    global_f1 = _binary_f1(global_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
-                    tile_preview_stats["max_f1_delta"] = max(
-                        tile_preview_stats["max_f1_delta"],
-                        abs(float(preview_f1) - float(global_f1)),
+                    onset_targets_batch = align_pitch_dim(
+                        tile_preview_neutral, onset_targets_batch, "onset"
                     )
-                    tile_preview_stats["count"] += 1
+                    preview_valid = onset_targets_batch.shape == tile_preview_neutral.shape
+                    if not preview_valid and not per_tile_target_issue_logged:
+                        print(
+                            "[per-tile] skipping preview: target shape {} != preview {} "
+                            "(pooling/pitch mismatch)".format(
+                                tuple(onset_targets_batch.shape),
+                                tuple(tile_preview_neutral.shape),
+                            ),
+                            flush=True,
+                        )
+                        per_tile_target_issue_logged = True
+                    if preview_valid:
+                        preview_probs = torch.sigmoid(tile_preview_neutral)
+                        global_probs_neutral = torch.sigmoid(onset_logits_neutral)
+                        preview_preds = (preview_probs >= preview_prob_threshold).float()
+                        global_preds = (global_probs_neutral >= preview_prob_threshold).float()
+                        preview_f1 = _binary_f1(preview_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+                        global_f1 = _binary_f1(global_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+                        tile_preview_stats["max_f1_delta"] = max(
+                            tile_preview_stats["max_f1_delta"],
+                            abs(float(preview_f1) - float(global_f1)),
+                        )
+                        tile_preview_stats["count"] += 1
                     if paths:
                         for clip_path in paths:
                             clip_id = canonical_video_id(Path(clip_path).stem)
