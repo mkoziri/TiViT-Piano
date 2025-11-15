@@ -428,6 +428,8 @@ class TiViTPiano(nn.Module):
         if getattr(self, "head_mode", "clip") == "frame":
             # Avg over spatial tokens to get per-tile temporal features
             tile_feats = enc_5d.mean(dim=3)  # (B, tiles, T', D)
+            # Note: downstream calibration paths read only the global logits
+            # computed below. Per-tile outputs remain diagnostic until Step 2.
             # Global path averages over tiles to preserve existing behavior
             g_t = tile_feats.mean(dim=1)  # (B, T', D)
 
@@ -455,6 +457,8 @@ class TiViTPiano(nn.Module):
                 pitch_tile  = self.head_pitch(tile_feats)   # (B, tiles, T', 88)
                 onset_tile  = self.head_onset(tile_feats)   # (B, tiles, T', 88)
                 offset_tile = self.head_offset(tile_feats)  # (B, tiles, T', 88)
+                # Future fusion/A0 logic should collapse these tensors back to (B,T,P)
+                # before invoking calibration so metric code sees the expected global shape.
                 outputs.update(
                     {
                         "pitch_tile":  pitch_tile,
@@ -475,4 +479,3 @@ class TiViTPiano(nn.Module):
             "clef_logits":   self.head_clef(g),                  # (B, 3)
         }
         return out
-

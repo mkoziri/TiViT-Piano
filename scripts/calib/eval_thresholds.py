@@ -430,6 +430,29 @@ def _handle_bad_batch(
     return skipped_batches
 
 
+def _validate_global_pair(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    label: str,
+) -> None:
+    """Ensure calibration receives global tensors (B,T,P) without extra tile dims."""
+
+    if not torch.is_tensor(logits) or not torch.is_tensor(targets):
+        return
+    if logits.dim() != targets.dim():
+        raise ValueError(
+            f"{label} logits/targets rank mismatch: got {tuple(logits.shape)} vs {tuple(targets.shape)}. "
+            "Per-head calibration requires reduced global tensors of identical rank."
+        )
+    if logits.dim() not in (2, 3):
+        raise ValueError(
+            f"{label} logits have unsupported shape {tuple(logits.shape)}. "
+            "Calibration expects (batch, time, keys) or (batch, keys). "
+            "If per-tile tensors were requested, reduce them to the global shape before calibration."
+        )
+
+
 def _percentile_tensor(flat: torch.Tensor, q: float) -> float:
     if flat.numel() == 0:
         return 0.0
@@ -1716,6 +1739,9 @@ def _collect_logits(
                             flush=True,
                         )
                         per_tile_shape_logged = True
+                    # Step-2 scaffolding: reduce per-tile logits to the global shape
+                    # before comparing. Calibration downstream only consumes the global
+                    # heads, so this preview stays diagnostic-only.
                     tile_preview_neutral = onset_tile.detach().mean(dim=1)
                     preview_abs = (tile_preview_neutral - onset_logits_neutral).abs().max().item()
                     tile_preview_stats["max_abs_diff"] = max(
@@ -1750,6 +1776,7 @@ def _collect_logits(
                             mask = tile_key_mask_cache[clip_id]
                             overlap = mask.sum(axis=0)
                             boundary_count = int(np.count_nonzero(overlap > 1))
+                            # These counts are logged for future Step-2 guardrails.
                             tile_boundary_hist[boundary_count] += 1
 
                 if onset_platt_stats["enabled"]:
@@ -2644,6 +2671,9 @@ def main():
     offset_probs = torch.cat(offset_probs, dim=0)
     onset_tgts = torch.cat(onset_tgts, dim=0)
     offset_tgts = torch.cat(offset_tgts, dim=0)
+
+    _validate_global_pair(onset_logits, onset_tgts, label="onset")
+    _validate_global_pair(offset_logits, offset_tgts, label="offset")
 
     T_logits, P_logits = onset_probs.shape[1], onset_probs.shape[2]
     if onset_tgts.shape[1] != T_logits:
