@@ -1651,6 +1651,7 @@ def _collect_logits(
     tile_preview_stats = {"max_abs_diff": 0.0, "max_f1_delta": 0.0, "count": 0}
     tile_key_mask_cushion = 2
     per_tile_shape_logged = False
+    per_tile_target_issue_logged = False
     reg_meta_cache: Dict[str, Dict[str, Any]] = {}
     if return_per_tile_requested:
         reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
@@ -1749,11 +1750,21 @@ def _collect_logits(
                         float(preview_abs),
                     )
                     onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
-                    # Collapse raw frame targets to the model's temporal resolution so the
-                    # preview metric compares like-for-like tensors.
                     onset_targets_batch = pool_roll_BT(
                         onset_targets_batch, tile_preview_neutral.shape[1]
                     )
+                    if onset_targets_batch.shape != tile_preview_neutral.shape:
+                        if not per_tile_target_issue_logged:
+                            print(
+                                "[per-tile] skipping preview: target shape {} != preview {} (pooling mismatch)".format(
+                                    tuple(onset_targets_batch.shape),
+                                    tuple(tile_preview_neutral.shape),
+                                ),
+                                flush=True,
+                            )
+                            per_tile_target_issue_logged = True
+                        # Skip this batch; keep going to avoid blowing up calibration.
+                        continue
                     preview_probs = torch.sigmoid(tile_preview_neutral)
                     global_probs_neutral = torch.sigmoid(onset_logits_neutral)
                     preview_preds = (preview_probs >= preview_prob_threshold).float()
