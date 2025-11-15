@@ -192,6 +192,18 @@ train:
   accumulate_steps: 12
   freeze_backbone_epochs: 0
 decoder:
+  global_fusion:
+    enabled: false
+    mode: masked_mean
+    cushion_keys: 2
+    apply_to:
+    - onset
+    - offset
+    - pitch
+    weighting: uniform
+    consistency_check:
+      enabled: false
+      batches: 2
   post:
     snap:
       enabled: false

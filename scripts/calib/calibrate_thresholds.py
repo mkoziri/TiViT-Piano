@@ -52,7 +52,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping, Optional, List, Dict
+from typing import Any, Mapping, Optional, List, Dict, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -77,7 +77,14 @@ from decoder.decode import (
     resolve_decoder_from_config,
     resolve_decoder_gates,
 )
-from utils import load_config, align_pitch_dim, configure_verbosity
+from tivit.decoder.global_fusion import (
+    GlobalFusionConfig,
+    FusionDebugState,
+    resolve_global_fusion_config,
+    build_batch_tile_mask,
+    fuse_tile_logits,
+)
+from utils import load_config, align_pitch_dim, configure_verbosity, canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
@@ -468,6 +475,33 @@ def _format_seconds(seconds: float) -> str:
     minutes, secs = divmod(int(seconds), 60)
     return f"{minutes:02d}:{secs:02d}"
 
+
+def _load_registration_metadata(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            result[canonical_video_id(str(key))] = value
+    return result
+
+
+def _resolve_clip_ids(paths: Sequence[str], count: int) -> List[Optional[str]]:
+    clip_ids: List[Optional[str]] = []
+    for idx in range(max(0, int(count))):
+        clip_id = None
+        if idx < len(paths):
+            clip_id = canonical_video_id(Path(paths[idx]).stem)
+        clip_ids.append(clip_id)
+    return clip_ids
+
 def _collect(
     model,
     loader,
@@ -478,12 +512,28 @@ def _collect(
     key_prior_fps: float,
     key_prior_midi_low: int | None,
     key_prior_midi_high: int | None,
+    return_per_tile: bool,
+    fusion_cfg: GlobalFusionConfig,
+    model_tiles: int,
+    preview_prob_threshold: float,
 ):
     onset_logits_list, offset_logits_list = [], []
     onset_probs_list, offset_probs_list = [], []
     onset_tgts_list, offset_tgts_list = [], []
     lag_ms_samples = []
     lag_source_counts: Counter[str] = Counter()
+    fusion_enabled = fusion_cfg.enabled
+    if fusion_enabled and not return_per_tile:
+        raise RuntimeError("Global fusion requires return_per_tile logits during calibration")
+    fusion_debug_state = FusionDebugState(model_tiles) if fusion_enabled else None
+    comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
+    comparison_batches_used = 0
+    tile_mask_cache: Dict[str, np.ndarray] = {}
+    reg_meta_cache: Dict[str, Dict[str, Any]] = {}
+    if fusion_enabled:
+        reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
+        reg_cache_path = Path(reg_cache_env) if reg_cache_env else REPO / "reg_refined.json"
+        reg_meta_cache = _load_registration_metadata(reg_cache_path)
 
     processed = 0
     timeout_hit = False
@@ -500,6 +550,14 @@ def _collect(
             if remaining is not None and remaining <= 0:
                 break
 
+            raw_paths = batch.get("path")
+            if isinstance(raw_paths, (list, tuple)):
+                paths = [str(p) for p in raw_paths]
+            elif raw_paths is None:
+                paths = []
+            else:
+                paths = [str(raw_paths)]
+
             x = batch["video"]
             batch_size = x.shape[0]
             take = batch_size if remaining is None or batch_size <= remaining else max(0, int(remaining))
@@ -507,8 +565,55 @@ def _collect(
                 break
             idx = slice(None) if take == batch_size else slice(0, take)
 
+            clip_ids: List[Optional[str]] = []
+            if fusion_enabled:
+                if paths and take < len(paths):
+                    paths = paths[:take]
+                clip_ids = _resolve_clip_ids(paths, take)
+
             x = x[idx]
-            out = model(x)
+            out = model(x, return_per_tile=return_per_tile)
+
+            comparison_pairs: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+            if fusion_enabled:
+                onset_tile = out.get("onset_tile")
+                offset_tile = out.get("offset_tile")
+                pitch_tile = out.get("pitch_tile")
+                if onset_tile is None or offset_tile is None:
+                    raise RuntimeError("global fusion enabled but model did not return per-tile logits")
+                tile_mask_tensor = build_batch_tile_mask(
+                    clip_ids,
+                    reg_meta_cache=reg_meta_cache,
+                    mask_cache=tile_mask_cache,
+                    num_tiles=model_tiles,
+                    cushion_keys=fusion_cfg.cushion_keys,
+                    n_keys=int(onset_tile.shape[-1]),
+                )
+                mask_device = onset_tile.device
+                mask_tensor_device = tile_mask_tensor.to(mask_device, dtype=onset_tile.dtype)
+                if fusion_debug_state is not None:
+                    mask_np_batch = (tile_mask_tensor.detach().cpu().numpy() >= 0.5)
+                    for mask_np in mask_np_batch:
+                        fusion_debug_state.record_mask(mask_np)
+                apply_heads = {head.lower() for head in fusion_cfg.apply_to}
+                if "onset" in apply_heads:
+                    fused_onset = fuse_tile_logits(onset_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                    if fusion_debug_state is not None:
+                        fusion_debug_state.record_shape("onset", onset_tile.shape, fused_onset.shape)
+                    comparison_pairs["onset"] = (onset_entry.detach(), fused_onset.detach())
+                    onset_entry = fused_onset
+                if "offset" in apply_heads:
+                    fused_offset = fuse_tile_logits(offset_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                    if fusion_debug_state is not None:
+                        fusion_debug_state.record_shape("offset", offset_tile.shape, fused_offset.shape)
+                    comparison_pairs["offset"] = (offset_entry.detach(), fused_offset.detach())
+                    offset_entry = fused_offset
+                if "pitch" in apply_heads and pitch_tile is not None and torch.is_tensor(out.get("pitch_logits")):
+                    fused_pitch = fuse_tile_logits(pitch_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                    if fusion_debug_state is not None:
+                        fusion_debug_state.record_shape("pitch", pitch_tile.shape, fused_pitch.shape)
+                    comparison_pairs["pitch"] = (out["pitch_logits"].detach(), fused_pitch.detach())
+                    out["pitch_logits"] = fused_pitch
 
             raw_heads: Dict[str, torch.Tensor] = {}
             onset_entry = out["onset_logits"] if "onset_logits" in out else out.get("onset")
@@ -550,6 +655,38 @@ def _collect(
 
             onset_roll = (onset_roll > 0).float()
             offset_roll = (offset_roll > 0).float()
+
+            if (
+                fusion_enabled
+                and comparison_enabled
+                and fusion_debug_state is not None
+                and comparison_batches_used < fusion_cfg.consistency_batches
+            ):
+                recorded = False
+                if "onset" in comparison_pairs:
+                    baseline, fused = comparison_pairs["onset"]
+                    if fusion_debug_state.record_comparison(
+                        "onset",
+                        baseline_logits=baseline,
+                        fused_logits=fused,
+                        targets=onset_roll,
+                        prob_threshold=preview_prob_threshold,
+                        f1_fn=_binary_f1,
+                    ):
+                        recorded = True
+                if "offset" in comparison_pairs:
+                    baseline, fused = comparison_pairs["offset"]
+                    if fusion_debug_state.record_comparison(
+                        "offset",
+                        baseline_logits=baseline,
+                        fused_logits=fused,
+                        targets=offset_roll,
+                        prob_threshold=preview_prob_threshold,
+                        f1_fn=_binary_f1,
+                    ):
+                        recorded = True
+                if recorded:
+                    comparison_batches_used += 1
 
             onset_logits_list.append(on_logits.cpu())
             offset_logits_list.append(off_logits.cpu())
@@ -635,6 +772,7 @@ def _collect(
         timeout_hit,
         lag_ms_samples,
         lag_source_counts,
+        fusion_debug_state,
     )
 
 def _compute_metrics(
@@ -846,6 +984,28 @@ def main():
         avlag_enabled = False
 
     cfg = dict(load_config("configs/config.yaml"))
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        cfg["model"] = model_cfg
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    fusion_cfg = resolve_global_fusion_config(decoder_cfg_runtime)
+    if fusion_cfg.enabled:
+        head_desc = ", ".join(fusion_cfg.apply_to)
+        print(
+            f"[fusion] enabled (mode={fusion_cfg.mode}, heads={head_desc}, cushion={fusion_cfg.cushion_keys})",
+            flush=True,
+        )
+        if fusion_cfg.consistency_check:
+            print(
+                f"[fusion] consistency check active for first {fusion_cfg.consistency_batches} batches",
+                flush=True,
+            )
+    return_per_tile = bool(model_cfg.get("return_per_tile"))
+    if fusion_cfg.needs_per_tile and not return_per_tile:
+        model_cfg["return_per_tile"] = True
+        return_per_tile = True
+        print("[fusion] forcing per-tile logits for calibration", flush=True)
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)
     cfg.setdefault("experiment", {})
@@ -863,12 +1023,16 @@ def main():
     agg_k_cfg = agg_cfg.get("k", {}) or {}
     agg_k_onset = max(1, int(agg_k_cfg.get("onset", 1) or 1))
     agg_k_offset = max(1, int(agg_k_cfg.get("offset", 1) or 1))
+    preview_prob_threshold = metrics_cfg.get("prob_threshold_onset", metrics_cfg.get("prob_threshold", 0.5))
+    try:
+        preview_prob_threshold = float(preview_prob_threshold)
+    except (TypeError, ValueError):
+        preview_prob_threshold = 0.5
     decoder_kind = "hysteresis"
     decoder_params = resolve_decoder_from_config(metrics_cfg)
     decoder_settings_summary = format_decoder_settings(decoder_kind, decoder_params)
     print(f"[decoder-settings] {decoder_settings_summary}")
     print(f"[decoder] {decoder_notice_text(decoder_kind, decoder_params)}")
-    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
     key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
     if key_prior_settings.enabled:
         applied = ", ".join(key_prior_settings.apply_to)
@@ -893,6 +1057,11 @@ def main():
             "[progress] debug mode: forcing num_workers=0, persistent_workers=False, pin_memory=False.",
             flush=True,
         )
+
+    try:
+        model_tiles = int(model_cfg.get("tiles", dataset_cfg.get("tiles", 3)))
+    except Exception:
+        model_tiles = int(dataset_cfg.get("tiles", 3) or 3)
 
     decode_fps = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
     hop_seconds = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
@@ -1103,6 +1272,7 @@ def main():
         timeout_hit,
         lag_ms_samples,
         lag_source_counts,
+        fusion_debug_state,
     ) = _collect(
         model,
         loader,
@@ -1112,9 +1282,19 @@ def main():
         key_prior_fps=decode_fps,
         key_prior_midi_low=key_prior_midi_low,
         key_prior_midi_high=None,
+        return_per_tile=return_per_tile,
+        fusion_cfg=fusion_cfg,
+        model_tiles=model_tiles,
+        preview_prob_threshold=preview_prob_threshold,
     )
     data_elapsed = time.time() - t_data0
     stage_durations["data_pass"] = data_elapsed
+
+    if fusion_cfg.enabled and fusion_debug_state is not None:
+        for line in fusion_debug_state.summary_lines():
+            print(line, flush=True)
+        if fusion_cfg.consistency_check and not fusion_debug_state.comparison:
+            print("[fusion] consistency check enabled but no comparison samples recorded", flush=True)
 
     if timeout_hit:
         print(f"[calib] timeout reached after {processed_clips} clips", flush=True)

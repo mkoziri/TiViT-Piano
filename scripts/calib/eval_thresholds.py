@@ -81,6 +81,13 @@ from decoder.decode import (
     resolve_decoder_gates,
     apply_postprocessing,
 )
+from tivit.decoder.global_fusion import (
+    GlobalFusionConfig,
+    FusionDebugState,
+    resolve_global_fusion_config,
+    build_batch_tile_mask,
+    fuse_tile_logits,
+)
 from tivit.decoder.tile_keymap import build_tile_key_mask
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.logging_utils import QUIET_INFO_FLAG
@@ -161,6 +168,7 @@ class RuntimeContext:
     avlag_disabled: bool
     model_tiles: int
     return_per_tile_requested: bool
+    fusion: GlobalFusionConfig
     stage_durations: Dict[str, float]
     only_id: Optional[str]
 
@@ -196,6 +204,14 @@ class EvalResults:
     skipped_batches: int
     tile_preview_stats: Dict[str, Any]
     tile_boundary_hist: Counter[int]
+    fusion_debug: Optional[FusionDebugState]
+
+
+@dataclass
+class TileBatchArtifacts:
+    mask: Optional[torch.Tensor]
+    fusion_targets: Dict[str, torch.Tensor]
+    pitch_logits: Optional[torch.Tensor]
 
 
 @dataclass
@@ -320,6 +336,134 @@ def _load_registration_metadata(path: Path) -> Dict[str, Dict[str, Any]]:
         if isinstance(value, dict):
             result[canonical_video_id(str(key))] = value
     return result
+
+
+def _resolve_clip_ids(paths: Sequence[str], batch_size: int) -> List[Optional[str]]:
+    clip_ids: List[Optional[str]] = []
+    for idx in range(batch_size):
+        clip_id = None
+        if idx < len(paths):
+            try:
+                clip_id = canonical_video_id(Path(paths[idx]).stem)
+            except Exception:
+                clip_id = canonical_video_id(Path(str(paths[idx])).stem)
+        clip_ids.append(clip_id)
+    return clip_ids
+
+
+def _align_batch_targets_to_logits(batch_data: Mapping[str, Any], head_name: str, ref_tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    roll_key = f"{head_name}_roll"
+    target_tensor = batch_data.get(roll_key)
+    if target_tensor is None or not torch.is_tensor(target_tensor):
+        return None
+    aligned = target_tensor.to(ref_tensor.device).float()
+    aligned = pool_roll_BT(aligned, ref_tensor.shape[1])
+    aligned = align_pitch_dim(ref_tensor, aligned, head_name)
+    if aligned.shape != ref_tensor.shape:
+        return None
+    return aligned
+
+
+def _process_per_tile_outputs(
+    *,
+    batch: Mapping[str, Any],
+    paths: Sequence[str],
+    onset_tile: torch.Tensor,
+    offset_tile: torch.Tensor,
+    pitch_tile: torch.Tensor,
+    model_tiles: int,
+    preview_prob_threshold: float,
+    tile_preview_stats: Dict[str, Any],
+    tile_key_mask_cache: Dict[str, np.ndarray],
+    tile_key_mask_cushion: int,
+    reg_meta_cache: Mapping[str, Mapping[str, Any]],
+    fusion_enabled: bool,
+    fusion_debug_state: Optional[FusionDebugState],
+    comparison_enabled: bool,
+    tile_boundary_hist: Counter[int],
+    onset_logits_neutral: torch.Tensor,
+    offset_logits_neutral: torch.Tensor,
+    pitch_logits_neutral: Optional[torch.Tensor],
+    per_tile_shape_logged: bool,
+    per_tile_target_issue_logged: bool,
+) -> Tuple[TileBatchArtifacts, bool, bool]:
+    if not per_tile_shape_logged:
+        print(
+            "[per-tile] onset_tile={} offset_tile={} pitch_tile={}".format(
+                tuple(onset_tile.shape),
+                tuple(offset_tile.shape),
+                tuple(pitch_tile.shape),
+            ),
+            flush=True,
+        )
+        per_tile_shape_logged = True
+
+    tile_preview_neutral = onset_tile.detach().mean(dim=1)
+    preview_abs = (tile_preview_neutral - onset_logits_neutral).abs().max().item()
+    tile_preview_stats["max_abs_diff"] = max(tile_preview_stats["max_abs_diff"], float(preview_abs))
+    onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
+    onset_targets_batch = pool_roll_BT(onset_targets_batch, tile_preview_neutral.shape[1])
+    onset_targets_batch = align_pitch_dim(tile_preview_neutral, onset_targets_batch, "onset")
+    preview_valid = onset_targets_batch.shape == tile_preview_neutral.shape
+    if not preview_valid and not per_tile_target_issue_logged:
+        print(
+            "[per-tile] skipping preview: target shape {} != preview {} (pooling/pitch mismatch)".format(
+                tuple(onset_targets_batch.shape),
+                tuple(tile_preview_neutral.shape),
+            ),
+            flush=True,
+        )
+        per_tile_target_issue_logged = True
+    if preview_valid:
+        preview_probs = torch.sigmoid(tile_preview_neutral)
+        global_probs_neutral = torch.sigmoid(onset_logits_neutral)
+        preview_preds = (preview_probs >= preview_prob_threshold).float()
+        global_preds = (global_probs_neutral >= preview_prob_threshold).float()
+        preview_f1 = _binary_f1(preview_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+        global_f1 = _binary_f1(global_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
+        tile_preview_stats["max_f1_delta"] = max(
+            tile_preview_stats["max_f1_delta"],
+            abs(float(preview_f1) - float(global_f1)),
+        )
+        tile_preview_stats["count"] += 1
+
+    tile_mask_tensor: Optional[torch.Tensor] = None
+    if fusion_enabled or paths:
+        clip_ids = _resolve_clip_ids(paths, onset_tile.shape[0])
+        key_dim = int(onset_tile.shape[-1])
+        tile_mask_tensor = build_batch_tile_mask(
+            clip_ids,
+            reg_meta_cache=reg_meta_cache,
+            mask_cache=tile_key_mask_cache,
+            num_tiles=model_tiles,
+            cushion_keys=tile_key_mask_cushion,
+            n_keys=key_dim,
+        )
+        mask_np_batch = (tile_mask_tensor.detach().cpu().numpy() >= 0.5)
+        for mask_np in mask_np_batch:
+            overlap = mask_np.sum(axis=0)
+            boundary_count = int(np.count_nonzero(overlap > 1))
+            tile_boundary_hist[boundary_count] += 1
+            if fusion_debug_state is not None:
+                fusion_debug_state.record_mask(mask_np, boundary_count=boundary_count)
+    fusion_targets: Dict[str, torch.Tensor] = {}
+    if comparison_enabled:
+        if preview_valid:
+            fusion_targets["onset"] = onset_targets_batch
+        else:
+            aligned_onset = _align_batch_targets_to_logits(batch, "onset", onset_logits_neutral)
+            if aligned_onset is not None:
+                fusion_targets["onset"] = aligned_onset
+        offset_target = _align_batch_targets_to_logits(batch, "offset", offset_logits_neutral)
+        if offset_target is not None:
+            fusion_targets["offset"] = offset_target
+        if torch.is_tensor(pitch_logits_neutral):
+            pitch_target = _align_batch_targets_to_logits(batch, "pitch", pitch_logits_neutral)
+            if pitch_target is not None:
+                fusion_targets["pitch"] = pitch_target
+
+    artifacts = TileBatchArtifacts(mask=tile_mask_tensor, fusion_targets=fusion_targets, pitch_logits=pitch_logits_neutral)
+    return artifacts, per_tile_shape_logged, per_tile_target_issue_logged
 
 
 def _init_progress_logger(args):
@@ -1335,9 +1479,26 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     if not isinstance(model_cfg, dict):
         model_cfg = {}
         cfg["model"] = model_cfg
+    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
+    fusion_cfg = resolve_global_fusion_config(decoder_cfg_runtime)
+    if fusion_cfg.enabled:
+        head_desc = ", ".join(fusion_cfg.apply_to)
+        print(
+            f"[fusion] enabled (mode={fusion_cfg.mode}, heads={head_desc}, cushion={fusion_cfg.cushion_keys})",
+            flush=True,
+        )
+        if fusion_cfg.consistency_check:
+            print(
+                f"[fusion] consistency check active for first {fusion_cfg.consistency_batches} batches",
+                flush=True,
+            )
     if args.model_return_per_tile is not None:
         model_cfg["return_per_tile"] = bool(args.model_return_per_tile)
     return_per_tile_requested = bool(model_cfg.get("return_per_tile"))
+    if fusion_cfg.needs_per_tile and not return_per_tile_requested:
+        model_cfg["return_per_tile"] = True
+        return_per_tile_requested = True
+        print("[fusion] forcing per-tile logits for global fusion", flush=True)
 
     dataset_raw = cfg.get("dataset")
     dataset_cfg = dict(dataset_raw) if isinstance(dataset_raw, dict) else {}
@@ -1420,7 +1581,6 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     default_k_onset = int(agg_k_cfg.get("onset", 1) or 1)
     default_k_offset = int(agg_k_cfg.get("offset", 1) or 1)
 
-    decoder_cfg_runtime = cfg.get("decoder", {}) or {}
     key_prior_settings = resolve_key_prior_settings(decoder_cfg_runtime.get("key_prior"))
     if key_prior_settings.enabled:
         print(
@@ -1458,6 +1618,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
         avlag_disabled=avlag_disabled,
         model_tiles=model_tiles,
         return_per_tile_requested=return_per_tile_requested,
+        fusion=fusion_cfg,
         stage_durations=stage_durations,
         only_id=only_id,
     )
@@ -1635,6 +1796,11 @@ def _collect_logits(
     preview_prob_threshold = runtime.preview_prob_threshold
     model_tiles = runtime.model_tiles
     return_per_tile_requested = runtime.return_per_tile_requested
+    fusion_cfg = runtime.fusion
+    fusion_enabled = fusion_cfg.enabled
+    fusion_debug_state = FusionDebugState(model_tiles) if fusion_enabled else None
+    comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
+    comparison_batches_used = 0
 
     onset_logits_list, offset_logits_list = [], []
     pitch_logits_list: List[torch.Tensor] = []
@@ -1649,11 +1815,11 @@ def _collect_logits(
     tile_boundary_hist: Counter[int] = Counter()
     tile_key_mask_cache: Dict[str, np.ndarray] = {}
     tile_preview_stats = {"max_abs_diff": 0.0, "max_f1_delta": 0.0, "count": 0}
-    tile_key_mask_cushion = 2
+    tile_key_mask_cushion = fusion_cfg.cushion_keys if fusion_enabled else 2
     per_tile_shape_logged = False
     per_tile_target_issue_logged = False
     reg_meta_cache: Dict[str, Dict[str, Any]] = {}
-    if return_per_tile_requested:
+    if return_per_tile_requested or fusion_enabled:
         reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
         reg_cache_path = Path(reg_cache_env) if reg_cache_env else repo / "reg_refined.json"
         reg_meta_cache = _load_registration_metadata(reg_cache_path)
@@ -1718,85 +1884,121 @@ def _collect_logits(
                 onset_logits_raw = out["onset_logits"] if "onset_logits" in out else out.get("onset")
                 offset_logits_raw = out["offset_logits"] if "offset_logits" in out else out.get("offset")
                 pitch_logits = out.get("pitch_logits")
+                pitch_logits_neutral = pitch_logits.detach() if torch.is_tensor(pitch_logits) else None
+                onset_tile: Optional[torch.Tensor] = out.get("onset_tile") if return_per_tile_requested else None
+                offset_tile: Optional[torch.Tensor] = out.get("offset_tile") if return_per_tile_requested else None
+                pitch_tile: Optional[torch.Tensor] = out.get("pitch_tile") if return_per_tile_requested else None
 
                 if onset_logits_raw is None or offset_logits_raw is None:
                     raise RuntimeError("Model output missing onset/offset logits")
                 onset_logits_neutral = onset_logits_raw.detach()
                 offset_logits_neutral = offset_logits_raw.detach()
 
+                tile_mask_tensor: Optional[torch.Tensor] = None
+                fusion_targets: Dict[str, torch.Tensor] = {}
+
                 if return_per_tile_requested:
-                    onset_tile = out.get("onset_tile")
-                    offset_tile = out.get("offset_tile")
-                    pitch_tile = out.get("pitch_tile")
                     if onset_tile is None or offset_tile is None or pitch_tile is None:
                         raise RuntimeError("return_per_tile enabled but model did not return per-tile logits")
-                    if not per_tile_shape_logged:
-                        print(
-                            "[per-tile] onset_tile={} offset_tile={} pitch_tile={}".format(
-                                tuple(onset_tile.shape),
-                                tuple(offset_tile.shape),
-                                tuple(pitch_tile.shape),
-                            ),
-                            flush=True,
-                        )
-                        per_tile_shape_logged = True
-                    # Step-2 scaffolding: reduce per-tile logits to the global shape
-                    # before comparing. Calibration downstream only consumes the global
-                    # heads, so this preview stays diagnostic-only.
-                    tile_preview_neutral = onset_tile.detach().mean(dim=1)
-                    preview_abs = (tile_preview_neutral - onset_logits_neutral).abs().max().item()
-                    tile_preview_stats["max_abs_diff"] = max(
-                        tile_preview_stats["max_abs_diff"],
-                        float(preview_abs),
+                    artifacts, per_tile_shape_logged, per_tile_target_issue_logged = _process_per_tile_outputs(
+                        batch=batch,
+                        paths=paths,
+                        onset_tile=onset_tile,
+                        offset_tile=offset_tile,
+                        pitch_tile=pitch_tile,
+                        model_tiles=model_tiles,
+                        preview_prob_threshold=preview_prob_threshold,
+                        tile_preview_stats=tile_preview_stats,
+                        tile_key_mask_cache=tile_key_mask_cache,
+                        tile_key_mask_cushion=tile_key_mask_cushion,
+                        reg_meta_cache=reg_meta_cache,
+                        fusion_enabled=fusion_enabled,
+                        fusion_debug_state=fusion_debug_state,
+                        comparison_enabled=comparison_enabled,
+                        tile_boundary_hist=tile_boundary_hist,
+                        onset_logits_neutral=onset_logits_neutral,
+                        offset_logits_neutral=offset_logits_neutral,
+                        pitch_logits_neutral=pitch_logits_neutral,
+                        per_tile_shape_logged=per_tile_shape_logged,
+                        per_tile_target_issue_logged=per_tile_target_issue_logged,
                     )
-                    onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
-                    onset_targets_batch = pool_roll_BT(
-                        onset_targets_batch, tile_preview_neutral.shape[1]
-                    )
-                    onset_targets_batch = align_pitch_dim(
-                        tile_preview_neutral, onset_targets_batch, "onset"
-                    )
-                    preview_valid = onset_targets_batch.shape == tile_preview_neutral.shape
-                    if not preview_valid and not per_tile_target_issue_logged:
-                        print(
-                            "[per-tile] skipping preview: target shape {} != preview {} "
-                            "(pooling/pitch mismatch)".format(
-                                tuple(onset_targets_batch.shape),
-                                tuple(tile_preview_neutral.shape),
-                            ),
-                            flush=True,
-                        )
-                        per_tile_target_issue_logged = True
-                    if preview_valid:
-                        preview_probs = torch.sigmoid(tile_preview_neutral)
-                        global_probs_neutral = torch.sigmoid(onset_logits_neutral)
-                        preview_preds = (preview_probs >= preview_prob_threshold).float()
-                        global_preds = (global_probs_neutral >= preview_prob_threshold).float()
-                        preview_f1 = _binary_f1(preview_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
-                        global_f1 = _binary_f1(global_preds.reshape(-1), onset_targets_batch.reshape(-1)) or 0.0
-                        tile_preview_stats["max_f1_delta"] = max(
-                            tile_preview_stats["max_f1_delta"],
-                            abs(float(preview_f1) - float(global_f1)),
-                        )
-                        tile_preview_stats["count"] += 1
-                    if paths:
-                        for clip_path in paths:
-                            clip_id = canonical_video_id(Path(clip_path).stem)
-                            if not clip_id:
-                                continue
-                            if clip_id not in tile_key_mask_cache:
-                                reg_entry = reg_meta_cache.get(clip_id)
-                                tile_key_mask_cache[clip_id] = build_tile_key_mask(
-                                    reg_entry,
-                                    num_tiles=model_tiles,
-                                    cushion_keys=tile_key_mask_cushion,
-                                    n_keys=int(onset_tile.shape[-1]),
-                                )
-                            mask = tile_key_mask_cache[clip_id]
-                            overlap = mask.sum(axis=0)
-                            boundary_count = int(np.count_nonzero(overlap > 1))
-                            # These counts are logged for future Step-2 guardrails.
-                            tile_boundary_hist[boundary_count] += 1
+                    tile_mask_tensor = artifacts.mask
+                    fusion_targets = artifacts.fusion_targets
+                elif fusion_enabled:
+                    raise RuntimeError("global fusion enabled but model did not emit per-tile logits")
+
+                if fusion_enabled:
+                    if tile_mask_tensor is None:
+                        raise RuntimeError("global fusion enabled but tile mask tensor is unavailable")
+                    primary_tile = onset_tile if onset_tile is not None else offset_tile
+                    mask_device = primary_tile.device if primary_tile is not None else onset_logits_neutral.device
+                    mask_dtype = primary_tile.dtype if primary_tile is not None else onset_logits_neutral.dtype
+                    mask_tensor_device = tile_mask_tensor.to(mask_device, dtype=mask_dtype)
+                    apply_heads = {head.lower() for head in fusion_cfg.apply_to}
+                    comparison_recorded = False
+                    if return_per_tile_requested and onset_tile is not None and "onset" in apply_heads:
+                        fused_onset = fuse_tile_logits(onset_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                        if fusion_debug_state is not None:
+                            fusion_debug_state.record_shape("onset", onset_tile.shape, fused_onset.shape)
+                        if (
+                            comparison_enabled
+                            and fusion_debug_state is not None
+                            and comparison_batches_used < fusion_cfg.consistency_batches
+                        ):
+                            target = fusion_targets.get("onset")
+                            if target is not None and fusion_debug_state.record_comparison(
+                                "onset",
+                                baseline_logits=onset_logits_neutral,
+                                fused_logits=fused_onset,
+                                targets=target,
+                                prob_threshold=preview_prob_threshold,
+                                f1_fn=_binary_f1,
+                            ):
+                                comparison_recorded = True
+                        onset_logits_neutral = fused_onset
+                    if return_per_tile_requested and offset_tile is not None and "offset" in apply_heads:
+                        fused_offset = fuse_tile_logits(offset_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                        if fusion_debug_state is not None:
+                            fusion_debug_state.record_shape("offset", offset_tile.shape, fused_offset.shape)
+                        if (
+                            comparison_enabled
+                            and fusion_debug_state is not None
+                            and comparison_batches_used < fusion_cfg.consistency_batches
+                        ):
+                            target = fusion_targets.get("offset")
+                            if target is not None and fusion_debug_state.record_comparison(
+                                "offset",
+                                baseline_logits=offset_logits_neutral,
+                                fused_logits=fused_offset,
+                                targets=target,
+                                prob_threshold=preview_prob_threshold,
+                                f1_fn=_binary_f1,
+                            ):
+                                comparison_recorded = True
+                        offset_logits_neutral = fused_offset
+                    if return_per_tile_requested and "pitch" in apply_heads and torch.is_tensor(pitch_tile) and torch.is_tensor(pitch_logits_neutral):
+                        fused_pitch = fuse_tile_logits(pitch_tile, mask_tensor_device, mode=fusion_cfg.mode)
+                        if fusion_debug_state is not None:
+                            fusion_debug_state.record_shape("pitch", pitch_tile.shape, fused_pitch.shape)
+                        if (
+                            comparison_enabled
+                            and fusion_debug_state is not None
+                            and comparison_batches_used < fusion_cfg.consistency_batches
+                        ):
+                            target = fusion_targets.get("pitch")
+                            if target is not None and fusion_debug_state.record_comparison(
+                                "pitch",
+                                baseline_logits=pitch_logits_neutral,
+                                fused_logits=fused_pitch,
+                                targets=target,
+                                prob_threshold=preview_prob_threshold,
+                                f1_fn=_binary_f1,
+                            ):
+                                comparison_recorded = True
+                        pitch_logits = fused_pitch
+                        pitch_logits_neutral = fused_pitch
+                    if comparison_recorded:
+                        comparison_batches_used += 1
 
                 if onset_platt_stats["enabled"]:
                     onset_prob_neutral = torch.sigmoid(onset_logits_neutral)
@@ -1950,6 +2152,7 @@ def _collect_logits(
         skipped_batches=skipped_batches,
         tile_preview_stats=tile_preview_stats,
         tile_boundary_hist=tile_boundary_hist,
+        fusion_debug=fusion_debug_state,
     )
 
 
@@ -1961,7 +2164,12 @@ def _summarize_data_pass(
 ):
     """Emit post-pass summaries including throughput, lag stats, and per-tile checks."""
 
-    if runtime.return_per_tile_requested:
+    if runtime.fusion.enabled and results.fusion_debug is not None:
+        for line in results.fusion_debug.summary_lines():
+            print(line, flush=True)
+        if runtime.fusion.consistency_check and not results.fusion_debug.comparison:
+            print("[fusion] consistency check enabled but no comparison samples recorded", flush=True)
+    elif runtime.return_per_tile_requested:
         stats = results.tile_preview_stats
         if stats["count"] > 0:
             print(
@@ -2292,11 +2500,9 @@ def _logit_to_probability(value: float) -> float:
 
 
 def _binary_f1(pred, target, eps=1e-8):
-    """Binary F1 score for tensors in {0,1}.
-
-    Returns None if both pred and target are all zeros."""
+    """Binary F1 score for tensors in {0,1}."""
     if target.sum().item() == 0 and pred.sum().item() == 0:
-        return None
+        return 0.0
     tp = (pred * target).sum().item()
     fp = (pred * (1 - target)).sum().item()
     fn = ((1 - pred) * target).sum().item()
