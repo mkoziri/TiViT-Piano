@@ -380,7 +380,7 @@ def _process_per_tile_outputs(
     tile_preview_stats: Dict[str, Any],
     tile_key_mask_cache: Dict[str, TileMaskResult],
     tile_key_mask_cushion: int,
-    reg_meta_cache: Mapping[str, Mapping[str, Any]],
+    reg_meta_cache: MutableMapping[str, Dict[str, Any]],
     reg_refiner: Optional[RegistrationRefiner],
     fusion_enabled: bool,
     fusion_debug_state: Optional[FusionDebugState],

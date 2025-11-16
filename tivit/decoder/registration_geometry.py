@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -403,9 +403,29 @@ def _uniform_bounds(num_tiles: int) -> List[Tuple[float, float]]:
     return [(float(edges[i]), float(edges[i + 1])) for i in range(num_tiles)]
 
 
+def build_canonical_registration_metadata(
+    width: float,
+    num_tiles: int,
+    *,
+    n_keys: int = 88,
+) -> Dict[str, Any]:
+    """Return a metadata-like payload using canonical key/tile geometry."""
+
+    span = max(float(width), 1.0)
+    _, left, right = _canonical_key_geometry(span, n_keys)
+    key_bounds = [[float(l), float(r)] for l, r in zip(left.tolist(), right.tolist())]
+    tile_bounds_norm = [(float(lo), float(hi)) for lo, hi in _uniform_bounds(num_tiles)]
+    return {
+        "rectified_width": span,
+        "key_bounds_px": key_bounds,
+        "tile_bounds_norm": tile_bounds_norm,
+    }
+
+
 __all__ = [
     "RectifiedKeyboardGeometry",
     "TileBounds",
     "resolve_rectified_keyboard_geometry",
     "resolve_tile_bounds",
+    "build_canonical_registration_metadata",
 ]

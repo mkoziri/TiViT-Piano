@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from collections import Counter
 
 import numpy as np
 import torch
 
 from .tile_keymap import TileMaskResult, build_tile_key_mask
+from .registration_geometry import build_canonical_registration_metadata
 from utils.identifiers import canonical_video_id
 from utils.registration_refinement import RegistrationRefiner
 
@@ -17,6 +18,25 @@ _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
 _FALLBACK_CACHE_KEY = "__fallback__"
 _REG_LOOKUP_LOGGED: Set[str] = set()
 _CACHE_PROBE_LOGGED = False
+
+
+def _metadata_width_hint(payload: Optional[Mapping[str, Any]]) -> Optional[float]:
+    if not payload:
+        return None
+    for key in ("rectified_width", "frame_width", "width"):
+        val = payload.get(key)
+        if isinstance(val, (int, float)) and float(val) > 0:
+            return float(val)
+    target_hw = payload.get("target_hw") or payload.get("canonical_hw")
+    if isinstance(target_hw, Sequence) and len(target_hw) >= 2:
+        try:
+            width = float(target_hw[1])
+        except (TypeError, ValueError):
+            width = None
+        else:
+            if width > 0:
+                return width
+    return None
 
 
 def _registration_cache_key(clip_id: Optional[str]) -> Optional[str]:
@@ -274,7 +294,7 @@ def resolve_global_fusion_config(decoder_cfg: Optional[Mapping[str, Any]]) -> Gl
 def resolve_tile_key_mask(
     clip_id: Optional[str],
     *,
-    reg_meta_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    reg_meta_cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     reg_refiner: Optional[RegistrationRefiner] = None,
     mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
@@ -295,18 +315,37 @@ def resolve_tile_key_mask(
         cushion_keys=cushion_keys,
         n_keys=n_keys,
     )
+    synthetic_used = False
+    synthetic_attempted = False
+    if (not result.registration_based) and clip_id and reg_refiner is not None:
+        reason = result.fallback_reason or "unknown"
+        if reason in {"missing_key_geometry", "missing_tile_bounds"}:
+            synthetic_attempted = True
+            width_hint = _metadata_width_hint(reg_meta) or float(reg_refiner.canonical_hw[1])
+            synth_meta = build_canonical_registration_metadata(width_hint, num_tiles, n_keys=n_keys)
+            synth_meta["target_hw"] = list(reg_refiner.canonical_hw)
+            reg_meta = synth_meta
+            if reg_meta_key:
+                reg_meta_cache[reg_meta_key] = synth_meta
+            result = build_tile_key_mask(
+                reg_meta,
+                num_tiles=num_tiles,
+                cushion_keys=cushion_keys,
+                n_keys=n_keys,
+            )
+            synthetic_used = result.registration_based
     if (not result.registration_based) and clip_id:
         reason = result.fallback_reason or "unknown"
         if not lookup_attempted:
             cache_state = "skipped"
         elif reg_meta is None:
             cache_state = "no_entry"
+        elif synthetic_attempted:
+            cache_state = "synthetic_failed"
         else:
             cache_state = "entry_unusable"
         query = reg_meta_key or "<none>"
-        refiner_entries = reg_refiner.cache_size if reg_refiner is not None else (
-            len(reg_meta_cache) if reg_meta_cache is not None else 0
-        )
+        refiner_entries = reg_refiner.cache_size if reg_refiner is not None else len(reg_meta_cache)
         print(
             "[fusion] fallback coverage clip={} query_key={} cache_state={} reason={} geometry_source={} tile_source={} refiner_entries={}".format(
                 clip_id,
@@ -321,6 +360,8 @@ def resolve_tile_key_mask(
         )
         if reg_refiner is not None and refiner_entries > 0:
             _log_cache_probe_once(reg_refiner)
+    elif synthetic_used and clip_id:
+        print(f"[fusion] synthesized registration metadata clip={clip_id} modality=canonical", flush=True)
     mask_cache[cache_key] = result
     return result
 
@@ -334,7 +375,7 @@ class TileMaskBatch:
 def build_batch_tile_mask(
     clip_ids: Sequence[Optional[str]],
     *,
-    reg_meta_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    reg_meta_cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     reg_refiner: Optional[RegistrationRefiner] = None,
     mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
