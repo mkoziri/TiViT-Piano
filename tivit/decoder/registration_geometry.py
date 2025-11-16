@@ -414,11 +414,13 @@ def build_canonical_registration_metadata(
     span = max(float(width), 1.0)
     _, left, right = _canonical_key_geometry(span, n_keys)
     key_bounds = [[float(l), float(r)] for l, r in zip(left.tolist(), right.tolist())]
-    tile_bounds_norm = [(float(lo), float(hi)) for lo, hi in _uniform_bounds(num_tiles)]
+    tile_bounds_px = [
+        (float(lo) * span, float(hi) * span) for lo, hi in _uniform_bounds(num_tiles)
+    ]
     return {
         "rectified_width": span,
         "key_bounds_px": key_bounds,
-        "tile_bounds_norm": tile_bounds_norm,
+        "tile_bounds_px": tile_bounds_px,
     }
 
 

@@ -159,7 +159,7 @@ def build_tile_key_mask(
     geometry = resolve_rectified_keyboard_geometry(reg_meta, n_keys=n_keys)
     tile_bounds = resolve_tile_bounds(reg_meta, num_tiles=num_tiles, width=geometry.width)
     geometry_ready = geometry.source != "uniform" and geometry.valid
-    tile_ready = tile_bounds.source != "uniform" and tile_bounds.pixels.size > 0
+    tile_ready = tile_bounds.pixels.size > 0
 
     if not geometry_ready or not tile_ready:
         reason = "missing_key_geometry" if not geometry_ready else "missing_tile_bounds"

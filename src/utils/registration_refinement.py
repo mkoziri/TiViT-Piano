@@ -34,6 +34,7 @@ _MIDI_LOW = 21
 _MIDI_HIGH = 108
 _WHITE_PITCHES = {0, 2, 4, 5, 7, 9, 11}
 _KEY_COUNT = _MIDI_HIGH - _MIDI_LOW + 1
+_DEFAULT_META_TILES = 3
 
 
 def _midi_is_white(midi: int) -> bool:
@@ -83,10 +84,14 @@ def _build_geometry_metadata_from_edges(edges: np.ndarray, width: float, canonic
     key_bounds = _key_bounds_from_white_edges(edges, width)
     if key_bounds is None:
         return None
+    tile_bounds = [
+        (float(lo) * width, float(hi) * width) for lo, hi in _uniform_bounds(_DEFAULT_META_TILES)
+    ]
     return {
         "rectified_width": float(width),
         "key_bounds_px": key_bounds,
         "target_hw": [int(canonical_hw[0]), int(canonical_hw[1])],
+        "tile_bounds_px": tile_bounds,
     }
 
 
@@ -105,6 +110,13 @@ def _apply_warp_ctrl(edges: np.ndarray, warp_ctrl: Optional[np.ndarray]) -> np.n
     post = ctrl[order, 1]
     warped = np.interp(edges, pre, post, left=post[0], right=post[-1])
     return warped.astype(np.float32, copy=False)
+
+
+def _uniform_bounds(num_tiles: int) -> List[Tuple[float, float]]:
+    if num_tiles <= 0:
+        return []
+    edges = np.linspace(0.0, 1.0, num_tiles + 1, dtype=np.float32)
+    return [(float(edges[i]), float(edges[i + 1])) for i in range(num_tiles)]
 
 
 try:
@@ -909,7 +921,7 @@ class RegistrationRefiner:
                     self.canonical_hw,
                 )
                 continue
-            if result.geometry_meta is None:
+            if result.geometry_meta is None or "tile_bounds_px" not in result.geometry_meta:
                 rebuilt = _reconstruct_geometry_from_result(result)
                 if rebuilt is not None:
                     result.geometry_meta = rebuilt
@@ -948,7 +960,8 @@ class RegistrationRefiner:
         entry = self._cache.get(canon)
         if entry is None:
             return None
-        if entry.geometry_meta is None:
+        needs_rebuild = entry.geometry_meta is None or "tile_bounds_px" not in entry.geometry_meta
+        if needs_rebuild:
             rebuilt = _reconstruct_geometry_from_result(entry)
             if rebuilt is None:
                 return None
