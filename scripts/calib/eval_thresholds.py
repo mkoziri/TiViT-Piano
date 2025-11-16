@@ -1765,11 +1765,17 @@ def _build_eval_loader(args, runtime: RuntimeContext, log_progress) -> LoaderCon
         reg_path_attr = getattr(base_dataset, "registration_cache_path", None)
         if reg_path_attr:
             reg_meta_path = Path(reg_path_attr)
-    if reg_meta_path is None:
-        reg_meta_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
-    reg_meta_cache = _load_registration_metadata(reg_meta_path) if reg_meta_path else {}
-    if not isinstance(registration_refiner, RegistrationRefiner):
+    if isinstance(registration_refiner, RegistrationRefiner):
+        reg_meta_cache = registration_refiner.export_geometry_cache()
+    else:
         registration_refiner = None
+        reg_meta_cache = {}
+    if (not reg_meta_cache) or reg_meta_path is None:
+        reg_meta_path = reg_meta_path or resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
+        if reg_meta_path:
+            from_file = _load_registration_metadata(reg_meta_path)
+            if from_file:
+                reg_meta_cache = from_file
 
     return LoaderContext(
         val_loader=val_loader,

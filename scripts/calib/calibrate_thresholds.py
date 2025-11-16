@@ -90,7 +90,7 @@ from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
-from utils.registration_refinement import resolve_registration_cache_path
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path
 from theory.key_prior_runtime import (
     KeyPriorRuntimeSettings,
     resolve_key_prior_settings,
@@ -518,6 +518,8 @@ def _collect(
     fusion_cfg: GlobalFusionConfig,
     model_tiles: int,
     preview_prob_threshold: float,
+    registration_refiner: Optional[RegistrationRefiner] = None,
+    reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     onset_logits_list, offset_logits_list = [], []
     onset_probs_list, offset_probs_list = [], []
@@ -531,10 +533,10 @@ def _collect(
     comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
     comparison_batches_used = 0
     tile_mask_cache: Dict[str, TileMaskResult] = {}
-    reg_meta_cache: Dict[str, Dict[str, Any]] = {}
-    if fusion_enabled:
+    effective_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
+    if fusion_enabled and not effective_meta_cache:
         reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
-        reg_meta_cache = _load_registration_metadata(reg_cache_path)
+        effective_meta_cache = _load_registration_metadata(reg_cache_path)
 
     processed = 0
     timeout_hit = False
@@ -584,7 +586,8 @@ def _collect(
                     raise RuntimeError("global fusion enabled but model did not return per-tile logits")
                 tile_mask_batch = build_batch_tile_mask(
                     clip_ids,
-                    reg_meta_cache=reg_meta_cache,
+                    reg_meta_cache=effective_meta_cache,
+                    reg_refiner=registration_refiner,
                     mask_cache=tile_mask_cache,
                     num_tiles=model_tiles,
                     cushion_keys=fusion_cfg.cushion_keys,
@@ -1263,6 +1266,15 @@ def main():
 
     timeout_secs = float(args.timeout_mins * 60.0) if args.timeout_mins else 0.0
     t_data0 = time.time()
+    base_dataset_for_reg = dataset
+    if isinstance(base_dataset_for_reg, Subset):
+        base_dataset_for_reg = base_dataset_for_reg.dataset
+    registration_refiner = getattr(base_dataset_for_reg, "registration_refiner", None) if base_dataset_for_reg is not None else None
+    reg_meta_cache = {}
+    if isinstance(registration_refiner, RegistrationRefiner):
+        reg_meta_cache = registration_refiner.export_geometry_cache()
+    else:
+        registration_refiner = None
     (
         onset_logits,
         offset_logits,
@@ -1288,6 +1300,8 @@ def main():
         fusion_cfg=fusion_cfg,
         model_tiles=model_tiles,
         preview_prob_threshold=preview_prob_threshold,
+        registration_refiner=registration_refiner,
+        reg_meta_cache=reg_meta_cache,
     )
     data_elapsed = time.time() - t_data0
     stage_durations["data_pass"] = data_elapsed

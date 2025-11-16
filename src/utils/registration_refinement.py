@@ -30,6 +30,83 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CANONICAL_HW_LOGGED: Set[Tuple[int, int]] = set()
 _CACHE_SUMMARY_LOGGED: Set[Tuple[Tuple[int, int], Path]] = set()
 
+_MIDI_LOW = 21
+_MIDI_HIGH = 108
+_WHITE_PITCHES = {0, 2, 4, 5, 7, 9, 11}
+_KEY_COUNT = _MIDI_HIGH - _MIDI_LOW + 1
+
+
+def _midi_is_white(midi: int) -> bool:
+    return (midi % 12) in _WHITE_PITCHES
+
+
+def _key_bounds_from_white_edges(edges: np.ndarray, width: float) -> Optional[List[List[float]]]:
+    if edges.ndim != 1 or edges.size < 2:
+        return None
+    sorted_edges = np.sort(edges.astype(np.float32, copy=True))
+    white_segments = sorted_edges.size - 1
+    if white_segments < 52:
+        return None
+    width = float(width)
+    bounds: List[List[float]] = []
+    white_idx = 0
+    for key_idx in range(_KEY_COUNT):
+        midi = _MIDI_LOW + key_idx
+        if _midi_is_white(midi):
+            if white_idx + 1 >= sorted_edges.size:
+                return None
+            left = float(np.clip(sorted_edges[white_idx], 0.0, width))
+            right = float(np.clip(sorted_edges[white_idx + 1], 0.0, width))
+            if right < left:
+                left, right = right, left
+            bounds.append([left, right])
+            white_idx += 1
+        else:
+            left_white = max(white_idx - 1, 0)
+            right_white = min(white_idx, sorted_edges.size - 2)
+            left_center = 0.5 * (sorted_edges[left_white] + sorted_edges[left_white + 1])
+            right_center = 0.5 * (sorted_edges[right_white] + sorted_edges[right_white + 1])
+            center = 0.5 * (left_center + right_center)
+            width_left = sorted_edges[left_white + 1] - sorted_edges[left_white]
+            width_right = sorted_edges[right_white + 1] - sorted_edges[right_white]
+            base_width = float(max(min(width_left, width_right), 1e-3))
+            key_width = 0.6 * base_width
+            left = float(np.clip(center - key_width / 2.0, 0.0, width))
+            right = float(np.clip(center + key_width / 2.0, 0.0, width))
+            if right < left:
+                left, right = right, left
+            bounds.append([left, right])
+    return bounds
+
+
+def _build_geometry_metadata_from_edges(edges: np.ndarray, width: float, canonical_hw: Tuple[int, int]) -> Optional[Dict[str, Any]]:
+    key_bounds = _key_bounds_from_white_edges(edges, width)
+    if key_bounds is None:
+        return None
+    return {
+        "rectified_width": float(width),
+        "key_bounds_px": key_bounds,
+        "target_hw": [int(canonical_hw[0]), int(canonical_hw[1])],
+    }
+
+
+def _canonical_white_edges(width: float) -> np.ndarray:
+    return np.linspace(0.0, float(width), num=52 + 1, dtype=np.float32)
+
+
+def _apply_warp_ctrl(edges: np.ndarray, warp_ctrl: Optional[np.ndarray]) -> np.ndarray:
+    if warp_ctrl is None or warp_ctrl.size < 4:
+        return edges
+    ctrl = np.asarray(warp_ctrl, dtype=np.float32)
+    if ctrl.ndim != 2 or ctrl.shape[1] != 2:
+        return edges
+    order = np.argsort(ctrl[:, 0])
+    pre = ctrl[order, 0]
+    post = ctrl[order, 1]
+    warped = np.interp(edges, pre, post, left=post[0], right=post[-1])
+    return warped.astype(np.float32, copy=False)
+
+
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover - OpenCV is optional at runtime
@@ -649,6 +726,16 @@ def resolve_registration_cache_path(path_candidate: Optional[os.PathLike[str] | 
     return candidate
 
 
+def _reconstruct_geometry_from_result(result: "RegistrationResult") -> Optional[Dict[str, Any]]:
+    target_hw = tuple(result.target_hw)
+    if len(target_hw) < 2:
+        return None
+    width = float(target_hw[1])
+    edges = _canonical_white_edges(width)
+    warped = _apply_warp_ctrl(edges, result.x_warp_ctrl)
+    return _build_geometry_metadata_from_edges(warped, width, target_hw)
+
+
 @dataclass
 class RegistrationResult:
     homography: np.ndarray
@@ -666,6 +753,7 @@ class RegistrationResult:
     timestamp: float
     x_warp_ctrl: Optional[np.ndarray] = None
     grid: Optional[torch.Tensor] = None
+    geometry_meta: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> Dict[str, Any]:
         warp_payload: Optional[List[List[float]]]
@@ -690,6 +778,7 @@ class RegistrationResult:
             "keyboard_height": float(self.keyboard_height),
             "timestamp": float(self.timestamp),
             "x_warp_ctrl": warp_payload,
+            "geometry_meta": self.geometry_meta,
         }
 
     @classmethod
@@ -713,6 +802,7 @@ class RegistrationResult:
             timestamp=float(payload.get("timestamp", time.time())),
             x_warp_ctrl=_load_warp_ctrl(payload.get("x_warp_ctrl")),
             grid=None,
+            geometry_meta=payload.get("geometry_meta") if isinstance(payload.get("geometry_meta"), dict) else None,
         )
 
 
@@ -799,6 +889,7 @@ class RegistrationRefiner:
         stored = 0
         skipped_target_hw = 0
         skipped_invalid = 0
+        metadata_updated = False
         for key, payload in data.items():
             if not isinstance(payload, dict):
                 skipped_invalid += 1
@@ -818,6 +909,11 @@ class RegistrationRefiner:
                     self.canonical_hw,
                 )
                 continue
+            if result.geometry_meta is None:
+                rebuilt = _reconstruct_geometry_from_result(result)
+                if rebuilt is not None:
+                    result.geometry_meta = rebuilt
+                    metadata_updated = True
             self._cache[str(key)] = result
             stored += 1
         self.logger.info(
@@ -827,6 +923,11 @@ class RegistrationRefiner:
             skipped_target_hw,
             skipped_invalid,
         )
+        if metadata_updated:
+            try:
+                self._persist_cache()
+            except Exception:
+                self.logger.debug("reg_refined: failed to persist geometry metadata update")
 
     @property
     def cache_size(self) -> int:
@@ -841,6 +942,29 @@ class RegistrationRefiner:
         if entry is None:
             return None
         return entry.to_json()
+
+    def get_geometry_metadata(self, video_id: str) -> Optional[Dict[str, Any]]:
+        canon = canonical_video_id(video_id)
+        entry = self._cache.get(canon)
+        if entry is None:
+            return None
+        if entry.geometry_meta is None:
+            rebuilt = _reconstruct_geometry_from_result(entry)
+            if rebuilt is None:
+                return None
+            entry.geometry_meta = rebuilt
+            try:
+                self._persist_cache()
+            except Exception:
+                pass
+        return json.loads(json.dumps(entry.geometry_meta))
+
+    def export_geometry_cache(self) -> Dict[str, Dict[str, Any]]:
+        result: Dict[str, Dict[str, Any]] = {}
+        for key, entry in self._cache.items():
+            if entry.geometry_meta:
+                result[key] = json.loads(json.dumps(entry.geometry_meta))
+        return result
 
     def peek_cache_keys(self, max_keys: int = 5) -> List[str]:
         max_keys = max(int(max_keys), 0)
@@ -1020,6 +1144,7 @@ class RegistrationRefiner:
                 x_warp_ctrl=None,
             )
 
+        geometry_meta: Optional[Dict[str, Any]] = None
         grayscale_frames: List[np.ndarray] = []
         slopes: List[float] = []
         intercepts: List[float] = []
@@ -1277,6 +1402,11 @@ class RegistrationRefiner:
                     white_proj_x = white_proj[:, 0]
                     white_err = np.abs(white_proj_x - canon_edges)
                     err_white_edges = float(np.mean(white_err))
+                    geometry_meta = _build_geometry_metadata_from_edges(
+                        white_proj_x,
+                        float(canonical[1]),
+                        canonical_hw=self.canonical_hw,
+                    )
 
                     black_proj_x = np.zeros((0,), dtype=np.float32)
                     err_black_gaps = 0.0
@@ -1406,6 +1536,7 @@ class RegistrationRefiner:
             timestamp=time.time(),
             x_warp_ctrl=warp_for_grid.copy() if warp_for_grid is not None else None,
             grid=grid,
+            geometry_meta=geometry_meta,
         )
 
     # --------------------------------------------------------------- Public API --

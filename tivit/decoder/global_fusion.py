@@ -308,6 +308,10 @@ def resolve_tile_key_mask(
         return mask_cache[cache_key]
     reg_meta_key = lookup_key or clip_id
     reg_meta = reg_meta_cache.get(reg_meta_key) if reg_meta_key else None
+    if reg_meta is None and reg_meta_key and reg_refiner is not None:
+        reg_meta = reg_refiner.get_geometry_metadata(reg_meta_key)
+        if reg_meta is not None:
+            reg_meta_cache[reg_meta_key] = reg_meta
     lookup_attempted = reg_meta_key is not None
     result = build_tile_key_mask(
         reg_meta,
