@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Sequence
 
 from utils.identifiers import canonical_video_id
-from utils.registration_refinement import RegistrationRefiner
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache",
         type=Path,
-        default=Path("reg_refined.json"),
-        help="Path to reg_refined.json cache (default: %(default)s)",
+        default=None,
+        help="Path to reg_refined.json cache (default: repository reg_refined.json)",
     )
     parser.add_argument(
         "--canonical-hw",
@@ -76,9 +76,10 @@ def log_entry(refiner: RegistrationRefiner, video_id: str) -> None:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    cache_path = resolve_registration_cache_path(args.cache)
     refiner = RegistrationRefiner(
         args.canonical_hw,
-        cache_path=args.cache,
+        cache_path=cache_path,
     )
     total_entries = len(refiner._cache)  # type: ignore[attr-defined]
     print(f"[cache] path={refiner.cache_path}")
@@ -91,4 +92,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

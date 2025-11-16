@@ -11,10 +11,12 @@ import torch
 
 from .tile_keymap import TileMaskResult, build_tile_key_mask
 from utils.identifiers import canonical_video_id
+from utils.registration_refinement import RegistrationRefiner
 
 _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
 _FALLBACK_CACHE_KEY = "__fallback__"
 _REG_LOOKUP_LOGGED: Set[str] = set()
+_CACHE_PROBE_LOGGED = False
 
 
 def _registration_cache_key(clip_id: Optional[str]) -> Optional[str]:
@@ -28,6 +30,24 @@ def _registration_cache_key(clip_id: Optional[str]) -> Optional[str]:
         print(f"[fusion] registration lookup dataset_id={clip_id} cache_key={key}", flush=True)
         _REG_LOOKUP_LOGGED.add(clip_id)
     return key
+
+
+def _log_cache_probe_once(refiner: RegistrationRefiner) -> None:
+    global _CACHE_PROBE_LOGGED
+    if _CACHE_PROBE_LOGGED:
+        return
+    keys = refiner.peek_cache_keys(1)
+    if not keys:
+        return
+    key = keys[0]
+    payload = refiner.get_cache_entry_payload(key) or {}
+    status = payload.get("status", "missing")
+    target_hw = payload.get("target_hw")
+    print(
+        f"[fusion] registration cache probe example_key={key} status={status} target_hw={target_hw}",
+        flush=True,
+    )
+    _CACHE_PROBE_LOGGED = True
 
 
 @dataclass(frozen=True)
@@ -254,7 +274,8 @@ def resolve_global_fusion_config(decoder_cfg: Optional[Mapping[str, Any]]) -> Gl
 def resolve_tile_key_mask(
     clip_id: Optional[str],
     *,
-    reg_meta_cache: Mapping[str, Mapping[str, Any]],
+    reg_meta_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    reg_refiner: Optional[RegistrationRefiner] = None,
     mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
@@ -265,7 +286,9 @@ def resolve_tile_key_mask(
     if cache_key in mask_cache:
         return mask_cache[cache_key]
     reg_meta_key = lookup_key or clip_id
-    reg_meta = reg_meta_cache.get(reg_meta_key) if reg_meta_key else None
+    reg_meta = reg_meta_cache.get(reg_meta_key) if (reg_meta_cache and reg_meta_key) else None
+    if reg_meta is None and reg_meta_key and reg_refiner is not None:
+        reg_meta = reg_refiner.get_cache_entry_payload(reg_meta_key)
     lookup_attempted = reg_meta_key is not None
     result = build_tile_key_mask(
         reg_meta,
@@ -282,17 +305,23 @@ def resolve_tile_key_mask(
         else:
             cache_state = "entry_unusable"
         query = reg_meta_key or "<none>"
+        refiner_entries = reg_refiner.cache_size if reg_refiner is not None else (
+            len(reg_meta_cache) if reg_meta_cache is not None else 0
+        )
         print(
-            "[fusion] fallback coverage clip={} query_key={} cache_state={} reason={} geometry_source={} tile_source={}".format(
+            "[fusion] fallback coverage clip={} query_key={} cache_state={} reason={} geometry_source={} tile_source={} refiner_entries={}".format(
                 clip_id,
                 query,
                 cache_state,
                 reason,
                 result.geometry_source,
                 result.tile_source,
+                refiner_entries,
             ),
             flush=True,
         )
+        if reg_refiner is not None and refiner_entries > 0:
+            _log_cache_probe_once(reg_refiner)
     mask_cache[cache_key] = result
     return result
 
@@ -306,7 +335,8 @@ class TileMaskBatch:
 def build_batch_tile_mask(
     clip_ids: Sequence[Optional[str]],
     *,
-    reg_meta_cache: Mapping[str, Mapping[str, Any]],
+    reg_meta_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    reg_refiner: Optional[RegistrationRefiner] = None,
     mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
@@ -321,6 +351,7 @@ def build_batch_tile_mask(
         record = resolve_tile_key_mask(
             clip_id,
             reg_meta_cache=reg_meta_cache,
+            reg_refiner=reg_refiner,
             mask_cache=mask_cache,
             num_tiles=num_tiles,
             cushion_keys=cushion_keys,

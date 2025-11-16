@@ -28,6 +28,7 @@ from .identifiers import canonical_video_id
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CANONICAL_HW_LOGGED: Set[Tuple[int, int]] = set()
+_CACHE_SUMMARY_LOGGED: Set[Tuple[Tuple[int, int], Path]] = set()
 
 try:
     import cv2  # type: ignore
@@ -633,6 +634,21 @@ def _load_warp_ctrl(raw: Any) -> Optional[np.ndarray]:
     return arr
 
 
+def resolve_registration_cache_path(path_candidate: Optional[os.PathLike[str] | str] = None) -> Path:
+    """Resolve registration cache path honoring env overrides and repo defaults."""
+
+    env_override = os.environ.get("TIVIT_REG_REFINED")
+    if path_candidate:
+        candidate = Path(path_candidate)
+    elif env_override:
+        candidate = Path(env_override)
+    else:
+        candidate = Path("reg_refined.json")
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return candidate
+
+
 @dataclass
 class RegistrationResult:
     homography: np.ndarray
@@ -748,6 +764,7 @@ class RegistrationRefiner:
         self._cache: Dict[str, RegistrationResult] = {}
         self._log_canonical_hw_once()
         self._load_cache()
+        self._log_cache_summary_once()
 
     # ------------------------------------------------------------------ I/O --
 
@@ -758,6 +775,13 @@ class RegistrationRefiner:
             return
         _CANONICAL_HW_LOGGED.add(canon)
         self.logger.info("reg_refined: canonical_hw=%s cache=%s", canon, self.cache_path)
+
+    def _log_cache_summary_once(self) -> None:
+        key = (self.canonical_hw, self.cache_path)
+        if key in _CACHE_SUMMARY_LOGGED:
+            return
+        _CACHE_SUMMARY_LOGGED.add(key)
+        self.log_cache_summary(max_keys=5)
 
     def _load_cache(self) -> None:
         path = self.cache_path
@@ -803,6 +827,26 @@ class RegistrationRefiner:
             skipped_target_hw,
             skipped_invalid,
         )
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+    def export_cache_payload(self) -> Dict[str, Dict[str, Any]]:
+        return {key: result.to_json() for key, result in self._cache.items()}
+
+    def get_cache_entry_payload(self, video_id: str) -> Optional[Dict[str, Any]]:
+        canon = canonical_video_id(video_id)
+        entry = self._cache.get(canon)
+        if entry is None:
+            return None
+        return entry.to_json()
+
+    def peek_cache_keys(self, max_keys: int = 5) -> List[str]:
+        max_keys = max(int(max_keys), 0)
+        if max_keys == 0:
+            return []
+        return sorted(self._cache.keys())[:max_keys]
 
     def _persist_cache(self) -> None:
         path = self.cache_path
@@ -1466,4 +1510,4 @@ class RegistrationRefiner:
         return warped
 
 
-__all__ = ["RegistrationRefiner", "RegistrationResult"]
+__all__ = ["RegistrationRefiner", "RegistrationResult", "resolve_registration_cache_path"]

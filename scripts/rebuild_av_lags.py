@@ -83,7 +83,7 @@ from models import build_model  # noqa: E402
 from utils import load_config  # noqa: E402
 from utils.av_sync import AVLagCache, AVLagResult, compute_av_lag  # noqa: E402
 from utils.identifiers import canonical_video_id  # noqa: E402
-from utils.registration_refinement import RegistrationRefiner  # noqa: E402
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path  # noqa: E402
 from utils.time_grid import frame_to_sec  # noqa: E402
 
 
@@ -466,7 +466,7 @@ def main() -> None:
     debug_curves_count = 0
 
     cache_path = Path("av_lags.json")
-    reg_cache_path = Path("reg_refined.json")
+    reg_cache_path = resolve_registration_cache_path(getattr(args, "reg_cache", None))
 
     if args.visual_source == "model" and not args.ckpt:
         raise SystemExit("--ckpt is required when --visual-source=model")

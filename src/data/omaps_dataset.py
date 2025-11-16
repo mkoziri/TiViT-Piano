@@ -46,7 +46,7 @@ from utils.frame_targets import (
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
-from utils.registration_refinement import RegistrationRefiner
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path
 
 from .sampler_utils import build_onset_balanced_sampler
 
@@ -678,9 +678,11 @@ class OMAPSDataset(Dataset):
         self.registration_enabled = bool(reg_cfg.get("enabled", True))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
         reg_sample_frames = int(reg_cfg.get("sample_frames", 96))
+        reg_cache_override = reg_cfg.get("cache_path")
+        reg_cache_path = resolve_registration_cache_path(reg_cache_override)
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
-            cache_path=Path("reg_refined.json"),
+            cache_path=reg_cache_path,
             sample_frames=reg_sample_frames,
             logger=LOGGER,
         )

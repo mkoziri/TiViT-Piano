@@ -55,7 +55,7 @@ from utils.frame_targets import (
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
-from utils.registration_refinement import RegistrationRefiner
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path
 
 from .omaps_dataset import (  # reuse established helpers for identical behaviour
     _load_clip_with_random_start,
@@ -585,19 +585,23 @@ class PianoYTDataset(Dataset):
         self.registration_enabled = bool(reg_cfg.get("enabled", True))
         self.registration_interp = str(reg_cfg.get("interp", "bilinear"))
         reg_sample_frames = int(reg_cfg.get("sample_frames", 96))
+        reg_cache_override = reg_cfg.get("cache_path")
+        reg_cache_path = resolve_registration_cache_path(reg_cache_override)
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
-            cache_path=Path("reg_refined.json"),
+            cache_path=reg_cache_path,
             sample_frames=reg_sample_frames,
             logger=LOGGER,
         )
         global _REG_DEBUG_CANON_LOGGED
         if not _REG_DEBUG_CANON_LOGGED:
             LOGGER.info(
-                "[PianoYT] registration canonical_hw=%s dataset_canonical_hw=%s dataset_resize=%s",
+                "[PianoYT] registration canonical_hw=%s dataset_canonical_hw=%s dataset_resize=%s cache=%s entries=%d",
                 self.registration_refiner.canonical_hw,
                 self.canonical_hw,
                 tuple(int(v) for v in self.resize),
+                self.registration_refiner.cache_path,
+                self.registration_refiner.cache_size,
             )
             _REG_DEBUG_CANON_LOGGED = True
 

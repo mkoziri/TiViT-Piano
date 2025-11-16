@@ -90,6 +90,7 @@ from utils.time_grid import frame_to_sec
 from data import make_dataloader
 from models import build_model
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
+from utils.registration_refinement import resolve_registration_cache_path
 from theory.key_prior_runtime import (
     KeyPriorRuntimeSettings,
     resolve_key_prior_settings,
@@ -532,8 +533,7 @@ def _collect(
     tile_mask_cache: Dict[str, TileMaskResult] = {}
     reg_meta_cache: Dict[str, Dict[str, Any]] = {}
     if fusion_enabled:
-        reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
-        reg_cache_path = Path(reg_cache_env) if reg_cache_env else REPO / "reg_refined.json"
+        reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
         reg_meta_cache = _load_registration_metadata(reg_cache_path)
 
     processed = 0

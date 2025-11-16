@@ -97,6 +97,7 @@ from data import make_dataloader
 from models import build_model
 from torch.utils.data import DataLoader, Subset
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
+from utils.registration_refinement import RegistrationRefiner, resolve_registration_cache_path
 from theory.key_prior_runtime import (
     KeyPriorRuntimeSettings,
     resolve_key_prior_settings,
@@ -181,6 +182,8 @@ class LoaderContext:
     dataset: Any
     target_clips: Optional[int]
     target_display: str
+    registration_refiner: Optional[RegistrationRefiner] = None
+    reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 @dataclass
@@ -377,6 +380,7 @@ def _process_per_tile_outputs(
     tile_key_mask_cache: Dict[str, TileMaskResult],
     tile_key_mask_cushion: int,
     reg_meta_cache: Mapping[str, Mapping[str, Any]],
+    reg_refiner: Optional[RegistrationRefiner],
     fusion_enabled: bool,
     fusion_debug_state: Optional[FusionDebugState],
     comparison_enabled: bool,
@@ -434,6 +438,7 @@ def _process_per_tile_outputs(
         tile_mask_batch = build_batch_tile_mask(
             clip_ids,
             reg_meta_cache=reg_meta_cache,
+            reg_refiner=reg_refiner,
             mask_cache=tile_key_mask_cache,
             num_tiles=model_tiles,
             cushion_keys=tile_key_mask_cushion,
@@ -1749,11 +1754,21 @@ def _build_eval_loader(args, runtime: RuntimeContext, log_progress) -> LoaderCon
         stage_durations["materialize"] = materialize_duration
 
     target_display = str(target_clips) if target_clips is not None else "?"
+    base_dataset = dataset
+    if isinstance(base_dataset, Subset):
+        base_dataset = base_dataset.dataset
+    registration_refiner = getattr(base_dataset, "registration_refiner", None) if base_dataset is not None else None
+    reg_meta_cache = None
+    if isinstance(registration_refiner, RegistrationRefiner):
+        reg_meta_cache = registration_refiner.export_cache_payload()
+
     return LoaderContext(
         val_loader=val_loader,
         dataset=dataset,
         target_clips=target_clips,
         target_display=target_display,
+        registration_refiner=registration_refiner if isinstance(registration_refiner, RegistrationRefiner) else None,
+        reg_meta_cache=reg_meta_cache,
     )
 
 
@@ -1818,10 +1833,12 @@ def _collect_logits(
     tile_key_mask_cushion = fusion_cfg.cushion_keys if fusion_enabled else 2
     per_tile_shape_logged = False
     per_tile_target_issue_logged = False
+    reg_refiner = loader_ctx.registration_refiner
     reg_meta_cache: Dict[str, Dict[str, Any]] = {}
-    if return_per_tile_requested or fusion_enabled:
-        reg_cache_env = os.environ.get("TIVIT_REG_REFINED")
-        reg_cache_path = Path(reg_cache_env) if reg_cache_env else repo / "reg_refined.json"
+    if reg_refiner is not None:
+        reg_meta_cache = loader_ctx.reg_meta_cache or reg_refiner.export_cache_payload()
+    elif return_per_tile_requested or fusion_enabled:
+        reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
         reg_meta_cache = _load_registration_metadata(reg_cache_path)
         if not reg_meta_cache:
             LOGGER.debug("per-tile: registration cache %s unavailable or empty", reg_cache_path)
@@ -1912,6 +1929,7 @@ def _collect_logits(
                         tile_key_mask_cache=tile_key_mask_cache,
                         tile_key_mask_cushion=tile_key_mask_cushion,
                         reg_meta_cache=reg_meta_cache,
+                        reg_refiner=reg_refiner,
                         fusion_enabled=fusion_enabled,
                         fusion_debug_state=fusion_debug_state,
                         comparison_enabled=comparison_enabled,
