@@ -17,7 +17,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -27,6 +27,7 @@ from .identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CANONICAL_HW_LOGGED: Set[Tuple[int, int]] = set()
 
 try:
     import cv2  # type: ignore
@@ -745,9 +746,18 @@ class RegistrationRefiner:
         self.cache_path = cache_candidate
         self.logger = logger or LOGGER
         self._cache: Dict[str, RegistrationResult] = {}
+        self._log_canonical_hw_once()
         self._load_cache()
 
     # ------------------------------------------------------------------ I/O --
+
+    def _log_canonical_hw_once(self) -> None:
+        h, w = self.canonical_hw
+        canon: Tuple[int, int] = (int(h), int(w))
+        if canon in _CANONICAL_HW_LOGGED:
+            return
+        _CANONICAL_HW_LOGGED.add(canon)
+        self.logger.info("reg_refined: canonical_hw=%s cache=%s", canon, self.cache_path)
 
     def _load_cache(self) -> None:
         path = self.cache_path
@@ -762,16 +772,37 @@ class RegistrationRefiner:
 
         if not isinstance(data, dict):
             return
+        stored = 0
+        skipped_target_hw = 0
+        skipped_invalid = 0
         for key, payload in data.items():
             if not isinstance(payload, dict):
+                skipped_invalid += 1
                 continue
             try:
                 result = RegistrationResult.from_json(payload)
-            except Exception:
+            except Exception as exc:
+                skipped_invalid += 1
+                self.logger.debug("reg_refined: failed to parse cache entry key=%s (%s)", key, exc)
                 continue
             if tuple(result.target_hw) != self.canonical_hw:
+                skipped_target_hw += 1
+                self.logger.debug(
+                    "reg_refined: skip cache entry key=%s target_hw=%s canonical_hw=%s",
+                    key,
+                    tuple(result.target_hw),
+                    self.canonical_hw,
+                )
                 continue
             self._cache[str(key)] = result
+            stored += 1
+        self.logger.info(
+            "reg_refined: loaded %d cache entries from %s (skipped_target_hw=%d skipped_invalid=%d)",
+            stored,
+            path,
+            skipped_target_hw,
+            skipped_invalid,
+        )
 
     def _persist_cache(self) -> None:
         path = self.cache_path
@@ -787,6 +818,46 @@ class RegistrationRefiner:
                 if tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
                 self.logger.warning("reg_refined: failed to persist cache %s (%s)", path, exc)
+
+    def log_cache_summary(
+        self,
+        *,
+        video_id: Optional[str] = None,
+        max_keys: int = 15,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        """Emit a human-readable snapshot of the current cache contents."""
+
+        max_keys = max(int(max_keys), 0)
+        target_logger = logger or self.logger
+        keys = sorted(self._cache.keys())
+        target_logger.info(
+            "reg_refined: cache_path=%s entries=%d canonical_hw=%s",
+            self.cache_path,
+            len(keys),
+            self.canonical_hw,
+        )
+        if keys and max_keys:
+            target_logger.info("reg_refined: cache_keys_preview=%s", keys[:max_keys])
+        elif not keys:
+            target_logger.info("reg_refined: cache empty")
+        if not video_id:
+            return
+        canon = canonical_video_id(video_id)
+        entry = self._cache.get(canon)
+        if entry is None:
+            target_logger.info("reg_refined: cache_entry[%s]=missing", canon)
+            return
+        target_logger.info(
+            "reg_refined: cache_entry[%s] status=%s target_hw=%s source_hw=%s keyboard_height=%.1f err_after=%.2f frames=%d",
+            canon,
+            entry.status,
+            entry.target_hw,
+            entry.source_hw,
+            entry.keyboard_height,
+            entry.err_after,
+            entry.frames,
+        )
 
     # --------------------------------------------------------------- Sampling --
 

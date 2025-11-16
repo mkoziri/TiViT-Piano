@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 from collections import Counter
 
 import numpy as np
 import torch
 
 from .tile_keymap import TileMaskResult, build_tile_key_mask
+from utils.identifiers import canonical_video_id
 
 _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
 _FALLBACK_CACHE_KEY = "__fallback__"
+_REG_LOOKUP_LOGGED: Set[str] = set()
+
+
+def _registration_cache_key(clip_id: Optional[str]) -> Optional[str]:
+    if clip_id is None:
+        return None
+    key = canonical_video_id(clip_id)
+    key = key.strip()
+    if not key:
+        return None
+    if clip_id not in _REG_LOOKUP_LOGGED:
+        print(f"[fusion] registration lookup dataset_id={clip_id} cache_key={key}", flush=True)
+        _REG_LOOKUP_LOGGED.add(clip_id)
+    return key
 
 
 @dataclass(frozen=True)
@@ -245,10 +260,13 @@ def resolve_tile_key_mask(
     cushion_keys: int,
     n_keys: int,
 ) -> TileMaskResult:
-    cache_key = clip_id or f"{_FALLBACK_CACHE_KEY}_{n_keys}"
+    lookup_key = _registration_cache_key(clip_id) if clip_id else None
+    cache_key = lookup_key or clip_id or f"{_FALLBACK_CACHE_KEY}_{n_keys}"
     if cache_key in mask_cache:
         return mask_cache[cache_key]
-    reg_meta = reg_meta_cache.get(clip_id) if clip_id else None
+    reg_meta_key = lookup_key or clip_id
+    reg_meta = reg_meta_cache.get(reg_meta_key) if reg_meta_key else None
+    lookup_attempted = reg_meta_key is not None
     result = build_tile_key_mask(
         reg_meta,
         num_tiles=num_tiles,
@@ -257,7 +275,24 @@ def resolve_tile_key_mask(
     )
     if (not result.registration_based) and clip_id:
         reason = result.fallback_reason or "unknown"
-        print(f"[fusion] fallback coverage clip={clip_id} reason={reason}", flush=True)
+        if not lookup_attempted:
+            cache_state = "skipped"
+        elif reg_meta is None:
+            cache_state = "no_entry"
+        else:
+            cache_state = "entry_unusable"
+        query = reg_meta_key or "<none>"
+        print(
+            "[fusion] fallback coverage clip={} query_key={} cache_state={} reason={} geometry_source={} tile_source={}".format(
+                clip_id,
+                query,
+                cache_state,
+                reason,
+                result.geometry_source,
+                result.tile_source,
+            ),
+            flush=True,
+        )
     mask_cache[cache_key] = result
     return result
 

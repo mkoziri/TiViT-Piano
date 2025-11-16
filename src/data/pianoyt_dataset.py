@@ -110,6 +110,7 @@ def _safe_expanduser(path: Union[str, Path]) -> Path:
         return candidate
 
 _VIDEO_EXTS: Sequence[str] = (".mp4", ".mkv", ".webm")
+_REG_DEBUG_CANON_LOGGED = False
 
 
 def _expand_root(root_dir: Optional[str]) -> Path:
@@ -590,6 +591,15 @@ class PianoYTDataset(Dataset):
             sample_frames=reg_sample_frames,
             logger=LOGGER,
         )
+        global _REG_DEBUG_CANON_LOGGED
+        if not _REG_DEBUG_CANON_LOGGED:
+            LOGGER.info(
+                "[PianoYT] registration canonical_hw=%s dataset_canonical_hw=%s dataset_resize=%s",
+                self.registration_refiner.canonical_hw,
+                self.canonical_hw,
+                tuple(int(v) for v in self.resize),
+            )
+            _REG_DEBUG_CANON_LOGGED = True
 
         global_aug_cfg = self.dataset_cfg.get("global_aug")
         if not isinstance(global_aug_cfg, dict):
