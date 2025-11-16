@@ -60,7 +60,7 @@ Usage:
 import argparse
 import sys, json, time, math, os, torch, logging, copy, hashlib
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import numpy as np
 from pathlib import Path
@@ -183,7 +183,8 @@ class LoaderContext:
     target_clips: Optional[int]
     target_display: str
     registration_refiner: Optional[RegistrationRefiner] = None
-    reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None
+    reg_meta_cache: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    reg_meta_path: Optional[Path] = None
 
 
 @dataclass
@@ -1757,18 +1758,27 @@ def _build_eval_loader(args, runtime: RuntimeContext, log_progress) -> LoaderCon
     base_dataset = dataset
     if isinstance(base_dataset, Subset):
         base_dataset = base_dataset.dataset
-    registration_refiner = getattr(base_dataset, "registration_refiner", None) if base_dataset is not None else None
-    reg_meta_cache = None
-    if isinstance(registration_refiner, RegistrationRefiner):
-        reg_meta_cache = registration_refiner.export_cache_payload()
+    registration_refiner = None
+    reg_meta_path: Optional[Path] = None
+    if base_dataset is not None:
+        registration_refiner = getattr(base_dataset, "registration_refiner", None)
+        reg_path_attr = getattr(base_dataset, "registration_cache_path", None)
+        if reg_path_attr:
+            reg_meta_path = Path(reg_path_attr)
+    if reg_meta_path is None:
+        reg_meta_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
+    reg_meta_cache = _load_registration_metadata(reg_meta_path) if reg_meta_path else {}
+    if not isinstance(registration_refiner, RegistrationRefiner):
+        registration_refiner = None
 
     return LoaderContext(
         val_loader=val_loader,
         dataset=dataset,
         target_clips=target_clips,
         target_display=target_display,
-        registration_refiner=registration_refiner if isinstance(registration_refiner, RegistrationRefiner) else None,
+        registration_refiner=registration_refiner,
         reg_meta_cache=reg_meta_cache,
+        reg_meta_path=reg_meta_path,
     )
 
 
@@ -1834,14 +1844,15 @@ def _collect_logits(
     per_tile_shape_logged = False
     per_tile_target_issue_logged = False
     reg_refiner = loader_ctx.registration_refiner
-    reg_meta_cache: Dict[str, Dict[str, Any]] = {}
-    if reg_refiner is not None:
-        reg_meta_cache = loader_ctx.reg_meta_cache or reg_refiner.export_cache_payload()
-    elif return_per_tile_requested or fusion_enabled:
-        reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
-        reg_meta_cache = _load_registration_metadata(reg_cache_path)
-        if not reg_meta_cache:
-            LOGGER.debug("per-tile: registration cache %s unavailable or empty", reg_cache_path)
+    reg_meta_cache: Dict[str, Dict[str, Any]] = loader_ctx.reg_meta_cache or {}
+    if (return_per_tile_requested or fusion_enabled) and not reg_meta_cache:
+        reg_cache_path = loader_ctx.reg_meta_path or resolve_registration_cache_path(
+            os.environ.get("TIVIT_REG_REFINED")
+        )
+        if reg_cache_path:
+            reg_meta_cache = _load_registration_metadata(reg_cache_path)
+            if not reg_meta_cache:
+                LOGGER.debug("per-tile: registration cache %s unavailable or empty", reg_cache_path)
 
     onset_temperature = float(onset_temperature)
     offset_temperature = float(offset_temperature)

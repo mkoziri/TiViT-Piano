@@ -587,6 +587,7 @@ class PianoYTDataset(Dataset):
         reg_sample_frames = int(reg_cfg.get("sample_frames", 96))
         reg_cache_override = reg_cfg.get("cache_path")
         reg_cache_path = resolve_registration_cache_path(reg_cache_override)
+        self.registration_cache_path = reg_cache_path
         self.registration_refiner = RegistrationRefiner(
             self.canonical_hw,
             cache_path=reg_cache_path,
