@@ -80,7 +80,10 @@ def _key_bounds_from_white_edges(edges: np.ndarray, width: float) -> Optional[Li
     return bounds
 
 
-def _build_geometry_metadata_from_edges(edges: np.ndarray, width: float, canonical_hw: Tuple[int, int]) -> Optional[Dict[str, Any]]:
+def _build_geometry_metadata_from_edges(edges: np.ndarray, width: float, canonical_hw: Sequence[int]) -> Optional[Dict[str, Any]]:
+    if len(canonical_hw) < 2:
+        return None
+    canon_pair = (int(canonical_hw[0]), int(canonical_hw[1]))
     key_bounds = _key_bounds_from_white_edges(edges, width)
     if key_bounds is None:
         return None
@@ -90,7 +93,7 @@ def _build_geometry_metadata_from_edges(edges: np.ndarray, width: float, canonic
     return {
         "rectified_width": float(width),
         "key_bounds_px": key_bounds,
-        "target_hw": [int(canonical_hw[0]), int(canonical_hw[1])],
+        "target_hw": [canon_pair[0], canon_pair[1]],
         "tile_bounds_px": tile_bounds,
     }
 
