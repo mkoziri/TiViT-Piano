@@ -1071,7 +1071,13 @@ class RegistrationRefiner:
                 if len(indices) > target_frames:
                     indices = indices[:target_frames]
                 for idx in indices:
-                    img = vr[idx].asnumpy()  # type: ignore[attr-defined]
+                    sample = vr[idx]
+                    if hasattr(sample, "asnumpy"):
+                        img = sample.asnumpy()  # type: ignore[attr-defined]
+                    elif isinstance(sample, torch.Tensor):
+                        img = sample.detach().cpu().numpy()
+                    else:  # decord bridge not set; best effort conversion
+                        img = np.asarray(sample)
                     if img is None:
                         continue
                     frame = _apply_crop_np(img, crop_meta)
