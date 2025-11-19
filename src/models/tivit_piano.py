@@ -19,10 +19,13 @@ CLI:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 from einops import rearrange
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from utils.tiling import tile_vertical_token_aligned
+
+LOGGER = logging.getLogger(__name__)
 
 
 # -------- Tubelet embedding (3D patchify) ----------
@@ -235,6 +238,8 @@ class TiViTPiano(nn.Module):
         self._tile_bounds: Optional[List[Tuple[int, int]]] = None
         self._tile_token_counts: Optional[List[int]] = None
         self._tile_widths_px: Optional[List[int]] = None
+        self._tiling_debug_enabled = False
+        self._tiling_debug_logged = False
 
         # Tubelet / patch embed
         self.embed = TubeletEmbed(in_ch=input_channels, embed_dim=d_model,
@@ -284,6 +289,12 @@ class TiViTPiano(nn.Module):
                 tiles=int(self.encoder_cfg["tiles"])
             )
 
+    def enable_tiling_debug(self) -> None:
+        """Allow a single detailed tiling log when logger level is DEBUG."""
+
+        self._tiling_debug_enabled = True
+        self._tiling_debug_logged = False
+
     def _tile_split_token_aligned(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Split ``x`` using token-aligned tiling consistent with the data pipeline."""
 
@@ -330,6 +341,38 @@ class TiViTPiano(nn.Module):
                 tiles = padded_tiles
                 
         return tiles
+
+    def _maybe_log_tiling_debug(self, tiles: Sequence[torch.Tensor]) -> None:
+        if not self._tiling_debug_enabled or self._tiling_debug_logged:
+            return
+        if not tiles:
+            return
+        try:
+            tile_shapes = [tuple(int(dim) for dim in tile.shape) for tile in tiles]
+        except Exception:
+            tile_shapes = []
+        heights = [int(tile.shape[-2]) for tile in tiles]
+        widths = [int(tile.shape[-1]) for tile in tiles]
+        LOGGER.debug(
+            "[tiling-debug] tiles=%d tile_shapes=%s",
+            len(tiles),
+            tile_shapes or "n/a",
+        )
+        LOGGER.debug(
+            "[tiling-debug] tile_heights=%s tile_widths=%s",
+            [h for h in heights],
+            [w for w in widths],
+        )
+        token_counts = self._tile_token_counts
+        if not token_counts:
+            patch_w = max(int(self.tiling_patch_w), 1)
+            token_counts = [int(w // patch_w) for w in widths]
+        LOGGER.debug(
+            "[tiling-debug] patch_columns_per_tile=%s (patch_w=%d)",
+            token_counts,
+            self.tiling_patch_w,
+        )
+        self._tiling_debug_logged = True
 
     def _infer_token_factors(self, t_cf: torch.Tensor) -> tuple[int, int]:
         """
@@ -399,6 +442,7 @@ class TiViTPiano(nn.Module):
             tiles = self._tile_split_token_aligned(x)
         else:
             raise ValueError(f"Unexpected input rank {x.dim()} for TiViTPiano forward")
+        self._maybe_log_tiling_debug(tiles)
             
         # Per-tile tubelet embedding (shared weights)
         tile_tokens = []

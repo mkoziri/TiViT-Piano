@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_fusion_sw_0d6a5b6d_auto
+  name: TiViT-Piano_PianoYT_tile_first
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -14,7 +14,7 @@ dataset:
   - offset
   - hand
   - clef
-  max_clips: null
+  max_clips: 80
   manifest:
     train: null
     val: null
@@ -28,14 +28,14 @@ dataset:
   hop_seconds: 0.03333333333333333
   resize:
   - 145
-  - 800
+  - 1024 #was 800
   tiles: 3
   channels: 3
   normalize: true
   apply_crop: true
   canonical_hw:
   - 145
-  - 800
+  - 1024 #was 800
   registration:
     source: metadata
     interp: bilinear
@@ -43,17 +43,17 @@ dataset:
       enabled: false
       resize_jitter:
       - 150
-      - 805
+      - 1030 #was 805
       random_crop_hw:
       - 145
-      - 800
+      - 1024 #was 800
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
   num_workers: 4
   shuffle: true
   sampler:
-    mode: onset_balanced
+    mode: onset_balanced          # set to "onset_balanced" to enable optional sampler or "null" for default
     onset_frac: 0.5
     nearmiss_frac: 0.25
     bg_frac: 0.25
@@ -95,7 +95,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 23
+  epochs: 4
   learning_rate: 3e-5
   weight_decay: 0.01
   eval_freq: 1
@@ -103,13 +103,13 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: true
-  reset_head_bias: false
+  resume: false
+  reset_head_bias: true
   bias_seed:
     onoff_prior_mean: 0.012
   loss_weights:
     onoff_loss: bce_pos
-    onoff_pos_weight_mode: adaptive
+    onoff_pos_weight_mode: adaptive  #it was fixed
     onoff_pos_weight: 16.0
     onoff_pos_weight_ema_alpha: 0.05
     onoff_neg_smooth: 0.0
@@ -119,8 +119,8 @@ training:
     onoff_prior_weight: 0.15
     onoff_heads:
       onset:
-        loss: focal
-        pos_weight_mode: adaptive
+        loss: focal #was bce_pos
+        pos_weight_mode: adaptive  #was fixed
         focal_gamma: 4.0
         focal_alpha: 0.25
         prior_mean: 0.012
@@ -148,15 +148,15 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.01  # default
-        hold: 0.0075  # default
-        min_on: 2  # default
-        merge_gap: 1  # default
+        open: 0.01  
+        hold: 0.0075
+        min_on: 2  
+        merge_gap: 1  
       offset:
-        open: 0.015  # default
-        hold: 0.01  # default
-        min_off: 2  # default
-        merge_gap: 1  # default
+        open: 0.015  
+        hold: 0.01  
+        min_off: 2  
+        merge_gap: 1  
     temporal_decoder:
       shared:
         low_ratio: 0.6
@@ -186,7 +186,7 @@ training:
       max_prob: 0.98
 optim:
   grad_clip: 1.0
-  head_lr_multiplier: 10.0
+  head_lr_multiplier: 10.0 #was 5.0
   offset_weight_decay_multiplier: 4.0
 train:
   accumulate_steps: 12
@@ -216,7 +216,7 @@ decoder:
       min_support_notes: 12
       confidence_floor: 0.15
     dp:
-      enabled: true
+      enabled: false
       min_on_beats: 0.25
       min_off_beats: 0.25
       penalty_on: 0.5
@@ -227,7 +227,7 @@ decoder:
       emission_mode: logit
       emission_gain: 4.0
       emission_bias: 0.0
-    key_prior: null
+    key_prior:
     enabled: true
     ref_head: onset
     apply_to:
@@ -241,8 +241,6 @@ decoder:
     fps: null
     midi_low: 21
     midi_high: null
-  key_prior:
-    enabled: false
 logging:
   log_dir: logs
   checkpoint_dir: checkpoints

@@ -35,6 +35,7 @@ from time import perf_counter
 from datetime import datetime
 
 import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -3479,6 +3480,12 @@ def main():
     
     # Model & optimizer
     model = build_model(cfg)
+    tiling_debug_active = logger.isEnabledFor(logging.DEBUG)
+    if tiling_debug_active and hasattr(model, "enable_tiling_debug"):
+        try:
+            model.enable_tiling_debug()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.debug("Failed to enable tiling debug logging: %s", exc)
     
     # --- diag: baseline random prediction stats right after init (removable) ---
     _baseline_batch = None
@@ -3687,6 +3694,8 @@ def main():
     if selection_mode not in {"loss", "proxy_event", "calibrated_event"}:
         selection_mode = "calibrated_event"
     selection_trigger = str(best_sel_cfg.get("trigger", "on_proxy_improvement")).lower()
+
+    tiling_input_logged = False
     if selection_trigger not in {"on_proxy_improvement", "every_n_epochs"}:
         selection_trigger = "on_proxy_improvement"
     selection_interval = _coerce_positive_int(best_sel_cfg.get("n")) or 1
@@ -3799,6 +3808,31 @@ def main():
         for it, batch in pbar:
             x = batch["video"]
             B = x.shape[0]
+            if tiling_debug_active and not tiling_input_logged:
+                if x.dim() == 5:
+                    B_in, T_in, C_in, H_in, W_in = x.shape
+                    logger.debug(
+                        "[tiling-debug] input tensor shape (B=%d, T=%d, C=%d, H=%d, W=%d)",
+                        B_in,
+                        T_in,
+                        C_in,
+                        H_in,
+                        W_in,
+                    )
+                elif x.dim() == 6:
+                    B_in, T_in, tiles_in, C_in, H_in, W_in = x.shape
+                    logger.debug(
+                        "[tiling-debug] input tensor shape (B=%d, T=%d, tiles=%d, C=%d, H=%d, W=%d)",
+                        B_in,
+                        T_in,
+                        tiles_in,
+                        C_in,
+                        H_in,
+                        W_in,
+                    )
+                else:
+                    logger.debug("[tiling-debug] unexpected input rank=%d shape=%s", x.dim(), tuple(x.shape))
+                tiling_input_logged = True
 
             # Prefer real labels; fallback to dummy
             want = ("pitch", "onset", "offset", "hand", "clef")
