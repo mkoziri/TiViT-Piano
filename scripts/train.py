@@ -882,6 +882,52 @@ def _binary_f1(pred, target, eps=1e-8):
     f1 = 2 * precision * recall / (precision + recall + eps)
     return f1
 
+
+def _summarize_pitch_predictions(pred_mask: torch.Tensor, target_mask: torch.Tensor) -> Optional[Dict[str, float]]:
+    """Return aggregate TP/FP/FN counts plus frame-exact matches for pitch predictions."""
+
+    if not torch.is_tensor(pred_mask) or not torch.is_tensor(target_mask):
+        return None
+    if pred_mask.shape != target_mask.shape:
+        raise ValueError(f"Pitch prediction/target shape mismatch: pred={pred_mask.shape} target={target_mask.shape}")
+    if pred_mask.numel() == 0:
+        return None
+
+    pred_bool = pred_mask.bool()
+    target_bool = target_mask.bool()
+    tp = float((pred_bool & target_bool).sum().item())
+    fp = float((pred_bool & (~target_bool)).sum().item())
+    fn = float(((~pred_bool) & target_bool).sum().item())
+    pred_pos = float(pred_bool.sum().item())
+    target_pos = float(target_bool.sum().item())
+
+    last_dim = pred_bool.shape[-1]
+    pred_flat = pred_bool.reshape(-1, last_dim)
+    target_flat = target_bool.reshape(-1, last_dim)
+    matches = (pred_flat == target_flat).all(dim=-1)
+    frame_match = float(matches.sum().item())
+    frame_total = float(matches.numel())
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "pred_pos": pred_pos,
+        "target_pos": target_pos,
+        "frame_match": frame_match,
+        "frame_total": frame_total,
+    }
+
+
+def _accumulate_pitch_counts(counts: Dict[str, Any], stats: Mapping[str, float]) -> None:
+    counts["pitch_pos_tp"] += stats["tp"]
+    counts["pitch_pos_fp"] += stats["fp"]
+    counts["pitch_pos_fn"] += stats["fn"]
+    counts["pitch_preds_pos"] += stats["pred_pos"]
+    counts["pitch_targets_pos"] += stats["target_pos"]
+    counts["pitch_frame_match"] += stats["frame_match"]
+    counts["pitch_frame_total"] += stats["frame_total"]
+
 def _acc_from_logits(logits, target):
     # logits: (B, C), target: (B,) long
     pred = logits.argmax(dim=1)
@@ -1081,7 +1127,13 @@ def _accumulate_pred_key_histogram(hist_bins: list[float], counts: torch.Tensor)
 
 def _init_eval_metric_counts() -> Dict[str, Any]:
     return {
-        "pitch_acc": 0.0,
+        "pitch_pos_tp": 0.0,
+        "pitch_pos_fp": 0.0,
+        "pitch_pos_fn": 0.0,
+        "pitch_preds_pos": 0.0,
+        "pitch_targets_pos": 0.0,
+        "pitch_frame_match": 0.0,
+        "pitch_frame_total": 0.0,
         "hand_acc": 0.0,
         "clef_acc": 0.0,
         "onset_f1": 0.0,
@@ -2613,8 +2665,12 @@ def evaluate_one_epoch(
                     if onset_logits_eval is None or offset_logits_eval is None:
                         logger.warning("[eval] Missing logits for frame-mode evaluation; skipping batch.")
                         continue
+                    if not torch.is_tensor(pitch_logits_eval):
+                        logger.warning("[eval] Missing pitch logits for frame-mode evaluation; skipping batch.")
+                        continue
                     B, T_logits, P = onset_logits_eval.shape
 
+                    pitch_roll = frame_batch["pitch_roll"].to(pitch_logits_eval.device)
                     onset_roll = frame_batch["onset_roll"]
                     offset_roll = frame_batch["offset_roll"]
                     hand_frame = frame_batch["hand_frame"]
@@ -2692,6 +2748,15 @@ def evaluate_one_epoch(
                     strict_offset_mask_float = strict_offset_mask.float()
                     onset_event_mask = strict_onset_mask.bool()
                     offset_event_mask = strict_offset_mask.bool()
+
+                    pitch_roll_aligned = _align_key_mask_to(pitch_logits_eval, pitch_roll)
+                    pitch_target_mask = (pitch_roll_aligned >= 0.5)
+                    pitch_pred_probs = torch.sigmoid(pitch_logits_eval)
+                    pitch_pred_mask = (pitch_pred_probs >= thr_pitch)
+                    pitch_stats = _summarize_pitch_predictions(pitch_pred_mask, pitch_target_mask)
+                    if pitch_stats is not None:
+                        _accumulate_pitch_counts(loose_counts, pitch_stats)
+                        _accumulate_pitch_counts(strict_counts, pitch_stats)
 
                     onset_probs_proxy = onset_probs_valid if torch.is_tensor(onset_probs_valid) else None
                     if onset_probs_proxy is None and "onset_logits" in metrics_out:
@@ -2863,12 +2928,26 @@ def evaluate_one_epoch(
                         continue
                     pitch_head_eval = pitch_logits_eval
                     if torch.is_tensor(pitch_head_eval):
-                        pitch_pred = (torch.sigmoid(pitch_head_eval) >= thr_pitch).float()
-                        pitch_gt = (tgt["pitch"] >= 0.5).float()
-                        f1_pitch = _binary_f1(pitch_pred.reshape(-1), pitch_gt.reshape(-1))
-                        if f1_pitch is not None:
-                            loose_counts["pitch_acc"] += f1_pitch
-                            strict_counts["pitch_acc"] += f1_pitch
+                        pitch_probs = torch.sigmoid(pitch_head_eval)
+                        pitch_pred_mask = (pitch_probs >= thr_pitch)
+                        pitch_gt_raw = tgt.get("pitch")
+                        if torch.is_tensor(pitch_gt_raw):
+                            pitch_gt_mask = (pitch_gt_raw >= 0.5)
+                            if pitch_gt_mask.shape != pitch_pred_mask.shape:
+                                if pitch_pred_mask.dim() == 3 and pitch_gt_mask.dim() == 3:
+                                    pitch_gt_mask = _align_key_mask_to(pitch_pred_mask, pitch_gt_mask)
+                                else:
+                                    logger.warning(
+                                        "[eval] Pitch target shape %s does not match predictions %s; skipping batch stats.",
+                                        tuple(pitch_gt_mask.shape),
+                                        tuple(pitch_pred_mask.shape),
+                                    )
+                                    pitch_gt_mask = None
+                            if pitch_gt_mask is not None:
+                                pitch_stats = _summarize_pitch_predictions(pitch_pred_mask, pitch_gt_mask)
+                                if pitch_stats is not None:
+                                    _accumulate_pitch_counts(loose_counts, pitch_stats)
+                                    _accumulate_pitch_counts(strict_counts, pitch_stats)
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
@@ -3127,7 +3206,17 @@ def evaluate_one_epoch(
     def _finalize_branch_counts(counts: Dict[str, Any]) -> Dict[str, float]:
         branch: Dict[str, float] = {}
         denom = max(1, metric_n)
-        branch["pitch_acc"] = counts["pitch_acc"] / denom
+        tp = counts["pitch_pos_tp"]
+        fp = counts["pitch_pos_fp"]
+        fn = counts["pitch_pos_fn"]
+        pitch_denom = 2 * tp + fp + fn
+        pitch_pos_f1 = (2 * tp / pitch_denom) if pitch_denom > 0 else 0.0
+        frame_total = counts["pitch_frame_total"]
+        pitch_frame_acc = (counts["pitch_frame_match"] / frame_total) if frame_total > 0 else 0.0
+        # Pitch metric used in reports/papers: per-key micro F1 on positives (pitch_pos_f1).
+        # Frame-exact accuracy remains as a debugging aid and is not treated as a headline score.
+        branch["pitch_pos_f1"] = pitch_pos_f1
+        branch["pitch_frame_exact_acc"] = pitch_frame_acc
         branch["hand_acc"] = counts["hand_acc"] / denom
         branch["clef_acc"] = counts["clef_acc"] / denom
         branch["onset_f1"] = counts["onset_f1"] / max(1, counts.get("n_on", 0))
@@ -3229,6 +3318,21 @@ def evaluate_one_epoch(
     print(f"[loose] {loose_line}\n")
     print(f"[strict] {strict_line}\n")
     print(f"[any] {legacy_line}\n")
+    pitch_tp = loose_counts["pitch_pos_tp"]
+    pitch_fp = loose_counts["pitch_pos_fp"]
+    pitch_fn = loose_counts["pitch_pos_fn"]
+    pitch_targets = loose_counts["pitch_targets_pos"]
+    pitch_preds = loose_counts["pitch_preds_pos"]
+    pitch_line = (
+        f"pitch_pos_f1={loose_branch.get('pitch_pos_f1', 0.0):.3f}\t"
+        f"thr={thr_pitch:.3f}\t"
+        f"targets_pos={pitch_targets:.0f}\t"
+        f"preds_pos={pitch_preds:.0f}\t"
+        f"tp={pitch_tp:.0f}\t"
+        f"fp={pitch_fp:.0f}\t"
+        f"fn={pitch_fn:.0f}"
+    )
+    print(f"[pitch] {pitch_line}\n")
     event_line = (
         f"onset={onset_event_f1:.3f}\t offset={offset_event_f1:.3f}\t mean={event_f1_mean:.3f} "
         f"(clips_on={event_proxy_accum['onset_count']} clips_off={event_proxy_accum['offset_count']})"
@@ -3238,6 +3342,7 @@ def evaluate_one_epoch(
     logger.info("[loose] %s", loose_line, extra=quiet_extra)
     logger.info("[strict] %s", strict_line, extra=quiet_extra)
     logger.info("[any] %s", legacy_line, extra=quiet_extra)
+    logger.info("[pitch] %s", pitch_line, extra=quiet_extra)
     logger.info("[event-proxy] %s", event_line, extra=quiet_extra)
 
     calibration_line = (

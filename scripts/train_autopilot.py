@@ -2737,6 +2737,8 @@ RESULT_HEADER = [
     "k_onset",
     "onset_f1",
     "offset_f1",
+    "pitch_pos_f1",
+    "pitch_frame_exact_acc",
     "onset_ev_f1",
     "offset_ev_f1",
     "ev_f1_mean",
@@ -2815,6 +2817,12 @@ def format_val_line(metrics: Dict[str, float], train_val: Optional[str]) -> str:
     if metrics:
         bits.append(f"onset_f1={metrics['onset_f1']:.3f}")
         bits.append(f"offset_f1={metrics['offset_f1']:.3f}")
+        pitch_pos_val = metrics.get("pitch_pos_f1")
+        if isinstance(pitch_pos_val, (int, float)):
+            bits.append(f"pitch_pos_f1={pitch_pos_val:.3f}")
+        pitch_exact_val = metrics.get("pitch_frame_exact_acc")
+        if isinstance(pitch_exact_val, (int, float)):
+            bits.append(f"pitch_frame_exact_acc={pitch_exact_val:.3f}")
         bits.append(f"onset_event_f1={metrics['onset_event_f1']:.3f}")
         bits.append(f"offset_event_f1={metrics['offset_event_f1']:.3f}")
         bits.append(f"onset_pred_rate={metrics['onset_pred_rate']:.3f}")
@@ -2909,6 +2917,8 @@ def append_results(
         _fmt_int(k_onset_val, "1"),
         _fmt_float(metrics.get("onset_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("offset_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("pitch_pos_f1"), ".4f", "0.0000"),
+        _fmt_float(metrics.get("pitch_frame_exact_acc"), ".4f", "0.0000"),
         _fmt_float(metrics.get("onset_event_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("offset_event_f1"), ".4f", "0.0000"),
         _fmt_float(metrics.get("ev_f1_mean"), ".4f", "0.0000"),
@@ -3469,6 +3479,8 @@ def main() -> int:
                     "k_onset": 1,
                     "onset_f1": 0.0,
                     "offset_f1": 0.0,
+                    "pitch_pos_f1": 0.0,
+                    "pitch_frame_exact_acc": 0.0,
                     "onset_event_f1": 0.0,
                     "offset_event_f1": 0.0,
                     "ev_f1_mean": 0.0,
@@ -3498,6 +3510,8 @@ def main() -> int:
                 "offset_thr": 0.3,
                 "onset_f1": 0.0,
                 "offset_f1": 0.0,
+                "pitch_pos_f1": 0.0,
+                "pitch_frame_exact_acc": 0.0,
                 "onset_event_f1": 0.0,
                 "offset_event_f1": 0.0,
                 "ev_f1_mean": 0.0,
