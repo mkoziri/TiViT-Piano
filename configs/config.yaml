@@ -14,7 +14,7 @@ dataset:
   - offset
   - hand
   - clef
-  max_clips: 80
+  max_clips: null
   manifest:
     train: null
     val: null
@@ -95,7 +95,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 20
+  epochs: 23
   learning_rate: 3e-5
   weight_decay: 0.01
   eval_freq: 1
