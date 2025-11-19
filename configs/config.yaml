@@ -50,7 +50,8 @@ dataset:
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
-  num_workers: 4
+  num_workers: 2
+  prefetch_factor: 1
   shuffle: true
   sampler:
     mode: onset_balanced          # set to "onset_balanced" to enable optional sampler or "null" for default

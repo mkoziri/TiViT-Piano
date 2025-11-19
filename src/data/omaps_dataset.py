@@ -1164,6 +1164,15 @@ def make_dataloader(
     pin_memory = bool(dcfg.get("pin_memory", False))
     persistent_workers_cfg = bool(dcfg.get("persistent_workers", False))
     persistent_workers = persistent_workers_cfg if num_workers > 0 else False
+    prefetch_factor_cfg = dcfg.get("prefetch_factor")
+    prefetch_factor: Optional[int] = None
+    if num_workers > 0 and prefetch_factor_cfg is not None:
+        try:
+            prefetch_candidate = int(prefetch_factor_cfg)
+        except (TypeError, ValueError):
+            prefetch_candidate = None
+        if prefetch_candidate is not None and prefetch_candidate > 0:
+            prefetch_factor = prefetch_candidate
 
     # Seed DataLoader so shuffling/workers stay reproducible across runs.
     base_seed = seed if seed is not None else getattr(dataset, "data_seed", None)
@@ -1182,8 +1191,8 @@ def make_dataloader(
     if sampler is not None:
         shuffle_flag = False
 
-    loader = DataLoader(
-        dataset,
+    loader_kwargs: Dict[str, Any] = dict(
+        dataset=dataset,
         batch_size=int(dcfg.get("batch_size", 2)),
         shuffle=shuffle_flag,
         sampler=sampler,
@@ -1195,4 +1204,8 @@ def make_dataloader(
         worker_init_fn=worker_init_fn,
         generator=generator,
     )
+    if prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    loader = DataLoader(**loader_kwargs)
     return loader
