@@ -905,6 +905,7 @@ class RegistrationRefiner:
         skipped_target_hw = 0
         skipped_invalid = 0
         metadata_updated = False
+        converted_target_hw = 0
         for key, payload in data.items():
             if not isinstance(payload, dict):
                 skipped_invalid += 1
@@ -915,15 +916,27 @@ class RegistrationRefiner:
                 skipped_invalid += 1
                 self.logger.debug("reg_refined: failed to parse cache entry key=%s (%s)", key, exc)
                 continue
-            if tuple(result.target_hw) != self.canonical_hw:
-                skipped_target_hw += 1
+            original_hw = tuple(result.target_hw)
+            if original_hw != self.canonical_hw:
+                upgraded = self._upgrade_cached_entry(result)
+                if upgraded is None:
+                    skipped_target_hw += 1
+                    self.logger.debug(
+                        "reg_refined: skip cache entry key=%s target_hw=%s canonical_hw=%s",
+                        key,
+                        original_hw,
+                        self.canonical_hw,
+                    )
+                    continue
+                result = upgraded
+                converted_target_hw += 1
+                metadata_updated = True
                 self.logger.debug(
-                    "reg_refined: skip cache entry key=%s target_hw=%s canonical_hw=%s",
+                    "reg_refined: upgraded cache entry key=%s target_hw=%s -> canonical_hw=%s",
                     key,
-                    tuple(result.target_hw),
+                    original_hw,
                     self.canonical_hw,
                 )
-                continue
             if result.geometry_meta is None or "tile_bounds_px" not in result.geometry_meta:
                 rebuilt = _reconstruct_geometry_from_result(result)
                 if rebuilt is not None:
@@ -932,9 +945,13 @@ class RegistrationRefiner:
             self._cache[str(key)] = result
             stored += 1
         self.logger.info(
-            "reg_refined: loaded %d cache entries from %s (skipped_target_hw=%d skipped_invalid=%d)",
+            (
+                "reg_refined: loaded %d cache entries from %s "
+                "(upgraded=%d skipped_target_hw=%d skipped_invalid=%d)"
+            ),
             stored,
             path,
+            converted_target_hw,
             skipped_target_hw,
             skipped_invalid,
         )
@@ -947,6 +964,44 @@ class RegistrationRefiner:
     @property
     def cache_size(self) -> int:
         return len(self._cache)
+
+    def _upgrade_cached_entry(self, entry: RegistrationResult) -> Optional[RegistrationResult]:
+        """Scale cached homographies/warp metadata to match the current canonical size."""
+
+        old_h, old_w = tuple(int(v) for v in entry.target_hw)
+        new_h, new_w = self.canonical_hw
+        if min(old_h, old_w, new_h, new_w) <= 0:
+            return None
+        old_span_w = max(float(old_w - 1), 1.0)
+        new_span_w = max(float(new_w - 1), 1.0)
+        old_span_h = max(float(old_h - 1), 1.0)
+        new_span_h = max(float(new_h - 1), 1.0)
+        scale_x = old_span_w / max(new_span_w, 1e-6)
+        scale_y = old_span_h / max(new_span_h, 1e-6)
+        if not (math.isfinite(scale_x) and math.isfinite(scale_y)):
+            return None
+
+        scale = np.array(
+            [
+                [scale_x, 0.0, 0.0],
+                [0.0, scale_y, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        homography = np.asarray(entry.homography, dtype=np.float32).reshape(3, 3)
+        entry.homography = (homography @ scale).astype(np.float32, copy=False)
+        ratio_x = new_span_w / max(old_span_w, 1e-6)
+        if entry.x_warp_ctrl is not None and getattr(entry.x_warp_ctrl, "size", 0) >= 2:
+            ctrl = np.asarray(entry.x_warp_ctrl, dtype=np.float32).copy()
+            ctrl[:, 0] = np.clip(ctrl[:, 0] * ratio_x, 0.0, float(new_w - 1))
+            ctrl[:, 1] = np.clip(ctrl[:, 1] * ratio_x, 0.0, float(new_w - 1))
+            entry.x_warp_ctrl = ctrl
+
+        entry.target_hw = (int(new_h), int(new_w))
+        entry.grid = None
+        entry.geometry_meta = _reconstruct_geometry_from_result(entry)
+        return entry
 
     def export_cache_payload(self) -> Dict[str, Dict[str, Any]]:
         return {key: result.to_json() for key, result in self._cache.items()}
