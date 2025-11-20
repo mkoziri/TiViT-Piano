@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_tile_first
+  name: TiViT-Piano_PianoYT_tile_local_heads
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -183,8 +183,19 @@ training:
     sweep:
       delta: 0.05
       low_guard: 0.1
-      min_prob: 0.02
-      max_prob: 0.98
+    min_prob: 0.02
+    max_prob: 0.98
+# Train-time per-tile supervision wiring (can be disabled for ablations)
+  per_tile:
+    enabled: true
+    heads:
+    - pitch
+    - onset
+    - offset
+    mask_cushion_keys: null
+    debug:
+      enabled: true
+      interval: 200
 optim:
   grad_clip: 1.0
   head_lr_multiplier: 10.0 #was 5.0

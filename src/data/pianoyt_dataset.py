@@ -1486,6 +1486,7 @@ class PianoYTDataset(Dataset):
         events_off = int(((shifted_labels[:, 1] > t0) & (shifted_labels[:, 1] <= t1)).sum().item()) if has_events else 0
         sample["lag_ms"] = lag_ms_int
         sample["lag_source"] = lag_source
+        sample["clip_id"] = video_id  # keep canonical id handy for per-tile geometry lookups
         if self.split != "train":
             sample["lag_flags"] = tuple(sorted(lag_flags)) if lag_flags else tuple()
             sample["lag_corr"] = lag_corr_val if lag_corr_val is not None else float("nan")

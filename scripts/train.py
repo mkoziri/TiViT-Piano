@@ -19,7 +19,7 @@ CLI:
     reproducibility settings.
 """
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, cast, overload, Literal
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, cast, overload, Literal, Sequence
 
 
 import argparse
@@ -52,6 +52,7 @@ from models import build_model
 from utils import load_config, configure_verbosity, get_logger
 from utils.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 from utils.logging_utils import QUIET_INFO_FLAG
+from utils.identifiers import canonical_video_id
 from utils.selection import (
     SweepSpec,
     SelectionRequest,
@@ -70,6 +71,7 @@ from decoder.decode import (
     resolve_decoder_from_config,
     resolve_decoder_gates,
 )
+from tivit.decoder.global_fusion import build_batch_tile_mask
 from theory.key_prior_runtime import (
     resolve_key_prior_settings,
     apply_key_prior_to_logits,
@@ -291,6 +293,172 @@ class OnOffPosWeightEMA:
                 tracker_state = saved_scope.get(head)
                 if tracker_state is not None:
                     tracker.load_state_dict(tracker_state)
+
+
+def _resolve_batch_clip_ids(batch: Mapping[str, Any], batch_size: int) -> List[Optional[str]]:
+    """Resolve canonical clip IDs for a batch to drive registration lookups."""
+    id_fields = ("clip_id", "clip_ids", "video_id", "video_ids")
+    for field in id_fields:
+        value = batch.get(field) if isinstance(batch, Mapping) else None
+        if value is None:
+            continue
+        if torch.is_tensor(value):
+            flat = value.reshape(-1).tolist()
+            if len(flat) >= batch_size:
+                return [canonical_video_id(str(item)) for item in flat[:batch_size]]
+        elif isinstance(value, (list, tuple)) and len(value) >= batch_size:
+            return [canonical_video_id(str(item)) if item is not None else None for item in value[:batch_size]]
+    paths = batch.get("path") if isinstance(batch, Mapping) else None
+    clip_ids: List[Optional[str]] = []
+    if isinstance(paths, (list, tuple)) and len(paths) >= batch_size:
+        for idx in range(batch_size):
+            path = paths[idx]
+            try:
+                stem = Path(str(path)).stem
+            except Exception:
+                stem = str(path)
+            clip_ids.append(canonical_video_id(stem))
+    else:
+        clip_ids = [None for _ in range(batch_size)]
+    return clip_ids
+
+
+class PerTileDebugAggregator:
+    """Accumulate per-tile diagnostics and emit compact summaries periodically."""
+
+    def __init__(self, tiles: int, interval: int, *, phase: str) -> None:
+        self.tiles = max(1, int(tiles))
+        self.interval = max(1, int(interval))
+        self.phase = phase
+        self._steps = 0
+        self._reset()
+
+    def _reset(self) -> None:
+        self._accum: Dict[str, Dict[str, Any]] = {}
+
+    def update(self, debug: Mapping[str, Any], *, step_label: Optional[str] = None) -> Optional[str]:
+        if not debug:
+            return None
+        self._steps += 1
+        for head, stats in debug.items():
+            slot = self._accum.setdefault(
+                head,
+                {
+                    "samples": 0,
+                    "loss_sum": [0.0 for _ in range(self.tiles)],
+                    "prob_active_sum": [0.0 for _ in range(self.tiles)],
+                    "prob_inactive_sum": [0.0 for _ in range(self.tiles)],
+                },
+            )
+            slot["samples"] += 1
+            for key, field in (
+                ("loss", "loss_sum"),
+                ("prob_active", "prob_active_sum"),
+                ("prob_inactive", "prob_inactive_sum"),
+            ):
+                values = stats.get(key) if isinstance(stats, Mapping) else None
+                if not isinstance(values, (list, tuple)):
+                    continue
+                use = min(len(values), self.tiles)
+                for idx in range(use):
+                    slot[field][idx] += float(values[idx])
+        if self._steps % self.interval != 0:
+            return None
+        lines: List[str] = []
+        for head, slot in self._accum.items():
+            samples = max(1, int(slot.get("samples", 0)))
+
+            def _fmt(field: str) -> str:
+                values = slot.get(field, [])
+                padded = list(values) + [0.0] * max(0, self.tiles - len(values))
+                avgs = [padded[idx] / samples for idx in range(self.tiles)]
+                return "[" + ", ".join(f"{val:.3f}" for val in avgs) + "]"
+
+            lines.append(
+                f"{head}: loss={_fmt('loss_sum')} pos={_fmt('prob_active_sum')} neg={_fmt('prob_inactive_sum')}"
+            )
+        self._reset()
+        if not lines:
+            return None
+        step_desc = f" step={step_label}" if step_label is not None else ""
+        return f"[per-tile][{self.phase}{step_desc}] " + " | ".join(lines)
+
+
+class PerTileSupport:
+    """Resolve tile masks and aggregate diagnostics for per-tile training."""
+
+    def __init__(self, cfg: Mapping[str, Any], dataset, *, phase: str) -> None:
+        training_cfg = cfg.get("training", {})
+        per_tile_cfg = training_cfg.get("per_tile", {}) or {}
+        self.enabled = bool(per_tile_cfg.get("enabled"))
+        self.loss_heads = tuple(
+            str(head).lower() for head in per_tile_cfg.get("heads", ("pitch", "onset", "offset"))
+        )
+        decoder_cfg = cfg.get("decoder", {}).get("global_fusion", {}) or {}
+        default_cushion = int(decoder_cfg.get("cushion_keys", 0))
+        cushion_override = per_tile_cfg.get("mask_cushion_keys")
+        if cushion_override is None:
+            self.mask_cushion = default_cushion
+        else:
+            self.mask_cushion = int(cushion_override)
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), Mapping) else {}
+        self.tiles = int(model_cfg.get("tiles", 3) or 3)
+        self.mask_cache: Dict[str, Any] = {}
+        self.reg_meta_cache: Dict[str, Dict[str, Any]] = {}
+        dataset_ref = dataset if dataset is not None else object()
+        self.reg_refiner = getattr(dataset_ref, "registration_refiner", None)
+        debug_cfg = per_tile_cfg.get("debug", {}) or {}
+        debug_interval = int(debug_cfg.get("interval", 200) or 200)
+        self.debugger = (
+            PerTileDebugAggregator(self.tiles, debug_interval, phase=phase)
+            if debug_cfg.get("enabled")
+            else None
+        )
+
+    def prepare_context(self, out: Mapping[str, Any], batch: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        pitch_tile = out.get("pitch_tile")
+        onset_tile = out.get("onset_tile")
+        offset_tile = out.get("offset_tile")
+        if not (torch.is_tensor(pitch_tile) and torch.is_tensor(onset_tile) and torch.is_tensor(offset_tile)):
+            return None
+        batch_size = int(onset_tile.shape[0])
+        key_dim = int(onset_tile.shape[-1])
+        try:
+            mask_tensor = self._build_mask(batch, batch_size=batch_size, key_dim=key_dim)
+        except Exception as exc:
+            logger.warning("[per-tile] failed to build tile mask: %s", exc)
+            return None
+        return {
+            "enabled": True,
+            "heads": self.loss_heads,
+            "mask": mask_tensor,
+            "pitch": pitch_tile,
+            "onset": onset_tile,
+            "offset": offset_tile,
+        }
+
+    def _build_mask(self, batch: Mapping[str, Any], *, batch_size: int, key_dim: int) -> torch.Tensor:
+        clip_ids = _resolve_batch_clip_ids(batch, batch_size)
+        tile_mask_batch = build_batch_tile_mask(
+            clip_ids,
+            reg_meta_cache=self.reg_meta_cache,
+            reg_refiner=self.reg_refiner,
+            mask_cache=self.mask_cache,
+            num_tiles=self.tiles,
+            cushion_keys=self.mask_cushion,
+            n_keys=key_dim,
+        )
+        return tile_mask_batch.tensor
+
+    def log_debug(self, payload: Optional[Mapping[str, Any]], *, step_label: Optional[str] = None) -> None:
+        if not self.debugger or not payload:
+            return
+        summary = self.debugger.update(payload, step_label=step_label)
+        if summary:
+            print(summary, flush=True)
+            logger.info(summary)
 
 def ensure_dirs(cfg: Mapping[str, Any]) -> Tuple[Path, Path]:
     log_cfg = cfg.get("logging", {})
@@ -670,6 +838,77 @@ def compute_loss(
         "clef": loss_clef.item(),
     }
     return total, parts
+
+
+def _per_tile_masked_loss(
+    logits_tile: torch.Tensor,
+    roll: torch.Tensor,
+    mask: torch.Tensor,
+    cfg: Mapping[str, Any],
+    pos_weight: Optional[torch.Tensor],
+    *,
+    head: str,
+) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, List[float]]]]:
+    """
+    Compute a masked per-tile loss and lightweight diagnostics.
+    Returns (loss_tensor, debug_dict) where debug_dict contains per-tile means.
+    """
+    if not torch.is_tensor(logits_tile) or not torch.is_tensor(mask):
+        return None, None
+    if logits_tile.dim() != 4 or mask.dim() != 3:
+        return None, None
+    B, tiles, T_logits, P_logits = logits_tile.shape
+    if mask.shape[0] != B or mask.shape[1] != tiles or mask.shape[2] != P_logits:
+        return None, None
+
+    target = roll.unsqueeze(1).expand_as(logits_tile)
+    mask_time = mask.to(device=logits_tile.device, dtype=logits_tile.dtype).unsqueeze(2)
+    mask_time = mask_time.expand_as(logits_tile)
+    supervised = mask_time.sum()
+    if supervised <= 0:
+        return None, None
+
+    mode = str(cfg.get("loss", "bce_pos")).lower()
+    if mode in {"focal", "focal_bce"}:
+        gamma = float(cfg.get("focal_gamma", 2.0))
+        alpha = float(cfg.get("focal_alpha", 0.25))
+        base = F.binary_cross_entropy_with_logits(logits_tile, target, reduction="none")
+        probs = torch.sigmoid(logits_tile)
+        weight = (alpha * (1.0 - probs).pow(gamma)).detach()
+        per_elem_loss = base * weight
+    else:
+        pos_weight_local = None
+        if torch.is_tensor(pos_weight):
+            pos_weight_local = pos_weight.to(device=logits_tile.device, dtype=logits_tile.dtype)
+        per_elem_loss = F.binary_cross_entropy_with_logits(
+            logits_tile,
+            target,
+            pos_weight=pos_weight_local,
+            reduction="none",
+        )
+
+    weighted_loss = per_elem_loss * mask_time
+    loss = weighted_loss.sum() / supervised.clamp_min(1e-6)
+
+    # Diagnostics: per-tile mean loss and probability stats (detach to CPU lists)
+    probs_detached = torch.sigmoid(logits_tile.detach())
+    tile_loss = weighted_loss.sum(dim=(0, 2, 3))
+    tile_weight = mask_time.sum(dim=(0, 2, 3)).clamp_min(1e-6)
+    tile_loss_mean = tile_loss / tile_weight
+
+    active_weight = mask_time * target
+    inactive_weight = mask_time * (1.0 - target)
+    active_sum = (probs_detached * active_weight).sum(dim=(0, 2, 3))
+    inactive_sum = (probs_detached * inactive_weight).sum(dim=(0, 2, 3))
+    active_count = active_weight.sum(dim=(0, 2, 3)).clamp_min(1e-6)
+    inactive_count = inactive_weight.sum(dim=(0, 2, 3)).clamp_min(1e-6)
+    debug = {
+        "loss": tile_loss_mean.detach().cpu().tolist(),
+        "prob_active": (active_sum / active_count).detach().cpu().tolist(),
+        "prob_inactive": (inactive_sum / inactive_count).detach().cpu().tolist(),
+        "head": str(head),
+    }
+    return loss, debug
     
 def compute_loss_frame(
     out: dict,
@@ -678,6 +917,7 @@ def compute_loss_frame(
     pos_rate_state: Optional[OnOffPosWeightEMA] = None,
     *,
     update_stats: bool = True,
+    per_tile: Optional[Mapping[str, Any]] = None,
 ):
     """
     Frame-level objective with the repo's time alignment:
@@ -740,12 +980,52 @@ def compute_loss_frame(
         onset_roll  = onset_roll  * (1.0 - neg_smooth) + neg_smooth * (1.0 - onset_roll)
         offset_roll = offset_roll * (1.0 - neg_smooth) + neg_smooth * (1.0 - offset_roll)
 
+    per_tile_ctx = per_tile or {}
+    per_tile_enabled = bool(per_tile_ctx.get("enabled"))
+    per_tile_heads_raw = per_tile_ctx.get("heads")
+    if isinstance(per_tile_heads_raw, Sequence) and not isinstance(per_tile_heads_raw, (str, bytes)):
+        per_tile_heads = {str(head).lower() for head in per_tile_heads_raw}
+    else:
+        per_tile_heads = {"pitch", "onset", "offset"}
+    tile_mask_tensor = per_tile_ctx.get("mask") if per_tile_enabled else None
+    if per_tile_enabled:
+        if not torch.is_tensor(tile_mask_tensor):
+            per_tile_enabled = False
+        else:
+            tile_mask_tensor = tile_mask_tensor.to(device=device)
+            if tile_mask_tensor.dim() != 3 or tile_mask_tensor.shape[0] != B or tile_mask_tensor.shape[2] != P:
+                per_tile_enabled = False
+    per_tile_debug: Dict[str, Dict[str, Any]] = {}
+    pitch_tile = per_tile_ctx.get("pitch") if per_tile_enabled else None
+    onset_tile = per_tile_ctx.get("onset") if per_tile_enabled else None
+    offset_tile = per_tile_ctx.get("offset") if per_tile_enabled else None
+
     # --- pitch loss: gentle per-pitch pos_weight (sqrt + clamp) ---
     eps = 1e-6
     pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)  # (P,)
     pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
     bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
-    loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
+    use_tile_pitch = per_tile_enabled and "pitch" in per_tile_heads and torch.is_tensor(pitch_tile)
+    tile_mask_tensor = tile_mask_tensor
+    if use_tile_pitch:
+        pitch_tile_tensor = cast(torch.Tensor, pitch_tile)
+        mask_tensor = cast(torch.Tensor, tile_mask_tensor)
+        loss_pitch_tile, debug_pitch = _per_tile_masked_loss(
+            pitch_tile_tensor,
+            pitch_roll,
+            mask_tensor,
+            {"loss": "bce_pos"},
+            pos_w_pitch,
+            head="pitch",
+        )
+        if loss_pitch_tile is not None:
+            loss_pitch = loss_pitch_tile * float(weights.get("pitch", 1.0))
+            if debug_pitch:
+                per_tile_debug["pitch"] = debug_pitch
+        else:
+            loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
+    else:
+        loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
 
     # --- Helper for adaptive pos_weight calculation ---
     def _adaptive_pos_weight(roll, P, eps=1e-6):
@@ -811,8 +1091,47 @@ def compute_loss_frame(
     pos_w_on = _frame_pos_weight("onset", onset_cfg, onset_roll)
     pos_w_off = _frame_pos_weight("offset", offset_cfg, offset_roll)
 
-    loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on)
-    loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off)
+    use_tile_onset = per_tile_enabled and "onset" in per_tile_heads and torch.is_tensor(onset_tile)
+    if use_tile_onset:
+        onset_tile_tensor = cast(torch.Tensor, onset_tile)
+        mask_tensor = cast(torch.Tensor, tile_mask_tensor)
+        loss_onset_tile, debug_onset = _per_tile_masked_loss(
+            onset_tile_tensor,
+            onset_roll,
+            mask_tensor,
+            onset_cfg,
+            pos_w_on,
+            head="onset",
+        )
+        if loss_onset_tile is not None:
+            loss_onset = loss_onset_tile
+            if debug_onset:
+                per_tile_debug["onset"] = debug_onset
+        else:
+            loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on)
+    else:
+        loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on)
+
+    use_tile_offset = per_tile_enabled and "offset" in per_tile_heads and torch.is_tensor(offset_tile)
+    if use_tile_offset:
+        offset_tile_tensor = cast(torch.Tensor, offset_tile)
+        mask_tensor = cast(torch.Tensor, tile_mask_tensor)
+        loss_offset_tile, debug_offset = _per_tile_masked_loss(
+            offset_tile_tensor,
+            offset_roll,
+            mask_tensor,
+            offset_cfg,
+            pos_w_off,
+            head="offset",
+        )
+        if loss_offset_tile is not None:
+            loss_offset = loss_offset_tile
+            if debug_offset:
+                per_tile_debug["offset"] = debug_offset
+        else:
+            loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off)
+    else:
+        loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off)
 
     loss_onset = loss_onset * float(weights.get("onset", 1.0))
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
@@ -824,7 +1143,7 @@ def compute_loss_frame(
 
     # --- total + optional activation prior ---
     total = loss_pitch + loss_onset + loss_offset + loss_hand + loss_clef
-    parts = {
+    parts: Dict[str, Any] = {
         "pitch":  float(loss_pitch.detach().cpu()),
         "onset":  float(loss_onset.detach().cpu()),
         "offset": float(loss_offset.detach().cpu()),
@@ -852,6 +1171,8 @@ def compute_loss_frame(
         for head, reg in reg_terms.items():
             parts[f"reg_{head}"] = float(reg.detach().cpu())
 
+    if per_tile_debug:
+        parts["per_tile_debug"] = per_tile_debug
     parts["total"] = float(total.detach().cpu())
     return total, parts
 
@@ -1781,6 +2102,7 @@ def train_one_epoch(
     writer=None,
     epoch=1,
     pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+    per_tile_support: Optional["PerTileSupport"] = None,
 ):
     summary = _targets_summary(train_loader)
     if summary:
@@ -1824,7 +2146,15 @@ def train_one_epoch(
             tgt = fabricate_dummy_targets(x.shape[0])
 
         with autocast(enabled=use_amp):
-            out = model(x)
+            use_frame = (
+                getattr(model, "head_mode", "clip") == "frame"
+                and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
+            )
+            request_per_tile = False
+            per_tile_ctx = None
+            if use_frame and per_tile_support is not None:
+                request_per_tile = per_tile_support.enabled or per_tile_support.debugger is not None
+            out = model(x, return_per_tile=request_per_tile)
 
             # Route: frame loss iff model is in frame mode AND batch has frame targets
             use_frame = (
@@ -1833,7 +2163,21 @@ def train_one_epoch(
             )
 
             if use_frame:
-                loss, parts = compute_loss_frame(out, batch, weights=w, pos_rate_state=pos_rate_state)
+                if per_tile_support is not None and per_tile_support.enabled:
+                    per_tile_ctx = per_tile_support.prepare_context(out, batch)
+                loss, parts = compute_loss_frame(
+                    out,
+                    batch,
+                    weights=w,
+                    pos_rate_state=pos_rate_state,
+                    per_tile=per_tile_ctx,
+                )
+                if per_tile_support is not None:
+                    per_tile_debug = parts.pop("per_tile_debug", None)
+                    per_tile_support.log_debug(
+                        cast(Optional[Mapping[str, Any]], per_tile_debug),
+                        step_label=f"{epoch}:{it}",
+                    )
             else:
                 # Guard: if model outputs (B,T,...) but we're using clip loss, pool over time
                 if out["pitch_logits"].dim() == 3:
@@ -1925,6 +2269,7 @@ def evaluate_one_epoch(
     optimizer=None,
     timeout_minutes: int = 15,
     pos_rate_state: Optional[OnOffPosWeightEMA] = None,
+    per_tile_support: Optional[PerTileSupport] = None,
 ):
     summary = _targets_summary(loader)
     if summary:
@@ -2427,7 +2772,19 @@ def evaluate_one_epoch(
                 use_dummy = bool(cfg["training"].get("debug_dummy_labels", False))
                 raw_tgt = {k: batch[k] for k in want} if have_all and not use_dummy else None
 
-                out = model(x)
+                use_frame = (
+                    getattr(model, "head_mode", "clip") == "frame"
+                    and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
+                )
+                extra_per_tile = (
+                    use_frame
+                    and per_tile_support is not None
+                    and (per_tile_support.enabled or per_tile_support.debugger is not None)
+                )
+                out = model(x, return_per_tile=extra_per_tile)
+                per_tile_ctx_full = None
+                if per_tile_support is not None and per_tile_support.enabled and extra_per_tile:
+                    per_tile_ctx_full = per_tile_support.prepare_context(out, batch)
 
                 onset_logits_full = out.get("onset_logits")
                 offset_logits_full = out.get("offset_logits")
@@ -2545,11 +2902,6 @@ def evaluate_one_epoch(
                 offset_logits_eval = metrics_out.get("offset_logits")
                 pitch_logits_eval = metrics_out.get("pitch_logits")
 
-                use_frame = (
-                    getattr(model, "head_mode", "clip") == "frame"
-                    and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
-                )
-
                 frame_batch = None
                 if use_frame:
                     pitch_roll_sel = _select_valid(batch["pitch_roll"])
@@ -2576,13 +2928,30 @@ def evaluate_one_epoch(
                         "hand_frame": hand_frame_tensor.long(),
                         "clef_frame": clef_frame_tensor.long(),
                     }
+                    per_tile_ctx = None
+                    if per_tile_support is not None and per_tile_support.enabled and per_tile_ctx_full is not None:
+                        per_tile_ctx = {
+                            "enabled": True,
+                            "heads": per_tile_ctx_full.get("heads"),
+                            "mask": _select_valid(per_tile_ctx_full.get("mask")),
+                            "pitch": _select_valid(per_tile_ctx_full.get("pitch")),
+                            "onset": _select_valid(per_tile_ctx_full.get("onset")),
+                            "offset": _select_valid(per_tile_ctx_full.get("offset")),
+                        }
                     loss, parts = compute_loss_frame(
                         out,
                         frame_batch,
                         weights=w,
                         pos_rate_state=pos_rate_state,
                         update_stats=False,
+                        per_tile=per_tile_ctx,
                     )
+                    if per_tile_support is not None:
+                        per_tile_debug = parts.pop("per_tile_debug", None)
+                        per_tile_support.log_debug(
+                            cast(Optional[Mapping[str, Any]], per_tile_debug),
+                            step_label=f"eval:{progress['count']}",
+                        )
                 else:
                     if out["pitch_logits"].dim() == 3:
                         out = _time_pool_out_to_clip(out)
@@ -3461,6 +3830,8 @@ def main():
     val_split = args.val_split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
     train_loader = make_dataloader(cfg, split=train_split, seed=seed)
     train_base_dataset = _unwrap_dataset(getattr(train_loader, "dataset", train_loader))
+    # Helper that wires tile→key masks plus optional debug summaries into the training step.
+    per_tile_train_support = PerTileSupport(cfg, train_base_dataset, phase="train")
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.
     val_loader = None
@@ -3475,8 +3846,13 @@ def main():
             except Exception:
                 val_loader = None
 
+    per_tile_eval_support = None
+    val_base_dataset = None
     if val_loader is not None:
         val_loader = _prepare_inner_eval_loader(cfg, val_loader)
+        val_base_dataset = _unwrap_dataset(getattr(val_loader, "dataset", val_loader))
+        # Mirrors the train-side helper so inner eval can materialize the same masks/logging.
+        per_tile_eval_support = PerTileSupport(cfg, val_base_dataset, phase="eval")
     
     # Model & optimizer
     model = build_model(cfg)
@@ -3848,7 +4224,20 @@ def main():
             else:
                 tgt = fabricate_dummy_targets(B)
 
-            out = model(x)
+            use_frame_local = (
+                getattr(model, "head_mode", "clip") == "frame"
+                and all(
+                    k in batch
+                    for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame")
+                )
+            )
+            request_per_tile_local = False
+            per_tile_ctx_local = None
+            if use_frame_local and per_tile_train_support is not None:
+                request_per_tile_local = (
+                    per_tile_train_support.enabled or per_tile_train_support.debugger is not None
+                )
+            out = model(x, return_per_tile=request_per_tile_local)
 
             # --- diag: prediction distribution monitoring (remove post-debug) ---
             batch_pred_stats = {
@@ -3899,14 +4288,22 @@ def main():
                         logger.debug(msg)
             # --- End of diag: prediction distribution monitoring ---
 
-            # --- Route to frame loss iff model is in frame mode AND batch has frame targets ---
-            use_frame = (
-                getattr(model, "head_mode", "clip") == "frame"
-                and all(k in batch for k in ("pitch_roll", "onset_roll", "offset_roll", "hand_frame", "clef_frame"))
-            )
-
-            if use_frame:
-                loss, parts = compute_loss_frame(out, batch, weights=w, pos_rate_state=pos_rate_state)
+            if use_frame_local:
+                if per_tile_train_support is not None and per_tile_train_support.enabled:
+                    per_tile_ctx_local = per_tile_train_support.prepare_context(out, batch)
+                loss, parts = compute_loss_frame(
+                    out,
+                    batch,
+                    weights=w,
+                    pos_rate_state=pos_rate_state,
+                    per_tile=per_tile_ctx_local,
+                )
+                if per_tile_train_support is not None:
+                    per_tile_debug = parts.pop("per_tile_debug", None)
+                    per_tile_train_support.log_debug(
+                        cast(Optional[Mapping[str, Any]], per_tile_debug),
+                        step_label=f"{epoch}:{it}",
+                    )
             else:
                 # Guard: if model outputs (B,T,...) but we're using clip loss, pool over time
                 if out["pitch_logits"].dim() == 3:
@@ -3989,6 +4386,7 @@ def main():
                 cfg,
                 optimizer=optimizer,
                 pos_rate_state=pos_rate_state,
+                per_tile_support=per_tile_eval_support,
             )
             if val_metrics is None:
                 logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
