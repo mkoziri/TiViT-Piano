@@ -1722,6 +1722,14 @@ def _resolved_verbosity() -> str:
     return os.environ.get("TIVIT_VERBOSE", "quiet").strip().lower() or "quiet"
 
 
+def _resolve_backend_label(cfg: Mapping[str, Any]) -> str:
+    """Normalize the configured model backend string."""
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
+    raw = model_cfg.get("backend", "vivit")
+    label = str(raw).strip().lower() if raw is not None else "vivit"
+    return label or "vivit"
+
+
 def _load_inner_eval_cache(path: Path = INNER_EVAL_CACHE_PATH) -> Optional[Dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -3781,6 +3789,7 @@ def main():
     args.verbose = configure_verbosity(args.verbose)
 
     cfg = dict(load_config(CONFIG_PATH))
+    model_backend = _resolve_backend_label(cfg)
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)
     exp_cfg = cfg.setdefault("experiment", {})
@@ -4475,6 +4484,7 @@ def main():
                     run_id=run_id,
                     start_time=timestamp_now,
                     end_time=timestamp_now,
+                    backend=model_backend,
                 )
 
                 if val_total_raw is not None:
@@ -4555,6 +4565,7 @@ def main():
                             deterministic=selection_deterministic,
                             log_path=selection_log_dir / f"epoch_{epoch:03d}.txt",
                             run_id=run_id,
+                            backend=model_backend,
                         )
                         try:
                             calibrated_result, calibrated_context, _ = calibrate_and_score(selection_request)

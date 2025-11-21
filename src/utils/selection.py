@@ -132,6 +132,7 @@ class SelectionContext:
     run_id: Optional[str]
     start_time: float
     end_time: float
+    backend: Optional[str] = None
 
     def duration(self) -> float:
         return max(0.0, self.end_time - self.start_time)
@@ -352,6 +353,7 @@ class SelectionRequest:
     target_metric: str = "ev_f1_mean"
     onset_anchor_used: Optional[float] = None
     prev_onset_threshold: Optional[float] = None
+    backend: Optional[str] = None
 
 
 def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, SelectionContext, List[str]]:
@@ -380,6 +382,8 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         f"delta={sweep.delta:.3f}",
         f"guard≥{sweep.low_guard:.2f}",
     ]
+    if request.backend:
+        banner_bits.append(f"backend={request.backend}")
     temp_line: List[str] = []
     if request.temperature_onset is not None:
         temp_line.append(f"T_on={request.temperature_onset:.3f}")
@@ -561,6 +565,9 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
     if tie_break_reason and tie_break_reason != "metric":
         decoder_payload["tie_break_note"] = tie_break_reason
 
+    decoder_kind_value = best.get("decoder_kind")
+    decoder_kind = str(decoder_kind_value) if decoder_kind_value is not None else None
+
     result = SelectionResult(
         onset_threshold=float(best["onset_thr"]),
         offset_threshold=float(best["offset_thr"]),
@@ -572,7 +579,7 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         offset_f1=float(best["offset_f1"]),
         onset_pred_rate=float(best["onset_pred_rate"]),
         onset_pos_rate=float(best["onset_pos_rate"]),
-        decoder_kind=best.get("decoder_kind"),
+        decoder_kind=decoder_kind,
         decoder_settings=decoder_payload,
     )
 
@@ -594,6 +601,7 @@ def calibrate_and_score(request: SelectionRequest) -> Tuple[SelectionResult, Sel
         run_id=request.run_id,
         start_time=t_start,
         end_time=time.time(),
+        backend=request.backend,
     )
 
     return result, ctx, lines
@@ -684,8 +692,11 @@ def record_best(
             "sweep": dict(context.sweep),
             "run_id": context.run_id,
             "duration_seconds": context.duration(),
+            "backend": context.backend,
         },
     }
+    if context.backend:
+        metadata["backend"] = context.backend
     git_commit = _git_commit(repo_root)
     git_dirty = _git_dirty(repo_root)
     metadata["git"] = {
@@ -722,14 +733,14 @@ def decoder_snapshot_from_config(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     metrics_cfg = train_cfg.get("metrics", {}) if isinstance(train_cfg, Mapping) else {}
     decoder_cfg = metrics_cfg.get("decoder", {})
     if isinstance(decoder_cfg, Mapping):
-        return copy.deepcopy(decoder_cfg)
+        return dict(copy.deepcopy(decoder_cfg))
     return {}
 
 
 def tolerance_snapshot_from_config(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     dataset_cfg = cfg.get("dataset", {}) if isinstance(cfg, Mapping) else {}
     frame_cfg = dataset_cfg.get("frame_targets", {}) if isinstance(dataset_cfg, Mapping) else {}
-    return copy.deepcopy(frame_cfg) if isinstance(frame_cfg, Mapping) else {}
+    return dict(copy.deepcopy(frame_cfg)) if isinstance(frame_cfg, Mapping) else {}
 
 def _normalize_explicit_candidates(values: Sequence[float]) -> Tuple[float, ...]:
     processed: List[float] = []

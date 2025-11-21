@@ -110,7 +110,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 try:
     import yaml
@@ -183,6 +183,13 @@ QUIET_EXTRA = {QUIET_INFO_FLAG: True}
 def load_cfg() -> dict:
     with CONFIG.open("r") as f:
         return yaml.safe_load(f)
+
+
+def _resolve_backend_label(cfg: Mapping[str, Any]) -> str:
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
+    raw = model_cfg.get("backend", "vivit")
+    label = str(raw).strip().lower() if raw is not None else "vivit"
+    return label or "vivit"
 
 
 def _normalize_eval_extras(tokens: Sequence[str]) -> List[str]:
@@ -1584,6 +1591,7 @@ def perform_calibration(
     desired_kind = args.first_calib if first_calibration else "fast"
 
     cfg_snapshot = load_cfg()
+    backend_label = _resolve_backend_label(cfg_snapshot)
     prev_metrics = (cfg_snapshot.get("training", {}) or {}).get("metrics", {}) or {}
     prev_onset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_onset"))
     prev_offset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_offset"))
@@ -1697,6 +1705,7 @@ def perform_calibration(
             target_metric=target_metric_field,
             onset_anchor_used=onset_center,
             prev_onset_threshold=prev_onset_best,
+            backend=backend_label,
         )
 
     def _run_two_stage(calib: dict, *, log_name: str) -> Tuple[SelectionResult, SelectionContext, List[str]]:
@@ -2059,7 +2068,7 @@ def perform_calibration(
 
         if not stage_a_state_valid or not isinstance(stage_a_state_payload, Mapping):
             raise SelectionError("Stage-A state unavailable for Stage-B evaluation")
-        stage_a_state_payload = dict(stage_a_state_payload)
+        stage_a_state_payload = dict(cast(Mapping[str, Any], stage_a_state_payload))
         stage_a_onset_state = stage_a_state_payload.get("onset")
         if not isinstance(stage_a_onset_state, Mapping):
             raise SelectionError("Stage-A onset gates missing from state")

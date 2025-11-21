@@ -4,6 +4,8 @@
 Key Functions/Classes:
     - TiViTPiano: Core ViViT-inspired architecture with tiled video encoding
       and multi-task heads.
+    - ViTSTilePiano: Alternative backend powered by a pretrained ViT-S tile
+      encoder plus temporal/tile mixing.
     - build_model(): Factory that builds models from configuration dictionaries.
 
 CLI:
@@ -12,7 +14,7 @@ CLI:
 """
 
 from .tivit_piano import TiViTPiano
+from .vits_tile import ViTSTilePiano
 from .factory import build_model
 
-__all__ = ["TiViTPiano", "build_model"]
-
+__all__ = ["TiViTPiano", "ViTSTilePiano", "build_model"]

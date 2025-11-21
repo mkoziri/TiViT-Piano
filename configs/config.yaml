@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoYT_tile_local_heads
+  name: TiViT-Piano_PianoYT_PViT
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -76,6 +76,7 @@ dataset:
     targets_sparse: true
 model:
   name: TiViT-Piano
+  backend: vivit          # Allowed: "vivit" (default) or "vits_tile"
   head_mode: frame
   tiles: 3
   input_channels: 3
@@ -91,6 +92,18 @@ model:
     global_tokens: 2
     mlp_ratio: 3.0
     dropout: 0.2
+  vits_tile:
+    backbone_name: vit_small_patch16_224  # or deit_small_patch16_224
+    pretrained: true
+    freeze_backbone: true
+    input_hw:
+    - 160
+    - 352
+    temporal_layers: 2
+    temporal_heads: 4
+    global_mixing_layers: 1
+    embed_dim: 384
+    dropout: 0.1
 tiling:
   patch_w: 16
   tokens_split: auto
