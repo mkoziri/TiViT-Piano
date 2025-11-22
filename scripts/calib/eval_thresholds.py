@@ -108,6 +108,13 @@ LOGGER = logging.getLogger("eval_thresholds")
 QUIET_EXTRA = {QUIET_INFO_FLAG: True}
 
 
+def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
+    raw = model_cfg.get("backend", "vivit")
+    label = str(raw).strip().lower() if raw is not None else "vivit"
+    return label or "vivit"
+
+
 # Default probability grid used when sweeping thresholds without an explicit
 # list.  We parse lists manually so callers can provide comma-separated values
 # without escaping leading minus signs.
@@ -1792,7 +1799,15 @@ def _setup_model(args, cfg: Mapping[str, Any]):
     """Instantiate TiViT-Piano and load checkpoint weights."""
 
     model = build_model(cfg)
+    cfg_backend = _resolve_backend_label(cfg)
     ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt, Mapping) else None
+    ckpt_backend = _resolve_backend_label(ckpt_cfg) if isinstance(ckpt_cfg, Mapping) else "vivit"
+    if ckpt_backend != cfg_backend:
+        raise RuntimeError(
+            f"Checkpoint backend '{ckpt_backend}' mismatches config backend '{cfg_backend}'. "
+            "Set model.backend accordingly before running evaluation."
+        )
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
     model.eval()
     return model

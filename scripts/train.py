@@ -4030,6 +4030,16 @@ def main():
         print(f"[resume] Loading from {resume_path}")
         logger.info("[resume] Loading from %s", resume_path)
         ckpt = torch.load(resume_path, map_location="cpu")
+        ckpt_cfg = ckpt.get("config") if isinstance(ckpt, Mapping) else None
+        ckpt_backend = _resolve_backend_label(ckpt_cfg) if isinstance(ckpt_cfg, Mapping) else "vivit"
+        if ckpt_backend != model_backend:
+            msg = (
+                f"[resume] backend mismatch: checkpoint={ckpt_backend} current={model_backend}. "
+                "Update config.model.backend or disable training.resume."
+            )
+            print(msg)
+            logger.error(msg)
+            raise RuntimeError(msg)
         model.load_state_dict(ckpt["model"], strict=False)
         best_loss_value = ckpt.get("best_val", math.inf)
         best_proxy_value = float(ckpt.get("best_event_f1", float("-inf")))

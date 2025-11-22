@@ -76,7 +76,7 @@ dataset:
     targets_sparse: true
 model:
   name: TiViT-Piano
-  backend: vivit          # Allowed: "vivit" (default) or "vits_tile"
+  backend: vits_tile         # Allowed: "vivit" (default) or "vits_tile"
   head_mode: frame
   tiles: 3
   input_channels: 3

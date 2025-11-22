@@ -82,6 +82,12 @@ _OFFSET_EXTRA = torch.arange(0.99, 1.001 + 1e-9, 0.002)
 OFFSET_PROB_GRID = torch.unique(torch.cat([DEFAULT_PROB_GRID, _OFFSET_EXTRA]))
 OFFSET_PROB_GRID = torch.sort(OFFSET_PROB_GRID).values.clamp(max=0.999)
 
+def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
+    raw = model_cfg.get("backend", "vivit")
+    label = str(raw).strip().lower() if raw is not None else "vivit"
+    return label or "vivit"
+
 _DECODER_DEFAULTS = {
     "onset": {
         "open": 0.36,
@@ -1431,7 +1437,15 @@ def main():
         raise RuntimeError("target_clips resolved to 0; dataset is empty after materialization.")
 
     model = build_model(cfg)
+    cfg_backend = _resolve_backend_label(cfg)
     ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt, Mapping) else None
+    ckpt_backend = _resolve_backend_label(ckpt_cfg) if isinstance(ckpt_cfg, Mapping) else "vivit"
+    if ckpt_backend != cfg_backend:
+        raise RuntimeError(
+            f"Checkpoint backend '{ckpt_backend}' mismatches config backend '{cfg_backend}'. "
+            "Set model.backend before running legacy calibration."
+        )
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
     model.eval()
 
