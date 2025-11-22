@@ -111,6 +111,36 @@ OFFSET_PROB_GRID = torch.unique(torch.cat([DEFAULT_PROB_GRID, _OFFSET_EXTRA]))
 OFFSET_PROB_GRID = torch.sort(OFFSET_PROB_GRID).values.clamp(max=0.999)
 
 
+def _format_per_tile_shape(tensor: torch.Tensor) -> str:
+    if not torch.is_tensor(tensor):
+        return str(type(tensor))
+    if tensor.dim() != 4:
+        return str(tuple(int(v) for v in tensor.shape))
+    b, t, tiles, keys = tensor.shape
+    return f"B={b} T={t} tiles={tiles} K={keys}"
+
+
+def _assert_per_tile_layout(
+    tensor: torch.Tensor,
+    *,
+    label: str,
+    expected_tiles: int,
+    backend_label: str,
+) -> None:
+    if not torch.is_tensor(tensor):
+        raise ValueError(f"{label} tensor missing for backend '{backend_label}'")
+    if tensor.dim() != 4:
+        raise ValueError(
+            f"{label} logits must be rank-4 (B, T, tiles, K); got shape {tuple(tensor.shape)} "
+            f"(backend={backend_label})"
+        )
+    if expected_tiles > 0 and tensor.shape[2] != expected_tiles:
+        raise ValueError(
+            f"{label} tensor tiles={tensor.shape[2]} does not match configured tiles={expected_tiles} "
+            f"(backend={backend_label})"
+        )
+
+
 def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
     model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
     raw = model_cfg.get("backend", "vivit")
@@ -524,6 +554,7 @@ def _collect(
     return_per_tile: bool,
     fusion_cfg: GlobalFusionConfig,
     model_tiles: int,
+    backend_label: str,
     preview_prob_threshold: float,
     registration_refiner: Optional[RegistrationRefiner] = None,
     reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -539,6 +570,7 @@ def _collect(
     fusion_debug_state = FusionDebugState(model_tiles) if fusion_enabled else None
     comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
     comparison_batches_used = 0
+    stageb_shape_logged = False
     tile_mask_cache: Dict[str, TileMaskResult] = {}
     effective_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
     if fusion_enabled and not effective_meta_cache:
@@ -591,6 +623,36 @@ def _collect(
                 pitch_tile = out.get("pitch_tile")
                 if onset_tile is None or offset_tile is None:
                     raise RuntimeError("global fusion enabled but model did not return per-tile logits")
+                _assert_per_tile_layout(
+                    onset_tile,
+                    label="stageB onset_tile",
+                    expected_tiles=model_tiles,
+                    backend_label=backend_label,
+                )
+                _assert_per_tile_layout(
+                    offset_tile,
+                    label="stageB offset_tile",
+                    expected_tiles=model_tiles,
+                    backend_label=backend_label,
+                )
+                if torch.is_tensor(pitch_tile):
+                    _assert_per_tile_layout(
+                        pitch_tile,
+                        label="stageB pitch_tile",
+                        expected_tiles=model_tiles,
+                        backend_label=backend_label,
+                    )
+                if not stageb_shape_logged:
+                    pitch_desc = _format_per_tile_shape(pitch_tile) if torch.is_tensor(pitch_tile) else "None"
+                    print(
+                        "[per-tile][StageB] layout=(B,T,tiles,K) onset={} offset={} pitch={}".format(
+                            _format_per_tile_shape(onset_tile),
+                            _format_per_tile_shape(offset_tile),
+                            pitch_desc,
+                        ),
+                        flush=True,
+                    )
+                    stageb_shape_logged = True
                 tile_mask_batch = build_batch_tile_mask(
                     clip_ids,
                     reg_meta_cache=effective_meta_cache,
@@ -1314,6 +1376,7 @@ def main():
         return_per_tile=return_per_tile,
         fusion_cfg=fusion_cfg,
         model_tiles=model_tiles,
+        backend_label=cfg_backend,
         preview_prob_threshold=preview_prob_threshold,
         registration_refiner=registration_refiner,
         reg_meta_cache=reg_meta_cache,

@@ -407,31 +407,47 @@ def build_batch_tile_mask(
     return TileMaskBatch(tensor=torch.from_numpy(stacked), records=records)
 
 
+_FUSE_SHAPE_LOGGED = False
+
+
 def fuse_tile_logits(tile_logits: torch.Tensor, tile_mask: torch.Tensor, *, mode: str = "masked_mean") -> torch.Tensor:
     if mode != "masked_mean":
         raise ValueError(f"Unsupported fusion mode '{mode}'")
     if tile_logits.ndim != 4:
         raise ValueError(f"Expected 4D tensor for tile logits, got shape {tuple(tile_logits.shape)}")
-    batch, tiles, time_steps, key_dim = tile_logits.shape
+    batch, time_steps, tiles, key_dim = tile_logits.shape
     if batch == 0 or tiles == 0:
-        return tile_logits.mean(dim=1)
+        return tile_logits.mean(dim=2)
     mask = tile_mask
     if not torch.is_tensor(mask):
         mask = torch.as_tensor(mask)
     if mask.ndim == 2:
         mask = mask.unsqueeze(0)
     if mask.ndim != 3 or mask.shape[1] != tiles or mask.shape[2] != key_dim:
-        raise ValueError(f"Tile mask shape {tuple(mask.shape)} incompatible with logits {tuple(tile_logits.shape)}")
+        raise ValueError(
+            f"Tile mask shape {tuple(mask.shape)} incompatible with per-tile logits {tuple(tile_logits.shape)} "
+            "(expected canonical (B, T, tiles, K) layout)."
+        )
     if mask.shape[0] == 1 and batch > 1:
         mask = mask.expand(batch, -1, -1)
     elif mask.shape[0] != batch:
         raise ValueError(f"Tile mask batch {mask.shape[0]} != logits batch {batch}")
     mask = mask.to(tile_logits.device, dtype=tile_logits.dtype)
-    weights = mask.unsqueeze(2)  # (B, tiles, 1, keys)
-    weighted_sum = (tile_logits * weights).sum(dim=1)  # (B, T, keys)
-    counts = weights.sum(dim=1)  # (B, 1, keys)
+    global _FUSE_SHAPE_LOGGED
+    if not _FUSE_SHAPE_LOGGED:
+        print(
+            "[fusion] per-tile multiply: logits(B,T,tiles,K)={} mask(B,tiles,K)={} tile_axis=2".format(
+                tuple(tile_logits.shape),
+                tuple(mask.shape),
+            ),
+            flush=True,
+        )
+        _FUSE_SHAPE_LOGGED = True
+    weights = mask.unsqueeze(1)  # (B, 1, tiles, keys)
+    weighted_sum = (tile_logits * weights).sum(dim=2)  # (B, T, keys)
+    counts = weights.sum(dim=2)  # (B, 1, keys)
     fused = weighted_sum / counts.clamp_min(1e-6)
-    fallback = tile_logits.mean(dim=1)
+    fallback = tile_logits.mean(dim=2)
     no_cover = counts <= 1e-6
     if no_cover.any():
         fused = torch.where(no_cover.expand(-1, time_steps, -1), fallback, fused)

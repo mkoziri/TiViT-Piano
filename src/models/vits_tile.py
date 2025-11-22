@@ -324,16 +324,16 @@ class ViTSTilePiano(nn.Module):
         tile_embeddings = self.embed_dropout(tile_embeddings)
         tile_embeddings = self.temporal_encoder(tile_embeddings)
         global_feats, tile_feats = self.tile_mixer(tile_embeddings)
-        # Downstream per-tile heads expect layout (B, tiles, T, D).
-        tile_feats = tile_feats.permute(0, 2, 1, 3).contiguous()
+        # Downstream per-tile heads expect the canonical (B, T, tiles, D) layout.
+        tile_feats = tile_feats.contiguous()
 
         if self.head_mode == "frame":
             pitch_tile = self.head_pitch(tile_feats)
             onset_tile = self.head_onset(tile_feats)
             offset_tile = self.head_offset(tile_feats)
-            pitch_global = pitch_tile.mean(dim=1)
-            onset_global = onset_tile.mean(dim=1)
-            offset_global = offset_tile.mean(dim=1)
+            pitch_global = pitch_tile.mean(dim=2)
+            onset_global = onset_tile.mean(dim=2)
+            offset_global = offset_tile.mean(dim=2)
             hand_global = self.head_hand(global_feats)
             clef_global = self.head_clef(global_feats)
 
@@ -350,6 +350,7 @@ class ViTSTilePiano(nn.Module):
                 "clef_global": clef_global,
             }
             if return_per_tile:
+                # Per-tile logits are emitted in (B, T, tiles, keys).
                 outputs.update(
                     {
                         "pitch_tile": pitch_tile,

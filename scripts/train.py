@@ -857,12 +857,12 @@ def _per_tile_masked_loss(
         return None, None
     if logits_tile.dim() != 4 or mask.dim() != 3:
         return None, None
-    B, tiles, T_logits, P_logits = logits_tile.shape
+    B, T_logits, tiles, P_logits = logits_tile.shape
     if mask.shape[0] != B or mask.shape[1] != tiles or mask.shape[2] != P_logits:
         return None, None
 
-    target = roll.unsqueeze(1).expand_as(logits_tile)
-    mask_time = mask.to(device=logits_tile.device, dtype=logits_tile.dtype).unsqueeze(2)
+    target = roll.unsqueeze(2).expand_as(logits_tile)
+    mask_time = mask.to(device=logits_tile.device, dtype=logits_tile.dtype).unsqueeze(1)
     mask_time = mask_time.expand_as(logits_tile)
     supervised = mask_time.sum()
     if supervised <= 0:
@@ -892,16 +892,16 @@ def _per_tile_masked_loss(
 
     # Diagnostics: per-tile mean loss and probability stats (detach to CPU lists)
     probs_detached = torch.sigmoid(logits_tile.detach())
-    tile_loss = weighted_loss.sum(dim=(0, 2, 3))
-    tile_weight = mask_time.sum(dim=(0, 2, 3)).clamp_min(1e-6)
+    tile_loss = weighted_loss.sum(dim=(0, 1, 3))
+    tile_weight = mask_time.sum(dim=(0, 1, 3)).clamp_min(1e-6)
     tile_loss_mean = tile_loss / tile_weight
 
     active_weight = mask_time * target
     inactive_weight = mask_time * (1.0 - target)
-    active_sum = (probs_detached * active_weight).sum(dim=(0, 2, 3))
-    inactive_sum = (probs_detached * inactive_weight).sum(dim=(0, 2, 3))
-    active_count = active_weight.sum(dim=(0, 2, 3)).clamp_min(1e-6)
-    inactive_count = inactive_weight.sum(dim=(0, 2, 3)).clamp_min(1e-6)
+    active_sum = (probs_detached * active_weight).sum(dim=(0, 1, 3))
+    inactive_sum = (probs_detached * inactive_weight).sum(dim=(0, 1, 3))
+    active_count = active_weight.sum(dim=(0, 1, 3)).clamp_min(1e-6)
+    inactive_count = inactive_weight.sum(dim=(0, 1, 3)).clamp_min(1e-6)
     debug = {
         "loss": tile_loss_mean.detach().cpu().tolist(),
         "prob_active": (active_sum / active_count).detach().cpu().tolist(),

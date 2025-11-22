@@ -472,17 +472,18 @@ class TiViTPiano(nn.Module):
         if getattr(self, "head_mode", "clip") == "frame":
             # Avg over spatial tokens to get per-tile temporal features
             tile_feats = enc_5d.mean(dim=3)  # (B, tiles, T', D)
-            # Local head logits (B, tiles, T', keys)
+            tile_feats = tile_feats.permute(0, 2, 1, 3).contiguous()  # canonical (B, T', tiles, D)
+            # Local head logits (B, T', tiles, keys)
             pitch_tile  = self.head_pitch(tile_feats)
             onset_tile  = self.head_onset(tile_feats)
             offset_tile = self.head_offset(tile_feats)
             # Global path: deterministic fusion (simple mean) over tiles so the
             # downstream pipeline always consumes logits produced via the local
             # heads' aggregation instead of any separate global head.
-            g_t = tile_feats.mean(dim=1)  # (B, T', D) for non-key heads
-            pitch_global  = pitch_tile.mean(dim=1)
-            onset_global  = onset_tile.mean(dim=1)
-            offset_global = offset_tile.mean(dim=1)
+            g_t = tile_feats.mean(dim=2)  # (B, T', D) for non-key heads
+            pitch_global  = pitch_tile.mean(dim=2)
+            onset_global  = onset_tile.mean(dim=2)
+            offset_global = offset_tile.mean(dim=2)
             hand_global   = self.head_hand(g_t)    # (B, T', 2)
             clef_global   = self.head_clef(g_t)    # (B, T', 3)
 
@@ -500,6 +501,7 @@ class TiViTPiano(nn.Module):
             }
 
             if return_per_tile:
+                # Per-tile logits always follow the canonical layout (B, T, tiles, keys).
                 outputs.update(
                     {
                         "pitch_tile":  pitch_tile,

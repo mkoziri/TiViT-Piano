@@ -174,6 +174,7 @@ class RuntimeContext:
     preview_prob_threshold: float
     debug_mode: bool
     avlag_disabled: bool
+    backend_label: str
     model_tiles: int
     return_per_tile_requested: bool
     fusion: GlobalFusionConfig
@@ -255,6 +256,36 @@ class EvalPairContext:
 
     def mark_decoder_notice_printed(self) -> None:
         self.decoder_notice_printed = True
+
+
+def _format_per_tile_shape(tensor: torch.Tensor) -> str:
+    if not torch.is_tensor(tensor):
+        return str(type(tensor))
+    if tensor.dim() != 4:
+        return str(tuple(int(v) for v in tensor.shape))
+    b, t, tiles, keys = tensor.shape
+    return f"B={b} T={t} tiles={tiles} K={keys}"
+
+
+def _assert_per_tile_layout(
+    tensor: torch.Tensor,
+    *,
+    label: str,
+    expected_tiles: int,
+    backend_label: str,
+) -> None:
+    if not torch.is_tensor(tensor):
+        raise ValueError(f"{label} tensor missing for backend '{backend_label}'")
+    if tensor.dim() != 4:
+        raise ValueError(
+            f"{label} logits must be rank-4 (B, T, tiles, K); got shape {tuple(tensor.shape)} "
+            f"(backend={backend_label})"
+        )
+    if expected_tiles > 0 and tensor.shape[2] != expected_tiles:
+        raise ValueError(
+            f"{label} tensor tiles={tensor.shape[2]} does not match configured tiles={expected_tiles} "
+            f"(backend={backend_label})"
+        )
 
 
 def _json_sanitize(value):
@@ -383,6 +414,7 @@ def _process_per_tile_outputs(
     offset_tile: torch.Tensor,
     pitch_tile: torch.Tensor,
     model_tiles: int,
+    backend_label: str,
     preview_prob_threshold: float,
     tile_preview_stats: Dict[str, Any],
     tile_key_mask_cache: Dict[str, TileMaskResult],
@@ -399,18 +431,36 @@ def _process_per_tile_outputs(
     per_tile_shape_logged: bool,
     per_tile_target_issue_logged: bool,
 ) -> Tuple[TileBatchArtifacts, bool, bool]:
+    _assert_per_tile_layout(
+        onset_tile,
+        label="stageA onset_tile",
+        expected_tiles=model_tiles,
+        backend_label=backend_label,
+    )
+    _assert_per_tile_layout(
+        offset_tile,
+        label="stageA offset_tile",
+        expected_tiles=model_tiles,
+        backend_label=backend_label,
+    )
+    _assert_per_tile_layout(
+        pitch_tile,
+        label="stageA pitch_tile",
+        expected_tiles=model_tiles,
+        backend_label=backend_label,
+    )
     if not per_tile_shape_logged:
         print(
-            "[per-tile] onset_tile={} offset_tile={} pitch_tile={}".format(
-                tuple(onset_tile.shape),
-                tuple(offset_tile.shape),
-                tuple(pitch_tile.shape),
+            "[per-tile][StageA] layout=(B,T,tiles,K) onset={} offset={} pitch={}".format(
+                _format_per_tile_shape(onset_tile),
+                _format_per_tile_shape(offset_tile),
+                _format_per_tile_shape(pitch_tile),
             ),
             flush=True,
         )
         per_tile_shape_logged = True
 
-    tile_preview_neutral = onset_tile.detach().mean(dim=1)
+    tile_preview_neutral = onset_tile.detach().mean(dim=2)
     preview_abs = (tile_preview_neutral - onset_logits_neutral).abs().max().item()
     tile_preview_stats["max_abs_diff"] = max(tile_preview_stats["max_abs_diff"], float(preview_abs))
     onset_targets_batch = batch["onset_roll"].to(tile_preview_neutral.device).float()
@@ -1488,6 +1538,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     """Load config, resolve dataset/model settings, and capture derived fields."""
 
     cfg = dict(load_config("configs/config.yaml"))
+    backend_label = _resolve_backend_label(cfg)
     model_cfg = cfg.get("model")
     if not isinstance(model_cfg, dict):
         model_cfg = {}
@@ -1629,6 +1680,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
         preview_prob_threshold=preview_prob_threshold,
         debug_mode=debug_mode,
         avlag_disabled=avlag_disabled,
+        backend_label=backend_label,
         model_tiles=model_tiles,
         return_per_tile_requested=return_per_tile_requested,
         fusion=fusion_cfg,
@@ -1866,6 +1918,7 @@ def _collect_logits(
     per_tile_target_issue_logged = False
     reg_refiner = loader_ctx.registration_refiner
     reg_meta_cache: Dict[str, Dict[str, Any]] = loader_ctx.reg_meta_cache or {}
+    backend_label = runtime.backend_label
     if (return_per_tile_requested or fusion_enabled) and not reg_meta_cache:
         reg_cache_path = loader_ctx.reg_meta_path or resolve_registration_cache_path(
             os.environ.get("TIVIT_REG_REFINED")
@@ -1956,6 +2009,7 @@ def _collect_logits(
                         offset_tile=offset_tile,
                         pitch_tile=pitch_tile,
                         model_tiles=model_tiles,
+                        backend_label=runtime.backend_label,
                         preview_prob_threshold=preview_prob_threshold,
                         tile_preview_stats=tile_preview_stats,
                         tile_key_mask_cache=tile_key_mask_cache,
