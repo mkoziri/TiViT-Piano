@@ -27,7 +27,7 @@ running `pip install`.
 
 ## Datasets
 
-The configuration file and dataset loaders support both the OMAPS and PianoYT
+The configuration file and dataset loaders support both the OMAPS, PianoYT and PianoVAM 
 collections. Each dataset resolver allows explicit paths in the YAML config and
 falls back to environment variables when unset.
 
@@ -42,7 +42,7 @@ export TIVIT_DATA_DIR=/path/to/datasets
 export DATASETS_HOME=/path/to/datasets
 ```
 
-When these variables are defined, the loaders expect `OMAPS/` and `PianoYT/`
+When these variables are defined, the loaders expect `OMAPS/`, `PianoYT/` and `PianoVAM_v1.0/`
 children within the directory. If neither variable is set, the code searches the
 paths declared in `configs/config.yaml` and finally falls back to
 `~/datasets/<name>` or repository-local `data/PianoYT` when available.
@@ -83,6 +83,27 @@ PianoYT/
 If split text files are missing, the loader infers clip IDs by scanning the
 split directories. Configure `dataset.manifest.*` or `split_*` keys in
 `configs/config.yaml` to select subsets during training, validation, or testing.
+
+### PianoVAM
+
+To train on PianoVAM, set `dataset.name: "PianoVAM"` in `configs/config.yaml`. The loader resolves the root directory using the same priority order:
+
+1. Explicit `root_dir` from the config, if provided.
+2. `$TIVIT_DATA_DIR/PianoVAM_v1.0` or `$DATASETS_HOME/PianoVAM_v1.0`.
+3. `~/datasets/PianoVAM_v1.0` as a final fallback.
+
+Expected structure under the resolved root:
+
+```text
+PianoVAM_v1.0/
+  Audio/
+  MIDI/
+  Video/
+  TSV/
+  Handskeleton/
+  metadata_v1.json
+  metadata_v2.json
+
 
 ### Onset-balanced sampling
 
