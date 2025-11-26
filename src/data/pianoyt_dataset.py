@@ -49,9 +49,11 @@ from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
     FrameTargetResult,
     FrameTargetSpec,
+    SoftTargetConfig,
     prepare_frame_targets,
     resolve_lag_ms,
     resolve_frame_target_spec,
+    resolve_soft_target_config,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
@@ -579,6 +581,7 @@ class PianoYTDataset(Dataset):
             if self.frame_target_spec is not None
             else "targets_conf: disabled"
         )
+        self.soft_target_cfg: Optional[SoftTargetConfig] = None
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -1423,6 +1426,7 @@ class PianoYTDataset(Dataset):
                         split=self.split,
                         video_id=video_id,
                         clip_start=t0,
+                        soft_targets=self.soft_target_cfg,
                     )
                 except Exception as exc:  # pragma: no cover - defensive
                     LOGGER.warning(
@@ -2372,6 +2376,9 @@ def make_dataloader(
         only_video=only_video_cfg,
         avlag_disabled=avlag_disabled_cfg,
     )
+    training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
+    soft_cfg_raw = training_cfg.get("soft_targets") if isinstance(training_cfg, Mapping) else None
+    dataset.soft_target_cfg = resolve_soft_target_config(soft_cfg_raw)
 
     include_low = bool(dcfg.get("include_low_res", False))
     excluded_ids = set()

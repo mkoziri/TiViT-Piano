@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+import logging
 import time
 
 import torch
@@ -24,6 +25,8 @@ from .av_sync import AVLagResult
 from .frame_target_cache import FrameTargetCache, FrameTargetMeta, make_target_cache_key
 from .identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 from .time_grid import sec_to_frame
+
+LOGGER = logging.getLogger(__name__)
 
 FRAME_TARGET_KEYS: Tuple[str, ...] = (
     "pitch_roll",
@@ -108,6 +111,81 @@ class FrameTargetSpec:
             f"lag_source={lag_source}, "
             f"cache_key={self.cache_key_prefix}"
         )
+
+
+@dataclass(frozen=True)
+class SoftTargetConfig:
+    """Normalised configuration for train-only soft target smoothing."""
+
+    enabled: bool
+    apply_onset: bool
+    apply_pitch: bool
+    apply_offset: bool
+    onset_kernel: Tuple[float, ...]
+    frame_kernel: Tuple[float, ...]
+
+
+_DEFAULT_ONSET_KERNEL: Tuple[float, ...] = (0.5, 1.0, 0.5)
+_DEFAULT_FRAME_KERNEL: Tuple[float, ...] = (0.5, 1.0, 0.5)
+_SOFT_TARGET_LOGGED = False
+
+
+def _coerce_kernel(
+    values: Optional[Sequence[Any]],
+    fallback: Tuple[float, ...],
+    *,
+    require_odd: bool = False,
+    min_len: int = 0,
+) -> Tuple[float, ...]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return fallback
+    try:
+        kernel = tuple(float(v) for v in values)
+    except (TypeError, ValueError):
+        return fallback
+    if not kernel:
+        return fallback
+    if require_odd and len(kernel) % 2 == 0:
+        return fallback
+    if min_len and len(kernel) < min_len:
+        return fallback
+    return kernel
+
+
+def resolve_soft_target_config(cfg: Optional[Mapping[str, Any]]) -> Optional[SoftTargetConfig]:
+    """Normalise soft target settings from configuration."""
+
+    if not isinstance(cfg, Mapping):
+        return None
+
+    enabled = bool(cfg.get("enabled", False))
+    if not enabled:
+        return None
+
+    apply_cfg = cfg.get("apply_to", {}) or {}
+    apply_onset = bool(apply_cfg.get("onset", True))
+    apply_pitch = bool(apply_cfg.get("pitch", True))
+    apply_offset = bool(apply_cfg.get("offset", False))
+    onset_kernel = _coerce_kernel(
+        cfg.get("onset_kernel"),
+        _DEFAULT_ONSET_KERNEL,
+        require_odd=True,
+        min_len=3,
+    )
+    frame_kernel = _coerce_kernel(
+        cfg.get("frame_kernel"),
+        _DEFAULT_FRAME_KERNEL,
+        min_len=3,
+    )
+
+    return SoftTargetConfig(
+        enabled=True,
+        apply_onset=apply_onset,
+        apply_pitch=apply_pitch,
+        apply_offset=apply_offset,
+        onset_kernel=onset_kernel,
+        frame_kernel=frame_kernel,
+    )
 
 
 @dataclass
@@ -285,6 +363,139 @@ def build_dense_frame_targets(
     }
 
 
+def _shift_bool_mask(mask: torch.Tensor, delta: int) -> torch.Tensor:
+    if mask.dim() != 2:
+        return torch.zeros_like(mask)
+    T = mask.shape[0]
+    if delta == 0:
+        return mask.clone()
+    if abs(delta) >= T:
+        return torch.zeros_like(mask)
+    shifted = torch.zeros_like(mask)
+    if delta > 0:
+        shifted[delta:, :] = mask[: T - delta, :]
+    else:
+        shifted[: T + delta, :] = mask[-delta:, :]
+    return shifted
+
+
+def _apply_onset_soft_targets(onset_roll: torch.Tensor, kernel: Sequence[float]) -> None:
+    if onset_roll.numel() == 0:
+        return
+    if not kernel:
+        return
+    center = len(kernel) // 2
+    base_mask = onset_roll >= 0.5
+    for idx, weight in enumerate(kernel):
+        weight_val = max(0.0, min(1.0, float(weight)))
+        if weight_val <= 0.0:
+            continue
+        delta = idx - center
+        shifted = _shift_bool_mask(base_mask, delta)
+        candidate = shifted.to(dtype=onset_roll.dtype) * weight_val
+        torch.maximum(onset_roll, candidate, out=onset_roll)
+
+
+def _apply_pitch_soft_targets(pitch_roll: torch.Tensor, kernel: Sequence[float]) -> None:
+    if pitch_roll.numel() == 0 or len(kernel) < 3:
+        return
+    pre = max(0.0, min(1.0, float(kernel[0])))
+    interior = max(0.0, min(1.0, float(kernel[1])))
+    post = max(0.0, min(1.0, float(kernel[-1])))
+    base_active = pitch_roll >= 0.5
+    if interior > 0.0:
+        torch.maximum(
+            pitch_roll,
+            base_active.to(dtype=pitch_roll.dtype) * interior,
+            out=pitch_roll,
+        )
+    if pre > 0.0:
+        prev_active = torch.zeros_like(base_active)
+        prev_active[1:, :] = base_active[:-1, :]
+        start_mask = base_active & (~prev_active)
+        if start_mask.any():
+            frames, pitches = start_mask.nonzero(as_tuple=True)
+            valid = frames > 0
+            if valid.any():
+                frames = frames[valid] - 1
+                pitches = pitches[valid]
+                current = pitch_roll[frames, pitches]
+                pitch_roll[frames, pitches] = torch.maximum(
+                    current,
+                    current.new_full(current.shape, pre),
+                )
+    if post > 0.0:
+        next_active = torch.zeros_like(base_active)
+        next_active[:-1, :] = base_active[1:, :]
+        end_mask = (~base_active) & next_active
+        if end_mask.any():
+            frames, pitches = end_mask.nonzero(as_tuple=True)
+            current = pitch_roll[frames, pitches]
+            pitch_roll[frames, pitches] = torch.maximum(
+                current,
+                current.new_full(current.shape, post),
+            )
+
+
+def _log_soft_target_summary(payload: Mapping[str, torch.Tensor], split: str) -> None:
+    global _SOFT_TARGET_LOGGED
+    if _SOFT_TARGET_LOGGED:
+        return
+    onset = payload.get("onset_roll")
+    pitch = payload.get("pitch_roll")
+    if not torch.is_tensor(onset) or not torch.is_tensor(pitch):
+        return
+    def _stats(t: torch.Tensor) -> Tuple[float, float, float]:
+        return (
+            float(t.min().item()),
+            float(t.mean().item()),
+            float(t.max().item()),
+        )
+    onset_stats = _stats(onset)
+    pitch_stats = _stats(pitch)
+    LOGGER.info(
+        "[targets:soft] split=%s onset[min=%.3f mean=%.3f max=%.3f] pitch[min=%.3f mean=%.3f max=%.3f]",
+        split,
+        onset_stats[0],
+        onset_stats[1],
+        onset_stats[2],
+        pitch_stats[0],
+        pitch_stats[1],
+        pitch_stats[2],
+    )
+    _SOFT_TARGET_LOGGED = True
+
+
+def _maybe_apply_soft_targets(
+    payload: Optional[Dict[str, torch.Tensor]],
+    soft_cfg: Optional[SoftTargetConfig],
+    *,
+    split: str,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if payload is None or soft_cfg is None or not soft_cfg.enabled:
+        return payload
+    if str(split).lower() != "train":
+        return payload
+
+    applied = False
+    onset_roll = payload.get("onset_roll")
+    if soft_cfg.apply_onset and torch.is_tensor(onset_roll):
+        _apply_onset_soft_targets(onset_roll, soft_cfg.onset_kernel)
+        applied = True
+
+    pitch_roll = payload.get("pitch_roll")
+    if soft_cfg.apply_pitch and torch.is_tensor(pitch_roll):
+        _apply_pitch_soft_targets(pitch_roll, soft_cfg.frame_kernel)
+        applied = True
+
+    # NOTE: Offsets intentionally remain binary spikes; apply_to.offset exists
+    # as a hook for future experiments mirroring the onset smoothing pattern.
+
+    if applied:
+        _log_soft_target_summary(payload, split)
+    return payload
+
+
 def prepare_frame_targets(
     *,
     labels: Optional[torch.Tensor],
@@ -294,6 +505,7 @@ def prepare_frame_targets(
     split: str,
     video_id: str,
     clip_start: float,
+    soft_targets: Optional[SoftTargetConfig] = None,
 ) -> FrameTargetResult:
     """Load or construct frame targets for a clip using a shared pipeline."""
 
@@ -349,8 +561,9 @@ def prepare_frame_targets(
         lag_frames_meta = key_meta.get("lag_frames", None)
         lag_ms_int = int(round(float(lag_ms_meta))) if lag_ms_meta is not None else None
         lag_frames_int = int(lag_frames_meta) if lag_frames_meta is not None else None
+        payload = _maybe_apply_soft_targets(cached_targets, soft_targets, split=split)
         return FrameTargetResult(
-            cached_targets,
+            payload,
             "reused",
             key_hash,
             key_meta,
@@ -395,12 +608,13 @@ def prepare_frame_targets(
         )
 
     cache_payload = {key: ft[key] for key in FRAME_TARGET_KEYS}
+    payload = _maybe_apply_soft_targets(ft, soft_targets, split=split)
     cache.save(primary_key_hash, primary_key_meta, cache_payload)
     lag_ms_int = primary_lag_ms_int
     lag_frames_int = primary_lag_frames_int
     status = "built"
     return FrameTargetResult(
-        cache_payload,
+        payload,
         status,
         primary_key_hash,
         primary_key_meta,
@@ -414,8 +628,10 @@ __all__ = [
     "FRAME_TARGET_KEYS",
     "FrameTargetResult",
     "FrameTargetSpec",
+    "SoftTargetConfig",
     "build_dense_frame_targets",
     "prepare_frame_targets",
     "resolve_frame_target_spec",
+    "resolve_soft_target_config",
     "resolve_lag_ms",
 ]
