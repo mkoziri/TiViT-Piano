@@ -427,14 +427,18 @@ def _apply_pitch_soft_targets(pitch_roll: torch.Tensor, kernel: Sequence[float])
     if post > 0.0:
         next_active = torch.zeros_like(base_active)
         next_active[:-1, :] = base_active[1:, :]
-        end_mask = (~base_active) & next_active
+        end_mask = base_active & (~next_active)
         if end_mask.any():
             frames, pitches = end_mask.nonzero(as_tuple=True)
-            current = pitch_roll[frames, pitches]
-            pitch_roll[frames, pitches] = torch.maximum(
-                current,
-                current.new_full(current.shape, post),
-            )
+            valid = frames < (pitch_roll.shape[0] - 1)
+            if valid.any():
+                frames = frames[valid] + 1
+                pitches = pitches[valid]
+                current = pitch_roll[frames, pitches]
+                pitch_roll[frames, pitches] = torch.maximum(
+                    current,
+                    current.new_full(current.shape, post),
+                )
 
 
 def _log_soft_target_summary(payload: Mapping[str, torch.Tensor], split: str) -> None:
