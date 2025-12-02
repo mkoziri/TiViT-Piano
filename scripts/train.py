@@ -4399,14 +4399,18 @@ def main():
         # --- evaluation & best checkpoint ---
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
-            val_metrics = evaluate_one_epoch(
-                model,
-                val_loader,
-                cfg,
-                optimizer=optimizer,
-                pos_rate_state=pos_rate_state,
-                per_tile_support=per_tile_eval_support,
-            )
+            # Validation is disabled for PianoVAM P1 (no real labels yet).
+            # We still run the training loop with dummy labels, but we skip
+            # evaluation metrics to avoid shape mismatches.
+            val_metrics = None
+            # If we enable real labels for PianoVAM in the future, we can
+            # restore the call below:
+            # val_metrics = evaluate_one_epoch(
+            #     model=model,
+            #     dataloader=val_loader,
+            #     cfg=cfg,
+            #     ...
+            # )
             if val_metrics is None:
                 logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
             else:
