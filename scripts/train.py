@@ -4440,65 +4440,71 @@ def main():
             # restore the call below:
             if is_pianovam:
                 # =====================================================
-                # PianoVAM custom evaluation (event-level F1)
+                # PianoVAM custom evaluation (event-level F1 vs TSV)
                 # =====================================================
+                from scripts.eval_pianovam import evaluate_clip
+
+                print("[PianoVAM Eval] Starting evaluation...")
                 logger.info("[PianoVAM Eval] Starting evaluation...")
 
-                device = _first_parameter_device(model)
-                model.eval()
-
-                # hop_seconds from config (decode_fps)
-                dataset_cfg = cfg.get("dataset", {}) or {}
-                decode_fps = float(dataset_cfg.get("decode_fps", 60.0))
-                hop_seconds = 1.0 / decode_fps
-
                 val_results = []
+                model.eval()
 
                 with torch.inference_mode():
                     for batch in val_loader:
-                        if batch is None:
-                            continue
+                        video = batch["video"]          # (B,T,C,H,W)
+                        frame_times = batch["frame_times"]   # (B,T)
+                        tsv_paths = batch["tsv_path"]        # length-B list/array
 
-                        video = batch["video"].to(device)   # (B, T, C, H, W)
-                        tsv_paths = batch["tsv_path"]       # list ή tuple B-length
+                        # ---- logits από το μοντέλο ----
+                        out = model(video)
 
-                        # Forward pass
-                        out = model(video, return_per_tile=False)
-
-                        onset_logits = out["onset_logits"].cpu()   # (B, T, 88)
-                        offset_logits = out["offset_logits"].cpu() # (B, T, 88)
+                        # ΠΡΟΣΟΧΗ: βάλε εδώ τα σωστά keys του μοντέλου σου.
+                        # Αν στο training χρησιμοποιείς out["onset"] / out["offset"],
+                        # τότε βάλε αυτά.
+                        onset_logits  = out["onset_logits"]   # (B,T,88)
+                        offset_logits = out["offset_logits"]    # (B,T,88)
 
                         B = onset_logits.shape[0]
+
                         for i in range(B):
+                            pred_on = onset_logits[i].cpu()    # (T,88)
+                            pred_off = offset_logits[i].cpu()  # (T,88)
+
+                            ft = frame_times[i].cpu().numpy()  # (T,)
+                            tsv = tsv_paths[i]
+
                             clip_metrics = evaluate_clip(
-                                onset_logits[i],          # (T, 88)
-                                offset_logits[i],         # (T, 88)
-                                tsv_paths[i],             # path for .tsv
-                                hop_seconds,
+                                pred_on,
+                                pred_off,
+                                tsv,
+                                ft,        # <-- περνάμε frame_times, όχι hop_seconds
                             )
                             val_results.append(clip_metrics)
 
+                # ---- Aggregate metrics ----
                 if len(val_results) == 0:
+                    print("[PianoVAM Eval] No samples evaluated.")
+                    logger.warning("[PianoVAM Eval] No samples evaluated.")
                     val_f1 = 0.0
                 else:
-                    f1s = [x.get("f1", 0.0) for x in val_results]
+                    f1s = [x["f1"] for x in val_results]
                     val_f1 = float(sum(f1s) / len(f1s))
 
-                logger.info(
-                    "[PianoVAM Eval] Mean F1 = %.4f over %d clips",
-                    val_f1,
-                    len(val_results),
-                )
+                print(f"[PianoVAM Eval] Mean F1 = {val_f1:.4f}")
+                logger.info("[PianoVAM Eval] Mean F1 = %.4f", val_f1)
 
+                # ---- Save per-clip metrics ----
+                import json, os
                 os.makedirs("logs", exist_ok=True)
                 with open("logs/pianovam_metrics.json", "w") as f:
                     json.dump(val_results, f, indent=2)
 
+                print("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
                 logger.info("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
 
-                # to fit with the whole code
+                # Επιστρέφουμε ένα απλό dict ώστε να μην σπάσει το υπόλοιπο train.py
                 val_metrics = {"f1": val_f1}
-
             else:
                 val_metrics = evaluate_one_epoch(
                     model,

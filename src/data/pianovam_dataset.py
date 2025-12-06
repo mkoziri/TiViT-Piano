@@ -340,27 +340,27 @@ class PianoVAMDataset(Dataset):
         assert pitch.shape == onset.shape == offset.shape
         T, P = pitch.shape
 
-        # ----- frame-level aliases for the training loop -----
-        # train.py expects these names for frame-mode:
+        # ----- frame-level aliases για το training loop -----
+        # train.py περιμένει:
         #   pitch_roll / onset_roll / offset_roll (B,T,P)
         #   hand_frame / clef_frame               (B,T)
-        # single-sample (T,P), DataLoader will put B dimension.
-        pitch_roll = pitch
-        onset_roll = onset
-        offset_roll = offset
+        # εδώ είμαστε single-sample (T,P), το DataLoader θα προσθέσει B.
+        pitch_roll = pitch          # (T,88)
+        onset_roll = onset          # (T,88)
+        offset_roll = offset        # (T,88)
 
-        # Dummy hand/clef labels (we don't train these heads; loss weights are 0.0)
-        hand_frame = torch.zeros(T, dtype=torch.long)   # e.g. class 0 for all frames
-        clef_frame = torch.zeros(T, dtype=torch.long)   # e.g. class 0 for all frames
+        # Dummy hand/clef labels (δεν τα χρησιμοποιούμε, loss weights=0.0)
+        hand_frame = torch.zeros(T, dtype=torch.long)
+        clef_frame = torch.zeros(T, dtype=torch.long)
 
-        # (Optional) clip-level pooled labels
-        pitch_clip = pitch_roll.max(dim=0).values       # (P,)
-        onset_clip = onset_roll.max(dim=0).values       # (P,)
-        offset_clip = offset_roll.max(dim=0).values     # (P,)
+        # Clip-level labels (max over time)
+        pitch_clip = pitch_roll.max(dim=0).values       # (88,)
+        onset_clip = onset_roll.max(dim=0).values       # (88,)
+        offset_clip = offset_roll.max(dim=0).values     # (88,)
 
         sample: Dict[str, Any] = {
             "video": video,                         # (T, C, H, W)
-            "path": str(self.root / rec["video_path"]),
+            "path": str(rec["video_path"]),
             "id": rec_id,
 
             # frame-level labels (used by compute_loss_frame)
@@ -375,27 +375,30 @@ class PianoVAMDataset(Dataset):
             "onset":  onset_clip,                  # (88,)
             "offset": offset_clip,                 # (88,)
 
-            # for the custom evaluation
-            "tsv_path": str(self.root / "TSV" / f"{rec_id}.tsv"),
+            # για το custom evaluation
+            "tsv_path": str(rec["tsv_path"]),      # GT labels
+            "frame_times": torch.from_numpy(frame_times).float(),  # (T,)
         }
 
-        # ---- ADD THIS (1/2): frame_targets dict ----
+        # frame_targets για συμβατότητα με generic κώδικα (δεν πειράζει αν δεν τα χρησιμοποιεί όλος ο κώδικας ακόμα)
         sample["frame_targets"] = {
             "pitch": pitch_roll,     # (T,88)
             "onset": onset_roll,     # (T,88)
             "offset": offset_roll,   # (T,88)
             "hand": hand_frame,      # (T,)
-            "clef": clef_frame,      # (T,)
+            "clef": clef_frame,      # (T,),
         }
 
-        # ---- ADD THIS (2/2): clip_targets dict ----
         sample["clip_targets"] = {
             "pitch": pitch_clip,     # (88,)
             "onset": onset_clip,     # (88,)
-            "offset": offset_clip,   # (88,)
+            "offset": offset_clip,   # (88,),
         }
 
         return sample
+
+
+
 
 
 
