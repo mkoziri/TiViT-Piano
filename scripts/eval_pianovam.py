@@ -1,19 +1,18 @@
 import torch
 import numpy as np
 from dataclasses import dataclass
-from typing import List
-
+from typing import Dict, List, Mapping, Tuple
 # ============================================================
 # Configurable thresholds and tolerances
 # ============================================================
 
-ONSET_THR = 0.20
+ONSET_THR = 0.05
 OFFSET_THR = 0.20
 
 # With 128 frames / full video, timestamps differ by ~5–20 sec.
 # So we MUST allow large tolerance.
-ONSET_TOL = 5.0
-OFFSET_TOL = 5.0
+ONSET_TOL = 1.0
+OFFSET_TOL = 1.0
 
 MIN_NOTE_LEN = 0.05
 

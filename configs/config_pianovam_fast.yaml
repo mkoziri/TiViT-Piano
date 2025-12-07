@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoVAM_supervised_v1
+  name: TiViT-Piano-PianoVAMv1-f128
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -20,9 +20,9 @@ dataset:
     test: null
   split: train
   split_train: train
-  split_val: val
+  split_val: valid
   split_test: test
-  frames: 128
+  frames: 256
   decode_fps: 30.0                # used mainly for metrics/time conversion
   hop_seconds: 0.03333333333333333
   resize:
@@ -31,7 +31,7 @@ dataset:
   tiles: 3
   channels: 3
   normalize: true
-  apply_crop: true
+  apply_crop: false
   canonical_hw:
     - 145
     - 1024
@@ -69,7 +69,7 @@ dataset:
   # We do NOT use the generic frame_targets machinery yet, because
   # we are building frame-level labels directly in the dataset.
   frame_targets:
-    enable: true
+    enable: false
     tolerance: 0.03
     dilate_active_frames: 1
     fill_mode: overlap
@@ -104,7 +104,7 @@ model:
   vits_tile:
     backbone_name: vit_small_patch16_224
     pretrained: true
-    freeze_backbone: true
+    freeze_backbone: false
     input_hw:
       - 224
       - 224
@@ -120,8 +120,8 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 50
-  learning_rate: 3e-5
+  epochs: 40
+  learning_rate: 1e-5
   weight_decay: 0.01
   eval_freq: 1
   debug_dummy_labels: false       
@@ -135,13 +135,13 @@ training:
   loss_weights:
     onoff_loss: bce_pos
     onoff_pos_weight_mode: adaptive
-    onoff_pos_weight: 16.0
+    onoff_pos_weight: 8.0
     onoff_pos_weight_ema_alpha: 0.05
     onoff_neg_smooth: 0.0
     focal_gamma: 4.0
     focal_alpha: 0.25
     onoff_prior_mean: 0.012
-    onoff_prior_weight: 0.15
+    onoff_prior_weight: 0.3
     onoff_heads:
       onset:
         loss: focal
@@ -149,21 +149,21 @@ training:
         focal_gamma: 4.0
         focal_alpha: 0.25
         prior_mean: 0.012
-        prior_weight: 0.15
+        prior_weight: 0.3
       offset:
         loss: focal
         focal_gamma: 2.5
         focal_alpha: 0.2
         prior_mean: 0.01
-        prior_weight: 0.15
-    onset: 1.8
-    offset: 0.6
-    pitch: 1.2
+        prior_weight: 0.3
+    onset: 3.0
+    offset: 1.5
+    pitch: 0.5
     hand: 0.0         # we do not train hand/clef in this first run
     clef: 0.0
   metrics:
     prob_threshold: 0.2
-    prob_threshold_onset: 0.2
+    prob_threshold_onset: 0.05
     prob_threshold_offset: 0.2
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
@@ -202,7 +202,7 @@ training:
     n: 1
     write_back: false
     frames: 96
-    max_clips: 80
+    max_clips: 40
     split: val
     sweep:
       delta: 0.05
@@ -227,7 +227,7 @@ optim:
 
 train:
   accumulate_steps: 12
-  freeze_backbone_epochs: 0
+  freeze_backbone_epochs: 3
 
 decoder:
   global_fusion:
@@ -269,46 +269,46 @@ logging:
   postproc_debug: true
 
 autopilot:
-  best_selection:
-    owner: autopilot
-  fast_strategy: two_stage
-  onset_optimizer:
-    open_grid:
-      - 0.01
-      - 0.015
-      - 0.02
-      - 0.03
-    min_on_grid:
-      - 2
-      - 3
-    hold_mode: fixed_ratio
-    hold_delta: 0.06
-    hold_min: 0.003
-    hold_ratio: 0.75
-    merge_gap: 1
-    thr_anchor: 0.2
-    thr_add_delta: 0.01
-    thr_add_steps: 5
-    thr_mul_ratio: 1.1
-    thr_mul_orders: 1
-    thr_min_prob: 0.005
-    thr_max_prob: 0.98
-    thr_low_guard: 0.01
-    thr_high_guard: 0.6
-    thr_min_points: 5
-    thr_max_points: 11
-  offset_optimizer:
-    thr_anchor: 0.3
-    thr_add_delta: 0.01
-    thr_add_steps: 5
-    thr_mul_ratio: 1.1
-    thr_mul_orders: 1
-    thr_min_prob: 0.02
-    thr_max_prob: 0.98
-    thr_low_guard: 0.02
-    thr_high_guard: 0.95
-    thr_min_points: 5
-    thr_max_points: 11
+#   best_selection:
+#     owner: autopilot
+#   fast_strategy: none
+#   onset_optimizer:
+#     open_grid:
+#       - 0.01
+#       - 0.015
+#       - 0.02
+#       - 0.03
+#     min_on_grid:
+#       - 2
+#       - 3
+#     hold_mode: fixed_ratio
+#     hold_delta: 0.06
+#     hold_min: 0.003
+#     hold_ratio: 0.75
+#     merge_gap: 1
+#     thr_anchor: 0.2
+#     thr_add_delta: 0.01
+#     thr_add_steps: 5
+#     thr_mul_ratio: 1.1
+#     thr_mul_orders: 1
+#     thr_min_prob: 0.005
+#     thr_max_prob: 0.98
+#     thr_low_guard: 0.01
+#     thr_high_guard: 0.6
+#     thr_min_points: 5
+#     thr_max_points: 11
+#   offset_optimizer:
+#     thr_anchor: 0.3
+#     thr_add_delta: 0.01
+#     thr_add_steps: 5
+#     thr_mul_ratio: 1.1
+#     thr_mul_orders: 1
+#     thr_min_prob: 0.02
+#     thr_max_prob: 0.98
+#     thr_low_guard: 0.02
+#     thr_high_guard: 0.95
+#     thr_min_points: 5
+#     thr_max_points: 11
 
 inference:
   output_dir: inference_results

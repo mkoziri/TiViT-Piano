@@ -1274,7 +1274,7 @@ def _parse_cli_args(argv: Sequence[str]):
         type=float,
         help="Override offset head logit bias prior to sigmoid",
     )
-    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument("--split", choices=["train", "valid", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
@@ -1619,7 +1619,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "valid"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")
@@ -2868,7 +2868,7 @@ def main():
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "valid"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")

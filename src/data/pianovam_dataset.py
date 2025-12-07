@@ -117,9 +117,9 @@ class PianoVAMDataset(Dataset):
         # ------------------------------------------------------------------
         # Load metadata_v2.json
         # ------------------------------------------------------------------
-        metadata_path = self.root / "metadata_v2.json"
+        metadata_path = self.root / "metadata_v1.json"
         if not metadata_path.is_file():
-            raise FileNotFoundError(f"[PianoVAM] metadata_v2.json not found: {metadata_path}")
+            raise FileNotFoundError(f"[PianoVAM] metadata_v1.json not found: {metadata_path}")
 
         with metadata_path.open("r", encoding="utf-8") as f:
             meta_raw = json.load(f)
@@ -189,11 +189,13 @@ class PianoVAMDataset(Dataset):
         meta_split = meta_split.lower()
 
         if requested == "train":
-            return meta_split == "train"
+           return meta_split in ("train", "ext-train")
         if requested in ("val", "validation"):
-            return meta_split in ("val", "validation")
+            return meta_split in ("val", "valid", "validation")
         if requested == "test":
             return meta_split == "test"
+        if meta_split.startswith("special"):
+            return False
         # Fallback: exact match.
         return requested == meta_split
 
