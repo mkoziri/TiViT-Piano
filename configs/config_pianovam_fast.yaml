@@ -46,6 +46,7 @@ dataset:
       random_crop_hw:
         - 145
         - 1024
+  crop_margin: 20
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
@@ -120,7 +121,7 @@ tiling:
   overlap_tokens: 0
 
 training:
-  epochs: 40
+  epochs: 50
   learning_rate: 1e-5
   weight_decay: 0.01
   eval_freq: 1

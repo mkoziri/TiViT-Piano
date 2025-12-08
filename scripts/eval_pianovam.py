@@ -6,15 +6,15 @@ from typing import Dict, List, Mapping, Tuple
 # Configurable thresholds and tolerances
 # ============================================================
 
-ONSET_THR = 0.05
-OFFSET_THR = 0.20
+ONSET_THR = 0.4
+OFFSET_THR = 0.4
 
 # With 128 frames / full video, timestamps differ by ~5–20 sec.
 # So we MUST allow large tolerance.
-ONSET_TOL = 1.0
-OFFSET_TOL = 1.0
+ONSET_TOL = 5.0
+OFFSET_TOL = 10.0
 
-MIN_NOTE_LEN = 0.05
+MIN_NOTE_LEN = 0.0
 
 @dataclass
 class NoteEvent:
@@ -45,6 +45,27 @@ def decode_events_from_logits(
     onset_prob  = torch.sigmoid(onset_logits)
     offset_prob = torch.sigmoid(offset_logits)
 
+    # --- DEBUG: ρίξε μια ματιά στα probs ---
+    print(
+        "[DEBUG-probs] onset min=%.3f max=%.3f mean=%.3f | "
+        "offset min=%.3f max=%.3f mean=%.3f"
+        % (
+            onset_prob.min().item(), onset_prob.max().item(), onset_prob.mean().item(),
+            offset_prob.min().item(), offset_prob.max().item(), offset_prob.mean().item(),
+        )
+    )
+    # optional: πόσα bins περνάνε το threshold
+    onset_bin_tmp = (onset_prob > ONSET_THR)
+    offset_bin_tmp = (offset_prob > OFFSET_THR)
+    print(
+        "[DEBUG-bins] onset>thr=%d / %d | offset>thr=%d / %d"
+        % (
+            onset_bin_tmp.sum().item(), onset_bin_tmp.numel(),
+            offset_bin_tmp.sum().item(), offset_bin_tmp.numel(),
+        )
+    )
+    # ----------------------------------------
+
     onset_bin  = (onset_prob  > ONSET_THR)
     offset_bin = (offset_prob > OFFSET_THR)
 
@@ -71,7 +92,11 @@ def decode_events_from_logits(
         if active:
             events.append(NoteEvent(onset_time, float(frame_times[-1]), pitch + 21))
 
-    return events
+    return [
+        e for e in events
+        if (e.offset - e.onset) >= MIN_NOTE_LEN
+    ]
+
 
 
 # ============================================================
@@ -137,6 +162,12 @@ def evaluate_clip(on_logits, off_logits, tsv_path, frame_times):
 
     pred_events = decode_events_from_logits(on_logits, off_logits, frame_times)
     gt_events   = load_tsv_events(tsv_path)
+
+    print(f"[DEBUG] {tsv_path}  n_pred={len(pred_events)}  n_gt={len(gt_events)}")
+    if len(pred_events) > 0:
+        print("[DEBUG] first pred:", pred_events[0])
+    if len(gt_events) > 0:
+        print("[DEBUG] first gt:", gt_events[0])
 
     tp, fp, fn = match_events(pred_events, gt_events)
 

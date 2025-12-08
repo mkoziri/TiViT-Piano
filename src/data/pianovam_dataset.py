@@ -48,6 +48,53 @@ NOTE_MAX = 108
 N_PITCHES = NOTE_MAX - NOTE_MIN + 1  # 88
 
 
+def _parse_point(s: Optional[str]):
+    """
+    Parse 'x, y' string from metadata σε (x, y) ints.
+    Αν κάτι πάει στραβά, επιστρέφει None.
+    """
+    if not s:
+        return None
+    try:
+        x_str, y_str = s.split(",")
+        return int(x_str.strip()), int(y_str.strip())
+    except Exception:
+        return None
+
+
+def _compute_crop_box(rec: Mapping[str, Any], margin: int = 0):
+    """
+    Υπολογίζει bounding box (x0, y0, x1, y1) από Point_LT/RT/RB/LB.
+
+    Επιστρέφει None αν λείπει κάποιο σημείο.
+    """
+    pts = []
+    for key in ("Point_LT", "Point_RT", "Point_RB", "Point_LB"):
+        p = _parse_point(rec.get(key))
+        if p is not None:
+            pts.append(p)
+
+    if len(pts) != 4:
+        return None
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+
+    x0 = min(xs)
+    y0 = min(ys)
+    x1 = max(xs)
+    y1 = max(ys)
+
+    if margin > 0:
+        x0 -= margin
+        y0 -= margin
+        x1 += margin
+        y1 += margin
+
+    return x0, y0, x1, y1
+
+
+
 def _resolve_root(cfg: Mapping[str, Any]) -> Path:
     """
     Resolve the root directory of the PianoVAM dataset.
@@ -117,9 +164,9 @@ class PianoVAMDataset(Dataset):
         # ------------------------------------------------------------------
         # Load metadata_v2.json
         # ------------------------------------------------------------------
-        metadata_path = self.root / "metadata_v1.json"
+        metadata_path = self.root / "metadata_v2.json"
         if not metadata_path.is_file():
-            raise FileNotFoundError(f"[PianoVAM] metadata_v1.json not found: {metadata_path}")
+            raise FileNotFoundError(f"[PianoVAM] metadata_v2.json not found: {metadata_path}")
 
         with metadata_path.open("r", encoding="utf-8") as f:
             meta_raw = json.load(f)
@@ -159,6 +206,12 @@ class PianoVAMDataset(Dataset):
                 rec_copy["id"] = record_time
                 rec_copy["video_path"] = video_path
                 rec_copy["tsv_path"] = tsv_path
+                # --- ΝΕΟ: crop box από τα σημεία του metadata ---
+                margin = int(dataset_cfg.get("crop_margin", 0))  # μπορείς να το αλλάξεις στο yaml
+                crop_box = _compute_crop_box(rec_copy, margin=margin)
+                rec_copy["crop_box"] = crop_box
+                # -----------------------------------------------
+
                 records.append(rec_copy)
 
         if not records:
@@ -240,6 +293,32 @@ class PianoVAMDataset(Dataset):
         if not isinstance(frames, torch.Tensor):
             frames = torch.from_numpy(frames)
 
+        # --- ΝΕΟ: πραγματικά timestamps για ΚΑΘΕ sampled frame ---
+        # χρόνος = frame_index / fps
+        frame_times = (idxs.astype(np.float32) / native_fps).astype(np.float32)
+        # ---------------------------------------------------------
+
+        # --- ΝΕΟ: crop γύρω από το keyboard αν έχουμε crop_box ---
+        crop_box = rec.get("crop_box")
+        if crop_box is not None:
+            x0, y0, x1, y1 = crop_box
+
+            H, W = frames.shape[1], frames.shape[2]
+            x0 = max(0, min(x0, W - 1))
+            y0 = max(0, min(y0, H - 1))
+            x1 = max(x0 + 1, min(x1, W))
+            y1 = max(y0 + 1, min(y1, H))
+
+            print(
+                f"[PianoVAM crop] id={rec.get('id')} "
+                f"full={H}x{W} → crop=({x0},{y0})-({x1},{y1}) "
+                f"→ {y1 - y0}x{x1 - x0}"
+            )
+
+            frames = frames[:, y0:y1, x0:x1, :]
+
+        # --------------------------------------------------------
+
         video = frames.permute(0, 3, 1, 2).float() / 255.0  # (T, C, H, W)
 
         # Optional resize.
@@ -253,7 +332,7 @@ class PianoVAMDataset(Dataset):
 
         # Build a time grid aligned with the T sampled frames.
         # Times go from 0 up to (duration_sec), excluding the endpoint.
-        frame_times = np.linspace(0.0, duration_sec, T, endpoint=False, dtype=np.float32)
+        # frame_times = np.linspace(0.0, duration_sec, T, endpoint=False, dtype=np.float32)
 
         return video, frame_times
 
@@ -280,6 +359,11 @@ class PianoVAMDataset(Dataset):
         pitch_grid = np.zeros((T, N_PITCHES), dtype=np.float32)
         onset_grid = np.zeros((T, N_PITCHES), dtype=np.float32)
         offset_grid = np.zeros((T, N_PITCHES), dtype=np.float32)
+        # Προσεγγιστικό χρονικό βήμα μεταξύ δύο διαδοχικών frame_times
+        if T > 1:
+            approx_frame_dt = float(frame_times[1] - frame_times[0])
+        else:
+            approx_frame_dt = 0.0
 
         with tsv_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -304,6 +388,13 @@ class PianoVAMDataset(Dataset):
                     continue
 
                 pitch_idx = note - NOTE_MIN
+
+                # --- ΝΕΟ: αγνόησε πολύ μικρές νότες που δεν "χωράνε" στο frame grid ---
+                duration = key_off_sec - onset_sec
+                if approx_frame_dt > 0.0 and duration < 0.5 * approx_frame_dt:
+                    # π.χ. αν frame step είναι ~2s, αγνοούμε νότες <1s
+                    continue
+                # -----------------------------------------------------------------------
 
                 # Determine which frame-times fall inside [onset, key_off).
                 mask = (frame_times >= onset_sec) & (frame_times < key_off_sec)

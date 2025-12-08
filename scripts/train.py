@@ -4491,20 +4491,45 @@ def main():
                     f1s = [x["f1"] for x in val_results]
                     val_f1 = float(sum(f1s) / len(f1s))
 
-                print(f"[PianoVAM Eval] Mean F1 = {val_f1:.4f}")
-                logger.info("[PianoVAM Eval] Mean F1 = %.4f", val_f1)
+                # Micro-F1 από όλα τα clips μαζί
+                total_tp = sum(x["tp"] for x in val_results)
+                total_fp = sum(x["fp"] for x in val_results)
+                total_fn = sum(x["fn"] for x in val_results)
 
+                if total_tp == 0:
+                    micro_f1 = 0.0
+                else:
+                    micro_prec = total_tp / (total_tp + total_fp + 1e-9)
+                    micro_rec  = total_tp / (total_tp + total_fn + 1e-9)
+                    micro_f1   = 2 * micro_prec * micro_rec / (micro_prec + micro_rec + 1e-9)
+
+                print(f"[PianoVAM Eval] Mean F1 = {val_f1:.4f}")
+                print(f"[PianoVAM Eval] Micro F1 = {micro_f1:.4f}")
+                logger.info("[PianoVAM Eval] Mean F1 = %.4f  |  Micro F1 = %.4f", val_f1, micro_f1)
+                
+                
                 # ---- Save per-clip metrics ----
                 import json, os
                 os.makedirs("logs", exist_ok=True)
                 with open("logs/pianovam_metrics.json", "w") as f:
-                    json.dump(val_results, f, indent=2)
+                    json.dump(
+                        {
+                            "clips": val_results,
+                            "mean_f1": float(val_f1),
+                            "micro_f1": float(micro_f1),
+                        },
+                        f,
+                        indent=2,
+                    )
 
                 print("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
                 logger.info("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
 
                 # Επιστρέφουμε ένα απλό dict ώστε να μην σπάσει το υπόλοιπο train.py
-                val_metrics = {"f1": val_f1}
+                val_metrics = {
+                    "f1": val_f1,
+                    "micro_f1": micro_f1,
+                }
             else:
                 val_metrics = evaluate_one_epoch(
                     model,

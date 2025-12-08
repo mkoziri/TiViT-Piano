@@ -1537,7 +1537,7 @@ def _parse_cli_args(argv: Sequence[str]):
 def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) -> RuntimeContext:
     """Load config, resolve dataset/model settings, and capture derived fields."""
 
-    cfg = dict(load_config("configs/config.yaml"))
+    cfg = dict(load_config("configs/config_pianovam_fast.yaml"))
     backend_label = _resolve_backend_label(cfg)
     model_cfg = cfg.get("model")
     if not isinstance(model_cfg, dict):
