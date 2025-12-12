@@ -261,7 +261,9 @@ class PianoVAMDataset(yt.PianoYTDataset):
             yt._expand_root = orig_expand_root
             yt._read_split_ids = orig_read_split_ids
             yt._resolve_media_paths = orig_resolve_media_paths
-            yt._read_midi_events = orig_read_midi_events
+            # Keep _read_midi_events patched so later label reads during training
+            # continue to parse TSV files correctly. The wrapper defers to the
+            # original reader for real MIDI files, so this is safe to leave in place.
 
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)
