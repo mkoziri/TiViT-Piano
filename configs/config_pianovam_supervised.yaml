@@ -8,11 +8,13 @@ dataset:
   name: PianoVAM
   root_dir: null                  # uses $TIVIT_DATA_DIR/PianoVAM_v1.0
   annotations_root: null
-  label_format: tsv
+  label_format: midi
   label_targets:
     - pitch
     - onset
     - offset
+    - hand
+    - clef
   max_clips: 80
   manifest:
     train: null
@@ -53,23 +55,17 @@ dataset:
   prefetch_factor: 1
   shuffle: true
 
-  # Sampler can be enabled now that we have labels (for future work),
-  # but for the first supervised run we keep it off for simplicity.
   sampler:
-    mode: null
+    mode: onset_balanced
     onset_frac: 0.5
     nearmiss_frac: 0.25
     bg_frac: 0.25
     nearmiss_radius: 6
 
-  # The dataset now returns labels directly (pitch/onset/offset),
-  # so we consider labels as required.
   require_labels: true
 
-  # We do NOT use the generic frame_targets machinery yet, because
-  # we are building frame-level labels directly in the dataset.
   frame_targets:
-    enable: false
+    enable: true
     tolerance: 0.03
     dilate_active_frames: 1
     fill_mode: overlap
@@ -79,7 +75,7 @@ dataset:
       - 64
     note_min: 21
     note_max: 108
-    cache_labels: false
+    cache_labels: true
     cache_dir: .cache/labels
     targets_sparse: true
 

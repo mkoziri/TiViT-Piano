@@ -112,6 +112,7 @@ def _safe_expanduser(path: Union[str, Path]) -> Path:
         return candidate
 
 _VIDEO_EXTS: Sequence[str] = (".mp4", ".mkv", ".webm")
+_MIDI_EXTS: Sequence[str] = (".midi", ".mid")
 _REG_DEBUG_CANON_LOGGED = False
 
 
@@ -354,10 +355,13 @@ def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optiona
                     audio_name = "audio_" + alias[6:]
                 else:
                     audio_name = alias
-                cand = base / f"{audio_name}.midi"
-                if cand.exists():
-                    midi_path = cand
-                    midi_alias = alias
+                for ext in _MIDI_EXTS:
+                    cand = base / f"{audio_name}{ext}"
+                    if cand.exists():
+                        midi_path = cand
+                        midi_alias = alias
+                        break
+                if midi_path is not None:
                     break
         if video_path is not None and midi_path is not None:
             break
