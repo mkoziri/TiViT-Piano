@@ -28,6 +28,7 @@ from utils.frame_targets import resolve_frame_target_spec, resolve_soft_target_c
 from utils.identifiers import canonical_video_id
 
 import src.data.pianoyt_dataset as yt
+from src.data.pianoyt_dataset import SampleBuildResult
 from .sampler_utils import build_onset_balanced_sampler
 
 LOGGER = logging.getLogger(__name__)
@@ -208,6 +209,12 @@ class PianoVAMDataset(yt.PianoYTDataset):
         if not split_ids:
             raise RuntimeError(f"[PianoVAM] No entries for split '{split}' in metadata_v2.json")
 
+        # Pre-compute TSV paths per canonical id for later attachment to samples.
+        self._tsv_by_canon: Dict[str, Optional[Path]] = {}
+        for canon_id, rec_id in id_map.items():
+            _, _, tsv_path = _resolve_media_paths(resolved_root, rec_id)
+            self._tsv_by_canon[canon_id] = tsv_path
+
         # Monkeypatch PianoYT split/media resolution to respect PianoVAM layout.
         orig_expand_root = yt._expand_root
         orig_read_split_ids = yt._read_split_ids
@@ -267,6 +274,28 @@ class PianoVAMDataset(yt.PianoYTDataset):
 
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)
+
+    def _build_sample(  # type: ignore[override]
+        self,
+        record_idx: int,
+        dataset_index: int,
+        *,
+        preferred_start_idx: Optional[int] = None,
+        audit: bool = False,
+    ) -> SampleBuildResult:
+        result = super()._build_sample(
+            record_idx,
+            dataset_index,
+            preferred_start_idx=preferred_start_idx,
+            audit=audit,
+        )
+        if result.sample is not None:
+            record = self.samples[record_idx]
+            canon = canonical_video_id(record.get("id", ""))
+            tsv_path = self._tsv_by_canon.get(canon)
+            if tsv_path is not None:
+                result.sample["tsv_path"] = str(tsv_path)
+        return result
 
 
 def make_dataloader(
