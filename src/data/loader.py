@@ -52,6 +52,8 @@ def make_dataloader(
         from . import omaps_dataset as dataset_mod
     elif name == "pianoyt":
         from . import pianoyt_dataset as dataset_mod
+    elif name == "pianovam":
+        from . import pianovam_dataset as dataset_mod
     else:
         raise ValueError(f"Unsupported dataset name: {dataset_cfg.get('name')}")
 
