@@ -14,10 +14,11 @@ Key Functions/Classes:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -26,14 +27,20 @@ from utils.determinism import DEFAULT_SEED, make_loader_components
 from utils.frame_targets import resolve_frame_target_spec, resolve_soft_target_config
 from utils.identifiers import canonical_video_id
 
-from .pianoyt_dataset import (
-    PianoYTDataset,
-    _read_excluded,
-    _safe_expanduser,
-)
+import src.data.pianoyt_dataset as yt
 from .sampler_utils import build_onset_balanced_sampler
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _safe_expanduser(path: os.PathLike[str] | str) -> Path:
+    """Expand user safely; mirrors PianoYT helper without importing it."""
+
+    candidate = Path(path)
+    try:
+        return candidate.expanduser()
+    except RuntimeError:
+        return candidate
 
 
 def _expand_root(root_dir: Optional[str]) -> Path:
@@ -48,22 +55,22 @@ def _expand_root(root_dir: Optional[str]) -> Path:
         env_base_path = _safe_expanduser(env_base)
         candidates.extend(
             [
-                env_base_path / "PianoVAM",
                 env_base_path / "PianoVAM_v1.0",
+                env_base_path / "PianoVAM",
             ]
         )
 
     project_root = Path(__file__).resolve().parents[2]
     candidates.extend(
         [
-            project_root / "data" / "PianoVAM",
             project_root / "data" / "PianoVAM_v1.0",
+            project_root / "data" / "PianoVAM",
         ]
     )
     candidates.extend(
         [
-            _safe_expanduser("~/datasets/PianoVAM"),
             _safe_expanduser("~/datasets/PianoVAM_v1.0"),
+            _safe_expanduser("~/datasets/PianoVAM"),
         ]
     )
 
@@ -73,14 +80,96 @@ def _expand_root(root_dir: Optional[str]) -> Path:
 
     msg = (
         "Unable to locate PianoVAM root. Set dataset.root_dir or define "
-        "TIVIT_DATA_DIR/DATASETS_HOME to point at a PianoYT-style PianoVAM layout."
+        "TIVIT_DATA_DIR/DATASETS_HOME to point at PianoVAM_v1.0 layout."
     )
     LOGGER.error(msg)
     raise FileNotFoundError(msg)
 
 
-class PianoVAMDataset(PianoYTDataset):
-    """PianoVAM dataset that reuses the PianoYT loader surface."""
+def _load_metadata(root: Path) -> Dict[str, Dict[str, Any]]:
+    meta_path = root / "metadata_v2.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"[PianoVAM] metadata_v2.json missing at {meta_path}")
+    with meta_path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError(f"[PianoVAM] metadata_v2.json is not a dict: {type(raw)}")
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _split_matches(requested: str, meta_split: str) -> bool:
+    req = requested.lower()
+    meta = meta_split.lower()
+    if req in {"val", "valid", "validation"}:
+        return meta in {"val", "valid", "validation"}
+    if req in {"train", "ext-train", "ext_train"}:
+        return meta in {"train", "ext-train", "ext_train"}
+    if req in {"test"}:
+        return meta == "test"
+    if req.startswith("special"):
+        return meta.startswith("special")
+    return req == meta
+
+
+def _resolve_media_paths(root: Path, record_id: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    """Return video, midi, tsv paths for ``record_id``."""
+
+    vid = root / "Video" / f"{record_id}.mp4"
+    midi_mid = root / "MIDI" / f"{record_id}.mid"
+    midi_midi = root / "MIDI" / f"{record_id}.midi"
+    midi = midi_mid if midi_mid.exists() else midi_midi if midi_midi.exists() else None
+    tsv = root / "TSV" / f"{record_id}.tsv"
+    if not vid.exists():
+        vid = None
+    if tsv.exists():
+        tsv_path: Optional[Path] = tsv
+    else:
+        tsv_path = None
+    # If MIDI is absent but TSV exists, use TSV as the label source.
+    if midi is None and tsv_path is not None:
+        midi = tsv_path
+    return vid, midi, tsv_path
+
+
+_LABEL_FALLBACK_LOGGED: set[str] = set()
+
+
+def _read_tsv_events(tsv_path: Path) -> torch.Tensor:
+    """Parse PianoVAM TSV and return (N,3) tensor [onset_sec, key_offset_sec, pitch]."""
+
+    if not tsv_path or not tsv_path.exists():
+        return torch.zeros((0, 3), dtype=torch.float32)
+
+    rows: list[tuple[float, float, float]] = []
+    with tsv_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                # fallback to whitespace split if tabs missing
+                parts = line.split()
+            if len(parts) < 5:
+                continue
+            try:
+                onset = float(parts[0])
+                key_offset = float(parts[1])  # use key_offset as the offset value
+                note = float(parts[3])
+            except (TypeError, ValueError):
+                continue
+            if onset < 0 or key_offset <= onset:
+                continue
+            rows.append((onset, key_offset, note))
+
+    if not rows:
+        return torch.zeros((0, 3), dtype=torch.float32)
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return torch.tensor(rows, dtype=torch.float32)
+
+
+class PianoVAMDataset(yt.PianoYTDataset):
+    """PianoVAM dataset that mirrors PianoYT surface but uses metadata_v2 layout."""
 
     def __init__(
         self,
@@ -101,22 +190,79 @@ class PianoVAMDataset(PianoYTDataset):
         avlag_disabled: Optional[bool] = None,
     ):
         resolved_root = _expand_root(root_dir or (dataset_cfg or {}).get("root_dir"))
-        super().__init__(
-            root_dir=str(resolved_root),
-            split=split,
-            frames=frames,
-            stride=stride,
-            resize=resize,
-            tiles=tiles,
-            channels=channels,
-            normalize=normalize,
-            manifest=manifest,
-            decode_fps=decode_fps,
-            dataset_cfg=dataset_cfg,
-            full_cfg=full_cfg,
-            only_video=only_video,
-            avlag_disabled=avlag_disabled,
-        )
+        metadata = _load_metadata(resolved_root)
+
+        # Build split list and ID mapping from metadata_v2.
+        id_map: Dict[str, str] = {}
+        split_ids: list[str] = []
+        for entry in metadata.values():
+            rec_id = entry.get("record_time") or entry.get("id")
+            meta_split = entry.get("split")
+            if not rec_id or not meta_split:
+                continue
+            if not _split_matches(split, str(meta_split)):
+                continue
+            canon = canonical_video_id(rec_id)
+            id_map[canon] = rec_id
+            split_ids.append(canon)
+        if not split_ids:
+            raise RuntimeError(f"[PianoVAM] No entries for split '{split}' in metadata_v2.json")
+
+        # Monkeypatch PianoYT split/media resolution to respect PianoVAM layout.
+        orig_expand_root = yt._expand_root
+        orig_read_split_ids = yt._read_split_ids
+        orig_resolve_media_paths = yt._resolve_media_paths
+        orig_read_midi_events = yt._read_midi_events
+
+        def _pv_expand_root(_: Optional[str]) -> Path:
+            return resolved_root
+
+        def _pv_read_split_ids(root: Path, split_name: str):
+            return split_ids
+
+        def _pv_resolve_media_paths(root: Path, split_name: str, video_id: str):
+            rec_id = id_map.get(canonical_video_id(video_id), video_id)
+            vid_path, midi_path, tsv_path = _resolve_media_paths(root, rec_id)
+            label_path = tsv_path if tsv_path is not None else midi_path
+            if label_path is midi_path and tsv_path is None and midi_path is not None:
+                canon_id = canonical_video_id(rec_id)
+                if canon_id not in _LABEL_FALLBACK_LOGGED:
+                    LOGGER.info("[PianoVAM] Using MIDI labels for id=%s (TSV missing)", canon_id)
+                    _LABEL_FALLBACK_LOGGED.add(canon_id)
+            return vid_path, label_path
+
+        def _pv_read_midi_events(path: Path) -> torch.Tensor:
+            if path.suffix.lower() == ".tsv":
+                return _read_tsv_events(path)
+            return orig_read_midi_events(path)
+
+        yt._expand_root = _pv_expand_root  # type: ignore
+        yt._read_split_ids = _pv_read_split_ids  # type: ignore
+        yt._resolve_media_paths = _pv_resolve_media_paths  # type: ignore
+        yt._read_midi_events = _pv_read_midi_events  # type: ignore
+        try:
+            super().__init__(
+                root_dir=str(resolved_root),
+                split=split,
+                frames=frames,
+                stride=stride,
+                resize=resize,
+                tiles=tiles,
+                channels=channels,
+                normalize=normalize,
+                manifest=manifest,
+                decode_fps=decode_fps,
+                dataset_cfg=dataset_cfg,
+                full_cfg=full_cfg,
+                only_video=only_video,
+                avlag_disabled=avlag_disabled,
+            )
+        finally:
+            yt._expand_root = orig_expand_root
+            yt._read_split_ids = orig_read_split_ids
+            yt._resolve_media_paths = orig_resolve_media_paths
+            yt._read_midi_events = orig_read_midi_events
+
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)
 
@@ -166,7 +312,7 @@ def make_dataloader(
     include_low = bool(dataset_cfg.get("include_low_res", False))
     excluded_ids = set()
     if not include_low:
-        excluded_ids = _read_excluded(dataset.root, dataset_cfg.get("excluded_list"))
+        excluded_ids = yt._read_excluded(dataset.root, dataset_cfg.get("excluded_list"))
     dataset.configure(
         include_low_res=include_low,
         excluded_ids=excluded_ids,
