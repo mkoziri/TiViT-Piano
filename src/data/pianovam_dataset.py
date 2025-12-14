@@ -160,6 +160,20 @@ class PianoVAMDataset(Dataset):
         # Map config split names to metadata "split" values if needed.
         # For now we keep them the same.
         self.split = split
+        # ---------------------------------------------------------------
+        # Handskeleton supervision (MediaPipe Hands landmarks).
+        # We use Handskeleton/{record_time}.json to derive a frame-level
+        # left/right label at note onsets (hand_frame ∈ {0:left, 1:right}).
+        # ---------------------------------------------------------------
+        hands_cfg = dataset_cfg.get("handskeleton", {})
+        self.use_handskeleton = bool(hands_cfg.get("enabled", True))
+        self.handskeleton_dir = self.root / str(hands_cfg.get("dir", "Handskeleton"))
+        self.handskeleton_fps = float(hands_cfg.get("fps", 60.0))
+        self._handskel_cache: Dict[str, Dict[int, Dict[str, Optional[np.ndarray]]]] = {}
+        self._handskel_cache_order: List[str] = []
+        self._handskel_cache_size: int = int(hands_cfg.get("cache_size", 64))
+        # MediaPipe fingertips indices: thumb/index/middle/ring/pinky tips
+        self._handskel_fingertips = [4, 8, 12, 16, 20]
 
         # ------------------------------------------------------------------
         # Load metadata_v2.json
@@ -258,12 +272,14 @@ class PianoVAMDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _load_video_and_times(self, rec: Dict[str, Any]) -> Tuple[torch.Tensor, np.ndarray]:
+    def _load_video_and_times(self, rec: Dict[str, Any]) -> Tuple[torch.Tensor, np.ndarray, np.ndarray, Tuple[int, int]]:
         """
         Load video frames and return:
           video: tensor(T, C, H, W)
           times: np.ndarray shape (T,) with timestamps in seconds
                  aligned with the sampled frames.
+           idxs:  np.ndarray shape (T,) with the sampled frame indices (in the original video)
+           full_hw: (H_full, W_full) of the original decoded frames (before crop/resize)
         """
         video_path: Path = rec["video_path"]
         if not video_path.is_file():
@@ -292,6 +308,10 @@ class PianoVAMDataset(Dataset):
 
         if not isinstance(frames, torch.Tensor):
             frames = torch.from_numpy(frames)
+
+        # Original decoded frame size (before crop/resize)
+        full_h = int(frames.shape[1])
+        full_w = int(frames.shape[2])
 
         # --- ΝΕΟ: πραγματικά timestamps για ΚΑΘΕ sampled frame ---
         # χρόνος = frame_index / fps
@@ -334,7 +354,7 @@ class PianoVAMDataset(Dataset):
         # Times go from 0 up to (duration_sec), excluding the endpoint.
         # frame_times = np.linspace(0.0, duration_sec, T, endpoint=False, dtype=np.float32)
 
-        return video, frame_times
+        return video, frame_times, idxs, (full_h, full_w)
 
     def _load_labels(
         self,
@@ -420,13 +440,211 @@ class PianoVAMDataset(Dataset):
         onset = torch.from_numpy(onset_grid)
         offset = torch.from_numpy(offset_grid)
         return pitch, onset, offset
+    
+    # ------------------------------------------------------------------ #
+    # Handskeleton -> hand_frame supervision
+    # ------------------------------------------------------------------ #
+    def _load_handskeleton(self, rec_id: str) -> Optional[Dict[int, Dict[str, Optional[np.ndarray]]]]:
+        """Load Handskeleton/{rec_id}.json and cache it.
+
+        Returns:
+          dict: frame_idx -> {"Left": (21,3) float32 or None, "Right": (21,3) float32 or None}
+          or None if file missing / disabled.
+        """
+        if not self.use_handskeleton:
+            return None
+
+        if rec_id in self._handskel_cache:
+            return self._handskel_cache[rec_id]
+
+        path = self.handskeleton_dir / f"{rec_id}.json"
+        if not path.is_file():
+            return None
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        parsed: Dict[int, Dict[str, Optional[np.ndarray]]] = {}
+        for k, v in raw.items():
+            try:
+                fi = int(k)
+            except Exception:
+                continue
+
+            left = v.get("Left")
+            right = v.get("Right")
+
+            left_arr = None
+            right_arr = None
+            if left is not None:
+                left_arr = np.asarray(left, dtype=np.float32)  # (21,3)
+            if right is not None:
+                right_arr = np.asarray(right, dtype=np.float32)
+
+            parsed[fi] = {"Left": left_arr, "Right": right_arr}
+
+        # simple LRU-ish cache
+        self._handskel_cache[rec_id] = parsed
+        self._handskel_cache_order.append(rec_id)
+        if len(self._handskel_cache_order) > self._handskel_cache_size:
+            evict = self._handskel_cache_order.pop(0)
+            self._handskel_cache.pop(evict, None)
+
+        return parsed
+
+    def _precompute_key_centers(self, rec: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Return (88,2) array of key centers in FULL-frame pixel coords.
+
+        Uses the 4 keyboard corner points from metadata (Point_LT/RT/RB/LB).
+        """
+        lt = _parse_point(rec.get("Point_LT"))
+        rt = _parse_point(rec.get("Point_RT"))
+        rb = _parse_point(rec.get("Point_RB"))
+        lb = _parse_point(rec.get("Point_LB"))
+        if lt is None or rt is None or rb is None or lb is None:
+            return None
+
+        lt = np.asarray(lt, dtype=np.float32)
+        rt = np.asarray(rt, dtype=np.float32)
+        rb = np.asarray(rb, dtype=np.float32)
+        lb = np.asarray(lb, dtype=np.float32)
+
+        centers = np.zeros((N_PITCHES, 2), dtype=np.float32)
+        for p in range(N_PITCHES):
+            u = (p + 0.5) / float(N_PITCHES)  # 0..1 across keyboard
+            top = lt + u * (rt - lt)
+            bot = lb + u * (rb - lb)
+            c = 0.5 * (top + bot)
+            centers[p, 0] = c[0]
+            centers[p, 1] = c[1]
+        return centers
+
+    def _hand_distance_to_key(self, hand_lm: np.ndarray, key_xy: np.ndarray, full_hw: Tuple[int, int]) -> float:
+        """Min fingertip distance (in pixels) from this hand to the key center."""
+        full_h, full_w = full_hw
+        # Convert normalized -> pixels
+        tips = hand_lm[self._handskel_fingertips, :2].copy()  # (5,2) in [0,1]
+        tips[:, 0] *= float(full_w)
+        tips[:, 1] *= float(full_h)
+        d = tips - key_xy[None, :]
+        dist = float(np.sqrt((d * d).sum(axis=1)).min())
+        return dist
+
+    def _build_hand_frame_targets(
+        self,
+        rec: Dict[str, Any],
+        onset_roll: torch.Tensor,
+        frame_idxs: np.ndarray,
+        full_hw: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Derive hand_frame[t] ∈ {0:left, 1:right} for this clip.
+
+        Strategy:
+          - For frames that contain onset(s), assign each onset note to the
+            closest hand (min fingertip distance to key center).
+          - Frame label = majority vote across onset notes in that frame.
+          - Fill unlabeled frames by forward/back fill.
+        """
+        T, P = onset_roll.shape
+        hand_frame = torch.full((T,), -1, dtype=torch.long)
+
+        rec_id = str(rec.get("id", ""))
+        skel = self._load_handskeleton(rec_id)
+        if skel is None:
+            # No skeleton available => keep dummy label (all zeros)
+            return torch.zeros((T,), dtype=torch.long)
+
+        centers = self._precompute_key_centers(rec)
+        if centers is None:
+            return torch.zeros((T,), dtype=torch.long)
+
+        onset_any = onset_roll.sum(dim=1) > 0  # (T,)
+        onset_frames = onset_any.nonzero(as_tuple=False).flatten().tolist()
+        if not onset_frames:
+            return torch.zeros((T,), dtype=torch.long)
+
+        for t in onset_frames:
+            fi = int(frame_idxs[t])  # original video frame index
+            v = skel.get(fi)
+            if v is None:
+                continue
+
+            left_lm = v.get("Left")
+            right_lm = v.get("Right")
+
+            # notes at this frame
+            notes = (onset_roll[t] > 0).nonzero(as_tuple=False).flatten().tolist()
+            if not notes:
+                continue
+
+            votes = []
+            # tie-breaker: keep the smallest distance for the chosen hand
+            dist_left_sum = 0.0
+            dist_right_sum = 0.0
+            n_used = 0
+
+            for p_idx in notes:
+                key_xy = centers[p_idx]  # (2,) in pixels
+
+                if left_lm is None and right_lm is None:
+                    continue
+                elif left_lm is None:
+                    votes.append(1)
+                    # approximate distance for tie-breaker
+                    dist_right_sum += 0.0
+                elif right_lm is None:
+                    votes.append(0)
+                    dist_left_sum += 0.0
+                else:
+                    dl = self._hand_distance_to_key(left_lm, key_xy, full_hw)
+                    dr = self._hand_distance_to_key(right_lm, key_xy, full_hw)
+                    if dl <= dr:
+                        votes.append(0)
+                        dist_left_sum += dl
+                    else:
+                        votes.append(1)
+                        dist_right_sum += dr
+                n_used += 1
+
+            if n_used == 0 or not votes:
+                continue
+
+            # Majority vote
+            n_right = sum(1 for x in votes if x == 1)
+            n_left = len(votes) - n_right
+            if n_left > n_right:
+                hand_frame[t] = 0
+            elif n_right > n_left:
+                hand_frame[t] = 1
+            else:
+                # tie: prefer the hand with smaller avg distance
+                avg_l = dist_left_sum / max(1, n_left)
+                avg_r = dist_right_sum / max(1, n_right)
+                hand_frame[t] = 0 if avg_l <= avg_r else 1
+
+        # Fill unknowns by forward/back fill
+        arr = hand_frame.numpy()
+        last = None
+        for i in range(T):
+            if arr[i] >= 0:
+                last = int(arr[i])
+            elif last is not None:
+                arr[i] = last
+
+        nxt = None
+        for i in range(T - 1, -1, -1):
+            if arr[i] >= 0:
+                nxt = int(arr[i])
+            elif nxt is not None:
+                arr[i] = nxt
+
+        return torch.from_numpy(arr.astype(np.int64))
+
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rec = self.records[idx]
         rec_id = rec.get("id")
 
         # Video frames and time grid
-        video, frame_times = self._load_video_and_times(rec)   # video: (T,C,H,W)
+        video, frame_times, frame_idxs, full_hw = self._load_video_and_times(rec)   # video: (T,C,H,W)
         pitch, onset, offset = self._load_labels(rec, frame_times)  # (T, 88) each
 
         # Sanity check on shapes
@@ -442,8 +660,8 @@ class PianoVAMDataset(Dataset):
         onset_roll = onset          # (T,88)
         offset_roll = offset        # (T,88)
 
-        # Dummy hand/clef labels (δεν τα χρησιμοποιούμε, loss weights=0.0)
-        hand_frame = torch.zeros(T, dtype=torch.long)
+        # Hand labels from Handskeleton (0=Left, 1=Right). Falls back to zeros if unavailable.
+        hand_frame = self._build_hand_frame_targets(rec, onset_roll, frame_idxs, full_hw)
         clef_frame = torch.zeros(T, dtype=torch.long)
 
         # Clip-level labels (max over time)
@@ -471,6 +689,7 @@ class PianoVAMDataset(Dataset):
             # για το custom evaluation
             "tsv_path": str(rec["tsv_path"]),      # GT labels
             "frame_times": torch.from_numpy(frame_times).float(),  # (T,)
+            "frame_idxs": torch.from_numpy(frame_idxs).long(),  # (T,) original frame indices
         }
 
         # frame_targets για συμβατότητα με generic κώδικα (δεν πειράζει αν δεν τα χρησιμοποιεί όλος ο κώδικας ακόμα)

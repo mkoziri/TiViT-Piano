@@ -1274,7 +1274,7 @@ def _parse_cli_args(argv: Sequence[str]):
         type=float,
         help="Override offset head logit bias prior to sigmoid",
     )
-    ap.add_argument("--split", choices=["train", "valid", "test"], help="Dataset split to evaluate")
+    ap.add_argument("--split", choices=["train", "val", "valid", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
@@ -1422,7 +1422,8 @@ def _parse_cli_args(argv: Sequence[str]):
         help="Toggle deterministic torch backends (default: config or enabled)",
     )
     args = ap.parse_args(argv)
-
+    if args.split == "val":
+        args.split = "valid"
     if args.legacy_eval_thresholds:
         from scripts.calib import eval_thresholds_legacy as legacy_eval
 
@@ -2809,7 +2810,7 @@ def main():
             args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
 
-    cfg = dict(load_config("configs/config.yaml"))
+    cfg = dict(load_config("configs/config_pianovam_fast.yaml"))
     model_cfg = cfg.get("model")
     if not isinstance(model_cfg, dict):
         model_cfg = {}

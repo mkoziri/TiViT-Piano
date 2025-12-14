@@ -6,15 +6,16 @@ from typing import Dict, List, Mapping, Tuple
 # Configurable thresholds and tolerances
 # ============================================================
 
-ONSET_THR = 0.5
-OFFSET_THR = 0.5
+ONSET_THR = 0.35
+OFFSET_THR = 0.35
+TOPK = 8 
 
 # With 128 frames / full video, timestamps differ by ~5–20 sec.
 # So we MUST allow large tolerance.
 ONSET_TOL = 5.0
 OFFSET_TOL = 10.0
 
-MIN_NOTE_LEN = 0.05
+MIN_NOTE_LEN = 0.00
 
 @dataclass
 class NoteEvent:
@@ -31,6 +32,8 @@ def decode_events_from_logits(
     onset_logits: torch.Tensor,
     offset_logits: torch.Tensor,
     frame_times: torch.Tensor,
+    onset_thr: float = ONSET_THR,
+    offset_thr: float = OFFSET_THR,
 ):
     """
     onset_logits, offset_logits: (T, 88) raw logits
@@ -44,6 +47,17 @@ def decode_events_from_logits(
 
     onset_prob  = torch.sigmoid(onset_logits)
     offset_prob = torch.sigmoid(offset_logits)
+    if TOPK and TOPK > 0:
+        # TOPK ΜΟΝΟ στο onset (για να περιορίσεις υποψήφια starts)
+        _, idx = torch.topk(onset_prob, k=TOPK, dim=1)
+        mask = torch.zeros_like(onset_prob, dtype=torch.bool)
+        mask.scatter_(1, idx, True)
+        onset_prob = onset_prob * mask
+
+        # ΜΗΝ κόβεις το offset με TOPK (αλλιώς δεν "κλείνουν" τα events)
+        # offset_prob μένει όπως είναι
+
+
 
     # --- DEBUG: ρίξε μια ματιά στα probs ---
     print(
@@ -55,19 +69,21 @@ def decode_events_from_logits(
         )
     )
     # optional: πόσα bins περνάνε το threshold
-    onset_bin_tmp = (onset_prob > ONSET_THR)
-    offset_bin_tmp = (offset_prob > OFFSET_THR)
+    onset_bin_tmp = (onset_prob > onset_thr)
+    offset_bin_tmp = (offset_prob > offset_thr)
     print(
-        "[DEBUG-bins] onset>thr=%d / %d | offset>thr=%d / %d"
+        "[DEBUG-bins] onset_thr=%.3f onset>thr=%d/%d | offset_thr=%.3f offset>thr=%d/%d"
         % (
-            onset_bin_tmp.sum().item(), onset_bin_tmp.numel(),
-            offset_bin_tmp.sum().item(), offset_bin_tmp.numel(),
+            float(onset_thr), onset_bin_tmp.sum().item(), onset_bin_tmp.numel(),
+            float(offset_thr), offset_bin_tmp.sum().item(), offset_bin_tmp.numel(),
         )
     )
+
+
     # ----------------------------------------
 
-    onset_bin  = (onset_prob  > ONSET_THR)
-    offset_bin = (offset_prob > OFFSET_THR)
+    onset_bin  = (onset_prob  > onset_thr)
+    offset_bin = (offset_prob > offset_thr)
 
     frame_times = torch.as_tensor(frame_times, dtype=torch.float32)
     T, P = onset_bin.shape
@@ -158,9 +174,9 @@ def match_events(pred, gt):
 # High-level evaluation per clip
 # ============================================================
 
-def evaluate_clip(on_logits, off_logits, tsv_path, frame_times):
+def evaluate_clip(on_logits, off_logits, tsv_path, frame_times, onset_thr: float = ONSET_THR, offset_thr: float = OFFSET_THR):
 
-    pred_events = decode_events_from_logits(on_logits, off_logits, frame_times)
+    pred_events = decode_events_from_logits(on_logits, off_logits, frame_times, onset_thr=onset_thr, offset_thr=offset_thr)
     gt_events   = load_tsv_events(tsv_path)
 
     print(f"[DEBUG] {tsv_path}  n_pred={len(pred_events)}  n_gt={len(gt_events)}")

@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano-PianoVAMv1-f128_sw_939df26a_auto
+  name: TiViT-Piano-PianoVAMv1-autopilot_sw_c06eec9e_auto
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -12,8 +12,6 @@ dataset:
   - pitch
   - onset
   - offset
-  - hand
-  - clef
   max_clips: 80
   manifest:
     train: null
@@ -75,11 +73,6 @@ dataset:
     cache_labels: false
     cache_dir: .cache/labels
     targets_sparse: true
-  handskeleton:
-    enabled: true
-    dir: Handskeleton
-    fps: 60.0
-    cache_size: 64
 model:
   name: TiViT-Piano
   backend: vits_tile
@@ -115,7 +108,7 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 4
+  epochs: 7
   learning_rate: 1e-5
   weight_decay: 0.01
   eval_freq: 1
@@ -123,7 +116,7 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: false
+  resume: true
   reset_head_bias: false
   bias_seed:
     onoff_prior_mean: 0.012
@@ -154,16 +147,18 @@ training:
     onset: 3.0
     offset: 1.5
     pitch: 0.5
-    hand: 0.5
+    hand: 0.0
     clef: 0.0
   metrics:
-    prob_threshold_onset: 0.02
-    prob_threshold_offset: 0.02
-    prob_temperature_onset: 0.4615945207
-    prob_temperature_offset: 0.3912307606
-    prob_logit_bias_onset: -3.8699383736
-    prob_logit_bias_offset: -3.8535997868
-    eval_toler_sec: 0.03
+    prob_threshold: 0.2
+    prob_threshold_onset: 0.05
+    prob_threshold_offset: 0.2
+    prob_temperature: 1.0
+    prob_temperature_onset: 1.0
+    prob_temperature_offset: 1.0
+    prob_logit_bias: 0.0
+    prob_logit_bias_onset: 0.0
+    prob_logit_bias_offset: 0.0
     decoder:
       onset:
         open: 0.024  # default
@@ -189,7 +184,6 @@ training:
         offset: 1
       top_k: 3
       tau_sum: 0.0
-    prob_threshold: 0.02
   best_selection:
     mode: calibrated_event
     trigger: on_proxy_improvement
@@ -200,9 +194,9 @@ training:
     split: val
     sweep:
       delta: 0.05
-      low_guard: 0.0
-    min_prob: 0.01
-    max_prob: 0.99
+      low_guard: 0.1
+    min_prob: 0.02
+    max_prob: 0.98
   per_tile:
     enabled: true
     heads:
@@ -219,7 +213,7 @@ optim:
   offset_weight_decay_multiplier: 4.0
 train:
   accumulate_steps: 12
-  freeze_backbone_epochs: 0
+  freeze_backbone_epochs: 3
 decoder:
   global_fusion:
     enabled: false

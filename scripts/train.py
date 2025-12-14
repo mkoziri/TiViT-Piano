@@ -1139,9 +1139,9 @@ def compute_loss_frame(
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
 
     # --- hand / clef CE at T' ---
-    ce = nn.CrossEntropyLoss()
-    loss_hand = ce(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * float(weights.get("hand", 1.0))
-    loss_clef = ce(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
+    ce_hand = nn.CrossEntropyLoss(ignore_index=-1)
+    loss_hand = ce_hand(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * float(weights.get("hand", 1.0))
+    loss_clef = ce_hand(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
 
     # --- total + optional activation prior ---
     total = loss_pitch + loss_onset + loss_offset + loss_hand + loss_clef
@@ -3795,7 +3795,7 @@ def evaluate_one_epoch(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/config.yaml")
+    ap.add_argument("--config", default="configs/config_pianovam_fast.yaml")
     ap.add_argument("--train-split", choices=["train", "val", "test"], help="Dataset split for training")
     ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
     ap.add_argument("--max-clips", type=int)
@@ -4174,7 +4174,8 @@ def main():
         # children and re-enable gradients for those whose name
         # contains "head".
         for name, module in model.named_children():
-            if "head" in name.lower():
+            name_l = name.lower()
+            if ("head" in name_l) or ("hand" in name_l) or ("clef" in name_l):
                 for p in module.parameters():
                     p.requires_grad = True
 
@@ -4438,107 +4439,15 @@ def main():
             # val_metrics = None
             # If we enable real labels for PianoVAM in the future, we can
             # restore the call below:
-            if is_pianovam:
-                # =====================================================
-                # PianoVAM custom evaluation (event-level F1 vs TSV)
-                # =====================================================
-                from scripts.eval_pianovam import evaluate_clip
-
-                print("[PianoVAM Eval] Starting evaluation...")
-                logger.info("[PianoVAM Eval] Starting evaluation...")
-
-                val_results = []
-                model.eval()
-
-                with torch.inference_mode():
-                    for batch in val_loader:
-                        video = batch["video"]          # (B,T,C,H,W)
-                        frame_times = batch["frame_times"]   # (B,T)
-                        tsv_paths = batch["tsv_path"]        # length-B list/array
-
-                        # ---- logits από το μοντέλο ----
-                        out = model(video)
-
-                        # ΠΡΟΣΟΧΗ: βάλε εδώ τα σωστά keys του μοντέλου σου.
-                        # Αν στο training χρησιμοποιείς out["onset"] / out["offset"],
-                        # τότε βάλε αυτά.
-                        onset_logits  = out["onset_logits"]   # (B,T,88)
-                        offset_logits = out["offset_logits"]    # (B,T,88)
-
-                        B = onset_logits.shape[0]
-
-                        for i in range(B):
-                            pred_on = onset_logits[i].cpu()    # (T,88)
-                            pred_off = offset_logits[i].cpu()  # (T,88)
-
-                            ft = frame_times[i].cpu().numpy()  # (T,)
-                            tsv = tsv_paths[i]
-
-                            clip_metrics = evaluate_clip(
-                                pred_on,
-                                pred_off,
-                                tsv,
-                                ft,        # <-- περνάμε frame_times, όχι hop_seconds
-                            )
-                            val_results.append(clip_metrics)
-
-                # ---- Aggregate metrics ----
-                if len(val_results) == 0:
-                    print("[PianoVAM Eval] No samples evaluated.")
-                    logger.warning("[PianoVAM Eval] No samples evaluated.")
-                    val_f1 = 0.0
-                else:
-                    f1s = [x["f1"] for x in val_results]
-                    val_f1 = float(sum(f1s) / len(f1s))
-
-                # Micro-F1 από όλα τα clips μαζί
-                total_tp = sum(x["tp"] for x in val_results)
-                total_fp = sum(x["fp"] for x in val_results)
-                total_fn = sum(x["fn"] for x in val_results)
-
-                if total_tp == 0:
-                    micro_f1 = 0.0
-                else:
-                    micro_prec = total_tp / (total_tp + total_fp + 1e-9)
-                    micro_rec  = total_tp / (total_tp + total_fn + 1e-9)
-                    micro_f1   = 2 * micro_prec * micro_rec / (micro_prec + micro_rec + 1e-9)
-
-                print(f"[PianoVAM Eval] Mean F1 = {val_f1:.4f}")
-                print(f"[PianoVAM Eval] Micro F1 = {micro_f1:.4f}")
-                logger.info("[PianoVAM Eval] Mean F1 = %.4f  |  Micro F1 = %.4f", val_f1, micro_f1)
-                
-                
-                # ---- Save per-clip metrics ----
-                import json, os
-                os.makedirs("logs", exist_ok=True)
-                with open("logs/pianovam_metrics.json", "w") as f:
-                    json.dump(
-                        {
-                            "clips": val_results,
-                            "mean_f1": float(val_f1),
-                            "micro_f1": float(micro_f1),
-                        },
-                        f,
-                        indent=2,
-                    )
-
-                print("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
-                logger.info("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
-
-                # Επιστρέφουμε ένα απλό dict ώστε να μην σπάσει το υπόλοιπο train.py
-                val_metrics = {
-                    "f1": val_f1,
-                    "micro_f1": micro_f1,
-                }
-            else:
-                val_metrics = evaluate_one_epoch(
-                    model,
-                    val_loader,
-                    cfg,
-                    optimizer=optimizer,
-                    pos_rate_state=pos_rate_state,
-                    per_tile_support=per_tile_eval_support,
-                )
+          
+            val_metrics = evaluate_one_epoch(
+                model,
+                val_loader,
+                cfg,
+                optimizer=optimizer,
+                pos_rate_state=pos_rate_state,
+                per_tile_support=per_tile_eval_support,
+            )
             if val_metrics is None:
                 logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
             else:
