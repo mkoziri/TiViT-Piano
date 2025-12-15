@@ -8,11 +8,13 @@ dataset:
   name: PianoVAM
   root_dir: null                  # uses $TIVIT_DATA_DIR/PianoVAM_v1.0
   annotations_root: null
-  label_format: tsv
+  label_format: midi
   label_targets:
     - pitch
     - onset
     - offset
+    - hand
+    - clef
   max_clips: 80
   manifest:
     train: null

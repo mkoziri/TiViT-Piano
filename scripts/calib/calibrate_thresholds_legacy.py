@@ -88,6 +88,13 @@ def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
     label = str(raw).strip().lower() if raw is not None else "vivit"
     return label or "vivit"
 
+
+def _normalise_split(split: Optional[str]) -> Optional[str]:
+    if split is None:
+        return None
+    val = split.strip().lower()
+    return "val" if val == "valid" else val
+
 _DECODER_DEFAULTS = {
     "onset": {
         "open": 0.36,
@@ -1172,7 +1179,11 @@ def _compute_metrics(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/tivit_best.pt")
-    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "valid", "test"],
+        help="Dataset split to evaluate (valid maps to val)",
+    )
     ap.add_argument("--max-clips", type=int, help="Limit number of clips evaluated (default: config)")
     ap.add_argument("--frames", type=int, help="Frames per clip during calibration (default: config)")
     ap.add_argument(
@@ -1258,7 +1269,7 @@ def main():
     frame_targets_cfg = dataset_cfg.get("frame_targets", {}) or {}
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
 
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")
     frame_text = frames_display if frames_display is not None else "?"

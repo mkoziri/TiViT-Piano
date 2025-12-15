@@ -19,7 +19,7 @@ CLI:
     reproducibility settings.
 """
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, cast, overload, Literal, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, cast, overload, Literal, Sequence, Set
 
 
 import argparse
@@ -76,9 +76,6 @@ from theory.key_prior_runtime import (
     resolve_key_prior_settings,
     apply_key_prior_to_logits,
 )
-from scripts.eval_pianovam import evaluate_clip
-
-
 logger = get_logger(__name__)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -249,6 +246,76 @@ def _pos_weight_from_rate(
     rate_clamped = rate.clone().clamp(min=eps, max=1.0 - eps)
     pos_weight = (1.0 - rate_clamped) / rate_clamped
     return pos_weight.clamp_(min=clamp_min, max=clamp_max)
+
+
+_ADAPTIVE_BAND_LOGGED: Set[Tuple[str, str]] = set()
+
+
+def _coerce_pos_weight_band(value: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(value, Mapping):
+        value = value.get("band", value.get("values", value.get("range", value)))
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    if len(value) < 2:
+        return None
+    try:
+        low = float(value[0])
+        high = float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(low) or math.isnan(high):
+        return None
+    if high < low:
+        low, high = high, low
+    return (low, high)
+
+
+def _adaptive_pos_weight_from_roll(target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    flat = target.detach().reshape(-1, target.shape[-1]).float()
+    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+    return ((1.0 - pos) / (pos + eps)).clamp(1.0, 100.0)
+
+
+def _banded_pos_weight_from_roll(
+    target: torch.Tensor,
+    band: Tuple[float, float],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    flat = target.detach().reshape(-1, target.shape[-1]).float()
+    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+    neg = (1.0 - pos).clamp_min(eps)
+    ratio = pos / neg
+    low, high = band
+    if high < low:
+        low, high = high, low
+    span = ratio.max() - ratio.min()
+    if span <= eps:
+        mapped = torch.full_like(ratio, 0.5 * (low + high))
+    else:
+        mapped = (ratio - ratio.min()) / span.clamp_min(eps)
+        mapped = low + mapped * (high - low)
+    mapped = mapped.clamp(min=min(low, high), max=max(low, high))
+    return mapped
+
+
+def _log_banded_weight_stats(head: str, context: str, weights: torch.Tensor, band: Tuple[float, float]) -> None:
+    key = (context, head)
+    if key in _ADAPTIVE_BAND_LOGGED:
+        return
+    w_min = float(weights.min().item())
+    w_mean = float(weights.mean().item())
+    w_max = float(weights.max().item())
+    logger.info(
+        "[onoff_loss] head=%s mode=adaptive_band context=%s band=[%.2f, %.2f] pos_weight min=%.3f mean=%.3f max=%.3f",
+        head,
+        context,
+        band[0],
+        band[1],
+        w_min,
+        w_mean,
+        w_max,
+    )
+    _ADAPTIVE_BAND_LOGGED.add(key)
 
 
 class OnOffPosWeightEMA:
@@ -708,11 +775,16 @@ def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str
         "focal_alpha": float(weights.get("focal_alpha", 0.25)),
         "prior_mean": float(weights.get("onoff_prior_mean", 0.12)),
         "prior_weight": float(weights.get("onoff_prior_weight", 0.0)),
+        "pos_weight_band": None,
     }
 
     per_head_overrides = weights.get("onoff_heads", {})
     if not isinstance(per_head_overrides, Mapping):
         per_head_overrides = {}
+
+    band_defaults = weights.get("onoff_pos_weight_bands", {})
+    if not isinstance(band_defaults, Mapping):
+        band_defaults = {}
 
     alias_patterns = {
         "loss": ("{head}_loss", "{head}_onoff_loss"),
@@ -722,15 +794,20 @@ def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str
         "focal_alpha": ("{head}_focal_alpha",),
         "prior_mean": ("{head}_prior_mean", "{head}_onoff_prior_mean"),
         "prior_weight": ("{head}_prior_weight", "{head}_onoff_prior_weight"),
+        "pos_weight_band": ("{head}_pos_weight_band",),
     }
 
     resolved: Dict[str, Dict[str, Any]] = {}
     for head in ("onset", "offset"):
         cfg = dict(default_cfg)
+        cfg["pos_weight_band"] = _coerce_pos_weight_band(band_defaults.get(head))
 
         nested = per_head_overrides.get(head)
         if isinstance(nested, Mapping):
             for key, value in nested.items():
+                if key == "pos_weight_band":
+                    cfg[key] = _coerce_pos_weight_band(value)
+                    continue
                 if key in cfg:
                     cfg[key] = value
 
@@ -738,7 +815,10 @@ def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str
             for pattern in patterns:
                 alias = pattern.format(head=head)
                 if alias in weights:
-                    cfg[key] = weights[alias]
+                    if key == "pos_weight_band":
+                        cfg[key] = _coerce_pos_weight_band(weights[alias])
+                    else:
+                        cfg[key] = weights[alias]
                     break
 
         cfg["loss"] = str(cfg["loss"]).lower()
@@ -797,6 +877,13 @@ def compute_loss(
             return torch.full((targets.shape[-1],), float(cfg["pos_weight"]), dtype=torch.float32)
         if mode == "ema" and pos_rate_state is not None:
             return pos_rate_state.clip_pos_weight(head, targets, update=update_stats)
+        if mode == "adaptive_band":
+            band = cfg.get("pos_weight_band")
+            if band is None:
+                return _adaptive_pos_weight_from_roll(targets)
+            weights_local = _banded_pos_weight_from_roll(targets, band)
+            _log_banded_weight_stats(head, "clip", weights_local, band)
+            return weights_local
         if mode in {"none", "off"}:
             return None
         # adaptive / fallback handled within _dynamic_pos_weighted_bce
@@ -1004,8 +1091,17 @@ def compute_loss_frame(
 
     # --- pitch loss: gentle per-pitch pos_weight (sqrt + clamp) ---
     eps = 1e-6
+    bands_cfg = weights.get("onoff_pos_weight_bands", {}) if isinstance(weights, Mapping) else {}
+    pitch_band_cfg = bands_cfg.get("pitch") if isinstance(bands_cfg, Mapping) else None
+    pitch_band = _coerce_pos_weight_band(pitch_band_cfg)
     pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)  # (P,)
-    pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
+    pitch_mode = str(weights.get("onoff_pos_weight_mode", "adaptive")).lower()
+    if pitch_mode == "adaptive_band" and pitch_band is not None:
+        pos_w_pitch = _banded_pos_weight_from_roll(pitch_roll, pitch_band, eps)
+        _log_banded_weight_stats("pitch", "frame", pos_w_pitch, pitch_band)
+        pos_w_pitch = pos_w_pitch.to(device)
+    else:
+        pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
     bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
     use_tile_pitch = per_tile_enabled and "pitch" in per_tile_heads and torch.is_tensor(pitch_tile)
     tile_mask_tensor = tile_mask_tensor
@@ -1034,17 +1130,8 @@ def compute_loss_frame(
         """
         Computes an adaptive positive class weight for BCE loss based on the mean positive rate
         per pitch dimension in the provided roll tensor.
-
-        Args:
-            roll (Tensor): Target tensor of shape (..., P) containing binary labels.
-            P (int): Number of pitch classes (last dimension of roll).
-            eps (float, optional): Small value to avoid division by zero. Default is 1e-6.
-
-        Returns:
-            Tensor: Per-pitch positive class weights (shape: [P]) for use in BCEWithLogitsLoss.
         """
-        p = roll.reshape(-1, P).mean(dim=0).clamp_min(eps)
-        return ((1.0 - p) / (p + eps)).clamp(1.0, 100.0).detach()
+        return _adaptive_pos_weight_from_roll(roll, eps).detach()
 
     head_cfgs = _resolve_onoff_loss_config(weights)
     onset_cfg = head_cfgs["onset"]
@@ -1059,6 +1146,13 @@ def compute_loss_frame(
             return torch.full((P,), float(cfg["pos_weight"]), dtype=torch.float32)
         if mode == "ema" and pos_rate_state is not None:
             return pos_rate_state.frame_pos_weight(head, roll, update=update_stats)
+        if mode == "adaptive_band":
+            band = cfg.get("pos_weight_band")
+            if band is None:
+                return _adaptive_pos_weight(roll, P, eps)
+            weights_local = _banded_pos_weight_from_roll(roll, band, eps).detach()
+            _log_banded_weight_stats(head, "frame", weights_local, band)
+            return weights_local
         if mode in {"none", "off"}:
             return None
         if mode in {"adaptive", "auto"}:
@@ -3848,7 +3942,6 @@ def main():
 
     cfg = dict(load_config(CONFIG_PATH))
     dataset_name = cfg.get("dataset", {}).get("name", "").lower()
-    is_pianovam = (dataset_name == "pianovam")
     model_backend = _resolve_backend_label(cfg)
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)

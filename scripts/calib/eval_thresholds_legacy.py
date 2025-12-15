@@ -53,6 +53,13 @@ def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
     return label or "vivit"
 
 
+def _normalise_split(split: Optional[str]) -> Optional[str]:
+    if split is None:
+        return None
+    val = split.strip().lower()
+    return "val" if val == "valid" else val
+
+
 # Default probability grid used when sweeping thresholds without an explicit
 # list.  We parse lists manually so callers can provide comma-separated values
 # without escaping leading minus signs.
@@ -785,7 +792,11 @@ def main():
         type=float,
         help="Override offset head logit bias prior to sigmoid",
     )
-    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "valid", "test"],
+        help="Dataset split to evaluate (valid maps to val)",
+    )
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
@@ -1213,7 +1224,7 @@ def main():
     event_tolerance = float(
         dataset_cfg.get("frame_targets", {}).get("tolerance", hop_seconds)
     )
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")

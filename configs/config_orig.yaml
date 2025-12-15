@@ -1,13 +1,13 @@
 experiment:
-  name: TiViT-Piano_PianoVAM_P1_sw_667aa537_auto
+  name: TiViT-Piano_PianoYT_soft_labels_and_clip_to_band
   seed: 1332
   deterministic: true
   output_dir: outputs
 dataset:
-  name: PianoVAM
-  root_dir: null
-  annotations_root: null
-  label_format: midi
+  name: PianoYT
+  root_dir: data/PianoYT
+  annotations_root: data/PianoYT
+  label_format: txt
   label_targets:
   - pitch
   - onset
@@ -23,19 +23,19 @@ dataset:
   split_train: train
   split_val: val
   split_test: test
-  frames: 128
+  frames: 96
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
   resize:
   - 145
-  - 1024
+  - 1024 #was 800
   tiles: 3
   channels: 3
   normalize: true
   apply_crop: true
   canonical_hw:
   - 145
-  - 1024
+  - 1024 #was 800
   registration:
     source: metadata
     interp: bilinear
@@ -43,10 +43,10 @@ dataset:
       enabled: false
       resize_jitter:
       - 150
-      - 1030
+      - 1030 #was 805
       random_crop_hw:
       - 145
-      - 1024
+      - 1024 #was 800
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
@@ -54,12 +54,12 @@ dataset:
   prefetch_factor: 1
   shuffle: true
   sampler:
-    mode: null
+    mode: onset_balanced          # set to "onset_balanced" to enable optional sampler or "null" for default
     onset_frac: 0.5
     nearmiss_frac: 0.25
     bg_frac: 0.25
     nearmiss_radius: 6
-  require_labels: false
+  require_labels: true
   frame_targets:
     enable: true
     tolerance: 0.03
@@ -71,12 +71,12 @@ dataset:
     - 64
     note_min: 0
     note_max: 127
-    cache_labels: false
+    cache_labels: true
     cache_dir: .cache/labels
     targets_sparse: true
 model:
   name: TiViT-Piano
-  backend: vits_tile
+  backend: vits_tile         # Allowed: "vivit" (default) or "vits_tile"
   head_mode: frame
   tiles: 3
   input_channels: 3
@@ -93,7 +93,7 @@ model:
     mlp_ratio: 3.0
     dropout: 0.2
   vits_tile:
-    backbone_name: vit_small_patch16_224
+    backbone_name: vit_small_patch16_224  # or deit_small_patch16_224
     pretrained: true
     freeze_backbone: true
     input_hw:
@@ -109,11 +109,11 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 20
+  epochs: 4
   learning_rate: 3e-5
   weight_decay: 0.01
   eval_freq: 1
-  debug_dummy_labels: true
+  debug_dummy_labels: false
   log_interval: 25
   save_every: 1
   amp: false
@@ -137,7 +137,7 @@ training:
     - 0.5
   loss_weights:
     onoff_loss: bce_pos
-    onoff_pos_weight_mode: adaptive
+    onoff_pos_weight_mode: adaptive  # fixed, adaptive, adaptive_band,
     onoff_pos_weight: 16.0
     onoff_pos_weight_ema_alpha: 0.05
     onoff_neg_smooth: 0.0
@@ -157,8 +157,8 @@ training:
       - 5.0
     onoff_heads:
       onset:
-        loss: focal
-        pos_weight_mode: adaptive
+        loss: focal #was bce_pos
+        pos_weight_mode: adaptive  #was fixed
         focal_gamma: 4.0
         focal_alpha: 0.25
         prior_mean: 0.012
@@ -186,15 +186,15 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.024  # default
-        hold: 0.018  # default
-        min_on: 2  # default
-        merge_gap: 1  # default
+        open: 0.01  
+        hold: 0.0075
+        min_on: 2  
+        merge_gap: 1  
       offset:
-        open: 0.015  # default
-        hold: 0.01  # default
-        min_off: 2  # default
-        merge_gap: 1  # default
+        open: 0.015  
+        hold: 0.01  
+        min_off: 2  
+        merge_gap: 1  
     temporal_decoder:
       shared:
         low_ratio: 0.6
@@ -222,6 +222,7 @@ training:
       low_guard: 0.1
     min_prob: 0.02
     max_prob: 0.98
+# Train-time per-tile supervision wiring (can be disabled for ablations)
   per_tile:
     enabled: true
     heads:
@@ -234,7 +235,7 @@ training:
       interval: 200
 optim:
   grad_clip: 1.0
-  head_lr_multiplier: 10.0
+  head_lr_multiplier: 10.0 #was 5.0
   offset_weight_decay_multiplier: 4.0
 train:
   accumulate_steps: 12
@@ -276,21 +277,19 @@ decoder:
       emission_gain: 4.0
       emission_bias: 0.0
     key_prior:
-      enabled: true
-      ref_head: onset
-      apply_to:
-      - onset
-      - offset
-      window_sec: 3.0
-      beta: 4.0
-      rho_uniform: 0.8
-      prior_strength: 0.5
-      epsilon: 1.0e-08
-      fps: null
-      midi_low: 21
-      midi_high: null
-  key_prior:
-    enabled: false
+    enabled: true
+    ref_head: onset
+    apply_to:
+    - onset
+    - offset
+    window_sec: 3.0
+    beta: 4.0
+    rho_uniform: 0.8
+    prior_strength: 0.5
+    epsilon: 1.0e-08
+    fps: null
+    midi_low: 21
+    midi_high: null
 logging:
   log_dir: logs
   checkpoint_dir: checkpoints

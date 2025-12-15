@@ -22,7 +22,7 @@ Key Functions/Classes:
 CLI Arguments:
     --ckpt PATH (default: checkpoints/tivit_best.pt)
         Checkpoint whose state_dict supplies model weights.
-    --split {train,val,test} / --max-clips INT / --frames INT / --only ID
+    --split {train,val,valid,test} / --max-clips INT / --frames INT / --only ID
         Dataset slice controls passed through to ``make_dataloader``.
     --thresholds FLOAT [FLOAT ...] / --prob_thresholds FLOAT [FLOAT ...]
         Explicit onset thresholds (logit or prob). Use matching ``--offset_*``
@@ -113,6 +113,13 @@ def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
     raw = model_cfg.get("backend", "vivit")
     label = str(raw).strip().lower() if raw is not None else "vivit"
     return label or "vivit"
+
+
+def _normalise_split(split: Optional[str]) -> Optional[str]:
+    if split is None:
+        return None
+    val = split.strip().lower()
+    return "val" if val == "valid" else val
 
 
 # Default probability grid used when sweeping thresholds without an explicit

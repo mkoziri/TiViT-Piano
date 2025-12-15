@@ -40,9 +40,11 @@ from utils.identifiers import canonical_video_id
 from utils.frame_targets import (
     FrameTargetResult,
     FrameTargetSpec,
+    SoftTargetConfig,
     prepare_frame_targets,
     resolve_frame_target_spec,
     resolve_lag_ms,
+    resolve_soft_target_config,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
@@ -666,6 +668,7 @@ class OMAPSDataset(Dataset):
         self._frame_target_failures: Set[str] = set()
         self.frame_target_spec: Optional[FrameTargetSpec] = None
         self.frame_target_summary: Optional[str] = None
+        self.soft_target_cfg: Optional[SoftTargetConfig] = None
 
         canonical_cfg = self.dataset_cfg.get("canonical_hw", self.resize)
         if isinstance(canonical_cfg, Sequence) and len(canonical_cfg) >= 2:
@@ -965,6 +968,7 @@ class OMAPSDataset(Dataset):
                     split=self.split,
                     video_id=video_id,
                     clip_start=t0,
+                    soft_targets=self.soft_target_cfg,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.warning(
@@ -1102,6 +1106,9 @@ def make_dataloader(
         dataset_cfg=dcfg,
         full_cfg=cfg,
     )
+    training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
+    soft_cfg_raw = training_cfg.get("soft_targets") if isinstance(training_cfg, Mapping) else None
+    dataset.soft_target_cfg = resolve_soft_target_config(soft_cfg_raw)
     only_video = dcfg.get("only_video")
     if only_video:
         only_canon = canonical_video_id(only_video)

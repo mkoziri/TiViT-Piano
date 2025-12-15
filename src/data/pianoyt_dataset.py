@@ -49,9 +49,11 @@ from utils.frame_target_cache import FrameTargetCache
 from utils.frame_targets import (
     FrameTargetResult,
     FrameTargetSpec,
+    SoftTargetConfig,
     prepare_frame_targets,
     resolve_lag_ms,
     resolve_frame_target_spec,
+    resolve_soft_target_config,
 )
 from utils.time_grid import frame_to_sec, sec_to_frame
 from utils.tiling import tile_vertical_token_aligned
@@ -110,6 +112,7 @@ def _safe_expanduser(path: Union[str, Path]) -> Path:
         return candidate
 
 _VIDEO_EXTS: Sequence[str] = (".mp4", ".mkv", ".webm")
+_MIDI_EXTS: Sequence[str] = (".midi", ".mid")
 _REG_DEBUG_CANON_LOGGED = False
 
 
@@ -352,10 +355,13 @@ def _resolve_media_paths(root: Path, split: str, video_id: str) -> Tuple[Optiona
                     audio_name = "audio_" + alias[6:]
                 else:
                     audio_name = alias
-                cand = base / f"{audio_name}.midi"
-                if cand.exists():
-                    midi_path = cand
-                    midi_alias = alias
+                for ext in _MIDI_EXTS:
+                    cand = base / f"{audio_name}{ext}"
+                    if cand.exists():
+                        midi_path = cand
+                        midi_alias = alias
+                        break
+                if midi_path is not None:
                     break
         if video_path is not None and midi_path is not None:
             break
@@ -579,6 +585,7 @@ class PianoYTDataset(Dataset):
             if self.frame_target_spec is not None
             else "targets_conf: disabled"
         )
+        self.soft_target_cfg: Optional[SoftTargetConfig] = None
 
         reg_cfg = dict(self.dataset_cfg.get("registration", {}) or {})
         self.registration_cfg = reg_cfg
@@ -1423,6 +1430,7 @@ class PianoYTDataset(Dataset):
                         split=self.split,
                         video_id=video_id,
                         clip_start=t0,
+                        soft_targets=self.soft_target_cfg,
                     )
                 except Exception as exc:  # pragma: no cover - defensive
                     LOGGER.warning(
@@ -2372,6 +2380,9 @@ def make_dataloader(
         only_video=only_video_cfg,
         avlag_disabled=avlag_disabled_cfg,
     )
+    training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
+    soft_cfg_raw = training_cfg.get("soft_targets") if isinstance(training_cfg, Mapping) else None
+    dataset.soft_target_cfg = resolve_soft_target_config(soft_cfg_raw)
 
     include_low = bool(dcfg.get("include_low_res", False))
     excluded_ids = set()
