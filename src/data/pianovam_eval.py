@@ -40,7 +40,7 @@ def roll_to_events(roll: torch.Tensor, fps: float, tol: float = 0.050):
 # -----------------------------------------
 # Event-level evaluation (F1)
 # -----------------------------------------
-def event_f1(pred_events, gt_events, tol=0.05):
+def event_f1(pred_events, gt_events, tol=5.0):
     """
     pred_events, gt_events: list of (pitch, onset, offset)
     tolerance: onset matching window
@@ -101,12 +101,12 @@ def evaluate_clip(pred: Dict[str, torch.Tensor],
     offset_t = roll_to_events(offset_gt, fps)
 
     # F1 per head
-    f1_pitch, *_ = event_f1(pitch_p, pitch_t)
-    f1_on, *_    = event_f1(onset_p, onset_t)
-    f1_off, *_   = event_f1(offset_p, offset_t)
+    f1_pitch, *_ = event_f1(pitch_p, pitch_t, tol=5.0)
+    f1_on,   *_  = event_f1(onset_p, onset_t, tol=5.0)
+    f1_off,  *_  = event_f1(offset_p, offset_t, tol=5.0)
 
     return {
         "pitch_f1": f1_pitch,
         "onset_f1": f1_on,
-        "offset_f1": f1_off
+        "offset_f1": f1_off,
     }

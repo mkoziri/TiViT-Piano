@@ -1233,9 +1233,9 @@ def compute_loss_frame(
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
 
     # --- hand / clef CE at T' ---
-    ce = nn.CrossEntropyLoss()
-    loss_hand = ce(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * float(weights.get("hand", 1.0))
-    loss_clef = ce(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
+    ce_hand = nn.CrossEntropyLoss(ignore_index=-1)
+    loss_hand = ce_hand(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * float(weights.get("hand", 1.0))
+    loss_clef = ce_hand(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
 
     # --- total + optional activation prior ---
     total = loss_pitch + loss_onset + loss_offset + loss_hand + loss_clef
@@ -1581,6 +1581,8 @@ def _init_eval_metric_counts() -> Dict[str, Any]:
         "pitch_frame_match": 0.0,
         "pitch_frame_total": 0.0,
         "hand_acc": 0.0,
+        "hand_acc_n": 0,
+        "clef_acc_n": 0,
         "clef_acc": 0.0,
         "onset_f1": 0.0,
         "offset_f1": 0.0,
@@ -3414,13 +3416,23 @@ def evaluate_one_epoch(
                     clef_prob = F.softmax(out["clef_logits"], dim=-1)
                     hand_pred = hand_prob.argmax(dim=-1)
                     clef_pred = clef_prob.argmax(dim=-1)
-                    Bx, Tx = hand_pred.shape
-                    hand_acc_val = (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
-                    clef_acc_val = (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
-                    loose_counts["hand_acc"] += hand_acc_val
-                    loose_counts["clef_acc"] += clef_acc_val
-                    strict_counts["hand_acc"] += hand_acc_val
-                    strict_counts["clef_acc"] += clef_acc_val
+                    # NOTE: hand_frame can contain -1 (unknown) when Handskeleton is missing.
+                    # Ignore those frames so hand_acc reflects real supervision.
+                    hand_mask = (hand_frame >= 0)
+                    if bool(hand_mask.any().item()):
+                        hand_acc_val = (hand_pred[hand_mask] == hand_frame[hand_mask]).float().mean().item()
+                        loose_counts["hand_acc"] += hand_acc_val
+                        strict_counts["hand_acc"] += hand_acc_val
+                        loose_counts["hand_acc_n"] += 1
+                        strict_counts["hand_acc_n"] += 1
+
+                    clef_mask = (clef_frame >= 0)
+                    if bool(clef_mask.any().item()):
+                        clef_acc_val = (clef_pred[clef_mask] == clef_frame[clef_mask]).float().mean().item()
+                        loose_counts["clef_acc"] += clef_acc_val
+                        strict_counts["clef_acc"] += clef_acc_val
+                        loose_counts["clef_acc_n"] += 1
+                        strict_counts["clef_acc_n"] += 1
 
                     metric_n += 1
 
@@ -3454,12 +3466,25 @@ def evaluate_one_epoch(
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
-                    hand_acc_val = (hand_pred == tgt["hand"]).float().mean().item()
-                    clef_acc_val = (clef_pred == tgt["clef"]).float().mean().item()
-                    loose_counts["hand_acc"] += hand_acc_val
-                    loose_counts["clef_acc"] += clef_acc_val
-                    strict_counts["hand_acc"] += hand_acc_val
-                    strict_counts["clef_acc"] += clef_acc_val
+                    hand_gt = tgt.get("hand")
+                    if torch.is_tensor(hand_gt):
+                        hand_mask = (hand_gt >= 0)
+                        if bool(hand_mask.any().item()):
+                            hand_acc_val = (hand_pred[hand_mask] == hand_gt[hand_mask]).float().mean().item()
+                            loose_counts["hand_acc"] += hand_acc_val
+                            strict_counts["hand_acc"] += hand_acc_val
+                            loose_counts["hand_acc_n"] += 1
+                            strict_counts["hand_acc_n"] += 1
+
+                    clef_gt = tgt.get("clef")
+                    if torch.is_tensor(clef_gt):
+                        clef_mask = (clef_gt >= 0)
+                        if bool(clef_mask.any().item()):
+                            clef_acc_val = (clef_pred[clef_mask] == clef_gt[clef_mask]).float().mean().item()
+                            loose_counts["clef_acc"] += clef_acc_val
+                            strict_counts["clef_acc"] += clef_acc_val
+                            loose_counts["clef_acc_n"] += 1
+                            strict_counts["clef_acc_n"] += 1
 
                     loose_onset_pred, _ = _aggregate_onoff_predictions(
                         onset_logits_eval,
@@ -3720,8 +3745,10 @@ def evaluate_one_epoch(
         # Frame-exact accuracy remains as a debugging aid and is not treated as a headline score.
         branch["pitch_pos_f1"] = pitch_pos_f1
         branch["pitch_frame_exact_acc"] = pitch_frame_acc
-        branch["hand_acc"] = counts["hand_acc"] / denom
-        branch["clef_acc"] = counts["clef_acc"] / denom
+        hand_denom = int(counts.get("hand_acc_n", 0))
+        clef_denom = int(counts.get("clef_acc_n", 0))
+        branch["hand_acc"] = (counts["hand_acc"] / hand_denom) if hand_denom > 0 else 0.0
+        branch["clef_acc"] = (counts["clef_acc"] / clef_denom) if clef_denom > 0 else 0.0
         branch["onset_f1"] = counts["onset_f1"] / max(1, counts.get("n_on", 0))
         branch["offset_f1"] = counts["offset_f1"] / max(1, counts.get("n_off", 0))
         branch["onset_pos_rate"] = counts["onset_pos_rate"] / denom
@@ -3889,7 +3916,7 @@ def evaluate_one_epoch(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/config.yaml")
+    ap.add_argument("--config", default="configs/config_pianovam_fast.yaml")
     ap.add_argument("--train-split", choices=["train", "val", "test"], help="Dataset split for training")
     ap.add_argument("--val-split", choices=["train", "val", "test"], help="Validation split")
     ap.add_argument("--max-clips", type=int)
@@ -4267,7 +4294,8 @@ def main():
         # children and re-enable gradients for those whose name
         # contains "head".
         for name, module in model.named_children():
-            if "head" in name.lower():
+            name_l = name.lower()
+            if ("head" in name_l) or ("hand" in name_l) or ("clef" in name_l):
                 for p in module.parameters():
                     p.requires_grad = True
 
@@ -4525,6 +4553,13 @@ def main():
         # --- evaluation & best checkpoint ---
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
+            # Validation is disabled for PianoVAM P1 (no real labels yet).
+            # We still run the training loop with dummy labels, but we skip
+            # evaluation metrics to avoid shape mismatches.
+            # val_metrics = None
+            # If we enable real labels for PianoVAM in the future, we can
+            # restore the call below:
+          
             val_metrics = evaluate_one_epoch(
                 model,
                 val_loader,

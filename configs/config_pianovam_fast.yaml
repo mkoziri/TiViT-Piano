@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoVAM_P1_sw_667aa537_auto
+  name: TiViT-Piano-PianoVAMv1-f128_sw_fc554f3a_auto
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -7,7 +7,7 @@ dataset:
   name: PianoVAM
   root_dir: null
   annotations_root: null
-  label_format: midi
+  label_format: tsv
   label_targets:
   - pitch
   - onset
@@ -21,9 +21,9 @@ dataset:
     test: null
   split: train
   split_train: train
-  split_val: val
+  split_val: valid
   split_test: test
-  frames: 128
+  frames: 256
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
   resize:
@@ -32,12 +32,12 @@ dataset:
   tiles: 3
   channels: 3
   normalize: true
-  apply_crop: true
+  apply_crop: false
   canonical_hw:
   - 145
   - 1024
   registration:
-    source: metadata
+    source: none
     interp: bilinear
     global_aug:
       enabled: false
@@ -47,6 +47,7 @@ dataset:
       random_crop_hw:
       - 145
       - 1024
+  crop_margin: 20
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
@@ -59,9 +60,9 @@ dataset:
     nearmiss_frac: 0.25
     bg_frac: 0.25
     nearmiss_radius: 6
-  require_labels: false
+  require_labels: true
   frame_targets:
-    enable: true
+    enable: false
     tolerance: 0.03
     dilate_active_frames: 1
     fill_mode: overlap
@@ -69,11 +70,17 @@ dataset:
     clef_thresholds:
     - 60
     - 64
-    note_min: 0
-    note_max: 127
+    note_min: 21
+    note_max: 108
     cache_labels: false
     cache_dir: .cache/labels
     targets_sparse: true
+  handskeleton:
+    enabled: true
+    dir: Handskeleton
+    fps: 60.0
+    cache_size: 64
+    fill: both
 model:
   name: TiViT-Piano
   backend: vits_tile
@@ -95,7 +102,7 @@ model:
   vits_tile:
     backbone_name: vit_small_patch16_224
     pretrained: true
-    freeze_backbone: true
+    freeze_backbone: false
     input_hw:
     - 224
     - 224
@@ -109,11 +116,11 @@ tiling:
   tokens_split: auto
   overlap_tokens: 0
 training:
-  epochs: 20
-  learning_rate: 3e-5
+  epochs: 4
+  learning_rate: 1e-5
   weight_decay: 0.01
   eval_freq: 1
-  debug_dummy_labels: true
+  debug_dummy_labels: false
   log_interval: 25
   save_every: 1
   amp: false
@@ -121,40 +128,16 @@ training:
   reset_head_bias: false
   bias_seed:
     onoff_prior_mean: 0.012
-  soft_targets:
-    enabled: false
-    apply_to:
-      onset: true
-      pitch: true
-      offset: false
-    onset_kernel:
-    - 0.5
-    - 1.0
-    - 0.5
-    frame_kernel:
-    - 0.5
-    - 1.0
-    - 0.5
   loss_weights:
     onoff_loss: bce_pos
     onoff_pos_weight_mode: adaptive
-    onoff_pos_weight: 16.0
+    onoff_pos_weight: 8.0
     onoff_pos_weight_ema_alpha: 0.05
     onoff_neg_smooth: 0.0
     focal_gamma: 4.0
     focal_alpha: 0.25
     onoff_prior_mean: 0.012
-    onoff_prior_weight: 0.15
-    onoff_pos_weight_bands:
-      onset:
-      - 3.0
-      - 5.0
-      pitch:
-      - 2.0
-      - 4.0
-      offset:
-      - 3.0
-      - 5.0
+    onoff_prior_weight: 0.3
     onoff_heads:
       onset:
         loss: focal
@@ -162,32 +145,30 @@ training:
         focal_gamma: 4.0
         focal_alpha: 0.25
         prior_mean: 0.012
-        prior_weight: 0.15
+        prior_weight: 0.3
       offset:
         loss: focal
         focal_gamma: 2.5
         focal_alpha: 0.2
         prior_mean: 0.01
-        prior_weight: 0.15
-    onset: 1.8
-    offset: 0.6
-    pitch: 1.2
-    hand: 0.3
-    clef: 0.3
+        prior_weight: 0.3
+    onset: 3.0
+    offset: 1.5
+    pitch: 0.5
+    hand: 0.5
+    clef: 0.0
   metrics:
-    prob_threshold: 0.2
-    prob_threshold_onset: 0.2
-    prob_threshold_offset: 0.2
-    prob_temperature: 1.0
-    prob_temperature_onset: 1.0
-    prob_temperature_offset: 1.0
-    prob_logit_bias: 0.0
-    prob_logit_bias_onset: 0.0
-    prob_logit_bias_offset: 0.0
+    prob_threshold_onset: 0.02
+    prob_threshold_offset: 0.02
+    prob_temperature_onset: 0.4615945207
+    prob_temperature_offset: 0.3912307606
+    prob_logit_bias_onset: -3.8699383736
+    prob_logit_bias_offset: -3.8535997868
+    eval_toler_sec: 0.03
     decoder:
       onset:
         open: 0.024  # default
-        hold: 0.018  # default
+        hold: 0.018000000000000002  # default
         min_on: 2  # default
         merge_gap: 1  # default
       offset:
@@ -209,19 +190,20 @@ training:
         offset: 1
       top_k: 3
       tau_sum: 0.0
+    prob_threshold: 0.02
   best_selection:
     mode: calibrated_event
     trigger: on_proxy_improvement
     n: 1
     write_back: false
     frames: 96
-    max_clips: 80
+    max_clips: 40
     split: val
     sweep:
       delta: 0.05
-      low_guard: 0.1
-    min_prob: 0.02
-    max_prob: 0.98
+      low_guard: 0.0
+    min_prob: 0.01
+    max_prob: 0.99
   per_tile:
     enabled: true
     heads:
@@ -255,26 +237,8 @@ decoder:
   post:
     snap:
       enabled: false
-      bpm_min: 40
-      bpm_max: 240
-      bpm_step: 1
-      local_window_beats: 4
-      max_dev_ms: 35
-      blend: 0.5
-      min_support_notes: 12
-      confidence_floor: 0.15
     dp:
       enabled: false
-      min_on_beats: 0.25
-      min_off_beats: 0.25
-      penalty_on: 0.5
-      penalty_off: 0.5
-      keep_gates: false
-      per_key: true
-      beam: 5
-      emission_mode: logit
-      emission_gain: 4.0
-      emission_bias: 0.0
     key_prior:
       enabled: true
       ref_head: onset
@@ -288,7 +252,7 @@ decoder:
       epsilon: 1.0e-08
       fps: null
       midi_low: 21
-      midi_high: null
+      midi_high: 108
   key_prior:
     enabled: false
 logging:
@@ -297,31 +261,28 @@ logging:
   tensorboard: true
   postproc_debug: true
 autopilot:
-  best_selection:
-    owner: autopilot
-  fast_strategy: two_stage
   onset_optimizer:
     open_grid:
-    - 0.01
-    - 0.015
+    - 0.018
     - 0.02
-    - 0.03
+    - 0.022
+    - 0.024
     min_on_grid:
     - 2
     - 3
     hold_mode: fixed_ratio
     hold_delta: 0.06
-    hold_min: 0.003
+    hold_min: 0.015
     hold_ratio: 0.75
     merge_gap: 1
     thr_anchor: 0.2
-    thr_add_delta: 0.01
+    thr_add_delta: 0.05
     thr_add_steps: 5
     thr_mul_ratio: 1.1
     thr_mul_orders: 1
-    thr_min_prob: 0.005
+    thr_min_prob: 0.02
     thr_max_prob: 0.98
-    thr_low_guard: 0.01
+    thr_low_guard: 0.1
     thr_high_guard: 0.6
     thr_min_points: 5
     thr_max_points: 11
@@ -337,6 +298,8 @@ autopilot:
     thr_high_guard: 0.95
     thr_min_points: 5
     thr_max_points: 11
+  fast_strategy: two_stage
+  best_selection: {}
 inference:
   output_dir: inference_results
   predict_on_train: false

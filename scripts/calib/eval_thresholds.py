@@ -1281,11 +1281,7 @@ def _parse_cli_args(argv: Sequence[str]):
         type=float,
         help="Override offset head logit bias prior to sigmoid",
     )
-    ap.add_argument(
-        "--split",
-        choices=["train", "val", "valid", "test"],
-        help="Dataset split to evaluate (valid maps to val)",
-    )
+    ap.add_argument("--split", choices=["train", "val", "valid", "test"], help="Dataset split to evaluate")
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
@@ -1433,7 +1429,8 @@ def _parse_cli_args(argv: Sequence[str]):
         help="Toggle deterministic torch backends (default: config or enabled)",
     )
     args = ap.parse_args(argv)
-
+    if args.split == "val":
+        args.split = "valid"
     if args.legacy_eval_thresholds:
         from scripts.calib import eval_thresholds_legacy as legacy_eval
 
@@ -1548,7 +1545,7 @@ def _parse_cli_args(argv: Sequence[str]):
 def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) -> RuntimeContext:
     """Load config, resolve dataset/model settings, and capture derived fields."""
 
-    cfg = dict(load_config("configs/config.yaml"))
+    cfg = dict(load_config("configs/config_pianovam_fast.yaml"))
     backend_label = _resolve_backend_label(cfg)
     model_cfg = cfg.get("model")
     if not isinstance(model_cfg, dict):
@@ -1630,7 +1627,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "valid"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")
@@ -2820,7 +2817,7 @@ def main():
             args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
 
-    cfg = dict(load_config("configs/config.yaml"))
+    cfg = dict(load_config("configs/config_pianovam_fast.yaml"))
     model_cfg = cfg.get("model")
     if not isinstance(model_cfg, dict):
         model_cfg = {}
@@ -2879,7 +2876,7 @@ def main():
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
+    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "valid"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")
