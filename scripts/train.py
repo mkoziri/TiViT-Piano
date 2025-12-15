@@ -1487,6 +1487,8 @@ def _init_eval_metric_counts() -> Dict[str, Any]:
         "pitch_frame_match": 0.0,
         "pitch_frame_total": 0.0,
         "hand_acc": 0.0,
+        "hand_acc_n": 0,
+        "clef_acc_n": 0,
         "clef_acc": 0.0,
         "onset_f1": 0.0,
         "offset_f1": 0.0,
@@ -3320,13 +3322,23 @@ def evaluate_one_epoch(
                     clef_prob = F.softmax(out["clef_logits"], dim=-1)
                     hand_pred = hand_prob.argmax(dim=-1)
                     clef_pred = clef_prob.argmax(dim=-1)
-                    Bx, Tx = hand_pred.shape
-                    hand_acc_val = (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
-                    clef_acc_val = (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
-                    loose_counts["hand_acc"] += hand_acc_val
-                    loose_counts["clef_acc"] += clef_acc_val
-                    strict_counts["hand_acc"] += hand_acc_val
-                    strict_counts["clef_acc"] += clef_acc_val
+                    # NOTE: hand_frame can contain -1 (unknown) when Handskeleton is missing.
+                    # Ignore those frames so hand_acc reflects real supervision.
+                    hand_mask = (hand_frame >= 0)
+                    if bool(hand_mask.any().item()):
+                        hand_acc_val = (hand_pred[hand_mask] == hand_frame[hand_mask]).float().mean().item()
+                        loose_counts["hand_acc"] += hand_acc_val
+                        strict_counts["hand_acc"] += hand_acc_val
+                        loose_counts["hand_acc_n"] += 1
+                        strict_counts["hand_acc_n"] += 1
+
+                    clef_mask = (clef_frame >= 0)
+                    if bool(clef_mask.any().item()):
+                        clef_acc_val = (clef_pred[clef_mask] == clef_frame[clef_mask]).float().mean().item()
+                        loose_counts["clef_acc"] += clef_acc_val
+                        strict_counts["clef_acc"] += clef_acc_val
+                        loose_counts["clef_acc_n"] += 1
+                        strict_counts["clef_acc_n"] += 1
 
                     metric_n += 1
 
@@ -3360,12 +3372,25 @@ def evaluate_one_epoch(
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
-                    hand_acc_val = (hand_pred == tgt["hand"]).float().mean().item()
-                    clef_acc_val = (clef_pred == tgt["clef"]).float().mean().item()
-                    loose_counts["hand_acc"] += hand_acc_val
-                    loose_counts["clef_acc"] += clef_acc_val
-                    strict_counts["hand_acc"] += hand_acc_val
-                    strict_counts["clef_acc"] += clef_acc_val
+                    hand_gt = tgt.get("hand")
+                    if torch.is_tensor(hand_gt):
+                        hand_mask = (hand_gt >= 0)
+                        if bool(hand_mask.any().item()):
+                            hand_acc_val = (hand_pred[hand_mask] == hand_gt[hand_mask]).float().mean().item()
+                            loose_counts["hand_acc"] += hand_acc_val
+                            strict_counts["hand_acc"] += hand_acc_val
+                            loose_counts["hand_acc_n"] += 1
+                            strict_counts["hand_acc_n"] += 1
+
+                    clef_gt = tgt.get("clef")
+                    if torch.is_tensor(clef_gt):
+                        clef_mask = (clef_gt >= 0)
+                        if bool(clef_mask.any().item()):
+                            clef_acc_val = (clef_pred[clef_mask] == clef_gt[clef_mask]).float().mean().item()
+                            loose_counts["clef_acc"] += clef_acc_val
+                            strict_counts["clef_acc"] += clef_acc_val
+                            loose_counts["clef_acc_n"] += 1
+                            strict_counts["clef_acc_n"] += 1
 
                     loose_onset_pred, _ = _aggregate_onoff_predictions(
                         onset_logits_eval,
@@ -3626,8 +3651,10 @@ def evaluate_one_epoch(
         # Frame-exact accuracy remains as a debugging aid and is not treated as a headline score.
         branch["pitch_pos_f1"] = pitch_pos_f1
         branch["pitch_frame_exact_acc"] = pitch_frame_acc
-        branch["hand_acc"] = counts["hand_acc"] / denom
-        branch["clef_acc"] = counts["clef_acc"] / denom
+        hand_denom = int(counts.get("hand_acc_n", 0))
+        clef_denom = int(counts.get("clef_acc_n", 0))
+        branch["hand_acc"] = (counts["hand_acc"] / hand_denom) if hand_denom > 0 else 0.0
+        branch["clef_acc"] = (counts["clef_acc"] / clef_denom) if clef_denom > 0 else 0.0
         branch["onset_f1"] = counts["onset_f1"] / max(1, counts.get("n_on", 0))
         branch["offset_f1"] = counts["offset_f1"] / max(1, counts.get("n_off", 0))
         branch["onset_pos_rate"] = counts["onset_pos_rate"] / denom

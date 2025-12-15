@@ -1,0 +1,32 @@
+{
+  "onset": {
+    "best_logit": -4.0,
+    "best_prob": 0.02,
+    "temperature": 0.49787279856522365,
+    "logit_bias": -3.8820955753326416,
+    "platt_scale": 2.008545160293579,
+    "platt_bias": -3.8820955753326416,
+    "scale": 2.008545160293579,
+    "calibrated_pred_rate": 0.019281992688775063,
+    "pos_rate": 0.014454440213739872,
+    "provenance": "thorough"
+  },
+  "offset": {
+    "best_logit": -4.0,
+    "best_prob": 0.02,
+    "temperature": 0.44111499562387585,
+    "logit_bias": -3.8842833042144775,
+    "platt_scale": 2.2669825553894043,
+    "platt_bias": -3.8842833042144775,
+    "scale": 2.2669825553894043,
+    "calibrated_pred_rate": 0.019112754613161087,
+    "pos_rate": 0.014257154427468777,
+    "provenance": "thorough"
+  },
+  "platt_onset_scale": 2.008545160293579,
+  "platt_onset_bias": -3.8820955753326416,
+  "temperature_onset": 0.49787279856522365,
+  "platt_offset_scale": 2.2669825553894043,
+  "platt_offset_bias": -3.8842833042144775,
+  "temperature_offset": 0.44111499562387585
+}

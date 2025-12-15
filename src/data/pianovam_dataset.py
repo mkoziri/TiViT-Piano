@@ -169,6 +169,16 @@ class PianoVAMDataset(Dataset):
         self.use_handskeleton = bool(hands_cfg.get("enabled", True))
         self.handskeleton_dir = self.root / str(hands_cfg.get("dir", "Handskeleton"))
         self.handskeleton_fps = float(hands_cfg.get("fps", 60.0))
+        # How to propagate hand labels to non-onset frames.
+        #   - "none": keep -1 on unlabeled frames (recommended for clean supervision)
+        #   - "ffill": forward-fill from the last labeled frame
+        #   - "bfill": backward-fill from the next labeled frame
+        #   - "both": ffill then bfill (fills all frames if at least one label exists)
+        self.handskeleton_fill = str(
+            hands_cfg.get("fill", hands_cfg.get("fill_strategy", "none"))
+        ).strip().lower()
+        if self.handskeleton_fill not in ("none", "ffill", "bfill", "both"):
+            self.handskeleton_fill = "none"
         self._handskel_cache: Dict[str, Dict[int, Dict[str, Optional[np.ndarray]]]] = {}
         self._handskel_cache_order: List[str] = []
         self._handskel_cache_size: int = int(hands_cfg.get("cache_size", 64))
@@ -257,7 +267,7 @@ class PianoVAMDataset(Dataset):
 
         if requested == "train":
            return meta_split in ("train", "ext-train")
-        if requested in ("val", "validation"):
+        if requested in ("val", "valid", "validation"):
             return meta_split in ("val", "valid", "validation")
         if requested == "test":
             return meta_split == "test"
@@ -289,6 +299,7 @@ class PianoVAMDataset(Dataset):
         total_frames = len(vr)
         if total_frames <= 1:
             raise RuntimeError(f"[PianoVAM] Empty or corrupt video: {video_path}")
+
 
         # Estimate duration in seconds using the native FPS.
         try:
@@ -549,17 +560,17 @@ class PianoVAMDataset(Dataset):
         rec_id = str(rec.get("id", ""))
         skel = self._load_handskeleton(rec_id)
         if skel is None:
-            # No skeleton available => keep dummy label (all zeros)
-            return torch.zeros((T,), dtype=torch.long)
+            # No skeleton available => no supervision (ignored by CE in train.py)
+            return torch.full((T,), -1, dtype=torch.long)
 
         centers = self._precompute_key_centers(rec)
         if centers is None:
-            return torch.zeros((T,), dtype=torch.long)
+            return torch.full((T,), -1, dtype=torch.long)
 
         onset_any = onset_roll.sum(dim=1) > 0  # (T,)
         onset_frames = onset_any.nonzero(as_tuple=False).flatten().tolist()
         if not onset_frames:
-            return torch.zeros((T,), dtype=torch.long)
+            return torch.full((T,), -1, dtype=torch.long)
 
         for t in onset_frames:
             fi = int(frame_idxs[t])  # original video frame index
@@ -620,22 +631,25 @@ class PianoVAMDataset(Dataset):
                 avg_r = dist_right_sum / max(1, n_right)
                 hand_frame[t] = 0 if avg_l <= avg_r else 1
 
-        # Fill unknowns by forward/back fill
+        fill_mode = getattr(self, "handskeleton_fill", "none")
+        if fill_mode == "none":
+            return hand_frame
+
         arr = hand_frame.numpy()
-        last = None
-        for i in range(T):
-            if arr[i] >= 0:
-                last = int(arr[i])
-            elif last is not None:
-                arr[i] = last
-
-        nxt = None
-        for i in range(T - 1, -1, -1):
-            if arr[i] >= 0:
-                nxt = int(arr[i])
-            elif nxt is not None:
-                arr[i] = nxt
-
+        if fill_mode in ("ffill", "both"):
+            last = None
+            for i in range(T):
+                if arr[i] >= 0:
+                    last = int(arr[i])
+                elif last is not None:
+                    arr[i] = last
+        if fill_mode in ("bfill", "both"):
+            nxt = None
+            for i in range(T - 1, -1, -1):
+                if arr[i] >= 0:
+                    nxt = int(arr[i])
+                elif nxt is not None:
+                    arr[i] = nxt
         return torch.from_numpy(arr.astype(np.int64))
 
 
@@ -663,6 +677,14 @@ class PianoVAMDataset(Dataset):
         # Hand labels from Handskeleton (0=Left, 1=Right). Falls back to zeros if unavailable.
         hand_frame = self._build_hand_frame_targets(rec, onset_roll, frame_idxs, full_hw)
         clef_frame = torch.zeros(T, dtype=torch.long)
+        # Clip-level labels (used by clip-mode training/eval paths).
+        # Keep these always defined so generic training/eval does not fall back to dummy targets.
+        valid_hand = hand_frame >= 0
+        if bool(valid_hand.any().item()):
+            hand_clip = torch.mode(hand_frame[valid_hand]).values.to(torch.long)
+        else:
+            hand_clip = torch.tensor(0, dtype=torch.long)
+        clef_clip = torch.tensor(0, dtype=torch.long)
 
         # Clip-level labels (max over time)
         pitch_clip = pitch_roll.max(dim=0).values       # (88,)
@@ -685,6 +707,8 @@ class PianoVAMDataset(Dataset):
             "pitch":  pitch_clip,                  # (88,)
             "onset":  onset_clip,                  # (88,)
             "offset": offset_clip,                 # (88,)
+            "hand":   hand_clip,
+            "clef":   clef_clip,
 
             # για το custom evaluation
             "tsv_path": str(rec["tsv_path"]),      # GT labels
@@ -705,6 +729,8 @@ class PianoVAMDataset(Dataset):
             "pitch": pitch_clip,     # (88,)
             "onset": onset_clip,     # (88,)
             "offset": offset_clip,   # (88,),
+            "hand":   hand_clip,
+            "clef":   clef_clip,
         }
 
         return sample

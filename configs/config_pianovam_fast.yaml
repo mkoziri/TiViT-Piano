@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano-PianoVAMv1-f128_sw_939df26a_auto
+  name: TiViT-Piano-PianoVAMv1-f128_sw_fc554f3a_auto
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -80,6 +80,7 @@ dataset:
     dir: Handskeleton
     fps: 60.0
     cache_size: 64
+    fill: both
 model:
   name: TiViT-Piano
   backend: vits_tile
@@ -123,7 +124,7 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: false
+  resume: true
   reset_head_bias: false
   bias_seed:
     onoff_prior_mean: 0.012

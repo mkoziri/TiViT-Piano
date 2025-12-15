@@ -1364,8 +1364,9 @@ def apply_metrics_to_config(metrics: Dict[str, float]) -> None:
     if onset_prob is not None:
         if lo <= onset_prob <= hi:
             metrics_cfg["prob_threshold_onset"] = float(onset_prob)
-            # keep legacy alias in sync if other codepaths read it
-            metrics_cfg["prob_threshold"] = float(onset_prob)
+            # IMPORTANT: do NOT overwrite the global prob_threshold (used by the pitch head)
+            # with the onset threshold. On PianoVAM, onset probabilities can be very low
+            # (e.g. ~0.02), and syncing would silently distort pitch metrics/eval.
         else:
             print(
                 f"[autopilot] WARNING: onset prob_threshold={onset_prob:.4f} outside [{lo:.2f}, {hi:.2f}]; skipping write"
