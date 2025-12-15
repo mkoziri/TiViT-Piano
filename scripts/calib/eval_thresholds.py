@@ -22,7 +22,7 @@ Key Functions/Classes:
 CLI Arguments:
     --ckpt PATH (default: checkpoints/tivit_best.pt)
         Checkpoint whose state_dict supplies model weights.
-    --split {train,val,test} / --max-clips INT / --frames INT / --only ID
+    --split {train,val,valid,test} / --max-clips INT / --frames INT / --only ID
         Dataset slice controls passed through to ``make_dataloader``.
     --thresholds FLOAT [FLOAT ...] / --prob_thresholds FLOAT [FLOAT ...]
         Explicit onset thresholds (logit or prob). Use matching ``--offset_*``
@@ -113,6 +113,13 @@ def _resolve_backend_label(cfg: Mapping[str, Any] | None) -> str:
     raw = model_cfg.get("backend", "vivit")
     label = str(raw).strip().lower() if raw is not None else "vivit"
     return label or "vivit"
+
+
+def _normalise_split(split: Optional[str]) -> Optional[str]:
+    if split is None:
+        return None
+    val = split.strip().lower()
+    return "val" if val == "valid" else val
 
 
 # Default probability grid used when sweeping thresholds without an explicit
@@ -1274,7 +1281,11 @@ def _parse_cli_args(argv: Sequence[str]):
         type=float,
         help="Override offset head logit bias prior to sigmoid",
     )
-    ap.add_argument("--split", choices=["train", "val", "test"], help="Dataset split to evaluate")
+    ap.add_argument(
+        "--split",
+        choices=["train", "val", "valid", "test"],
+        help="Dataset split to evaluate (valid maps to val)",
+    )
     ap.add_argument("--max-clips", type=int)
     ap.add_argument("--frames", type=int)
     ap.add_argument("--only", help="Restrict evaluation to a single canonical video id")
@@ -1619,7 +1630,7 @@ def _prepare_runtime(args, debug_mode: bool, stage_durations: Dict[str, float]) 
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")
@@ -2868,7 +2879,7 @@ def main():
     event_tolerance = float(frame_targets_cfg.get("tolerance", hop_seconds))
     midi_low_cfg = frame_targets_cfg.get("note_min")
     key_prior_midi_low = int(midi_low_cfg) if isinstance(midi_low_cfg, (int, float)) else 21
-    split = args.split or dataset_cfg.get("split_val") or dataset_cfg.get("split") or "val"
+    split = _normalise_split(args.split) or _normalise_split(dataset_cfg.get("split_val")) or _normalise_split(dataset_cfg.get("split")) or "val"
 
     frames_display = dataset_cfg.get("frames")
     max_clips_display = dataset_cfg.get("max_clips")

@@ -98,6 +98,45 @@ def _load_metadata(root: Path) -> Dict[str, Dict[str, Any]]:
     return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
 
 
+def _parse_point(value: Any) -> Optional[Tuple[float, float]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = value.split(",")
+        if len(parts) >= 2:
+            try:
+                return float(parts[0]), float(parts[1])
+            except (TypeError, ValueError):
+                return None
+    if isinstance(value, Sequence) and len(value) >= 2:
+        try:
+            return float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _crop_from_points(entry: Mapping[str, Any]) -> Optional[Tuple[int, int, int, int]]:
+    """Compute (min_y, max_y, min_x, max_x) from Point_LT/RT/RB/LB."""
+
+    labels = ["Point_LT", "Point_RT", "Point_RB", "Point_LB"]
+    points: list[Tuple[float, float]] = []
+    for key in labels:
+        pt = _parse_point(entry.get(key))
+        if pt is not None:
+            points.append(pt)
+    if len(points) < 2:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    try:
+        return (int(round(min_y)), int(round(max_y)), int(round(min_x)), int(round(max_x)))
+    except Exception:
+        return None
+
+
 def _split_matches(requested: str, meta_split: str) -> bool:
     req = requested.lower()
     meta = meta_split.lower()
@@ -196,6 +235,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
         # Build split list and ID mapping from metadata_v2.
         id_map: Dict[str, str] = {}
         split_ids: list[str] = []
+        crop_map: Dict[str, Tuple[int, int, int, int]] = {}
         for entry in metadata.values():
             rec_id = entry.get("record_time") or entry.get("id")
             meta_split = entry.get("split")
@@ -206,6 +246,9 @@ class PianoVAMDataset(yt.PianoYTDataset):
             canon = canonical_video_id(rec_id)
             id_map[canon] = rec_id
             split_ids.append(canon)
+            crop_box = _crop_from_points(entry)
+            if crop_box is not None:
+                crop_map[canon] = crop_box
         if not split_ids:
             raise RuntimeError(f"[PianoVAM] No entries for split '{split}' in metadata_v2.json")
 
@@ -220,6 +263,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
         orig_read_split_ids = yt._read_split_ids
         orig_resolve_media_paths = yt._resolve_media_paths
         orig_read_midi_events = yt._read_midi_events
+        orig_load_metadata = yt._load_metadata
 
         def _pv_expand_root(_: Optional[str]) -> Path:
             return resolved_root
@@ -243,10 +287,14 @@ class PianoVAMDataset(yt.PianoYTDataset):
                 return _read_tsv_events(path)
             return orig_read_midi_events(path)
 
+        def _pv_load_metadata(_: Path):
+            return {k: v for k, v in crop_map.items()}
+
         yt._expand_root = _pv_expand_root  # type: ignore
         yt._read_split_ids = _pv_read_split_ids  # type: ignore
         yt._resolve_media_paths = _pv_resolve_media_paths  # type: ignore
         yt._read_midi_events = _pv_read_midi_events  # type: ignore
+        yt._load_metadata = _pv_load_metadata  # type: ignore
         try:
             super().__init__(
                 root_dir=str(resolved_root),
@@ -271,6 +319,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
             # Keep _read_midi_events patched so later label reads during training
             # continue to parse TSV files correctly. The wrapper defers to the
             # original reader for real MIDI files, so this is safe to leave in place.
+            yt._load_metadata = orig_load_metadata
 
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)

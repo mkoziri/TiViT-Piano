@@ -76,9 +76,6 @@ from theory.key_prior_runtime import (
     resolve_key_prior_settings,
     apply_key_prior_to_logits,
 )
-from scripts.eval_pianovam import evaluate_clip
-
-
 logger = get_logger(__name__)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -3918,7 +3915,6 @@ def main():
 
     cfg = dict(load_config(CONFIG_PATH))
     dataset_name = cfg.get("dataset", {}).get("name", "").lower()
-    is_pianovam = (dataset_name == "pianovam")
     model_backend = _resolve_backend_label(cfg)
     seed = resolve_seed(args.seed, cfg)
     deterministic = resolve_deterministic_flag(args.deterministic, cfg)
@@ -4529,82 +4525,14 @@ def main():
         # --- evaluation & best checkpoint ---
         val_total = None
         if eval_freq and val_loader is not None and (epoch % eval_freq == 0):
-            # Validation is disabled for PianoVAM P1 (no real labels yet).
-            # We still run the training loop with dummy labels, but we skip
-            # evaluation metrics to avoid shape mismatches.
-            # val_metrics = None
-            # If we enable real labels for PianoVAM in the future, we can
-            # restore the call below:
-            if is_pianovam:
-                # =====================================================
-                # PianoVAM custom evaluation (event-level F1)
-                # =====================================================
-                logger.info("[PianoVAM Eval] Starting evaluation...")
-
-                device = _first_parameter_device(model)
-                model.eval()
-
-                # hop_seconds from config (decode_fps)
-                dataset_cfg = cfg.get("dataset", {}) or {}
-                decode_fps = float(dataset_cfg.get("decode_fps", 60.0))
-                hop_seconds = 1.0 / decode_fps
-
-                val_results = []
-
-                with torch.inference_mode():
-                    for batch in val_loader:
-                        if batch is None:
-                            continue
-
-                        video = batch["video"].to(device)   # (B, T, C, H, W)
-                        tsv_paths = batch["tsv_path"]       # list ή tuple B-length
-
-                        # Forward pass
-                        out = model(video, return_per_tile=False)
-
-                        onset_logits = out["onset_logits"].cpu()   # (B, T, 88)
-                        offset_logits = out["offset_logits"].cpu() # (B, T, 88)
-
-                        B = onset_logits.shape[0]
-                        for i in range(B):
-                            clip_metrics = evaluate_clip(
-                                onset_logits[i],          # (T, 88)
-                                offset_logits[i],         # (T, 88)
-                                tsv_paths[i],             # path for .tsv
-                                hop_seconds,
-                            )
-                            val_results.append(clip_metrics)
-
-                if len(val_results) == 0:
-                    val_f1 = 0.0
-                else:
-                    f1s = [x.get("f1", 0.0) for x in val_results]
-                    val_f1 = float(sum(f1s) / len(f1s))
-
-                logger.info(
-                    "[PianoVAM Eval] Mean F1 = %.4f over %d clips",
-                    val_f1,
-                    len(val_results),
-                )
-
-                os.makedirs("logs", exist_ok=True)
-                with open("logs/pianovam_metrics.json", "w") as f:
-                    json.dump(val_results, f, indent=2)
-
-                logger.info("[PianoVAM Eval] Saved metrics → logs/pianovam_metrics.json")
-
-                # to fit with the whole code
-                val_metrics = {"f1": val_f1}
-
-            else:
-                val_metrics = evaluate_one_epoch(
-                    model,
-                    val_loader,
-                    cfg,
-                    optimizer=optimizer,
-                    pos_rate_state=pos_rate_state,
-                    per_tile_support=per_tile_eval_support,
-                )
+            val_metrics = evaluate_one_epoch(
+                model,
+                val_loader,
+                cfg,
+                optimizer=optimizer,
+                pos_rate_state=pos_rate_state,
+                per_tile_support=per_tile_eval_support,
+            )
             if val_metrics is None:
                 logger.warning("[train:eval] metrics skipped (timeout) for epoch %d", epoch)
             else:

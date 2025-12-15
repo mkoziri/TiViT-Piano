@@ -16,7 +16,7 @@ dataset:
     - offset
     - hand
     - clef
-  max_clips: 80
+  max_clips: 5  #just for quick testing
   manifest:
     train: null
     val: null
@@ -29,26 +29,26 @@ dataset:
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
   resize:
-    - 145
-    - 1024    # was 800
+    - 180     # was 145
+    - 1536    # was 1024
   tiles: 3
   channels: 3
   normalize: true
   apply_crop: true
   canonical_hw:
-    - 145
-    - 1024    # was 800
+    - 185        # was 150
+    - 1540       # was 1030
   registration:
     source: metadata
     interp: bilinear
     global_aug:
       enabled: false
       resize_jitter:
-        - 150
+        - 150 
         - 1030   # was 805
       random_crop_hw:
-        - 145
-        - 1024   # was 800
+        - 180     # was 145
+        - 1536    # was 1024
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
