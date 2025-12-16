@@ -185,6 +185,114 @@ def _event_f1(pred, target, hop_seconds: float, tol_sec: float, eps: float = 1e-
     return 2 * precision * recall / (precision + recall + eps)
 
 
+def _unique_sorted_thresholds(values: Sequence[float]) -> List[float]:
+    """Return sorted, deduped probability thresholds in [0, 1]."""
+
+    seen: Dict[int, float] = {}
+    for raw in values:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        val = max(0.0, min(1.0, val))
+        key = int(round(val * 1e6))
+        if key not in seen:
+            seen[key] = val
+    return sorted(seen.values())
+
+
+def _coerce_quantiles(values: Sequence[float] | None) -> List[float]:
+    """Normalize percentile inputs (0-100 or 0-1) into quantile fractions."""
+
+    if not values:
+        return []
+    fracs: List[float] = []
+    for raw in values:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(val):
+            continue
+        if abs(val) > 1.0:
+            val = val / 100.0
+        val = max(0.0, min(1.0, val))
+        fracs.append(val)
+    return _unique_sorted_thresholds(fracs)
+
+
+def _quantile_thresholds(
+    tensor: torch.Tensor,
+    *,
+    quantiles: Sequence[float],
+    floor_band: Sequence[float] = (),
+    include_zero: bool = True,
+    include_max: bool = True,
+) -> List[float]:
+    """Build probability thresholds from quantiles plus guard rails."""
+
+    flat = tensor.reshape(-1).float()
+    flat = flat[torch.isfinite(flat)]
+    base: List[float] = [0.0] if include_zero else []
+    if flat.numel() == 0:
+        base.extend(floor_band)
+        cleaned = _unique_sorted_thresholds(base)
+        return cleaned if cleaned else [0.0]
+    for q in quantiles:
+        try:
+            base.append(float(torch.quantile(flat, float(q)).item()))
+        except Exception:
+            continue
+    if include_max:
+        try:
+            base.append(float(flat.max().item()))
+        except Exception:
+            pass
+    base.extend(floor_band)
+    cleaned = _unique_sorted_thresholds(base)
+    return cleaned if cleaned else [0.0]
+
+
+def _format_float_list(vals: Sequence[float], max_items: int = 24) -> str:
+    vals = list(vals)
+    display = vals[:max_items]
+    suffix = "" if len(vals) <= max_items else f"...(+{len(vals) - max_items})"
+    return "[" + ",".join(f"{v:.4f}" for v in display) + "]" + suffix
+
+
+def _summarize_probs(name: str, tensor: torch.Tensor) -> None:
+    flat = tensor.reshape(-1).float()
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        print(f"[sweep] {name} prob stats: empty", flush=True)
+        return
+    stats = {
+        "min": float(flat.min().item()),
+        "max": float(flat.max().item()),
+        "p50": float(torch.quantile(flat, 0.50).item()),
+        "p90": float(torch.quantile(flat, 0.90).item()),
+        "p95": float(torch.quantile(flat, 0.95).item()),
+        "p99": float(torch.quantile(flat, 0.99).item()),
+        "p99.5": float(torch.quantile(flat, 0.995).item()),
+    }
+    print(
+        "[sweep] {name} prob stats: min={min:.4f} max={max:.4f} "
+        "p50={p50:.4f} p90={p90:.4f} p95={p95:.4f} p99={p99:.4f} p99.5={p99_5:.4f}".format(
+            name=name,
+            min=stats["min"],
+            max=stats["max"],
+            p50=stats["p50"],
+            p90=stats["p90"],
+            p95=stats["p95"],
+            p99=stats["p99"],
+            p99_5=stats["p99.5"],
+        ),
+        flush=True,
+    )
+
+
 def _print_progress(processed: int, total: Optional[int]) -> None:
     if total is not None and total > 0:
         pct = 100.0 * processed / total
@@ -1048,6 +1156,17 @@ def main():
         action="store_true",
         help="Route execution through scripts/calib/calibrate_thresholds_legacy.py",
     )
+    ap.add_argument(
+        "--threshold-mode",
+        choices=["absolute", "quantile", "hybrid"],
+        help="Probability grid mode: absolute (default), quantile-based, or hybrid union",
+    )
+    ap.add_argument(
+        "--quantile-values",
+        type=float,
+        nargs="*",
+        help="Percentile cutoffs (0-100 or 0-1) for quantile threshold generation",
+    )
     argv = sys.argv[1:]
     args = ap.parse_args(argv)
     if args.legacy_calibrate_thresholds:
@@ -1108,6 +1227,35 @@ def main():
     agg_k_cfg = agg_cfg.get("k", {}) or {}
     agg_k_onset = max(1, int(agg_k_cfg.get("onset", 1) or 1))
     agg_k_offset = max(1, int(agg_k_cfg.get("offset", 1) or 1))
+    sweep_cfg = metrics_cfg.get("sweep", {}) or {}
+    floor_band_raw = sweep_cfg.get("floor_band", [0.20, 0.30, 0.40])
+    floor_band: List[float] = []
+    if isinstance(floor_band_raw, (list, tuple)):
+        for item in floor_band_raw:
+            try:
+                val = float(item)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= val <= 1.0:
+                floor_band.append(val)
+    else:
+        try:
+            val = float(floor_band_raw)
+        except (TypeError, ValueError):
+            val = None
+        if val is not None and 0.0 <= val <= 1.0:
+            floor_band.append(val)
+    if not floor_band:
+        floor_band = [0.20, 0.30, 0.40]
+    threshold_mode_cfg = str(sweep_cfg.get("threshold_mode", "absolute") or "absolute").strip().lower()
+    threshold_mode = str(args.threshold_mode or threshold_mode_cfg or "absolute").strip().lower()
+    if threshold_mode not in {"absolute", "quantile", "hybrid"}:
+        threshold_mode = "absolute"
+    quantile_cfg = sweep_cfg.get("quantile_values", [0, 50, 70, 80, 90, 95, 98, 99])
+    quantile_values = _coerce_quantiles(args.quantile_values if args.quantile_values is not None else quantile_cfg)
+    if not quantile_values:
+        quantile_values = [0.0, 0.5, 0.9, 0.99]
+    include_max_quantile = bool(sweep_cfg.get("include_max_quantile", True))
     preview_prob_threshold = metrics_cfg.get("prob_threshold_onset", metrics_cfg.get("prob_threshold", 0.5))
     try:
         preview_prob_threshold = float(preview_prob_threshold)
@@ -1427,12 +1575,52 @@ def main():
     else:
         print("[progress] A/V lag ms stats: disabled (all zero).", flush=True)
 
+    _summarize_probs("onset", onset_probs)
+    _summarize_probs("offset", offset_probs)
+
+    def _build_prob_grid(
+        head: str,
+        probs: torch.Tensor,
+        base_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        base_list = [float(v) for v in base_grid.cpu().tolist()]
+        if threshold_mode in {"quantile", "hybrid"}:
+            quantile_percent_display = "[" + ",".join(f"{q * 100:.1f}" for q in quantile_values) + "]"
+            quantiles = _quantile_thresholds(
+                probs,
+                quantiles=quantile_values,
+                floor_band=floor_band,
+                include_zero=True,
+                include_max=include_max_quantile,
+            )
+            if threshold_mode == "hybrid":
+                merged = _unique_sorted_thresholds([*base_list, *quantiles])
+            else:
+                merged = _unique_sorted_thresholds(quantiles)
+            if not merged:
+                merged = [0.0]
+            print(
+                f"[sweep] {head} thresholds mode={threshold_mode} percentiles={quantile_percent_display} "
+                f"include_max={include_max_quantile} n={len(merged)} values={_format_float_list(merged)}",
+                flush=True,
+            )
+        else:
+            merged = _unique_sorted_thresholds(base_list)
+            print(
+                f"[sweep] {head} thresholds mode=absolute n={len(merged)} values={_format_float_list(merged)}",
+                flush=True,
+            )
+        return torch.as_tensor(merged, dtype=probs.dtype)
+
+    onset_prob_grid = _build_prob_grid("onset", onset_probs, DEFAULT_PROB_GRID)
+    offset_prob_grid = _build_prob_grid("offset", offset_probs, OFFSET_PROB_GRID)
+
     onset_stats = _compute_metrics(
         onset_logits,
         onset_probs,
         onset_tgts,
         "onset",
-        prob_grid=DEFAULT_PROB_GRID,
+        prob_grid=onset_prob_grid,
         logit_grid=DEFAULT_LOGIT_GRID,
         agg_mode=agg_mode,
         agg_top_k=agg_top_k,
@@ -1447,7 +1635,7 @@ def main():
         offset_probs,
         offset_tgts,
         "offset",
-        prob_grid=OFFSET_PROB_GRID,
+        prob_grid=offset_prob_grid,
         logit_grid=DEFAULT_LOGIT_GRID,
         agg_mode=agg_mode,
         agg_top_k=agg_top_k,

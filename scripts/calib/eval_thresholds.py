@@ -676,6 +676,71 @@ def _percentile_tensor(flat: torch.Tensor, q: float) -> float:
         return float(np.quantile(flat.numpy(), q))
 
 
+def _unique_sorted_thresholds(values: Sequence[float]) -> List[float]:
+    """Return sorted, deduplicated probability thresholds clipped to [0, 1]."""
+
+    uniq: Dict[int, float] = {}
+    for val in values:
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(fval):
+            continue
+        fval = max(0.0, min(1.0, fval))
+        key = int(round(fval * 1e6))
+        if key not in uniq:
+            uniq[key] = fval
+    return sorted(uniq.values())
+
+
+def _coerce_quantiles(values: Sequence[float] | None) -> List[float]:
+    """Convert percentile inputs to quantile fractions clipped to [0, 1]."""
+
+    if not values:
+        return []
+    coerced: List[float] = []
+    for raw in values:
+        try:
+            frac = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(frac):
+            continue
+        if abs(frac) > 1.0:
+            frac = frac / 100.0
+        frac = max(0.0, min(1.0, frac))
+        coerced.append(frac)
+    return _unique_sorted_thresholds(coerced)
+
+
+def _quantile_thresholds(
+    tensor: torch.Tensor,
+    *,
+    quantiles: Sequence[float],
+    floor_band: Sequence[float] = (),
+    include_zero: bool = True,
+    include_max: bool = True,
+) -> List[float]:
+    """Build a probability threshold list from score quantiles plus guard rails."""
+
+    flat = tensor.reshape(-1).float()
+    flat = flat[torch.isfinite(flat)]
+    base: List[float] = [0.0] if include_zero else []
+    if flat.numel() == 0:
+        base.extend(floor_band)
+        cleaned = _unique_sorted_thresholds(base)
+        return cleaned if cleaned else [0.0]
+
+    for q in quantiles:
+        base.append(_percentile_tensor(flat, float(q)))
+    if include_max:
+        base.append(float(flat.max().item()))
+    base.extend(floor_band)
+    cleaned = _unique_sorted_thresholds(base)
+    return cleaned if cleaned else [0.0]
+
+
 def _summarize_probs(
     name: str,
     tensor: torch.Tensor,
@@ -683,14 +748,17 @@ def _summarize_probs(
 ) -> Tuple[float, Dict[float, float]]:
     flat = tensor.reshape(-1).float()
     max_prob = float(flat.max().item()) if flat.numel() else 0.0
+    min_prob = float(flat.min().item()) if flat.numel() else 0.0
     stats = {
+        0.50: _percentile_tensor(flat, 0.50),
+        0.90: _percentile_tensor(flat, 0.90),
         0.95: _percentile_tensor(flat, 0.95),
         0.99: _percentile_tensor(flat, 0.99),
         0.995: _percentile_tensor(flat, 0.995),
     }
     log_progress(
-        "[sweep] %s prob stats: max=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
-        % (name, max_prob, stats[0.95], stats[0.99], stats[0.995]),
+        "[sweep] %s prob stats: min=%.4f max=%.4f p50=%.4f p90=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
+        % (name, min_prob, max_prob, stats[0.50], stats[0.90], stats[0.95], stats[0.99], stats[0.995]),
         force=True,
     )
     return max_prob, stats
@@ -837,6 +905,8 @@ def evaluate_threshold_pair(
     ev_f1_off = _event_f1(offset_pred_bin, ctx.offset_true_bin, ctx.hop_seconds, ctx.event_tolerance)
     onset_pred_rate = onset_pred_bin.mean().item()
     onset_pos_rate = ctx.onset_true_bin.mean().item()
+    offset_pred_rate = offset_pred_bin.mean().item()
+    offset_pos_rate = ctx.offset_true_bin.mean().item()
 
     f1_on = 0.0 if f1_on is None else f1_on
     f1_off = 0.0 if f1_off is None else f1_off
@@ -880,6 +950,8 @@ def evaluate_threshold_pair(
         "f1_off": float(f1_off),
         "onset_pred_rate": float(onset_pred_rate),
         "onset_pos_rate": float(onset_pos_rate),
+        "offset_pred_rate": float(offset_pred_rate),
+        "offset_pos_rate": float(offset_pos_rate),
         "ev_f1_on": float(ev_f1_on),
         "ev_f1_off": float(ev_f1_off),
         "k_onset": int(k_onset),
@@ -1044,10 +1116,33 @@ def update_best_result(
     if best_result is None:
         return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
     best_mean = best_result.get("ev_mean", -1.0)
-    if ev_mean > best_mean + 1e-9:
+    eps = 1e-9
+    if ev_mean > best_mean + eps:
         return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
-    if abs(ev_mean - best_mean) <= 1e-9 and res["ev_f1_on"] > best_result["ev_f1_on"] + 1e-9:
-        return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+
+    criteria = [
+        ("ev_f1_off", True),
+        ("ev_f1_on", True),
+        ("f1_off", True),
+        ("f1_on", True),
+        ("offset_pred_rate", False),
+        ("onset_pred_rate", False),
+        ("onset_thr", False),
+        ("offset_thr", False),
+        ("k_onset", False),
+    ]
+
+    for key, descending in criteria:
+        cand_val = float(res.get(key, -math.inf if descending else math.inf))
+        best_val = float(best_result.get(key, -math.inf if descending else math.inf))
+        delta = cand_val - best_val
+        if descending and delta > eps:
+            return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+        if not descending and delta < -eps:
+            return {**res, "ev_mean": ev_mean}, copy.deepcopy(stats) if stats else None
+        if abs(delta) > eps:
+            return best_result, best_post_stats
+
     return best_result, best_post_stats
 
 
@@ -1212,6 +1307,7 @@ def _parse_cli_args(argv: Sequence[str]):
         offset_logit_thrs = _parse_list(argv, "offset_thresholds")
         offset_prob_thrs = _parse_list(argv, "offset_prob_thresholds")
         sanity_prob_thrs = _parse_list(argv, "sanity_thresholds")
+        quantile_vals = _parse_list(argv, "quantile-values")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -1248,6 +1344,18 @@ def _parse_cli_args(argv: Sequence[str]):
         metavar="P",
         nargs="*",
         help="Optional onset probability thresholds for monotonic sanity verification",
+    )
+    ap.add_argument(
+        "--threshold-mode",
+        choices=["absolute", "quantile", "hybrid"],
+        help="Probability sweep mode: absolute grid (default), quantile-driven, or hybrid union",
+    )
+    ap.add_argument(
+        "--quantile-values",
+        metavar="Q",
+        nargs="*",
+        type=float,
+        help="Percentile cutoffs (0-100 or 0-1) for quantile threshold mode (default: config sweep.quantile_values)",
     )
     ap.add_argument(
         "--temperature",
@@ -1453,6 +1561,7 @@ def _parse_cli_args(argv: Sequence[str]):
     args.offset_thresholds = offset_logit_thrs
     args.offset_prob_thresholds = offset_prob_thrs
     args.sanity_thresholds = sanity_prob_thrs
+    args.quantile_values = quantile_vals if quantile_vals is not None else args.quantile_values
 
     if args.thresholds is not None and args.prob_thresholds is not None:
         print("error: --thresholds and --prob_thresholds are mutually exclusive", file=sys.stderr)
@@ -1527,9 +1636,14 @@ def _parse_cli_args(argv: Sequence[str]):
     onset_platt_stats = _init_platt_stats(_platt_stats_enabled(onset_temperature, onset_bias))
     offset_platt_stats = _init_platt_stats(_platt_stats_enabled(offset_temperature, offset_bias))
 
+    prob_grid_defaulted = False
     if args.thresholds is None and args.prob_thresholds is None:
         if args.head is not None or not args.calibration:
-            args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+            if (args.threshold_mode or "absolute") == "absolute":
+                args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+                prob_grid_defaulted = True
+
+    args._prob_grid_defaulted = prob_grid_defaulted
 
     return (
         args,
@@ -2731,27 +2845,6 @@ def main():
     log_handle, _log_progress = _init_progress_logger(args)
     _ = log_handle  # handle kept alive for atexit cleanup
 
-    onset_probs_final = list(args.prob_thresholds) if args.prob_thresholds is not None else []
-    offset_probs_final = list(args.offset_prob_thresholds) if args.offset_prob_thresholds is not None else []
-    if args.grid_prob_thresholds:
-        combos = len(onset_probs_final) * len(offset_probs_final)
-    else:
-        combos = max(len(onset_probs_final), len(offset_probs_final))
-    onset_display = "[" + ",".join(f"{p:.4f}" for p in onset_probs_final) + "]"
-    offset_display = "[" + ",".join(f"{p:.4f}" for p in offset_probs_final) + "]"
-    LOGGER.info(
-        "[grid] onset_probs=%s offset_probs=%s (final) combos=%d",
-        onset_display,
-        offset_display,
-        combos,
-        extra=QUIET_EXTRA,
-    )
-
-    if args.head is None and args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):
-        print("[eval] offset probability thresholds not provided; reusing onset list", flush=True)
-    if args.head is None and args.thresholds is not None and logit_reuse.get("offset_from_onset"):
-        print("[eval] offset logit thresholds not provided; reusing onset list", flush=True)
-
     loader_ctx = _build_eval_loader(args, runtime, _log_progress)
     if loader_ctx.target_clips == 0:
         _log_progress("[progress] target_clips resolved to 0; exiting early.", force=True)
@@ -2813,11 +2906,6 @@ def main():
     return_per_tile_requested = runtime.return_per_tile_requested
     split = runtime.split
     stage_durations = runtime.stage_durations
-    # Unless a calibration file is provided and no head is specified, default to
-    # sweeping over probability thresholds when none were specified explicitly.
-    if args.thresholds is None and args.prob_thresholds is None:
-        if args.head is not None or not args.calibration:
-            args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
 
 
     cfg = dict(load_config("configs/config.yaml"))
@@ -2913,6 +3001,15 @@ def main():
             floor_band.append(val)
     if not floor_band:
         floor_band = [0.20, 0.30, 0.40]
+    threshold_mode_cfg = str(sweep_cfg.get("threshold_mode", "absolute") or "absolute").strip().lower()
+    threshold_mode = str(args.threshold_mode or threshold_mode_cfg or "absolute").strip().lower()
+    if threshold_mode not in {"absolute", "quantile", "hybrid"}:
+        threshold_mode = "absolute"
+    quantile_cfg = sweep_cfg.get("quantile_values", [0, 50, 70, 80, 90, 95, 98, 99])
+    quantile_values = _coerce_quantiles(args.quantile_values if args.quantile_values is not None else quantile_cfg)
+    if not quantile_values:
+        quantile_values = [0.0, 0.5, 0.9, 0.99]
+    include_max_quantile = bool(sweep_cfg.get("include_max_quantile", True))
 
     calibration_data = None
     if args.calibration:
@@ -3103,7 +3200,77 @@ def main():
     onset_lower_hint = float(max(0.0, min(onset_peak - 0.10, 0.95)))
     offset_lower_hint = float(max(0.0, min(offset_peak - 0.10, 0.95)))
 
+    prob_grid_defaulted = bool(getattr(args, "_prob_grid_defaulted", False))
+    auto_allowed = args.head is not None or not args.calibration
+    prob_lists_missing = not args.prob_thresholds and not args.offset_prob_thresholds
+    should_quantile = (
+        threshold_mode in {"quantile", "hybrid"}
+        and args.thresholds is None
+        and args.offset_thresholds is None
+        and auto_allowed
+        and (prob_lists_missing or prob_grid_defaulted)
+    )
+    if threshold_mode in {"quantile", "hybrid"} and not should_quantile:
+        _log_progress(
+            "[sweep] threshold_mode=%s ignored (explicit thresholds provided or calibration-only run)" % threshold_mode,
+            force=True,
+        )
+    if should_quantile:
+        abs_base = list(args.prob_thresholds or DEFAULT_THRESHOLDS)
+        quantile_percent_display = "[" + ",".join(f"{q * 100:.1f}" for q in quantile_values) + "]"
+        _log_progress(
+            f"[sweep] quantile grid → percentiles={quantile_percent_display} include_max={include_max_quantile}",
+            force=True,
+        )
+        onset_quantiles = _quantile_thresholds(
+            onset_probs,
+            quantiles=quantile_values,
+            floor_band=floor_band,
+            include_zero=True,
+            include_max=include_max_quantile,
+        )
+        offset_quantiles = _quantile_thresholds(
+            offset_probs,
+            quantiles=quantile_values,
+            floor_band=floor_band,
+            include_zero=True,
+            include_max=include_max_quantile,
+        )
+        if threshold_mode == "hybrid":
+            onset_list = _unique_sorted_thresholds([*abs_base, *onset_quantiles])
+            offset_base = args.offset_prob_thresholds if args.offset_prob_thresholds is not None else abs_base
+            offset_list = _unique_sorted_thresholds([*offset_base, *offset_quantiles])
+        else:
+            onset_list = onset_quantiles
+            offset_list = offset_quantiles
+        args.prob_thresholds = onset_list
+        args.offset_prob_thresholds = offset_list
+        _log_progress(
+            "[sweep] threshold_mode=%s onset_thresholds=%s offset_thresholds=%s "
+            "(n_onset=%d n_offset=%d)"
+            % (
+                threshold_mode,
+                _format_float_list(onset_list),
+                _format_float_list(offset_list),
+                len(onset_list),
+                len(offset_list),
+            ),
+            force=True,
+        )
+
+    if args.head is not None and per_head_mode == "prob":
+        if args.head == "onset":
+            per_head_sweep_vals = args.prob_thresholds
+        else:
+            per_head_sweep_vals = (
+                args.offset_prob_thresholds if args.offset_prob_thresholds is not None else args.prob_thresholds
+            )
+
     if args.head is None:
+        if args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):
+            print("[eval] offset probability thresholds not provided; reusing onset list", flush=True)
+        if args.thresholds is not None and logit_reuse.get("offset_from_onset"):
+            print("[eval] offset logit thresholds not provided; reusing onset list", flush=True)
         if args.prob_thresholds:
             using_grid = bool(args.grid_prob_thresholds)
             onset_list = list(args.prob_thresholds)
@@ -3354,6 +3521,9 @@ def main():
             "offset_prob_thresholds": _normalize_threshold_list(args.offset_prob_thresholds),
             "logit_thresholds": _normalize_threshold_list(args.thresholds),
             "offset_logit_thresholds": _normalize_threshold_list(args.offset_thresholds),
+            "threshold_mode": threshold_mode,
+            "quantile_values": _normalize_threshold_list(quantile_values),
+            "include_max_quantile": bool(include_max_quantile),
             "grid_prob_thresholds": bool(args.grid_prob_thresholds),
             "k_candidates": [int(k) for k in k_candidates],
             "default_k": {"onset": int(default_k_onset), "offset": int(default_k_offset)},
