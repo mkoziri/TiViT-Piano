@@ -1595,6 +1595,13 @@ def perform_calibration(
     prev_metrics = (cfg_snapshot.get("training", {}) or {}).get("metrics", {}) or {}
     prev_onset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_onset"))
     prev_offset_best = _coerce_optional_float(prev_metrics.get("prob_threshold_offset"))
+    dataset_cfg = cfg_snapshot.get("dataset", {}) if isinstance(cfg_snapshot, Mapping) else {}
+    dataset_frames_cfg = _coerce_positive_int(dataset_cfg.get("frames"))
+    dataset_max_clips_cfg = _coerce_positive_int(dataset_cfg.get("max_clips"))
+    calib_frames = args.calib_frames if args.calib_frames is not None else (dataset_frames_cfg or 96)
+    calib_max_clips = args.calib_max_clips if args.calib_max_clips is not None else dataset_max_clips_cfg
+    if calib_max_clips is None:
+        calib_max_clips = 80
 
     autop_cfg = cfg_snapshot.get("autopilot", {}) if isinstance(cfg_snapshot, Mapping) else {}
     onset_stageb_cfg = autop_cfg.get("onset_optimizer", {}) if isinstance(autop_cfg, Mapping) else {}
@@ -1670,8 +1677,8 @@ def perform_calibration(
             eval_extras.append("--legacy-eval-thresholds")
         if extras:
             eval_extras.extend(extras)
-        frames = args.calib_frames if args.calib_frames is not None else 96
-        max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
+        frames = calib_frames
+        max_clips = calib_max_clips
         def _resolve_platt_tuple(head: str) -> Tuple[Optional[float], Optional[float]]:
             if not platt_overrides:
                 return (None, None)
@@ -1844,8 +1851,8 @@ def perform_calibration(
         stage_a_records: List[Dict[str, Any]] = []
         stage_a_winner: Optional[Dict[str, Any]] = None
         total_candidates = max(1, len(args.onset_open_grid) * len(args.onset_min_on_grid))
-        frames = args.calib_frames if args.calib_frames is not None else 96
-        max_clips = args.calib_max_clips if args.calib_max_clips is not None else 80
+        frames = calib_frames
+        max_clips = calib_max_clips
         if stage_a_state_valid:
             onset_state = stage_a_state_payload.get("onset") if isinstance(stage_a_state_payload, Mapping) else {}
             open_val = _coerce_optional_float(onset_state.get("open")) if isinstance(onset_state, Mapping) else None
@@ -2694,8 +2701,8 @@ def perform_calibration(
             ckpt,
             stdout_dir,
             split,
-            args.calib_max_clips,
-            args.calib_frames,
+            calib_max_clips,
+            calib_frames,
             verbose=args.verbose,
             seed=seed,
             deterministic=deterministic,
