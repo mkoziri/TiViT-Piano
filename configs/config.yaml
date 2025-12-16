@@ -25,7 +25,7 @@ dataset:
   split_train: train
   split_val: val
   split_test: test
-  frames: 128
+  frames: 96
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
   resize:
@@ -36,16 +36,16 @@ dataset:
   normalize: true
   apply_crop: true
   canonical_hw:
-    - 185        # was 150
-    - 1540       # was 1030
+    - 180     # was 145
+    - 1536    # was 1024
   registration:
     source: metadata
     interp: bilinear
     global_aug:
       enabled: false
       resize_jitter:
-        - 150 
-        - 1030   # was 805
+        - 185        # was 150
+        - 1540       # was 1030
       random_crop_hw:
         - 180     # was 145
         - 1536    # was 1024
