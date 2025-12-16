@@ -92,7 +92,7 @@ model:
     tube_size: 2
     d_model: 192
     num_heads: 3
-    depth_temporal: 3 #it was 1
+    depth_temporal: 2 #it was 1
     depth_spatial: 1
     depth_global: 1
     global_tokens: 2

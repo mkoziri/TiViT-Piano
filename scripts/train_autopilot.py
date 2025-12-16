@@ -3306,6 +3306,7 @@ def main() -> int:
     loss_cfg = train_cfg.setdefault("loss_weights", {})
     dataset_cfg = cfg.setdefault("dataset", {})
     frame_cfg = dataset_cfg.setdefault("frame_targets", {})
+    best_sel_cfg = train_cfg.setdefault("best_selection", {})
 
     if ensure_default(train_cfg, ("epochs",), args.burst_epochs):
         changed = True
@@ -3322,6 +3323,18 @@ def main() -> int:
     if args.dataset_max_clips is not None:
         dataset_cfg["max_clips"] = int(args.dataset_max_clips)
         changed = True
+    desired_best_sel_clips: Optional[int] = None
+    if args.calib_max_clips is not None:
+        desired_best_sel_clips = int(args.calib_max_clips)
+    elif args.dataset_max_clips is not None:
+        desired_best_sel_clips = int(args.dataset_max_clips)
+    else:
+        desired_best_sel_clips = _coerce_positive_int(dataset_cfg.get("max_clips"))
+    if desired_best_sel_clips:
+        best_sel_max = _coerce_positive_int(best_sel_cfg.get("max_clips"))
+        if best_sel_max != desired_best_sel_clips:
+            best_sel_cfg["max_clips"] = desired_best_sel_clips
+            changed = True
     if changed:
         print("[autopilot] updated config defaults/determinism for training/calibration")
     save_cfg(cfg)
