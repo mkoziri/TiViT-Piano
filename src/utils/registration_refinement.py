@@ -943,6 +943,100 @@ def _reconstruct_geometry_from_result(result: "RegistrationResult") -> Optional[
     return _build_geometry_metadata_from_edges(warped, width, target_hw)
 
 
+def _safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _validate_cache_payload(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for key, payload in data.items():
+        if not isinstance(payload, dict):
+            return False
+        status = payload.get("status")
+        if not isinstance(status, str):
+            return False
+        target_hw = payload.get("target_hw")
+        source_hw = payload.get("source_hw")
+        if not (
+            isinstance(target_hw, (list, tuple))
+            and len(target_hw) >= 2
+            and all(isinstance(v, (int, float)) for v in target_hw[:2])
+        ):
+            return False
+        if not (
+            isinstance(source_hw, (list, tuple))
+            and len(source_hw) >= 2
+            and all(isinstance(v, (int, float)) for v in source_hw[:2])
+        ):
+            return False
+        homography = payload.get("homography")
+        if not (isinstance(homography, (list, tuple)) and len(homography) == 9):
+            return False
+    return True
+
+
+def _result_error_score(result: "RegistrationResult") -> float:
+    err = float(result.err_after)
+    if not math.isfinite(err) or err <= 0.0:
+        err = float(result.err_before)
+    if not math.isfinite(err):
+        err = float("inf")
+    return err
+
+
+def _merge_results(
+    existing: Optional["RegistrationResult"], candidate: "RegistrationResult"
+) -> Optional["RegistrationResult"]:
+    """Apply deterministic merge rules; returns the preferred result."""
+
+    if candidate.status.startswith("fallback"):
+        # Do not persist fallback results at all.
+        return existing
+
+    if existing is None:
+        return candidate
+
+    if existing.status == "ok" and candidate.status != "ok":
+        return existing
+    if candidate.status == "ok" and existing.status != "ok":
+        return candidate
+
+    if existing.status == "ok" and candidate.status == "ok":
+        err_existing = _result_error_score(existing)
+        err_candidate = _result_error_score(candidate)
+        if err_candidate + 1e-6 < err_existing:
+            return candidate
+        if err_existing + 1e-6 < err_candidate:
+            return existing
+        ts_existing = float(existing.timestamp) if math.isfinite(existing.timestamp) else 0.0
+        ts_candidate = float(candidate.timestamp) if math.isfinite(candidate.timestamp) else 0.0
+        if ts_candidate > ts_existing:
+            return candidate
+        if ts_existing > ts_candidate:
+            return existing
+        # Same timestamp and score: keep existing but backfill metadata if missing.
+        if existing.geometry_meta is None and candidate.geometry_meta is not None:
+            existing.geometry_meta = candidate.geometry_meta
+        if existing.x_warp_ctrl is None and candidate.x_warp_ctrl is not None:
+            existing.x_warp_ctrl = candidate.x_warp_ctrl
+        return existing
+
+    # Both fallback (or unknown): keep the one with latest timestamp.
+    ts_existing = float(existing.timestamp) if math.isfinite(existing.timestamp) else 0.0
+    ts_candidate = float(candidate.timestamp) if math.isfinite(candidate.timestamp) else 0.0
+    return candidate if ts_candidate > ts_existing else existing
+
+
 @dataclass
 class RegistrationResult:
     homography: np.ndarray
@@ -1257,13 +1351,44 @@ class RegistrationRefiner:
     def _persist_cache(self) -> None:
         path = self.cache_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {key: result.to_json() for key, result in self._cache.items()}
         tmp_path = path.with_suffix(".tmp")
         with _file_lock(path):
+            on_disk = _safe_load_json(path) or {}
+            merged: Dict[str, RegistrationResult] = {}
+            for key, payload in on_disk.items():
+                if not isinstance(payload, dict):
+                    continue
+                try:
+                    existing_res = RegistrationResult.from_json(payload)
+                except Exception:
+                    continue
+                chosen = _merge_results(None, existing_res)
+                if chosen is not None:
+                    merged[key] = chosen
+            for key, result in self._cache.items():
+                chosen = _merge_results(merged.get(key), result)
+                if chosen is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = chosen
+            payload = {key: result.to_json() for key, result in merged.items()}
             try:
                 with tmp_path.open("w", encoding="utf-8") as handle:
                     json.dump(payload, handle, indent=2, sort_keys=True)
-                os.replace(tmp_path, path)
+                try:
+                    with tmp_path.open("r", encoding="utf-8") as handle:
+                        written = json.load(handle)
+                    valid = _validate_cache_payload(written)
+                except Exception:
+                    valid = False
+                if valid:
+                    os.replace(tmp_path, path)
+                else:
+                    tmp_path.unlink(missing_ok=True)
+                    self.logger.warning(
+                        "reg_refined: validation failed after persisting cache %s; keeping previous file",
+                        path,
+                    )
             except Exception as exc:
                 if tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
