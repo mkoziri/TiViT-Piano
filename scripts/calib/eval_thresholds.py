@@ -747,8 +747,10 @@ def _summarize_probs(
     log_progress,
 ) -> Tuple[float, Dict[float, float]]:
     flat = tensor.reshape(-1).float()
+    flat = flat[torch.isfinite(flat)]
     max_prob = float(flat.max().item()) if flat.numel() else 0.0
     min_prob = float(flat.min().item()) if flat.numel() else 0.0
+    mean_prob = float(flat.mean().item()) if flat.numel() else 0.0
     stats = {
         0.50: _percentile_tensor(flat, 0.50),
         0.90: _percentile_tensor(flat, 0.90),
@@ -757,8 +759,8 @@ def _summarize_probs(
         0.995: _percentile_tensor(flat, 0.995),
     }
     log_progress(
-        "[sweep] %s prob stats: min=%.4f max=%.4f p50=%.4f p90=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
-        % (name, min_prob, max_prob, stats[0.50], stats[0.90], stats[0.95], stats[0.99], stats[0.995]),
+        "[sweep] %s prob stats: min=%.4f mean=%.4f max=%.4f p50=%.4f p90=%.4f p95=%.4f p99=%.4f p99.5=%.4f"
+        % (name, min_prob, mean_prob, max_prob, stats[0.50], stats[0.90], stats[0.95], stats[0.99], stats[0.995]),
         force=True,
     )
     return max_prob, stats
@@ -766,6 +768,40 @@ def _summarize_probs(
 
 def _format_float_list(vals: Sequence[float]) -> str:
     return "[" + ",".join(f"{v:.3f}" for v in vals) + "]"
+
+
+def _format_thr_preview(vals: Sequence[float], k: int = 3) -> str:
+    values = list(vals)
+    if not values:
+        return "[]"
+    first = ", ".join(f"{v:.3f}" for v in values[:k])
+    if len(values) <= k:
+        return "[" + first + "]"
+    last = ", ".join(f"{v:.3f}" for v in values[-k:])
+    return "[" + first + " ... " + last + "]"
+
+
+def _pred_rate_range(
+    probs: torch.Tensor,
+    thresholds: Sequence[float],
+    *,
+    mode: str,
+    cap_count: int,
+    top_k: int,
+) -> Tuple[float, float]:
+    rates: List[float] = []
+    for thr in thresholds:
+        mask = build_threshold_mask(
+            probs,
+            float(thr),
+            mode=mode,
+            cap_count=cap_count,
+            top_k=top_k,
+        )
+        rates.append(float(mask.float().mean().item()))
+    if not rates:
+        return 0.0, 0.0
+    return min(rates), max(rates)
 
 
 def evaluate_threshold_pair(
@@ -3201,13 +3237,11 @@ def main():
     offset_lower_hint = float(max(0.0, min(offset_peak - 0.10, 0.95)))
 
     prob_grid_defaulted = bool(getattr(args, "_prob_grid_defaulted", False))
-    auto_allowed = args.head is not None or not args.calibration
     prob_lists_missing = not args.prob_thresholds and not args.offset_prob_thresholds
     should_quantile = (
         threshold_mode in {"quantile", "hybrid"}
         and args.thresholds is None
         and args.offset_thresholds is None
-        and auto_allowed
         and (prob_lists_missing or prob_grid_defaulted)
     )
     if threshold_mode in {"quantile", "hybrid"} and not should_quantile:
@@ -3265,6 +3299,15 @@ def main():
             per_head_sweep_vals = (
                 args.offset_prob_thresholds if args.offset_prob_thresholds is not None else args.prob_thresholds
             )
+
+    onset_mode_used = "explicit"
+    offset_mode_used = "explicit"
+    if should_quantile:
+        onset_mode_used = threshold_mode
+        offset_mode_used = threshold_mode
+    elif prob_grid_defaulted:
+        onset_mode_used = "absolute"
+        offset_mode_used = "absolute"
 
     if args.head is None:
         if args.prob_thresholds is not None and prob_reuse.get("offset_from_onset"):
@@ -3373,6 +3416,30 @@ def main():
                 f"offset={_format_float_list(offset_list)} combos={num_combos}",
                 force=True,
             )
+            onset_rate_min, onset_rate_max = _pred_rate_range(
+                onset_probs,
+                onset_list,
+                mode=agg_mode,
+                cap_count=default_k_onset,
+                top_k=agg_top_k,
+            )
+            offset_rate_min, offset_rate_max = _pred_rate_range(
+                offset_probs,
+                offset_list,
+                mode=agg_mode,
+                cap_count=default_k_offset,
+                top_k=agg_top_k,
+            )
+            _log_progress(
+                "[sweep] onset thresholds mode=%s n=%d %s pred_rate=[%.4f,%.4f]"
+                % (onset_mode_used, len(onset_list), _format_thr_preview(onset_list), onset_rate_min, onset_rate_max),
+                force=True,
+            )
+            _log_progress(
+                "[sweep] offset thresholds mode=%s n=%d %s pred_rate=[%.4f,%.4f]"
+                % (offset_mode_used, len(offset_list), _format_thr_preview(offset_list), offset_rate_min, offset_rate_max),
+                force=True,
+            )
     else:
         if per_head_mode == "prob" and per_head_sweep_vals is not None:
             values = set(float(v) for v in per_head_sweep_vals)
@@ -3401,6 +3468,26 @@ def main():
                 )
             _log_progress(
                 f"[sweep] per-head sweep ({args.head}) values={_format_float_list(per_head_sweep_vals)} combos={num_combos}",
+                force=True,
+            )
+            per_head_rate_min, per_head_rate_max = _pred_rate_range(
+                onset_probs if args.head == "onset" else offset_probs,
+                per_head_sweep_vals,
+                mode=agg_mode,
+                cap_count=default_k_onset if args.head == "onset" else default_k_offset,
+                top_k=agg_top_k,
+            )
+            per_head_mode_desc = threshold_mode if should_quantile else ("absolute" if prob_grid_defaulted else "explicit")
+            _log_progress(
+                "[sweep] %s thresholds mode=%s n=%d %s pred_rate=[%.4f,%.4f]"
+                % (
+                    args.head,
+                    per_head_mode_desc,
+                    len(per_head_sweep_vals),
+                    _format_thr_preview(per_head_sweep_vals),
+                    per_head_rate_min,
+                    per_head_rate_max,
+                ),
                 force=True,
             )
 
