@@ -9,6 +9,7 @@ video.  Results are cached on disk so repeated runs avoid recomputation.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
@@ -27,6 +28,7 @@ from .identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEBUG_ARTIFACT_ROOT = PROJECT_ROOT / "logs" / "reg_debug"
 _CANONICAL_HW_LOGGED: Set[Tuple[int, int]] = set()
 _CACHE_SUMMARY_LOGGED: Set[Tuple[Tuple[int, int], Path]] = set()
 
@@ -35,6 +37,74 @@ _MIDI_HIGH = 108
 _WHITE_PITCHES = {0, 2, 4, 5, 7, 9, 11}
 _KEY_COUNT = _MIDI_HIGH - _MIDI_LOW + 1
 _DEFAULT_META_TILES = 3
+_DEBUG_TOP_K = 5
+BLACK_ERR_DEBUG_THRESHOLD = 6.0
+
+
+class RegistrationDebugAggregator:
+    """Collect per-clip diagnostics and emit a summary at process exit."""
+
+    def __init__(self) -> None:
+        self.records: List[Dict[str, Any]] = []
+        self._registered = False
+
+    def record(self, payload: Dict[str, Any]) -> None:
+        self.records.append(payload)
+        if not self._registered:
+            atexit.register(self.flush)
+            self._registered = True
+
+    def _top(self, key: str, *, reverse: bool = True) -> List[Dict[str, Any]]:
+        ranked = [r for r in self.records if key in r and r[key] is not None]
+        ranked.sort(key=lambda r: float(r.get(key, float("nan"))), reverse=reverse)
+        return ranked[:_DEBUG_TOP_K]
+
+    def flush(self) -> None:
+        if not self.records:
+            return
+        logger = logging.getLogger(__name__)
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        total = len(self.records)
+        fallback = sum(1 for r in self.records if str(r.get("status", "")).startswith("fallback"))
+        worsened = sum(1 for r in self.records if r.get("worsened"))
+        ok = sum(1 for r in self.records if str(r.get("status")) == "ok")
+        logger.info(
+            "reg_debug.summary: total=%d ok=%d fallback=%d worsened=%d",
+            total,
+            ok,
+            fallback,
+            worsened,
+        )
+
+        def _log_bucket(title: str, rows: List[Dict[str, Any]], metric: str) -> None:
+            if not rows:
+                return
+            logger.info("reg_debug.summary.%s:", title)
+            for r in rows:
+                logger.info(
+                    "  id=%s status=%s %s=%.3f err_before=%.3f err_after=%.3f err_black=%.3f "
+                    "improvement=%.3f reason=%s split=%s idx=%s",
+                    r.get("video_id"),
+                    r.get("status"),
+                    metric,
+                    float(r.get(metric, 0.0)),
+                    float(r.get("err_before", 0.0)),
+                    float(r.get("err_after", 0.0)),
+                    float(r.get("err_black_gaps", 0.0)),
+                    float(r.get("improvement", 0.0)),
+                    r.get("decision_reason", "n/a"),
+                    r.get("split", "n/a"),
+                    r.get("dataset_index", "n/a"),
+                )
+
+        _log_bucket("worst_err_after", self._top("err_after"), "err_after")
+        _log_bucket("worst_err_black_gaps", self._top("err_black_gaps"), "err_black_gaps")
+        _log_bucket("most_worsened", self._top("improvement", reverse=False), "improvement")
+
+
+DEBUG_AGG = RegistrationDebugAggregator()
 
 
 def _midi_is_white(midi: int) -> bool:
@@ -173,13 +243,42 @@ def _extract_crop_values(
         return None
 
 
-def _apply_crop_np(frame: np.ndarray, meta: Optional[Sequence[float] | Dict[str, Any]]) -> np.ndarray:
+def _describe_crop_source(meta: Optional[Sequence[float] | Dict[str, Any]]) -> str:
+    if meta is None:
+        return "none"
+    if isinstance(meta, dict):
+        if "detector" in meta:
+            return "detector"
+        if "crop_source" in meta:
+            return str(meta.get("crop_source"))
+        return "dataset_meta"
+    return "sequence"
+
+
+def _apply_crop_np(
+    frame: np.ndarray,
+    meta: Optional[Sequence[float] | Dict[str, Any]],
+    crop_debug: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    h, w = frame.shape[:2]
     coords = _extract_crop_values(meta)
+    if crop_debug is not None:
+        crop_debug.update(
+            {
+                "input_hw": [int(h), int(w)],
+                "applied": False,
+                "crop_source": _describe_crop_source(meta),
+                "requested": None,
+                "requested_normalized": None,
+                "clamped": None,
+                "output_hw": [int(h), int(w)],
+                "issues": [],
+            }
+        )
     if coords is None:
         return frame
 
     min_y, max_y, min_x, max_x = coords
-    h, w = frame.shape[:2]
     is_normalised = all(0.0 <= v <= 1.0 for v in (min_y, max_y, min_x, max_x))
     if is_normalised:
         min_y *= h
@@ -196,7 +295,29 @@ def _apply_crop_np(frame: np.ndarray, meta: Optional[Sequence[float] | Dict[str,
     x0 = max(0, min(x0, w - 1))
     y1 = max(y0 + 1, min(y1, h))
     x1 = max(x0 + 1, min(x1, w))
-    return frame[y0:y1, x0:x1]
+    cropped = frame[y0:y1, x0:x1]
+
+    if crop_debug is not None:
+        issues: List[str] = []
+        out_h, out_w = cropped.shape[:2]
+        if out_h < h * 0.25 or out_w < w * 0.25:
+            issues.append("crop_small")
+        if out_h <= 4 or out_w <= 4:
+            issues.append("crop_tiny")
+        aspect = out_h / max(out_w, 1e-6)
+        if aspect < 0.05 or aspect > 4.0:
+            issues.append("crop_aspect_abnormal")
+        crop_debug.update(
+            {
+                "applied": True,
+                "requested": [float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])],
+                "requested_normalized": is_normalised,
+                "clamped": [y0, y1, x0, x1],
+                "output_hw": [int(out_h), int(out_w)],
+                "issues": issues,
+            }
+        )
+    return cropped
 
 
 def _median_or_none(values: Sequence[float]) -> Optional[float]:
@@ -769,6 +890,7 @@ class RegistrationResult:
     x_warp_ctrl: Optional[np.ndarray] = None
     grid: Optional[torch.Tensor] = None
     geometry_meta: Optional[Dict[str, Any]] = None
+    debug_info: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> Dict[str, Any]:
         warp_payload: Optional[List[List[float]]]
@@ -818,6 +940,7 @@ class RegistrationResult:
             x_warp_ctrl=_load_warp_ctrl(payload.get("x_warp_ctrl")),
             grid=None,
             geometry_meta=payload.get("geometry_meta") if isinstance(payload.get("geometry_meta"), dict) else None,
+            debug_info=None,
         )
 
 
@@ -1106,25 +1229,42 @@ class RegistrationRefiner:
         crop_meta: Optional[Sequence[float] | Dict[str, Any]],
         *,
         max_frames: Optional[int] = None,
+        debug: Optional[Dict[str, Any]] = None,
     ) -> List[np.ndarray]:
         target_frames = int(max_frames or self.sample_frames)
         target_frames = int(np.clip(target_frames, 60, 100))
+        if debug is not None:
+            debug.update(
+                {
+                    "target_frames": target_frames,
+                    "reader": None,
+                    "indices": [],
+                    "total_frames": None,
+                    "crop": {},
+                }
+            )
         if target_frames <= 0:
             return []
 
         frames: List[np.ndarray] = []
+        crop_debug: Dict[str, Any] = {}
 
         if _HAVE_DECORD:
             assert decord is not None
             try:
                 vr = decord.VideoReader(str(video_path))
                 total = len(vr)
+                if debug is not None:
+                    debug["reader"] = "decord"
+                    debug["total_frames"] = int(total)
                 if total <= 0:
                     return []
                 step = max(total // target_frames, 1)
                 indices = list(range(0, total, step))
                 if len(indices) > target_frames:
                     indices = indices[:target_frames]
+                if debug is not None:
+                    debug["indices"] = [int(i) for i in indices[:10]]
                 for idx in indices:
                     sample = vr[idx]
                     if hasattr(sample, "asnumpy"):
@@ -1135,9 +1275,11 @@ class RegistrationRefiner:
                         img = np.asarray(sample)
                     if img is None:
                         continue
-                    frame = _apply_crop_np(img, crop_meta)
+                    frame = _apply_crop_np(img, crop_meta, crop_debug)
                     frames.append(frame)
                 if frames:
+                    if debug is not None:
+                        debug["crop"] = dict(crop_debug)
                     return frames
             except Exception as exc:  # pragma: no cover - fallback to cv2
                 self.logger.debug("reg_refined: decord failed for %s (%s)", video_path, exc)
@@ -1150,6 +1292,9 @@ class RegistrationRefiner:
             return frames
         try:
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if debug is not None:
+                debug["reader"] = "cv2"
+                debug["total_frames"] = int(total)
             if total <= 0 or not math.isfinite(total):
                 total = target_frames * 4
             indices = np.linspace(0, max(total - 1, 0), num=target_frames, dtype=int)
@@ -1164,11 +1309,15 @@ class RegistrationRefiner:
                 if not ok or frame is None:
                     continue
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(_apply_crop_np(frame_rgb, crop_meta))
+                frame_crop = _apply_crop_np(frame_rgb, crop_meta, crop_debug)
+                frames.append(frame_crop)
                 if len(frames) >= target_frames:
                     break
         finally:
             cap.release()
+        if debug is not None:
+            debug["indices"] = sorted(int(i) for i in list(seen)[:10])
+            debug["crop"] = dict(crop_debug)
         return frames
 
     # ------------------------------------------------------------ Computation --
@@ -1178,11 +1327,34 @@ class RegistrationRefiner:
         video_id: str,
         video_path: Path,
         crop_meta: Optional[Sequence[float] | Dict[str, Any]],
+        *,
+        debug_enabled: bool,
+        debug_context: Optional[Dict[str, Any]],
     ) -> RegistrationResult:
-        frames = self._sample_video_frames(video_path, crop_meta)
+        debug_info: Optional[Dict[str, Any]] = None
+        sample_debug: Optional[Dict[str, Any]] = None
+        if debug_enabled:
+            sample_debug = {}
+            debug_info = {
+                "video_id": video_id,
+                "video_path": str(video_path),
+                "split": None if debug_context is None else debug_context.get("split"),
+                "dataset_index": None if debug_context is None else debug_context.get("dataset_index"),
+                "context": debug_context or {},
+                "sampling": sample_debug,
+                "baseline": {},
+                "black_keys": {},
+                "refinement": {},
+                "metrics": {},
+                "decision": {},
+                "crop": {},
+            }
+        frames = self._sample_video_frames(video_path, crop_meta, debug=sample_debug)
         canonical = self.canonical_hw
+        decision_reason = ""
         if not frames:
-            return RegistrationResult(
+            status = "fallback_no_frames"
+            result = RegistrationResult(
                 homography=np.eye(3, dtype=np.float32),
                 source_hw=canonical,
                 target_hw=canonical,
@@ -1191,20 +1363,45 @@ class RegistrationRefiner:
                 err_white_edges=0.0,
                 err_black_gaps=0.0,
                 frames=0,
-                status="fallback_no_frames",
+                status=status,
                 baseline_slope=0.0,
                 baseline_intercept=0.0,
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
                 x_warp_ctrl=None,
             )
+            if debug_info is not None:
+                debug_info["sampling"] = sample_debug or {}
+                debug_info["decision"] = {"status": status, "reason": "no_frames_sampled"}
+                debug_info["metrics"] = {
+                    "err_before": 0.0,
+                    "err_after": 0.0,
+                    "err_white_edges": 0.0,
+                    "err_black_gaps": 0.0,
+                    "improvement": 0.0,
+                    "worsened": False,
+                }
+                result.debug_info = debug_info
+            return result
 
         heights = [frame.shape[0] for frame in frames]
         widths = [frame.shape[1] for frame in frames]
         height = int(np.median(heights))
         width = int(np.median(widths))
+        if debug_info is not None:
+            debug_info["sampling"] = sample_debug or {}
+            debug_info["crop"] = (sample_debug or {}).get("crop", {})
+            debug_info["sampling"].update(
+                {
+                    "frames_collected": len(frames),
+                    "median_hw": [int(height), int(width)],
+                    "raw_heights": heights[:5],
+                    "raw_widths": widths[:5],
+                }
+            )
         if height <= 0 or width <= 0:
-            return RegistrationResult(
+            status = "fallback_bad_dims"
+            result = RegistrationResult(
                 homography=np.eye(3, dtype=np.float32),
                 source_hw=canonical,
                 target_hw=canonical,
@@ -1220,11 +1417,26 @@ class RegistrationRefiner:
                 timestamp=time.time(),
                 x_warp_ctrl=None,
             )
+            if debug_info is not None:
+                debug_info["sampling"] = sample_debug or {}
+                debug_info["decision"] = {"status": status, "reason": "non_positive_dimensions"}
+                debug_info["metrics"] = {
+                    "err_before": 0.0,
+                    "err_after": 0.0,
+                    "err_white_edges": 0.0,
+                    "err_black_gaps": 0.0,
+                    "improvement": 0.0,
+                    "worsened": False,
+                }
+                debug_info["crop"] = (sample_debug or {}).get("crop", {})
+                result.debug_info = debug_info
+            return result
 
         geometry_meta: Optional[Dict[str, Any]] = None
         grayscale_frames: List[np.ndarray] = []
         slopes: List[float] = []
         intercepts: List[float] = []
+        representative_frame: Optional[np.ndarray] = None
 
         for frame in frames:
             if frame.shape[0] != height or frame.shape[1] != width:
@@ -1244,11 +1456,23 @@ class RegistrationRefiner:
                 slopes.append(baseline[0])
                 intercepts.append(baseline[1])
             grayscale_frames.append(gray)
+        if grayscale_frames:
+            representative_frame = grayscale_frames[0]
+        if debug_info is not None:
+            debug_info["baseline"].update(
+                {
+                    "frames_used": len(grayscale_frames),
+                    "detections": len(slopes),
+                    "slopes": [float(s) for s in slopes[:5]],
+                    "intercepts": [float(b) for b in intercepts[:5]],
+                }
+            )
 
         slope = _median_or_none(slopes)
         intercept = _median_or_none(intercepts)
         if slope is None or intercept is None:
-            return RegistrationResult(
+            status = "fallback_no_baseline"
+            result = RegistrationResult(
                 homography=np.eye(3, dtype=np.float32),
                 source_hw=(height, width),
                 target_hw=canonical,
@@ -1263,6 +1487,24 @@ class RegistrationRefiner:
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
                 x_warp_ctrl=None,
+            )
+            if debug_info is not None:
+                debug_info["decision"] = {"status": status, "reason": "no_baseline_detected"}
+                debug_info["metrics"] = {
+                    "err_before": 0.0,
+                    "err_after": 0.0,
+                    "err_white_edges": 0.0,
+                    "err_black_gaps": 0.0,
+                    "improvement": 0.0,
+                    "worsened": False,
+                }
+                debug_info["baseline"]["reason"] = "no_baseline_detected"
+                result.debug_info = debug_info
+            return result
+
+        if debug_info is not None:
+            debug_info["baseline"].update(
+                {"median_slope": float(slope), "median_intercept": float(intercept)}
             )
 
         if grayscale_frames:
@@ -1295,6 +1537,22 @@ class RegistrationRefiner:
         edge_weight_scale = float(np.max(edge_strengths))
         edge_weights = edge_strengths / max(edge_weight_scale, 1e-6)
         edge_weights = np.clip(edge_weights, 0.05, 1.0) * WHITE_ANCHOR_PRIORITY
+        if debug_info is not None:
+            debug_info["refinement"].update(
+                {
+                    "source_hw": [int(height), int(width)],
+                    "target_hw": [int(canonical[0]), int(canonical[1])],
+                    "scale": [float(scale_y), float(scale_x)],
+                    "baseline_row": int(baseline_row),
+                    "keyboard_height_px": float(keyboard_height),
+                    "white_edges": {
+                        "count": int(edges.size),
+                        "strength_max": float(edge_weight_scale),
+                        "x_left": float(x_left),
+                        "x_right": float(x_right),
+                    },
+                }
+            )
 
         black_positions, black_strengths, black_boundaries = _compute_black_key_gaps(
             avg_frame,
@@ -1323,11 +1581,17 @@ class RegistrationRefiner:
             black_strengths = np.abs(black_strengths.astype(np.float32)) + 1e-6
             black_weight_scale = float(np.max(black_strengths))
             black_weights = np.clip(black_strengths / max(black_weight_scale, 1e-6), 0.05, 1.0) * BLACK_ANCHOR_PRIORITY
-        else:
-            canon_black_positions = np.zeros((0,), dtype=np.float32)
-            black_weights = np.zeros((0,), dtype=np.float32)
-            black_positions = np.zeros((0,), dtype=np.float32)
-            black_boundaries = np.zeros((0,), dtype=np.int32)
+        if debug_info is not None:
+            debug_info["black_keys"] = {
+                "detected": int(black_positions.size),
+                "canon_detected": int(canon_black_positions.size),
+                "boundaries_ok": bool(black_positions.size > 0 and canon_black_positions.size == black_positions.size),
+                "reasons": [] if black_positions.size > 0 else ["no_black_key_gaps"],
+            }
+
+        refinement_attempted = False
+        refinement_iterations = 0
+        refinement_stop_reason = ""
 
         src_pts: List[List[float]] = []
         dst_pts: List[List[float]] = []
@@ -1388,21 +1652,27 @@ class RegistrationRefiner:
             dtype=np.float32,
         )
 
+        reg_lambda_val = 0.05
         status = "ok"
         err_after = err_before
         err_white_edges = err_before
         err_black_gaps = err_before if black_positions.size > 0 else 0.0
         warp_ctrl = np.zeros((0, 2), dtype=np.float32)
+        white_after: Optional[np.ndarray] = None
+        black_after: Optional[np.ndarray] = None
         H: Optional[np.ndarray]
+        ransac_inliers: Optional[int] = None
 
         if src_arr.shape[0] < 4 or np.count_nonzero(weights_arr > 0.05) < 4:
             H = base_h
             status = "fallback_points"
             err_black_gaps = err_before if black_positions.size > 0 else 0.0
+            refinement_stop_reason = "insufficient_points"
         else:
             weights_norm = weights_arr / max(float(np.max(weights_arr)), 1e-6)
             weights_norm = np.clip(weights_norm, 0.05, 1.0)
             inlier_mask: Optional[np.ndarray] = None
+            ransac_inliers: Optional[int] = None
             if cv2 is not None:
                 _, mask = cv2.findHomography(
                     src_arr,
@@ -1416,33 +1686,42 @@ class RegistrationRefiner:
                     mask = mask.ravel().astype(bool)
                     if int(mask.sum()) >= 4:
                         inlier_mask = mask
+                        ransac_inliers = int(mask.sum())
 
             src_fit = src_arr[inlier_mask] if inlier_mask is not None else src_arr
             dst_fit = dst_arr[inlier_mask] if inlier_mask is not None else dst_arr
             weights_fit = weights_norm[inlier_mask] if inlier_mask is not None else weights_norm
+            refinement_attempted = bool(
+                src_fit.shape[0] >= 4 and np.count_nonzero(weights_fit > 0.05) >= 4
+            )
 
             if src_fit.shape[0] < 4 or np.count_nonzero(weights_fit > 0.05) < 4:
                 H = base_h
                 status = "fallback_points"
                 err_black_gaps = err_before if black_positions.size > 0 else 0.0
+                refinement_stop_reason = "insufficient_inliers"
             else:
                 weights_iter = weights_fit.astype(np.float32, copy=True)
                 H_candidate: Optional[np.ndarray] = None
-                for _ in range(6):
+                reg_lambda = reg_lambda_val
+                for iter_idx in range(6):
+                    refinement_iterations += 1
                     H_try = _solve_regularized_homography(
                         src_fit,
                         dst_fit,
                         base_h,
-                        reg_lambda=0.05,
+                        reg_lambda=reg_lambda,
                         weights=weights_iter.tolist(),
                     )
                     if H_try is None or not np.all(np.isfinite(H_try)):
                         H_candidate = None
+                        refinement_stop_reason = "solver_invalid"
                         break
                     proj_pts = _apply_homography_to_points(H_try, src_fit)
                     residuals = np.linalg.norm(proj_pts - dst_fit, axis=1)
                     if residuals.size == 0:
                         H_candidate = H_try
+                        refinement_stop_reason = "no_residuals"
                         break
                     median_resid = float(np.median(residuals))
                     if not math.isfinite(median_resid) or median_resid <= 1e-6:
@@ -1457,16 +1736,23 @@ class RegistrationRefiner:
                     if np.linalg.norm(weights_new - weights_iter) <= 1e-3:
                         H_candidate = H_try
                         weights_iter = weights_new
+                        refinement_stop_reason = "converged"
                         break
                     weights_iter = weights_new
                     H_candidate = H_try
                     if np.count_nonzero(weights_iter > 0.05) < 4:
+                        refinement_stop_reason = "weights_exhausted"
                         break
+
+                if refinement_stop_reason == "" and H_candidate is not None:
+                    refinement_stop_reason = "max_iters"
 
                 if H_candidate is None:
                     H = base_h
                     status = "fallback_homography"
                     err_black_gaps = err_before if black_positions.size > 0 else 0.0
+                    if refinement_stop_reason == "":
+                        refinement_stop_reason = "no_candidate"
                 else:
                     base_norm = float(np.linalg.norm(base_h))
                     delta_norm = float(np.linalg.norm(H_candidate - base_h))
@@ -1563,6 +1849,8 @@ class RegistrationRefiner:
                         err_white_edges = err_before
                         err_black_gaps = err_before if black_positions.size > 0 else 0.0
                         warp_ctrl = np.zeros((0, 2), dtype=np.float32)
+                        if refinement_stop_reason == "":
+                            refinement_stop_reason = "non_finite_error"
                     else:
                         H = H_candidate
 
@@ -1574,6 +1862,107 @@ class RegistrationRefiner:
             H = base_h if H is None else H
         else:
             err_after = float(err_after)
+
+        improvement = float(err_before - err_after)
+        worsened = bool(err_after > err_before + 1e-3)
+        if decision_reason == "":
+            if status.startswith("fallback"):
+                decision_reason = refinement_stop_reason or status
+            elif worsened:
+                decision_reason = "refinement_worsened"
+            else:
+                decision_reason = "refined"
+
+        if debug_info is not None:
+            warp_ctrl_points = int(warp_ctrl.shape[0]) if warp_ctrl is not None else 0
+            debug_info["refinement"].update(
+                {
+                    "attempted": refinement_attempted,
+                    "iterations": refinement_iterations,
+                    "stop_reason": refinement_stop_reason or None,
+                    "ransac_inliers": ransac_inliers,
+                    "regularization_lambda": reg_lambda_val,
+                    "apply_x_warp": bool(warp_ctrl_points >= 4),
+                    "warp_ctrl_points": warp_ctrl_points,
+                }
+            )
+            debug_info["metrics"] = {
+                "err_before": float(err_before),
+                "err_after": float(err_after),
+                "err_white_edges": float(err_white_edges),
+                "err_black_gaps": float(err_black_gaps),
+                "improvement": improvement,
+                "worsened": worsened,
+            }
+            if white_after is not None:
+                debug_info["metrics"]["white_after_preview"] = [float(white_after[0]), float(white_after[-1])]
+            if black_after is not None and black_after.size > 0:
+                debug_info["metrics"]["black_after_preview"] = [float(black_after[0]), float(black_after[-1])]
+            debug_info["decision"] = {"status": status, "reason": decision_reason, "worsened": worsened}
+
+        def _maybe_dump_debug_artifacts() -> None:
+            if not (debug_enabled and cv2 is not None):
+                return
+            dump_needed = status.startswith("fallback") or worsened or (err_black_gaps > BLACK_ERR_DEBUG_THRESHOLD)
+            if not dump_needed:
+                return
+            if representative_frame is None:
+                return
+            try:
+                clip_dir = DEBUG_ARTIFACT_ROOT / canonical_video_id(video_id)
+                clip_dir.mkdir(parents=True, exist_ok=True)
+                ts = int(time.time())
+                stem = f"{ts}_{status}"
+                roi_path = clip_dir / f"{stem}_roi.png"
+                overlay_path = clip_dir / f"{stem}_overlay.png"
+                if representative_frame.ndim == 2:
+                    roi_img = representative_frame
+                    overlay = cv2.cvtColor(representative_frame, cv2.COLOR_GRAY2BGR)
+                else:
+                    roi_img = cv2.cvtColor(representative_frame, cv2.COLOR_RGB2BGR)
+                    overlay = roi_img.copy()
+                cv2.imwrite(str(roi_path), roi_img)
+                baseline_y = int(np.clip(baseline_row, 0, overlay.shape[0] - 1))
+                top_y = int(np.clip(baseline_row - keyboard_height, 0, overlay.shape[0] - 1))
+                cv2.line(overlay, (0, baseline_y), (overlay.shape[1] - 1, baseline_y), (255, 0, 0), 1)
+                cv2.line(overlay, (0, top_y), (overlay.shape[1] - 1, top_y), (0, 165, 255), 1)
+                for x_val, y_top_val, y_base_val in zip(xs, source_top, ys):
+                    x_int = int(np.clip(x_val, 0, overlay.shape[1] - 1))
+                    y0 = int(np.clip(y_top_val, 0, overlay.shape[0] - 1))
+                    y1 = int(np.clip(y_base_val, 0, overlay.shape[0] - 1))
+                    cv2.line(overlay, (x_int, y0), (x_int, y1), (0, 255, 0), 1)
+                if white_after is not None:
+                    scale_back = (overlay.shape[1] - 1) / max(float(canonical[1] - 1), 1e-6)
+                    for x_val in white_after:
+                        x_int = int(np.clip(x_val * scale_back, 0, overlay.shape[1] - 1))
+                        cv2.line(overlay, (x_int, top_y), (x_int, baseline_y), (0, 255, 255), 1)
+                for x_gap in black_positions:
+                    x_int = int(np.clip(x_gap, 0, overlay.shape[1] - 1))
+                    cv2.line(overlay, (x_int, top_y), (x_int, baseline_y), (0, 0, 255), 1)
+                if black_after is not None and black_after.size > 0:
+                    scale_back = (overlay.shape[1] - 1) / max(float(canonical[1] - 1), 1e-6)
+                    for x_gap in black_after:
+                        x_int = int(np.clip(x_gap * scale_back, 0, overlay.shape[1] - 1))
+                        cv2.line(overlay, (x_int, top_y), (x_int, baseline_y), (255, 0, 255), 1)
+                cv2.putText(
+                    overlay,
+                    f"{status} err_before={err_before:.2f} err_after={err_after:.2f}",
+                    (8, max(12, top_y + 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.imwrite(str(overlay_path), overlay)
+                if debug_info is not None:
+                    debug_info.setdefault("artifacts", {})
+                    debug_info["artifacts"].update({"roi": str(roi_path), "overlay": str(overlay_path)})
+            except Exception as exc:  # pragma: no cover - best-effort
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug("reg_refined.debug: failed to dump artifacts for %s (%s)", video_id, exc)
+
+        _maybe_dump_debug_artifacts()
 
         H_arr = np.asarray(H, dtype=np.float32)
         if self.logger.isEnabledFor(logging.DEBUG):
@@ -1614,9 +2003,126 @@ class RegistrationRefiner:
             x_warp_ctrl=warp_for_grid.copy() if warp_for_grid is not None else None,
             grid=grid,
             geometry_meta=geometry_meta,
+            debug_info=debug_info,
         )
 
     # --------------------------------------------------------------- Public API --
+
+    def _emit_debug_block(
+        self,
+        result: RegistrationResult,
+        *,
+        debug_context: Optional[Dict[str, Any]],
+        cached: bool,
+    ) -> None:
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+        info = result.debug_info or {}
+        metrics = info.get("metrics") or {
+            "err_before": float(result.err_before),
+            "err_after": float(result.err_after),
+            "err_white_edges": float(result.err_white_edges),
+            "err_black_gaps": float(result.err_black_gaps),
+            "improvement": float(result.err_before - result.err_after),
+            "worsened": bool(result.err_after > result.err_before + 1e-3),
+        }
+        decision = info.get("decision", {})
+        refine = info.get("refinement", {})
+        sampling = info.get("sampling", {})
+        crop = info.get("crop", {})
+        baseline = info.get("baseline", {})
+        black_keys = info.get("black_keys", {})
+        artifacts = info.get("artifacts", {})
+        split = info.get("split") or (debug_context or {}).get("split") or "n/a"
+        dataset_index = info.get("dataset_index", (debug_context or {}).get("dataset_index"))
+        clip_id = info.get("video_id") or info.get("video_path") or "unknown"
+        decision_reason = decision.get("reason", result.status)
+        improvement = float(metrics.get("improvement", float(result.err_before - result.err_after)))
+        worsened = bool(metrics.get("worsened", result.err_after > result.err_before + 1e-3))
+        lines = [
+            (
+                f"reg_debug clip={clip_id} status={result.status} reason={decision_reason} cached={cached} "
+                f"split={split} idx={dataset_index}"
+            )
+        ]
+        lines.append(
+            "  sampling: reader={reader} frames={frames} target={target} indices={indices}".format(
+                reader=sampling.get("reader", "n/a"),
+                frames=sampling.get("frames_collected", "n/a"),
+                target=sampling.get("target_frames", "n/a"),
+                indices=sampling.get("indices", []),
+            )
+        )
+        lines.append(
+            "  crop: source={source} requested={req} clamped={clamped} out_hw={out_hw} issues={issues}".format(
+                source=crop.get("crop_source", "n/a"),
+                req=crop.get("requested"),
+                clamped=crop.get("clamped"),
+                out_hw=crop.get("output_hw", "n/a"),
+                issues=crop.get("issues", []),
+            )
+        )
+        lines.append(
+            "  baseline: detections={det} slope={slope} intercept={intercept} reason={reason}".format(
+                det=baseline.get("detections"),
+                slope=baseline.get("median_slope"),
+                intercept=baseline.get("median_intercept"),
+                reason=baseline.get("reason"),
+            )
+        )
+        lines.append(
+            "  black_keys: detected={det} canon={canon} reasons={reasons}".format(
+                det=black_keys.get("detected"),
+                canon=black_keys.get("canon_detected"),
+                reasons=black_keys.get("reasons"),
+            )
+        )
+        lines.append(
+            (
+                "  refinement: attempted={attempted} iter={iters} stop={stop} ransac_inliers={inliers} "
+                "warp_pts={warp_pts} apply_x_warp={apply_warp} reg_lambda={reg} source_hw={source_hw} target_hw={target_hw}"
+            ).format(
+                attempted=refine.get("attempted"),
+                iters=refine.get("iterations"),
+                stop=refine.get("stop_reason"),
+                inliers=refine.get("ransac_inliers"),
+                warp_pts=refine.get("warp_ctrl_points"),
+                apply_warp=refine.get("apply_x_warp"),
+                reg=refine.get("regularization_lambda"),
+                source_hw=refine.get("source_hw"),
+                target_hw=refine.get("target_hw"),
+            )
+        )
+        lines.append(
+            (
+                "  metrics: err_before={b:.3f} err_after={a:.3f} err_white={w:.3f} err_black={bk:.3f} "
+                "improvement={impr:.3f} worsened={wor}"
+            ).format(
+                b=float(metrics.get("err_before", 0.0)),
+                a=float(metrics.get("err_after", 0.0)),
+                w=float(metrics.get("err_white_edges", metrics.get("err_after", 0.0))),
+                bk=float(metrics.get("err_black_gaps", 0.0)),
+                impr=improvement,
+                wor=worsened,
+            )
+        )
+        if artifacts:
+            lines.append(f"  artifacts: {artifacts}")
+        self.logger.debug("\n".join(lines))
+        DEBUG_AGG.record(
+            {
+                "video_id": clip_id,
+                "status": result.status,
+                "err_before": float(metrics.get("err_before", 0.0)),
+                "err_after": float(metrics.get("err_after", 0.0)),
+                "err_black_gaps": float(metrics.get("err_black_gaps", 0.0)),
+                "improvement": improvement,
+                "worsened": worsened,
+                "decision_reason": decision_reason,
+                "split": split,
+                "dataset_index": dataset_index,
+            }
+        )
 
     def refine(
         self,
@@ -1624,7 +2130,9 @@ class RegistrationRefiner:
         video_id: str,
         video_path: Path,
         crop_meta: Optional[Sequence[float] | Dict[str, Any]],
+        debug_context: Optional[Dict[str, Any]] = None,
     ) -> RegistrationResult:
+        debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
         canon_id = canonical_video_id(video_id)
         cached = self._cache.get(canon_id)
         if cached is not None:
@@ -1639,9 +2147,17 @@ class RegistrationRefiner:
                     )
                 except Exception:
                     cached.grid = None
+            if debug_enabled:
+                self._emit_debug_block(cached, debug_context=debug_context, cached=True)
             return cached
 
-        result = self._compute_refinement(canon_id, video_path, crop_meta)
+        result = self._compute_refinement(
+            canon_id,
+            video_path,
+            crop_meta,
+            debug_enabled=debug_enabled,
+            debug_context=debug_context,
+        )
         if result.grid is None:
             try:
                 H_inv = _invert_homography(result.homography)
@@ -1678,6 +2194,8 @@ class RegistrationRefiner:
                 result.err_black_gaps,
                 result.frames,
             )
+        if debug_enabled:
+            self._emit_debug_block(result, debug_context=debug_context, cached=False)
         self._persist_cache()
         return result
 
@@ -1689,8 +2207,14 @@ class RegistrationRefiner:
         video_path: Path,
         crop_meta: Optional[Sequence[float] | Dict[str, Any]],
         interp: str = "bilinear",
+        debug_context: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
-        result = self.refine(video_id=video_id, video_path=video_path, crop_meta=crop_meta)
+        result = self.refine(
+            video_id=video_id,
+            video_path=video_path,
+            crop_meta=crop_meta,
+            debug_context=debug_context,
+        )
         target_h, target_w = self.canonical_hw
         alignable = {"linear", "bilinear", "bicubic", "trilinear"}
         if result.grid is None or clip.ndim != 4:

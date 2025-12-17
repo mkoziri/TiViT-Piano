@@ -587,12 +587,21 @@ def main() -> None:
             clip = apply_registration_crop(clip, meta, cfg=None)
 
         try:
+            debug_ctx = {
+                "split": split,
+                "dataset_index": processed,
+                "start_frame": start_idx,
+                "frames": frames,
+                "stride": stride,
+                "decode_fps": fps_eff,
+            }
             clip = registration_refiner.transform_clip(
                 clip,
                 video_id=canon_id,
                 video_path=video_path,
                 crop_meta=meta,
                 interp="bilinear",
+                debug_context=debug_ctx,
             )
         except Exception as exc:
             print(f"[warn] registration failed for {canon_id}: {exc}")

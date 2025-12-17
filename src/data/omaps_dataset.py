@@ -803,6 +803,14 @@ class OMAPSDataset(Dataset):
             clip = apply_registration_crop(clip, meta, self.registration_cfg)
         elif not self.registration_enabled and not self._registration_off_logged:
             self._registration_off_logged = True
+        debug_ctx = {
+            "split": self.split,
+            "dataset_index": sample_index,
+            "start_frame": start_idx,
+            "frames": self.frames,
+            "stride": self.stride,
+            "decode_fps": self.decode_fps,
+        }
 
         clip = self.registration_refiner.transform_clip(
             clip,
@@ -810,6 +818,7 @@ class OMAPSDataset(Dataset):
             video_path=path,
             crop_meta=meta if (self.registration_enabled and self.apply_crop) else None,
             interp=self.registration_interp,
+            debug_context=debug_ctx,
         )
 
         if self.global_aug_enabled and is_train:
