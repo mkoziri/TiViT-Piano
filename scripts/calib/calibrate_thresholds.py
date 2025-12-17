@@ -1256,6 +1256,7 @@ def main():
     if not quantile_values:
         quantile_values = [0.0, 0.5, 0.9, 0.99]
     include_max_quantile = bool(sweep_cfg.get("include_max_quantile", True))
+    floor_band_active = [] if threshold_mode == "quantile" else floor_band
     preview_prob_threshold = metrics_cfg.get("prob_threshold_onset", metrics_cfg.get("prob_threshold", 0.5))
     try:
         preview_prob_threshold = float(preview_prob_threshold)
@@ -1589,7 +1590,7 @@ def main():
             quantiles = _quantile_thresholds(
                 probs,
                 quantiles=quantile_values,
-                floor_band=floor_band,
+                floor_band=floor_band_active,
                 include_zero=True,
                 include_max=include_max_quantile,
             )

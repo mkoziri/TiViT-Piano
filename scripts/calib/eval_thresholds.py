@@ -1673,11 +1673,11 @@ def _parse_cli_args(argv: Sequence[str]):
     offset_platt_stats = _init_platt_stats(_platt_stats_enabled(offset_temperature, offset_bias))
 
     prob_grid_defaulted = False
+    desired_mode = str(args.threshold_mode or "absolute").strip().lower()
     if args.thresholds is None and args.prob_thresholds is None:
-        if args.head is not None or not args.calibration:
-            if (args.threshold_mode or "absolute") == "absolute":
-                args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
-                prob_grid_defaulted = True
+        if desired_mode not in {"quantile", "hybrid"} and (args.head is not None or not args.calibration):
+            args.prob_thresholds = DEFAULT_THRESHOLDS.copy()
+            prob_grid_defaulted = True
 
     args._prob_grid_defaulted = prob_grid_defaulted
 
@@ -3046,6 +3046,7 @@ def main():
     if not quantile_values:
         quantile_values = [0.0, 0.5, 0.9, 0.99]
     include_max_quantile = bool(sweep_cfg.get("include_max_quantile", True))
+    floor_band_active = [] if threshold_mode == "quantile" else floor_band
 
     calibration_data = None
     if args.calibration:
@@ -3242,11 +3243,12 @@ def main():
         threshold_mode in {"quantile", "hybrid"}
         and args.thresholds is None
         and args.offset_thresholds is None
-        and (prob_lists_missing or prob_grid_defaulted)
+        and prob_lists_missing
     )
     if threshold_mode in {"quantile", "hybrid"} and not should_quantile:
+        reason = "explicit thresholds provided" if not prob_lists_missing else "logit thresholds provided"
         _log_progress(
-            "[sweep] threshold_mode=%s ignored (explicit thresholds provided or calibration-only run)" % threshold_mode,
+            "[sweep] threshold_mode=%s ignored (%s)" % (threshold_mode, reason),
             force=True,
         )
     if should_quantile:
@@ -3259,14 +3261,14 @@ def main():
         onset_quantiles = _quantile_thresholds(
             onset_probs,
             quantiles=quantile_values,
-            floor_band=floor_band,
+            floor_band=floor_band_active,
             include_zero=True,
             include_max=include_max_quantile,
         )
         offset_quantiles = _quantile_thresholds(
             offset_probs,
             quantiles=quantile_values,
-            floor_band=floor_band,
+            floor_band=floor_band_active,
             include_zero=True,
             include_max=include_max_quantile,
         )
@@ -3338,8 +3340,8 @@ def main():
             if using_grid:
                 onset_set = set(onset_list)
                 offset_set = set(offset_list)
-                onset_set.update(floor_band)
-                offset_set.update(floor_band)
+                onset_set.update(floor_band_active)
+                offset_set.update(floor_band_active)
                 if onset_extend_needed:
                     onset_set.add(onset_lower_hint)
                     inserted_lower_onset = onset_lower_hint
@@ -3357,7 +3359,7 @@ def main():
                     if key not in pair_map:
                         pair_map[key] = (float(on_val), float(off_val))
 
-                for val in floor_band:
+                for val in floor_band_active:
                     _add_pair(val, val)
                 if onset_extend_needed:
                     _add_pair(onset_lower_hint, onset_lower_hint)
@@ -3398,9 +3400,9 @@ def main():
                     force=True,
                 )
             _log_progress(
-                f"[sweep] ensured floor band {', '.join(f'{v:.2f}' for v in sorted(floor_band))} in probability sweep.",
+                f"[sweep] ensured floor band {', '.join(f'{v:.2f}' for v in sorted(floor_band_active))} in probability sweep.",
                 force=True,
-            )
+            ) if floor_band_active else None
             if using_grid:
                 prob_desc = f"prob_grid:{len(onset_list)}x{len(offset_list)}"
             else:
@@ -3443,7 +3445,7 @@ def main():
     else:
         if per_head_mode == "prob" and per_head_sweep_vals is not None:
             values = set(float(v) for v in per_head_sweep_vals)
-            values.update(floor_band)
+            values.update(floor_band_active)
             inserted_lower = None
             if args.head == "offset":
                 lowest = min(values) if values else None

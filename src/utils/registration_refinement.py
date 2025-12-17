@@ -331,25 +331,84 @@ def _median_or_none(values: Sequence[float]) -> Optional[float]:
     return 0.5 * (arr[mid - 1] + arr[mid])
 
 
+def _base_scaling_homography(
+    source_hw: Sequence[int],
+    target_hw: Sequence[int],
+) -> np.ndarray:
+    """Return a pure scaling homography that maps ``source_hw`` -> ``target_hw``."""
+
+    if len(source_hw) < 2 or len(target_hw) < 2:
+        return np.eye(3, dtype=np.float32)
+    h_src, w_src = int(source_hw[0]), int(source_hw[1])
+    h_tgt, w_tgt = int(target_hw[0]), int(target_hw[1])
+    span_w_src = max(float(w_src - 1), 1.0)
+    span_h_src = max(float(h_src - 1), 1.0)
+    span_w_tgt = max(float(w_tgt - 1), 1.0)
+    span_h_tgt = max(float(h_tgt - 1), 1.0)
+    scale_x = span_w_tgt / max(span_w_src, 1e-6)
+    scale_y = span_h_tgt / max(span_h_src, 1e-6)
+    if not (math.isfinite(scale_x) and math.isfinite(scale_y)):
+        return np.eye(3, dtype=np.float32)
+    return np.array(
+        [
+            [scale_x, 0.0, 0.0],
+            [0.0, scale_y, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
 def _detect_baseline(gray: np.ndarray) -> Optional[Tuple[float, float]]:
     if cv2 is None:
         return None
-    edges = cv2.Canny(gray, 80, 160, apertureSize=3, L2gradient=True)
-    lines = cv2.HoughLines(edges, 1.0, np.pi / 180.0, threshold=max(80, int(gray.shape[1] * 0.4)))
+    if gray.ndim != 2:
+        return None
+    h, w = gray.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
+    gray_u8 = np.clip(gray, 0, 255).astype(np.uint8, copy=False)
+    if h >= 5:
+        gray_u8 = cv2.medianBlur(gray_u8, 5)
+
+    roi_start = int(max(0, math.floor(h * 0.35)))
+    roi = gray_u8[roi_start:, :] if roi_start < h else gray_u8
+    roi_arr = np.asarray(roi, dtype=np.float32)
+    roi_median = float(np.median(roi_arr)) if roi_arr.size > 0 else 0.0
+    lower = int(max(12, roi_median * 0.66))
+    upper = int(min(255, roi_median * 1.33 + 10))
+    if upper <= lower:
+        upper = min(255, lower + 24)
+
+    edges_roi = cv2.Canny(roi, lower, upper, apertureSize=3, L2gradient=True)
+    edges = np.zeros_like(gray_u8)
+    edges[roi_start:, :] = edges_roi
+
+    edge_density = float(np.count_nonzero(edges_roi)) / max(float(edges_roi.size), 1.0)
+    density_scale = np.clip(edge_density * 6.0, 0.35, 1.5)
+    hough_thresh = max(25, int(w * 0.25 * density_scale))
+    lines = cv2.HoughLines(edges, 1.0, np.pi / 180.0, threshold=hough_thresh)
     if lines is None:
         return None
 
     best: Optional[Tuple[float, float]] = None
-    best_votes = -1
+    best_score = -float("inf")
     for candidate in lines[:, 0]:
         rho, theta = float(candidate[0]), float(candidate[1])
-        # Horizontal line corresponds to theta approx pi/2
-        if abs(theta - (math.pi / 2.0)) > math.radians(25.0):
+        angle_dev = abs(theta - (math.pi / 2.0))
+        if angle_dev > math.radians(30.0):
             continue
-        votes = 1
-        if best is None or votes > best_votes:
+        sin_t = math.sin(theta)
+        cos_t = math.cos(theta)
+        if abs(sin_t) < 1e-6:
+            continue
+        intercept = rho / sin_t
+        # Prefer lower, near-horizontal lines.
+        score = intercept - angle_dev * 50.0
+        if score > best_score:
+            best_score = score
             best = (rho, theta)
-            best_votes = votes
 
     if best is None:
         return None
@@ -363,6 +422,18 @@ def _detect_baseline(gray: np.ndarray) -> Optional[Tuple[float, float]]:
     slope = -cos_t / sin_t
     intercept = rho / sin_t
     return slope, intercept
+
+
+def _estimate_baseline_from_profile(grad_y_profile: np.ndarray) -> Optional[int]:
+    if grad_y_profile.size == 0:
+        return None
+    smoothed = _gaussian_smooth_1d(grad_y_profile.astype(np.float32), kernel=7)
+    start = int(max(0, math.floor(smoothed.shape[0] * 0.35)))
+    focus = smoothed[start:]
+    if focus.size == 0:
+        return None
+    idx = int(np.argmax(focus))
+    return int(start + idx)
 
 
 def _gaussian_smooth_1d(data: np.ndarray, kernel: int = 9) -> np.ndarray:
@@ -1095,12 +1166,18 @@ class RegistrationRefiner:
         new_h, new_w = self.canonical_hw
         if min(old_h, old_w, new_h, new_w) <= 0:
             return None
+        try:
+            src_h, src_w = int(entry.source_hw[0]), int(entry.source_hw[1])  # type: ignore[index]
+        except Exception:
+            return None
+        if min(src_h, src_w) <= 0:
+            return None
         old_span_w = max(float(old_w - 1), 1.0)
         new_span_w = max(float(new_w - 1), 1.0)
         old_span_h = max(float(old_h - 1), 1.0)
         new_span_h = max(float(new_h - 1), 1.0)
-        scale_x = old_span_w / max(new_span_w, 1e-6)
-        scale_y = old_span_h / max(new_span_h, 1e-6)
+        scale_x = new_span_w / max(old_span_w, 1e-6)
+        scale_y = new_span_h / max(old_span_h, 1e-6)
         if not (math.isfinite(scale_x) and math.isfinite(scale_y)):
             return None
 
@@ -1113,13 +1190,24 @@ class RegistrationRefiner:
             dtype=np.float32,
         )
         homography = np.asarray(entry.homography, dtype=np.float32).reshape(3, 3)
-        entry.homography = (homography @ scale).astype(np.float32, copy=False)
+        entry.homography = (scale @ homography).astype(np.float32, copy=False)
         ratio_x = new_span_w / max(old_span_w, 1e-6)
         if entry.x_warp_ctrl is not None and getattr(entry.x_warp_ctrl, "size", 0) >= 2:
             ctrl = np.asarray(entry.x_warp_ctrl, dtype=np.float32).copy()
             ctrl[:, 0] = np.clip(ctrl[:, 0] * ratio_x, 0.0, float(new_w - 1))
             ctrl[:, 1] = np.clip(ctrl[:, 1] * ratio_x, 0.0, float(new_w - 1))
             entry.x_warp_ctrl = ctrl
+
+        if entry.status.startswith("fallback"):
+            expected = _base_scaling_homography((src_h, src_w), (new_h, new_w))
+            if expected.shape != (3, 3):
+                return None
+            base_norm = float(np.linalg.norm(expected))
+            delta_norm = float(np.linalg.norm(entry.homography - expected))
+            if not math.isfinite(delta_norm) or delta_norm > (0.1 * max(base_norm, 1e-6)):
+                return None
+            if entry.x_warp_ctrl is not None and entry.x_warp_ctrl.size > 0:
+                entry.x_warp_ctrl = None
 
         entry.target_hw = (int(new_h), int(new_w))
         entry.grid = None
@@ -1433,6 +1521,7 @@ class RegistrationRefiner:
             return result
 
         geometry_meta: Optional[Dict[str, Any]] = None
+        base_h = _base_scaling_homography((height, width), canonical)
         grayscale_frames: List[np.ndarray] = []
         slopes: List[float] = []
         intercepts: List[float] = []
@@ -1449,8 +1538,6 @@ class RegistrationRefiner:
             else:
                 gray = frame
             gray = gray.astype(np.uint8)
-            if cv2 is not None:
-                gray = cv2.medianBlur(gray, 5)
             baseline = _detect_baseline(gray)
             if baseline:
                 slopes.append(baseline[0])
@@ -1458,6 +1545,11 @@ class RegistrationRefiner:
             grayscale_frames.append(gray)
         if grayscale_frames:
             representative_frame = grayscale_frames[0]
+            stack = np.stack(grayscale_frames, axis=0)
+            avg_frame = np.median(stack, axis=0).astype(np.float32)
+            del stack
+        else:
+            avg_frame = np.zeros((height, width), dtype=np.float32)
         if debug_info is not None:
             debug_info["baseline"].update(
                 {
@@ -1468,12 +1560,33 @@ class RegistrationRefiner:
                 }
             )
 
-        slope = _median_or_none(slopes)
-        intercept = _median_or_none(intercepts)
+        baseline_source = None
+        slope = None
+        intercept = None
+        avg_frame_u8 = np.clip(avg_frame, 0, 255).astype(np.uint8, copy=False)
+        baseline_med = _detect_baseline(avg_frame_u8)
+        if baseline_med is not None:
+            slope, intercept = baseline_med
+            baseline_source = "median_frame"
+        if slope is None or intercept is None:
+            slope = _median_or_none(slopes)
+            intercept = _median_or_none(intercepts)
+            if slope is not None and intercept is not None:
+                baseline_source = "per_frame_median"
+
+        grad_x_profile, grad_y_profile = _aggregate_gradients(grayscale_frames)
+        if (slope is None or intercept is None) and grad_y_profile.size > 0:
+            baseline_row_guess = _estimate_baseline_from_profile(grad_y_profile)
+            if baseline_row_guess is not None:
+                slope = 0.0
+                intercept = float(baseline_row_guess)
+                baseline_source = "profile_peak"
         if slope is None or intercept is None:
             status = "fallback_no_baseline"
+            H_inv = _invert_homography(base_h)
+            grid = _homography_to_grid(H_inv, (height, width), canonical)
             result = RegistrationResult(
-                homography=np.eye(3, dtype=np.float32),
+                homography=base_h,
                 source_hw=(height, width),
                 target_hw=canonical,
                 err_before=0.0,
@@ -1487,6 +1600,7 @@ class RegistrationRefiner:
                 keyboard_height=float(canonical[0]),
                 timestamp=time.time(),
                 x_warp_ctrl=None,
+                grid=grid,
             )
             if debug_info is not None:
                 debug_info["decision"] = {"status": status, "reason": "no_baseline_detected"}
@@ -1499,27 +1613,24 @@ class RegistrationRefiner:
                     "worsened": False,
                 }
                 debug_info["baseline"]["reason"] = "no_baseline_detected"
+                debug_info["baseline"]["source"] = baseline_source or "missing"
                 result.debug_info = debug_info
             return result
 
         if debug_info is not None:
             debug_info["baseline"].update(
-                {"median_slope": float(slope), "median_intercept": float(intercept)}
+                {
+                    "median_slope": float(slope),
+                    "median_intercept": float(intercept),
+                    "source": baseline_source or "detected",
+                }
             )
-
-        if grayscale_frames:
-            stack = np.stack(grayscale_frames, axis=0)
-            avg_frame = np.median(stack, axis=0).astype(np.float32)
-            del stack
-        else:
-            avg_frame = np.zeros((height, width), dtype=np.float32)
-        grad_x_profile, grad_y_profile = _aggregate_gradients(grayscale_frames)
 
         edges, edge_strengths, x_left, x_right = _compute_keyboard_edges(grad_x_profile, width)
         canon_edges = np.linspace(0.0, float(canonical[1] - 1), edges.shape[0], dtype=np.float32)
 
-        scale_x = (canonical[1] - 1) / max(width - 1, 1)
-        scale_y = (canonical[0] - 1) / max(height - 1, 1)
+        scale_x = float(base_h[0, 0])
+        scale_y = float(base_h[1, 1])
         x_before = edges * scale_x
         err_before = float(np.mean(np.abs(x_before - canon_edges)))
 
@@ -1643,14 +1754,7 @@ class RegistrationRefiner:
             src_arr = src_arr[valid_mask]
             dst_arr = dst_arr[valid_mask]
             weights_arr = weights_arr[valid_mask]
-        base_h = np.array(
-            [
-                [scale_x, 0.0, 0.0],
-                [0.0, scale_y, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
+        base_h = np.asarray(base_h, dtype=np.float32)
 
         reg_lambda_val = 0.05
         status = "ok"
@@ -1860,6 +1964,16 @@ class RegistrationRefiner:
                     else:
                         H = H_candidate
 
+        err_after_raw = float(err_after)
+        if status == "ok" and err_after_raw > err_before + 1e-3:
+            status = "fallback_worsened"
+            refinement_stop_reason = refinement_stop_reason or "worsened_error"
+            err_after = err_before
+            err_white_edges = err_before
+            err_black_gaps = err_before if black_positions.size > 0 else 0.0
+            warp_ctrl = np.zeros((0, 2), dtype=np.float32)
+            H = base_h
+
         if status != "ok":
             err_after = err_before
             err_white_edges = err_before
@@ -1870,7 +1984,7 @@ class RegistrationRefiner:
             err_after = float(err_after)
 
         improvement = float(err_before - err_after)
-        worsened = bool(err_after > err_before + 1e-3)
+        worsened = bool(err_after_raw > err_before + 1e-3)
         if decision_reason == "":
             if status.startswith("fallback"):
                 decision_reason = refinement_stop_reason or status
@@ -1895,6 +2009,7 @@ class RegistrationRefiner:
             debug_info["metrics"] = {
                 "err_before": float(err_before),
                 "err_after": float(err_after),
+                "err_after_raw": float(err_after_raw),
                 "err_white_edges": float(err_white_edges),
                 "err_black_gaps": float(err_black_gaps),
                 "improvement": improvement,
