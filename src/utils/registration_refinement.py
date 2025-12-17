@@ -1819,11 +1819,17 @@ class RegistrationRefiner:
                             ctrl_order = np.argsort(warp_ctrl[:, 0])
                             pre = warp_ctrl[ctrl_order, 0]
                             post = warp_ctrl[ctrl_order, 1]
-                            white_after = np.interp(white_proj_x, pre, post, left=post[0], right=post[-1])
+                            white_after = np.asarray(
+                                np.interp(white_proj_x, pre, post, left=post[0], right=post[-1]),
+                                dtype=np.float32,
+                            )
                             white_after = np.clip(white_after, 0.0, float(canonical[1] - 1))
                             err_white_edges = float(np.mean(np.abs(white_after - canon_edges)))
                             if black_positions.size > 0 and black_proj_x.size == canon_black_positions.size:
-                                black_after = np.interp(black_proj_x, pre, post, left=post[0], right=post[-1])
+                                black_after = np.asarray(
+                                    np.interp(black_proj_x, pre, post, left=post[0], right=post[-1]),
+                                    dtype=np.float32,
+                                )
                                 black_after = np.clip(black_after, 0.0, float(canonical[1] - 1))
                                 err_black_gaps = float(np.mean(np.abs(black_after - canon_black_positions)))
                             if (
