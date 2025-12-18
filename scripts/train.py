@@ -1293,20 +1293,22 @@ def compute_loss_frame(
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
 
     # --- hand / clef CE at T' ---
-    ce = nn.CrossEntropyLoss(reduction="none")
+    ce_hand = nn.CrossEntropyLoss(reduction="none")
+    ce_clef = nn.CrossEntropyLoss()
     hand_target = hand_frame.reshape(B * T_logits)
     hand_logits_flat = hand_logit.reshape(B * T_logits, -1)
     if torch.is_tensor(hand_frame_mask):
         mask = hand_frame_mask.reshape(B * T_logits).to(device=hand_logits_flat.device, dtype=hand_logits_flat.dtype)
-        # clamp labels into valid range to avoid NaNs when mask=0
         hand_target = hand_target.clamp(min=0, max=hand_logits_flat.shape[-1] - 1)
-        hand_loss_elem = ce(hand_logits_flat, hand_target)
+        hand_loss_elem = ce_hand(hand_logits_flat, hand_target)
         supervised = mask.sum().clamp_min(1e-6)
         loss_hand = (hand_loss_elem * mask).sum() / supervised
     else:
-        loss_hand = ce(hand_logits_flat, hand_target)  # default mean
+        loss_hand = ce_hand(hand_logits_flat, hand_target).mean()
     loss_hand = loss_hand * float(weights.get("hand", 1.0))
-    loss_clef = ce(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
+    clef_logits_flat = clef_logit.reshape(B * T_logits, -1)
+    clef_target = clef_frame.reshape(B * T_logits)
+    loss_clef = ce_clef(clef_logits_flat, clef_target) * float(weights.get("clef", 1.0))
 
     # --- total + optional activation prior ---
     total = loss_pitch + loss_onset + loss_offset + loss_hand + loss_clef
