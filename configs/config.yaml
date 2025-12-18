@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoVAM_quantile
+  name: TiViT-Piano_PianoVAM_hand
   seed: 1332
   deterministic: true
   output_dir: outputs
@@ -80,13 +80,13 @@ dataset:
     cache_dir: .cache/labels
     targets_sparse: true
   hand_supervision:
-    enable: false          # default off for backward compatibility
+    enable: true          # default off for backward compatibility
     min_confidence: 0.05
     time_tolerance: 0.05
     max_dx: 0.12
     min_points: 4
     reach:
-      enable: false
+      enable: true
       radius: 0.12
       dilate_margin: 0.02
       min_points: 4
@@ -103,7 +103,7 @@ model:
     tube_size: 2
     d_model: 192
     num_heads: 3
-    depth_temporal: 2 #it was 1
+    depth_temporal: 1
     depth_spatial: 1
     depth_global: 1
     global_tokens: 2
@@ -136,8 +136,8 @@ training:
   log_interval: 25
   save_every: 1
   amp: false
-  resume: true
-  reset_head_bias: false
+  resume: false
+  reset_head_bias: true
   bias_seed:
     onoff_prior_mean: 0.012
   soft_targets:
@@ -194,8 +194,8 @@ training:
     hand: 0.3
     clef: 0.3
   hand_gating:
-    mode: off            # off | loss_reweight
-    strength: 1.0
+    mode: loss_reweight            # off | loss_reweight
+    strength: 0.75 # 1.0
   metrics:
     prob_threshold: 0.2
     prob_threshold_onset: 0.2

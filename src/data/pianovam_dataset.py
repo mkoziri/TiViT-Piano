@@ -239,6 +239,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
         avlag_disabled: Optional[bool] = None,
     ):
         dataset_cfg = dict(dataset_cfg or {})
+        self.hand_supervision_cfg: Dict[str, Any] = dict(dataset_cfg.get("hand_supervision", {}) or {})
         resolved_root = _expand_root(root_dir or (dataset_cfg or {}).get("root_dir"))
         metadata = _load_metadata(resolved_root)
 
@@ -337,8 +338,6 @@ class PianoVAMDataset(yt.PianoYTDataset):
 
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)
-        self.hand_supervision_cfg: Dict[str, Any] = dict(dataset_cfg.get("hand_supervision", {}) or {})
-
     def _build_sample(  # type: ignore[override]
         self,
         record_idx: int,
