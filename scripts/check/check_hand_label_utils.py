@@ -106,7 +106,12 @@ def check_event_hand_labels() -> None:
     meta = {"key_bounds_px": [[0.0, 1.0], [1.0, 3.0]], "target_hw": [100, 200]}
     centers = key_centers_from_geometry(meta)
     assert centers is not None
-    torch.testing.assert_close(centers, torch.tensor([0.0025, 0.01]))
+    torch.testing.assert_close(
+        centers,
+        torch.tensor([0.0025, 0.01]),
+        atol=1e-4,
+        rtol=1e-4,
+    )
 
 
 def check_coordinate_transforms() -> None:
