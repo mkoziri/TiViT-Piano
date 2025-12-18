@@ -1,5 +1,5 @@
 experiment:
-  name: TiViT-Piano_PianoVAM_hand
+  name: TiViT-Piano_PianoVAM_cache
   seed: 1332
   deterministic: true
   output_dir: outputs

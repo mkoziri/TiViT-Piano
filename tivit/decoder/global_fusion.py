@@ -11,11 +11,11 @@ import torch
 
 from .tile_keymap import TileMaskResult, build_tile_key_mask
 from .registration_geometry import build_canonical_registration_metadata
+from .tile_support_cache import CacheScope, TileSupportCache, make_tile_cache_key
 from utils.identifiers import canonical_video_id
 from utils.registration_refinement import RegistrationRefiner
 
 _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
-_FALLBACK_CACHE_KEY = "__fallback__"
 _REG_LOOKUP_LOGGED: Set[str] = set()
 _CACHE_PROBE_LOGGED = False
 
@@ -39,16 +39,16 @@ def _metadata_width_hint(payload: Optional[Mapping[str, Any]]) -> Optional[float
     return None
 
 
-def _registration_cache_key(clip_id: Optional[str]) -> Optional[str]:
-    if clip_id is None:
+def _registration_cache_key(video_uid: Optional[str]) -> Optional[str]:
+    if video_uid is None:
         return None
-    key = canonical_video_id(clip_id)
+    key = canonical_video_id(video_uid)
     key = key.strip()
     if not key:
         return None
-    if clip_id not in _REG_LOOKUP_LOGGED:
-        print(f"[fusion] registration lookup dataset_id={clip_id} cache_key={key}", flush=True)
-        _REG_LOOKUP_LOGGED.add(clip_id)
+    if video_uid not in _REG_LOOKUP_LOGGED:
+        print(f"[fusion] registration lookup dataset_id={video_uid} cache_key={key}", flush=True)
+        _REG_LOOKUP_LOGGED.add(video_uid)
     return key
 
 
@@ -292,21 +292,33 @@ def resolve_global_fusion_config(decoder_cfg: Optional[Mapping[str, Any]]) -> Gl
 
 
 def resolve_tile_key_mask(
-    clip_id: Optional[str],
+    video_uid: Optional[str],
     *,
+    cache: TileSupportCache,
+    cache_scope: CacheScope,
     reg_meta_cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     reg_refiner: Optional[RegistrationRefiner] = None,
-    mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
     n_keys: int,
+    canonical_hw: Optional[Tuple[int, int]] = None,
 ) -> TileMaskResult:
+    if cache is None:
+        raise ValueError("TileSupportCache instance is required for resolve_tile_key_mask")
     reg_meta_cache = reg_meta_cache or {}
-    lookup_key = _registration_cache_key(clip_id) if clip_id else None
-    cache_key = lookup_key or clip_id or f"{_FALLBACK_CACHE_KEY}_{n_keys}"
-    if cache_key in mask_cache:
-        return mask_cache[cache_key]
-    reg_meta_key = lookup_key or clip_id
+    lookup_key = _registration_cache_key(video_uid) if video_uid else None
+    key_hw = canonical_hw or getattr(reg_refiner, "canonical_hw", None)
+    cache_key = make_tile_cache_key(
+        lookup_key,
+        num_tiles=num_tiles,
+        cushion_keys=cushion_keys,
+        n_keys=n_keys,
+        canonical_hw=key_hw,
+    )
+    cached = cache.get(cache_scope, cache_key)
+    if cached is not None:
+        return cached
+    reg_meta_key = lookup_key or video_uid
     reg_meta = reg_meta_cache.get(reg_meta_key) if reg_meta_key else None
     if reg_meta is None and reg_meta_key and reg_refiner is not None:
         reg_meta = reg_refiner.get_geometry_metadata(reg_meta_key)
@@ -321,7 +333,7 @@ def resolve_tile_key_mask(
     )
     synthetic_used = False
     synthetic_attempted = False
-    if (not result.registration_based) and clip_id and reg_refiner is not None:
+    if (not result.registration_based) and video_uid and reg_refiner is not None:
         reason = result.fallback_reason or "unknown"
         if reason in {"missing_key_geometry", "missing_tile_bounds"}:
             synthetic_attempted = True
@@ -338,7 +350,7 @@ def resolve_tile_key_mask(
                 n_keys=n_keys,
             )
             synthetic_used = result.registration_based
-    if (not result.registration_based) and clip_id:
+    if (not result.registration_based) and video_uid:
         reason = result.fallback_reason or "unknown"
         if not lookup_attempted:
             cache_state = "skipped"
@@ -352,7 +364,7 @@ def resolve_tile_key_mask(
         refiner_entries = reg_refiner.cache_size if reg_refiner is not None else len(reg_meta_cache)
         print(
             "[fusion] fallback coverage clip={} query_key={} cache_state={} reason={} geometry_source={} tile_source={} refiner_entries={}".format(
-                clip_id,
+                video_uid,
                 query,
                 cache_state,
                 reason,
@@ -364,9 +376,9 @@ def resolve_tile_key_mask(
         )
         if reg_refiner is not None and refiner_entries > 0:
             _log_cache_probe_once(reg_refiner)
-    elif synthetic_used and clip_id:
-        print(f"[fusion] synthesized registration metadata clip={clip_id} modality=canonical", flush=True)
-    mask_cache[cache_key] = result
+    elif synthetic_used and video_uid:
+        print(f"[fusion] synthesized registration metadata clip={video_uid} modality=canonical", flush=True)
+    cache.put(cache_scope, cache_key, result)
     return result
 
 
@@ -377,29 +389,33 @@ class TileMaskBatch:
 
 
 def build_batch_tile_mask(
-    clip_ids: Sequence[Optional[str]],
+    video_uids: Sequence[Optional[str]],
     *,
+    cache: TileSupportCache,
+    cache_scope: CacheScope = "train",
     reg_meta_cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     reg_refiner: Optional[RegistrationRefiner] = None,
-    mask_cache: MutableMapping[str, TileMaskResult],
     num_tiles: int,
     cushion_keys: int,
     n_keys: int,
+    canonical_hw: Optional[Tuple[int, int]] = None,
 ) -> TileMaskBatch:
-    if not clip_ids:
+    if not video_uids:
         empty = torch.zeros((0, num_tiles, n_keys), dtype=torch.float32)
         return TileMaskBatch(tensor=empty, records=[])
     masks: List[np.ndarray] = []
     records: List[TileMaskResult] = []
-    for clip_id in clip_ids:
+    for video_uid in video_uids:
         record = resolve_tile_key_mask(
-            clip_id,
+            video_uid,
+            cache=cache,
+            cache_scope=cache_scope,
             reg_meta_cache=reg_meta_cache,
             reg_refiner=reg_refiner,
-            mask_cache=mask_cache,
             num_tiles=num_tiles,
             cushion_keys=cushion_keys,
             n_keys=n_keys,
+            canonical_hw=canonical_hw,
         )
         records.append(record)
         masks.append(record.mask.astype(np.float32))

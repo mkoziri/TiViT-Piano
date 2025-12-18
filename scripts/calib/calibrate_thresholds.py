@@ -84,7 +84,7 @@ from tivit.decoder.global_fusion import (
     build_batch_tile_mask,
     fuse_tile_logits,
 )
-from tivit.decoder.tile_keymap import TileMaskResult
+from tivit.decoder.tile_support_cache import TileSupportCache
 from utils import load_config, align_pitch_dim, configure_verbosity, canonical_video_id
 from utils.time_grid import frame_to_sec
 from data import make_dataloader
@@ -622,7 +622,7 @@ def _collect(
     comparison_enabled = fusion_cfg.consistency_check and fusion_cfg.consistency_batches > 0
     comparison_batches_used = 0
     stageb_shape_logged = False
-    tile_mask_cache: Dict[str, TileMaskResult] = {}
+    tile_mask_cache = TileSupportCache()
     effective_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
     if fusion_enabled and not effective_meta_cache:
         reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
@@ -708,10 +708,12 @@ def _collect(
                     clip_ids,
                     reg_meta_cache=effective_meta_cache,
                     reg_refiner=registration_refiner,
-                    mask_cache=tile_mask_cache,
+                    cache=tile_mask_cache,
+                    cache_scope="eval",
                     num_tiles=model_tiles,
                     cushion_keys=fusion_cfg.cushion_keys,
                     n_keys=int(onset_tile.shape[-1]),
+                    canonical_hw=getattr(registration_refiner, "canonical_hw", None),
                 )
                 tile_mask_tensor = tile_mask_batch.tensor
                 mask_device = onset_tile.device

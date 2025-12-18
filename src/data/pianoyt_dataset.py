@@ -1504,6 +1504,7 @@ class PianoYTDataset(Dataset):
         sample["lag_ms"] = lag_ms_int
         sample["lag_source"] = lag_source
         sample["clip_id"] = video_id  # keep canonical id handy for per-tile geometry lookups
+        sample["video_uid"] = video_id  # stable per-video id used by shared caches
         if self.split != "train":
             sample["lag_flags"] = tuple(sorted(lag_flags)) if lag_flags else tuple()
             sample["lag_corr"] = lag_corr_val if lag_corr_val is not None else float("nan")

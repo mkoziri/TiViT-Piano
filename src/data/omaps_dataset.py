@@ -1009,6 +1009,7 @@ class OMAPSDataset(Dataset):
         sample["lag_ms"] = lag_ms_int
         sample["lag_source"] = lag_source
         sample["clip_id"] = video_id  # propagated so training can fetch per-tile masks
+        sample["video_uid"] = video_id  # stable per-video id used by shared caches
         return sample
 
     def _log_missing_labels_once(self, path: Path) -> None:

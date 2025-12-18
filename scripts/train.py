@@ -72,6 +72,7 @@ from decoder.decode import (
     resolve_decoder_gates,
 )
 from tivit.decoder.global_fusion import build_batch_tile_mask
+from tivit.decoder.tile_support_cache import CacheScope, TileSupportCache
 from theory.key_prior_runtime import (
     resolve_key_prior_settings,
     apply_key_prior_to_logits,
@@ -366,7 +367,7 @@ class OnOffPosWeightEMA:
 
 def _resolve_batch_clip_ids(batch: Mapping[str, Any], batch_size: int) -> List[Optional[str]]:
     """Resolve canonical clip IDs for a batch to drive registration lookups."""
-    id_fields = ("clip_id", "clip_ids", "video_id", "video_ids")
+    id_fields = ("video_uid", "video_uids", "clip_id", "clip_ids", "video_id", "video_ids")
     for field in id_fields:
         value = batch.get(field) if isinstance(batch, Mapping) else None
         if value is None:
@@ -456,7 +457,15 @@ class PerTileDebugAggregator:
 class PerTileSupport:
     """Resolve tile masks and aggregate diagnostics for per-tile training."""
 
-    def __init__(self, cfg: Mapping[str, Any], dataset, *, phase: str) -> None:
+    def __init__(
+        self,
+        cfg: Mapping[str, Any],
+        dataset,
+        *,
+        phase: str,
+        tile_cache: Optional[TileSupportCache] = None,
+        reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
         training_cfg = cfg.get("training", {})
         per_tile_cfg = training_cfg.get("per_tile", {}) or {}
         self.enabled = bool(per_tile_cfg.get("enabled"))
@@ -472,8 +481,9 @@ class PerTileSupport:
             self.mask_cushion = int(cushion_override)
         model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), Mapping) else {}
         self.tiles = int(model_cfg.get("tiles", 3) or 3)
-        self.mask_cache: Dict[str, Any] = {}
-        self.reg_meta_cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_scope: CacheScope = "eval" if str(phase).lower() == "eval" else "train"
+        self.tile_cache = tile_cache if tile_cache is not None else TileSupportCache()
+        self.reg_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
         dataset_ref = dataset if dataset is not None else object()
         self.reg_refiner = getattr(dataset_ref, "registration_refiner", None)
         debug_cfg = per_tile_cfg.get("debug", {}) or {}
@@ -509,15 +519,18 @@ class PerTileSupport:
         }
 
     def _build_mask(self, batch: Mapping[str, Any], *, batch_size: int, key_dim: int) -> torch.Tensor:
-        clip_ids = _resolve_batch_clip_ids(batch, batch_size)
+        video_uids = _resolve_batch_clip_ids(batch, batch_size)
+        canonical_hw = getattr(self.reg_refiner, "canonical_hw", None)
         tile_mask_batch = build_batch_tile_mask(
-            clip_ids,
+            video_uids,
+            cache=self.tile_cache,
+            cache_scope=self.cache_scope,
             reg_meta_cache=self.reg_meta_cache,
             reg_refiner=self.reg_refiner,
-            mask_cache=self.mask_cache,
             num_tiles=self.tiles,
             cushion_keys=self.mask_cushion,
             n_keys=key_dim,
+            canonical_hw=canonical_hw,
         )
         return tile_mask_batch.tensor
 
@@ -2485,6 +2498,23 @@ def evaluate_one_epoch(
     per_tile_support: Optional[PerTileSupport] = None,
 ):
     
+    cache_for_eval = getattr(per_tile_support, "tile_cache", None) if per_tile_support is not None else None
+
+    def _clear_eval_cache(label: str) -> None:
+        if cache_for_eval is None:
+            return
+        counts_before = cache_for_eval.counts()
+        cleared = cache_for_eval.clear_eval()
+        counts_after = cache_for_eval.counts()
+        logger.info(
+            "[per-tile-cache] clear_eval phase=%s shared=%d eval=%d->%d cleared=%d",
+            label,
+            counts_before.shared,
+            counts_before.eval,
+            counts_after.eval,
+            cleared,
+        )
+
     summary = _targets_summary(loader)
     if summary:
         logger.info(summary)
@@ -3768,6 +3798,7 @@ def evaluate_one_epoch(
         timeout_label = int(round(timeout_seconds / 60.0)) if timeout_seconds > 0 else 0
         print(f"[train:eval] timeout after {timeout_label}m; skipping metrics", flush=True)
         logger.warning("[train:eval] timeout after %sm; skipping metrics", timeout_label)
+        _clear_eval_cache("timeout")
         return None
     have_valid_metrics = valid_clip_counter > 0
 
@@ -4000,6 +4031,7 @@ def evaluate_one_epoch(
     }
     _store_inner_eval_cache(cache_payload)
 
+    _clear_eval_cache("complete")
     return val_metrics
 
 def main():
@@ -4080,8 +4112,17 @@ def main():
     val_split = args.val_split or cfg["dataset"].get("split_val") or cfg["dataset"].get("split") or "val"
     train_loader = make_dataloader(cfg, split=train_split, seed=seed)
     train_base_dataset = _unwrap_dataset(getattr(train_loader, "dataset", train_loader))
+    # Shared tile/key cache reused across train and eval to avoid duplication.
+    tile_support_cache = TileSupportCache()
+    shared_reg_meta_cache: Dict[str, Dict[str, Any]] = {}
     # Helper that wires tile→key masks plus optional debug summaries into the training step.
-    per_tile_train_support = PerTileSupport(cfg, train_base_dataset, phase="train")
+    per_tile_train_support = PerTileSupport(
+        cfg,
+        train_base_dataset,
+        phase="train",
+        tile_cache=tile_support_cache,
+        reg_meta_cache=shared_reg_meta_cache,
+    )
 
     # If you have a dedicated val split, use it; otherwise reuse "test" as a stand-in.
     val_loader = None
@@ -4102,7 +4143,13 @@ def main():
         val_loader = _prepare_inner_eval_loader(cfg, val_loader)
         val_base_dataset = _unwrap_dataset(getattr(val_loader, "dataset", val_loader))
         # Mirrors the train-side helper so inner eval can materialize the same masks/logging.
-        per_tile_eval_support = PerTileSupport(cfg, val_base_dataset, phase="eval")
+        per_tile_eval_support = PerTileSupport(
+            cfg,
+            val_base_dataset,
+            phase="eval",
+            tile_cache=tile_support_cache,
+            reg_meta_cache=shared_reg_meta_cache,
+        )
     
     # Model & optimizer
     model = build_model(cfg)

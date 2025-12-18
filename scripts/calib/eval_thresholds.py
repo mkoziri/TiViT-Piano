@@ -88,7 +88,7 @@ from tivit.decoder.global_fusion import (
     build_batch_tile_mask,
     fuse_tile_logits,
 )
-from tivit.decoder.tile_keymap import TileMaskResult
+from tivit.decoder.tile_support_cache import TileSupportCache
 from utils import load_config, align_pitch_dim, configure_verbosity
 from utils.logging_utils import QUIET_INFO_FLAG
 from utils.identifiers import canonical_video_id
@@ -430,7 +430,7 @@ def _process_per_tile_outputs(
     backend_label: str,
     preview_prob_threshold: float,
     tile_preview_stats: Dict[str, Any],
-    tile_key_mask_cache: Dict[str, TileMaskResult],
+    tile_key_mask_cache: TileSupportCache,
     tile_key_mask_cushion: int,
     reg_meta_cache: MutableMapping[str, Dict[str, Any]],
     reg_refiner: Optional[RegistrationRefiner],
@@ -508,12 +508,14 @@ def _process_per_tile_outputs(
         key_dim = int(onset_tile.shape[-1])
         tile_mask_batch = build_batch_tile_mask(
             clip_ids,
+            cache=tile_key_mask_cache,
+            cache_scope="eval",
             reg_meta_cache=reg_meta_cache,
             reg_refiner=reg_refiner,
-            mask_cache=tile_key_mask_cache,
             num_tiles=model_tiles,
             cushion_keys=tile_key_mask_cushion,
             n_keys=key_dim,
+            canonical_hw=getattr(reg_refiner, "canonical_hw", None),
         )
         tile_mask_tensor = tile_mask_batch.tensor
         records = tile_mask_batch.records
@@ -2013,7 +2015,7 @@ def _collect_logits(
     skipped_batches = 0
 
     tile_boundary_hist: Counter[int] = Counter()
-    tile_key_mask_cache: Dict[str, TileMaskResult] = {}
+    tile_key_mask_cache = TileSupportCache()
     tile_preview_stats = {"max_abs_diff": 0.0, "max_f1_delta": 0.0, "count": 0}
     tile_key_mask_cushion = fusion_cfg.cushion_keys if fusion_enabled else 2
     per_tile_shape_logged = False
