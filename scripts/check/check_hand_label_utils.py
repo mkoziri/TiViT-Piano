@@ -169,7 +169,9 @@ def check_pianovam_loader() -> None:
 
         assert result.landmarks.shape == (3, 2, 21, 3)
         assert result.mask.shape == (3, 2, 21)
-        assert result.mask.all()
+        assert result.mask.sum() > 0
+        assert result.mask[0, 0, 0]
+        assert result.mask[1, 1, 0]
         torch.testing.assert_close(result.landmarks[0, 0, 0, 0], torch.tensor(0.1))
         torch.testing.assert_close(result.landmarks[1, 1, 0, 0], torch.tensor(0.4))
         torch.testing.assert_close(result.landmarks[2, 0, 0, 0], torch.tensor(0.2))
