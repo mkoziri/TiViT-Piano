@@ -329,6 +329,11 @@ def build_dense_frame_targets(
             x = F.conv1d(x, ker, padding=dilate_active_frames)
             roll.copy_((x.squeeze(1) > 0).transpose(0, 1).float())
 
+    # Hand head consumes 2-way per-frame labels (0=left, 1=right) and the
+    # current implementation feeds it pseudo-supervision inferred from MIDI.
+    # With no hand annotations available, we average active note pitches per
+    # frame and threshold them (clef thresholds below) to decide left/right;
+    # the resulting heuristic hand_frame drives both the hand loss/metric.
     if hand_from_pitch:
         active = pitch_roll > 0
         pitch_ids = torch.arange(P, dtype=torch.float32) + float(note_min)

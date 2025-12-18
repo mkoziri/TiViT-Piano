@@ -26,10 +26,19 @@ from torch.utils.data import DataLoader
 from utils.determinism import DEFAULT_SEED, make_loader_components
 from utils.frame_targets import resolve_frame_target_spec, resolve_soft_target_config
 from utils.identifiers import canonical_video_id
+from utils.registration_refinement import RegistrationRefiner
 
 import src.data.pianoyt_dataset as yt
 from src.data.pianoyt_dataset import SampleBuildResult
 from .sampler_utils import build_onset_balanced_sampler
+from hand_labels import (
+    EventHandLabelConfig,
+    build_event_hand_labels,
+    key_centers_from_geometry,
+    load_pianovam_hand_landmarks,
+    map_landmarks_to_canonical,
+)
+from hand_labels.hand_reach import compute_hand_reach
 
 LOGGER = logging.getLogger(__name__)
 
@@ -151,7 +160,7 @@ def _split_matches(requested: str, meta_split: str) -> bool:
     return req == meta
 
 
-def _resolve_media_paths(root: Path, record_id: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
+def _resolve_media_paths_local(root: Path, record_id: str) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
     """Return video, midi, tsv paths for ``record_id``."""
 
     vid = root / "Video" / f"{record_id}.mp4"
@@ -229,6 +238,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
         only_video: Optional[str] = None,
         avlag_disabled: Optional[bool] = None,
     ):
+        dataset_cfg = dict(dataset_cfg or {})
         resolved_root = _expand_root(root_dir or (dataset_cfg or {}).get("root_dir"))
         metadata = _load_metadata(resolved_root)
 
@@ -255,8 +265,12 @@ class PianoVAMDataset(yt.PianoYTDataset):
         # Pre-compute TSV paths per canonical id for later attachment to samples.
         self._tsv_by_canon: Dict[str, Optional[Path]] = {}
         for canon_id, rec_id in id_map.items():
-            _, _, tsv_path = _resolve_media_paths(resolved_root, rec_id)
+            _, _, tsv_path = _resolve_media_paths_local(resolved_root, rec_id)
             self._tsv_by_canon[canon_id] = tsv_path
+        self._hands_by_canon: Dict[str, Optional[Path]] = {}
+        for canon_id, rec_id in id_map.items():
+            hand_path = resolved_root / "Handskeleton" / f"{rec_id}.json"
+            self._hands_by_canon[canon_id] = hand_path if hand_path.exists() else None
 
         # Monkeypatch PianoYT split/media resolution to respect PianoVAM layout.
         orig_expand_root = yt._expand_root
@@ -273,7 +287,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
 
         def _pv_resolve_media_paths(root: Path, split_name: str, video_id: str):
             rec_id = id_map.get(canonical_video_id(video_id), video_id)
-            vid_path, midi_path, tsv_path = _resolve_media_paths(root, rec_id)
+            vid_path, midi_path, tsv_path = _resolve_media_paths_local(root, rec_id)
             label_path = tsv_path if tsv_path is not None else midi_path
             if label_path is midi_path and tsv_path is None and midi_path is not None:
                 canon_id = canonical_video_id(rec_id)
@@ -323,6 +337,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
 
         self.dataset_name = "pianovam"
         self.root = Path(resolved_root)
+        self.hand_supervision_cfg: Dict[str, Any] = dict(dataset_cfg.get("hand_supervision", {}) or {})
 
     def _build_sample(  # type: ignore[override]
         self,
@@ -332,6 +347,7 @@ class PianoVAMDataset(yt.PianoYTDataset):
         preferred_start_idx: Optional[int] = None,
         audit: bool = False,
     ) -> SampleBuildResult:
+        hand_cfg = self.hand_supervision_cfg
         result = super()._build_sample(
             record_idx,
             dataset_index,
@@ -344,7 +360,134 @@ class PianoVAMDataset(yt.PianoYTDataset):
             tsv_path = self._tsv_by_canon.get(canon)
             if tsv_path is not None:
                 result.sample["tsv_path"] = str(tsv_path)
+            hand_path = self._hands_by_canon.get(canon)
+            if hand_path is not None and hand_cfg.get("enable", False) and not audit:
+                try:
+                    self._attach_hand_targets(
+                        sample=result.sample,
+                        hand_json=hand_path,
+                        video_id=canon,
+                        clip_start_sec=float(result.start_idx) / max(float(self.decode_fps), 1e-6),
+                        T=self.frames,
+                        stride=self.stride,
+                        decode_fps=self.decode_fps,
+                    )
+                except Exception as exc:  # pragma: no cover - fail soft
+                    LOGGER.debug("[PianoVAM] hand label attach failed for %s: %s", canon, exc)
         return result
+
+    def _attach_hand_targets(
+        self,
+        *,
+        sample: Dict[str, Any],
+        hand_json: Path,
+        video_id: str,
+        clip_start_sec: float,
+        T: int,
+        stride: int,
+        decode_fps: float,
+    ) -> None:
+        """Attach hand labels/reach to a sample using Handskeleton JSON."""
+
+        cfg = self.hand_supervision_cfg
+        min_conf = float(cfg.get("min_confidence", 0.05))
+        time_tol = float(cfg.get("time_tolerance", stride / max(decode_fps, 1e-6)))
+        max_dx = float(cfg.get("max_dx", 0.12))
+        min_pts = int(cfg.get("min_points", 4))
+
+        # Load hands aligned to clip grid (native coords).
+        aligned = load_pianovam_hand_landmarks(
+            hand_json,
+            clip_start_sec=clip_start_sec,
+            frames=T,
+            stride=stride,
+            decode_fps=decode_fps,
+            min_confidence=min_conf,
+            time_tolerance=time_tol,
+        )
+
+        reg_refiner = getattr(self, "registration_refiner", None)
+        reg_payload = None
+        if isinstance(reg_refiner, RegistrationRefiner):
+            reg_payload = reg_refiner.get_cache_entry_payload(video_id)
+
+        # Estimate source_hw for crop translation: prefer registration source, else video tensor size.
+        raw_hw = sample["video"].shape[-2:] if isinstance(sample.get("video"), torch.Tensor) else None
+        if raw_hw:
+            source_hw = (int(raw_hw[0]), int(raw_hw[1]))
+        elif reg_payload and isinstance(reg_payload.get("source_hw"), list) and len(reg_payload["source_hw"]) >= 2:
+            source_hw = (int(reg_payload["source_hw"][0]), int(reg_payload["source_hw"][1]))
+        else:
+            source_hw = (aligned.landmarks.shape[-2], aligned.landmarks.shape[-3]) if aligned.landmarks.dim() >= 3 else (0, 0)
+
+        crop_meta = self.metadata.get(video_id)
+        canonical = map_landmarks_to_canonical(
+            aligned,
+            registration=reg_payload,
+            source_hw=source_hw,
+            crop_meta=crop_meta,
+        )
+
+        key_centers = None
+        if reg_payload is not None:
+            key_centers = key_centers_from_geometry(reg_payload.get("geometry_meta"))
+
+        labels_tensor = sample.get("labels")
+        if key_centers is not None and torch.is_tensor(labels_tensor) and labels_tensor.numel() > 0:
+            onsets = labels_tensor[:, 0]
+            pitches = labels_tensor[:, 2].to(torch.int64) - 21  # MIDI 21->0
+            valid_keys = (pitches >= 0) & (pitches < key_centers.numel())
+            onsets = onsets[valid_keys]
+            pitches = pitches[valid_keys]
+            cfg_obj = EventHandLabelConfig(
+                time_tolerance=time_tol,
+                max_dx=max_dx,
+                min_points=min_pts,
+                unknown_class=0,
+            )
+            evt_labels = build_event_hand_labels(
+                onsets_sec=onsets,
+                key_indices=pitches,
+                key_centers_norm=key_centers,
+                frame_times=aligned.frame_times,
+                canonical=canonical,
+                config=cfg_obj,
+            )
+
+            # Project event labels to frame grid: closest frame wins; conflicts drop mask.
+            frame_lab = torch.zeros((T,), dtype=torch.long)
+            frame_mask = torch.zeros((T,), dtype=torch.bool)
+            for onset, lbl, valid in zip(onsets.tolist(), evt_labels.labels.tolist(), evt_labels.mask.tolist()):
+                if not valid:
+                    continue
+                idx = int(torch.abs(aligned.frame_times - float(onset)).argmin().item())
+                if idx < 0 or idx >= T:
+                    continue
+                if not frame_mask[idx]:
+                    frame_lab[idx] = int(lbl)
+                    frame_mask[idx] = True
+                elif frame_lab[idx] != int(lbl):
+                    frame_lab[idx] = 0
+                    frame_mask[idx] = False
+
+            sample["hand_frame"] = frame_lab
+            sample["hand_frame_mask"] = frame_mask
+            sample["hand_coverage"] = evt_labels.coverage
+            sample["hand_events"] = evt_labels.labels
+            sample["hand_event_mask"] = evt_labels.mask
+
+        reach_cfg = cfg.get("reach", {}) or {}
+        if reach_cfg.get("enable", False) and key_centers is not None:
+            reach = compute_hand_reach(
+                canonical,
+                key_centers_norm=key_centers,
+                radius=float(reach_cfg.get("radius", 0.12)),
+                dilate=float(reach_cfg.get("dilate_margin", 0.02)),
+                min_points=int(reach_cfg.get("min_points", min_pts)),
+            )
+            sample["hand_reach"] = reach.reach
+            sample["hand_reach_valid"] = reach.valid
+            sample["hand_reach_coverage"] = reach.coverage
 
 
 def make_dataloader(

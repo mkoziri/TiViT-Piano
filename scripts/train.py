@@ -619,6 +619,13 @@ def _interp_labels_BT(x_bt, Tprime):
     x = F.interpolate(x, size=Tprime, mode="nearest")
     return x.squeeze(1).long()             # (B,T')
 
+
+def _interp_mask_BT(mask_bt, Tprime):
+    """Interpolate a (B,T) mask to T' using nearest sampling."""
+    m = mask_bt.float().unsqueeze(1)
+    m = F.interpolate(m, size=Tprime, mode="nearest")
+    return (m.squeeze(1) > 0.5)
+
 # --- helper: normalize DataLoader returns -----------------------------------
 def _pick_loader(obj, split_key=None):
     """
@@ -1007,6 +1014,7 @@ def compute_loss_frame(
     *,
     update_stats: bool = True,
     per_tile: Optional[Mapping[str, Any]] = None,
+    hand_gating: Optional[Mapping[str, Any]] = None,
 ):
     """
     Frame-level objective with the repo's time alignment:
@@ -1040,6 +1048,9 @@ def compute_loss_frame(
     offset_roll  = batch["offset_roll"].float()  # (B,T,P)
     hand_frame   = batch["hand_frame"].long()    # (B,T)
     clef_frame   = batch["clef_frame"].long()    # (B,T)
+    hand_frame_mask = batch.get("hand_frame_mask")
+    hand_reach = batch.get("hand_reach")
+    hand_reach_valid = batch.get("hand_reach_valid")
     T_targets = pitch_roll.shape[1]
 
     # --- time alignment: T -> T' (keep your repo behavior) ---
@@ -1049,6 +1060,13 @@ def compute_loss_frame(
         offset_roll = pool_roll_BT(offset_roll, T_logits)
         hand_frame  = _interp_labels_BT(hand_frame, T_logits)
         clef_frame  = _interp_labels_BT(clef_frame, T_logits)
+        if torch.is_tensor(hand_frame_mask):
+            hand_frame_mask = _interp_mask_BT(hand_frame_mask, T_logits)
+        if torch.is_tensor(hand_reach):
+            hr = hand_reach.float().unsqueeze(1)  # (B,1,T,P)
+            hand_reach = F.interpolate(hr, size=T_logits, mode="nearest").squeeze(1)
+        if torch.is_tensor(hand_reach_valid):
+            hand_reach_valid = _interp_mask_BT(hand_reach_valid, T_logits)
     # (this matches the alignment already used elsewhere in your code). :contentReference[oaicite:2]{index=2}
 
     # --- ensure pitch dimension matches model head ---
@@ -1089,6 +1107,20 @@ def compute_loss_frame(
     onset_tile = per_tile_ctx.get("onset") if per_tile_enabled else None
     offset_tile = per_tile_ctx.get("offset") if per_tile_enabled else None
 
+    gating_cfg = hand_gating or {}
+    gating_mode = str(gating_cfg.get("mode", "off")).lower()
+    gating_alpha = float(gating_cfg.get("strength", 1.0))
+    reach_weights = None
+    if gating_mode in {"loss_reweight"}:
+        if torch.is_tensor(hand_reach) and torch.is_tensor(hand_reach_valid):
+            hr = hand_reach.to(device=device, dtype=pitch_roll.dtype)
+            hr_valid = hand_reach_valid.to(device=device, dtype=pitch_roll.dtype)
+            # Expand to (B,T,P) and clamp.
+            hr = hr.clamp(0.0, 1.0)
+            hr_valid_exp = hr_valid.unsqueeze(-1).expand_as(hr)
+            neg_weight = 1.0 + gating_alpha * (1.0 - hr)
+            reach_weights = torch.where(hr_valid_exp > 0.5, neg_weight, torch.ones_like(hr))
+
     # --- pitch loss: gentle per-pitch pos_weight (sqrt + clamp) ---
     eps = 1e-6
     bands_cfg = weights.get("onoff_pos_weight_bands", {}) if isinstance(weights, Mapping) else {}
@@ -1103,6 +1135,21 @@ def compute_loss_frame(
     else:
         pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
     bce_pitch = nn.BCEWithLogitsLoss(pos_weight=pos_w_pitch)
+    def _bce_with_reach(logits: torch.Tensor, targets: torch.Tensor, pos_w: Optional[torch.Tensor]):
+        if reach_weights is None or logits.shape != targets.shape:
+            if pos_w is not None:
+                crit = nn.BCEWithLogitsLoss(pos_weight=pos_w.to(device=logits.device, dtype=logits.dtype))
+                return crit(logits, targets)
+            return F.binary_cross_entropy_with_logits(logits, targets)
+        weight = reach_weights.to(device=logits.device, dtype=logits.dtype)
+        pos_w_local = pos_w.to(device=logits.device, dtype=logits.dtype) if pos_w is not None else None
+        return F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            weight=weight,
+            pos_weight=pos_w_local,
+            reduction="mean",
+        )
     use_tile_pitch = per_tile_enabled and "pitch" in per_tile_heads and torch.is_tensor(pitch_tile)
     tile_mask_tensor = tile_mask_tensor
     if use_tile_pitch:
@@ -1121,9 +1168,9 @@ def compute_loss_frame(
             if debug_pitch:
                 per_tile_debug["pitch"] = debug_pitch
         else:
-            loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
+            loss_pitch = _bce_with_reach(pitch_logit, pitch_roll, pos_w_pitch) * float(weights.get("pitch", 1.0))
     else:
-        loss_pitch = bce_pitch(pitch_logit, pitch_roll) * float(weights.get("pitch", 1.0))
+        loss_pitch = _bce_with_reach(pitch_logit, pitch_roll, pos_w_pitch) * float(weights.get("pitch", 1.0))
 
     # --- Helper for adaptive pos_weight calculation ---
     def _adaptive_pos_weight(roll, P, eps=1e-6):
@@ -1174,6 +1221,8 @@ def compute_loss_frame(
             bce = F.binary_cross_entropy_with_logits(logits, roll, reduction="none")
             probs = torch.sigmoid(logits)
             weight = (alpha * (1.0 - probs).pow(gamma)).detach()
+            if reach_weights is not None and reach_weights.shape == bce.shape:
+                weight = weight * reach_weights.to(device=logits.device, dtype=logits.dtype)
             return (weight * bce).mean()
 
         # default: BCE with optional pos_weight
@@ -1181,7 +1230,18 @@ def compute_loss_frame(
             pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
             crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
-            crit = nn.BCEWithLogitsLoss()
+            crit = None
+        if reach_weights is not None and reach_weights.shape == roll.shape:
+            weight = reach_weights.to(device=logits.device, dtype=logits.dtype)
+            return F.binary_cross_entropy_with_logits(
+                logits,
+                roll,
+                weight=weight,
+                pos_weight=None if pos_weight is None else pos_weight.to(device=logits.device, dtype=logits.dtype),
+                reduction="mean",
+            )
+        if crit is None:
+            return F.binary_cross_entropy_with_logits(logits, roll)
         return crit(logits, roll)
 
     pos_w_on = _frame_pos_weight("onset", onset_cfg, onset_roll)
@@ -1233,8 +1293,19 @@ def compute_loss_frame(
     loss_offset = loss_offset * float(weights.get("offset", 1.0))
 
     # --- hand / clef CE at T' ---
-    ce = nn.CrossEntropyLoss()
-    loss_hand = ce(hand_logit.reshape(B*T_logits, -1), hand_frame.reshape(B*T_logits)) * float(weights.get("hand", 1.0))
+    ce = nn.CrossEntropyLoss(reduction="none")
+    hand_target = hand_frame.reshape(B * T_logits)
+    hand_logits_flat = hand_logit.reshape(B * T_logits, -1)
+    if torch.is_tensor(hand_frame_mask):
+        mask = hand_frame_mask.reshape(B * T_logits).to(device=hand_logits_flat.device, dtype=hand_logits_flat.dtype)
+        # clamp labels into valid range to avoid NaNs when mask=0
+        hand_target = hand_target.clamp(min=0, max=hand_logits_flat.shape[-1] - 1)
+        hand_loss_elem = ce(hand_logits_flat, hand_target)
+        supervised = mask.sum().clamp_min(1e-6)
+        loss_hand = (hand_loss_elem * mask).sum() / supervised
+    else:
+        loss_hand = ce(hand_logits_flat, hand_target)  # default mean
+    loss_hand = loss_hand * float(weights.get("hand", 1.0))
     loss_clef = ce(clef_logit.reshape(B*T_logits, -1), clef_frame.reshape(B*T_logits)) * float(weights.get("clef", 1.0))
 
     # --- total + optional activation prior ---
@@ -1374,10 +1445,16 @@ def _accumulate_pitch_counts(counts: Dict[str, Any], stats: Mapping[str, float])
     counts["pitch_frame_match"] += stats["frame_match"]
     counts["pitch_frame_total"] += stats["frame_total"]
 
-def _acc_from_logits(logits, target):
+def _acc_from_logits(logits, target, mask=None):
     # logits: (B, C), target: (B,) long
     pred = logits.argmax(dim=1)
-    return (pred == target).float().mean().item()
+    if mask is None:
+        return (pred == target).float().mean().item()
+    mask_t = mask.to(dtype=pred.dtype)
+    denom = mask_t.sum().item()
+    if denom <= 0:
+        return 0.0
+    return float(((pred == target) * mask_t).sum().item() / denom)
 
 def _binarize_sigmoid(logits, threshold):
     # logits: (B,), returns 0/1 float tensor
@@ -2242,6 +2319,7 @@ def train_one_epoch(
     model.train()
     crit = make_criterions()  # used only in clip-mode
     w = cfg["training"]["loss_weights"]
+    hand_gating_cfg = cfg["training"].get("hand_gating", {}) if isinstance(cfg.get("training", {}), Mapping) else {}
     onoff_cal = _get_onoff_calibration(cfg)
     onset_cal = onoff_cal["onset"]
     offset_cal = onoff_cal["offset"]
@@ -2303,6 +2381,7 @@ def train_one_epoch(
                     weights=w,
                     pos_rate_state=pos_rate_state,
                     per_tile=per_tile_ctx,
+                    hand_gating=hand_gating_cfg,
                 )
                 if per_tile_support is not None:
                     per_tile_debug = parts.pop("per_tile_debug", None)
@@ -2559,6 +2638,7 @@ def evaluate_one_epoch(
     model.eval()
     crit = make_criterions()
     w = cfg["training"]["loss_weights"]
+    hand_gating_cfg = cfg["training"].get("hand_gating", {}) if isinstance(cfg.get("training", {}), Mapping) else {}
     metrics_cfg = cfg.get("training", {}).get("metrics", {})
     thr_pitch = float(metrics_cfg.get("prob_threshold", 0.5))
     onoff_cal = _get_onoff_calibration(cfg)
@@ -3061,6 +3141,18 @@ def evaluate_one_epoch(
                         "hand_frame": hand_frame_tensor.long(),
                         "clef_frame": clef_frame_tensor.long(),
                     }
+                    if "hand_frame_mask" in batch:
+                        mask_candidate = _select_valid(batch.get("hand_frame_mask"))
+                        if torch.is_tensor(mask_candidate):
+                            frame_batch["hand_frame_mask"] = mask_candidate
+                    if "hand_reach" in batch:
+                        reach_candidate = _select_valid(batch.get("hand_reach"))
+                        if torch.is_tensor(reach_candidate):
+                            frame_batch["hand_reach"] = reach_candidate
+                    if "hand_reach_valid" in batch:
+                        reach_valid_candidate = _select_valid(batch.get("hand_reach_valid"))
+                        if torch.is_tensor(reach_valid_candidate):
+                            frame_batch["hand_reach_valid"] = reach_valid_candidate
                     per_tile_ctx = None
                     if per_tile_support is not None and per_tile_support.enabled and per_tile_ctx_full is not None:
                         per_tile_ctx = {
@@ -3078,6 +3170,7 @@ def evaluate_one_epoch(
                         pos_rate_state=pos_rate_state,
                         update_stats=False,
                         per_tile=per_tile_ctx,
+                        hand_gating=hand_gating_cfg,
                     )
                     if per_tile_support is not None:
                         per_tile_debug = parts.pop("per_tile_debug", None)
@@ -3415,8 +3508,23 @@ def evaluate_one_epoch(
                     hand_pred = hand_prob.argmax(dim=-1)
                     clef_pred = clef_prob.argmax(dim=-1)
                     Bx, Tx = hand_pred.shape
-                    hand_acc_val = (hand_pred.reshape(Bx * Tx) == hand_frame.reshape(Bx * Tx)).float().mean().item()
-                    clef_acc_val = (clef_pred.reshape(Bx * Tx) == clef_frame.reshape(Bx * Tx)).float().mean().item()
+                    hand_mask_eval = batch.get("hand_frame_mask")
+                    if torch.is_tensor(hand_mask_eval) and hand_mask_eval.shape[1] != Tx:
+                        hand_mask_eval = _interp_mask_BT(hand_mask_eval, Tx)
+                    if torch.is_tensor(hand_mask_eval):
+                        hand_mask_flat = hand_mask_eval.reshape(Bx * Tx)
+                    else:
+                        hand_mask_flat = None
+                    hand_acc_val = _acc_from_logits(
+                        out["hand_logits"].reshape(Bx * Tx, -1),
+                        hand_frame.reshape(Bx * Tx),
+                        hand_mask_flat,
+                    )
+                    clef_acc_val = _acc_from_logits(
+                        out["clef_logits"].reshape(Bx * Tx, -1),
+                        clef_frame.reshape(Bx * Tx),
+                        None,
+                    )
                     loose_counts["hand_acc"] += hand_acc_val
                     loose_counts["clef_acc"] += clef_acc_val
                     strict_counts["hand_acc"] += hand_acc_val
@@ -3454,8 +3562,13 @@ def evaluate_one_epoch(
 
                     hand_pred = F.softmax(out["hand_logits"], dim=-1).argmax(dim=-1)
                     clef_pred = F.softmax(out["clef_logits"], dim=-1).argmax(dim=-1)
-                    hand_acc_val = (hand_pred == tgt["hand"]).float().mean().item()
-                    clef_acc_val = (clef_pred == tgt["clef"]).float().mean().item()
+                    hand_mask_eval = batch.get("hand_frame_mask")
+                    hand_mask_flat = None
+                    if torch.is_tensor(hand_mask_eval):
+                        # In clip mode logits are (B,2); mask is per-frame; fallback to None
+                        hand_mask_flat = None
+                    hand_acc_val = _acc_from_logits(out["hand_logits"], tgt["hand"], hand_mask_flat)
+                    clef_acc_val = _acc_from_logits(out["clef_logits"], tgt["clef"], None)
                     loose_counts["hand_acc"] += hand_acc_val
                     loose_counts["clef_acc"] += clef_acc_val
                     strict_counts["hand_acc"] += hand_acc_val
@@ -4300,6 +4413,7 @@ def main():
         model.train()
         crit = make_criterions()
         w = cfg["training"]["loss_weights"]
+        hand_gating_cfg = cfg["training"].get("hand_gating", {}) if isinstance(cfg.get("training", {}), Mapping) else {}
         #w = get_loss_weights(cfg) if "get_loss_weights" in globals() else cfg["training"]["loss_weights"] #get_loss_weights not defined in this file
         log_interval = int(cfg["training"].get("log_interval", 20))
         pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}", ncols=100)
@@ -4442,6 +4556,7 @@ def main():
                     weights=w,
                     pos_rate_state=pos_rate_state,
                     per_tile=per_tile_ctx_local,
+                    hand_gating=hand_gating_cfg,
                 )
                 if per_tile_train_support is not None:
                     per_tile_debug = parts.pop("per_tile_debug", None)
