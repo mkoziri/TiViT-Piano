@@ -169,12 +169,16 @@ def check_pianovam_loader() -> None:
 
         assert result.landmarks.shape == (3, 2, 21, 3)
         assert result.mask.shape == (3, 2, 21)
-        assert result.mask.sum() > 0
-        assert result.mask[0, 0, 0]
-        assert result.mask[1, 1, 0]
+        assert result.mask.all()
+        # t0 should align to source frame 1, t1/t2 land on nearest source frames.
         torch.testing.assert_close(result.landmarks[0, 0, 0, 0], torch.tensor(0.1))
         torch.testing.assert_close(result.landmarks[1, 1, 0, 0], torch.tensor(0.4))
         torch.testing.assert_close(result.landmarks[2, 0, 0, 0], torch.tensor(0.2))
+        # t0 should align to source frame 1, t1/t2 land on nearest source frames.
+        torch.testing.assert_close(result.landmarks[0, 0, 0, 0], torch.tensor(0.1))
+        torch.testing.assert_close(result.landmarks[1, 1, 0, 0], torch.tensor(0.4))
+        if result.mask[2, 0, 0]:
+            torch.testing.assert_close(result.landmarks[2, 0, 0, 0], torch.tensor(0.2))
 
         far_path = tmp / "hands_far.json"
         far_path.write_text(json.dumps({"fps": 30.0, "frames": [_make_frame(0, 0.0, 0.0)]}), encoding="utf-8")

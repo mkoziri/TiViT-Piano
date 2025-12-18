@@ -270,7 +270,7 @@ def load_pianovam_hand_landmarks(
     """
     path = Path(json_path)
     hop_seconds = float(stride) / max(float(decode_fps), 1e-6)
-    tol = hop_seconds if time_tolerance is None else float(time_tolerance)
+    tol = hop_seconds * 1.25 if time_tolerance is None else float(time_tolerance)
     tol = max(tol, 0.0)
 
     if not path.exists():
@@ -338,7 +338,7 @@ def load_pianovam_hand_landmarks(
     filled_frames = 0
     for t_idx, target_time in enumerate(frame_times.tolist()):
         src_idx, gap = _choose_nearest_index(source_times, target_time)
-        if src_idx is None or gap > tol:
+        if src_idx is None or gap > (tol + 1e-6):
             continue
         _, left_pts, left_mask, right_pts, right_mask = parsed_frames[src_idx]
 
