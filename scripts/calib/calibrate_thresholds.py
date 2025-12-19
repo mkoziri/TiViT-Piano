@@ -611,7 +611,6 @@ def _collect(
     reg_meta_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     onset_logits_list, offset_logits_list = [], []
-    onset_probs_list, offset_probs_list = [], []
     onset_tgts_list, offset_tgts_list = [], []
     lag_ms_samples = []
     lag_source_counts: Counter[str] = Counter()
@@ -766,9 +765,6 @@ def _collect(
             on_logits = onset_entry
             off_logits = offset_entry
 
-            onset_probs = torch.sigmoid(on_logits)
-            offset_probs = torch.sigmoid(off_logits)
-
             onset_roll = batch["onset_roll"][idx].float()
             offset_roll = batch["offset_roll"][idx].float()
 
@@ -817,8 +813,6 @@ def _collect(
 
             onset_logits_list.append(on_logits.cpu())
             offset_logits_list.append(off_logits.cpu())
-            onset_probs_list.append(onset_probs.cpu())
-            offset_probs_list.append(offset_probs.cpu())
             onset_tgts_list.append(onset_roll.cpu())
             offset_tgts_list.append(offset_roll.cpu())
 
@@ -866,8 +860,8 @@ def _collect(
 
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
-    onset_probs = torch.cat(onset_probs_list, dim=0)
-    offset_probs = torch.cat(offset_probs_list, dim=0)
+    onset_probs = torch.sigmoid(onset_logits)
+    offset_probs = torch.sigmoid(offset_logits)
     onset_tgts = torch.cat(onset_tgts_list, dim=0)
     offset_tgts = torch.cat(offset_tgts_list, dim=0)
     elapsed_total = time.monotonic() - start_time

@@ -215,8 +215,8 @@ class EvalResults:
     onset_logits_list: List[torch.Tensor]
     offset_logits_list: List[torch.Tensor]
     pitch_logits_list: List[torch.Tensor]
-    onset_probs: List[torch.Tensor]
-    offset_probs: List[torch.Tensor]
+    onset_probs: Optional[List[torch.Tensor]]  # collected only when dumping logits
+    offset_probs: Optional[List[torch.Tensor]]
     onset_tgts: List[torch.Tensor]
     offset_tgts: List[torch.Tensor]
     clips_done: int
@@ -2006,7 +2006,6 @@ def _collect_logits(
 
     onset_logits_list, offset_logits_list = [], []
     pitch_logits_list: List[torch.Tensor] = []
-    onset_probs, offset_probs = [], []
     onset_tgts, offset_tgts = [], []
     lag_ms_samples: List[float] = []
     lag_source_counter: Counter[str] = Counter()
@@ -2246,18 +2245,14 @@ def _collect_logits(
                     pitch_prior_tensor = prior_outputs["pitch"]
                     pitch_logits = pitch_prior_tensor.squeeze(1) if pitch_was_2d else pitch_prior_tensor
 
-                onset_prob = torch.sigmoid(onset_logits)
-                offset_prob = torch.sigmoid(offset_logits)
-
-                if onset_prob_neutral is not None:
-                    _update_platt_stats(onset_platt_stats, onset_prob.detach() - onset_prob_neutral)
-                if offset_prob_neutral is not None:
-                    _update_platt_stats(offset_platt_stats, offset_prob.detach() - offset_prob_neutral)
-
                 onset_logits_list.append(onset_logits.detach().cpu())
                 offset_logits_list.append(offset_logits.detach().cpu())
-                onset_probs.append(onset_prob.detach().cpu())
-                offset_probs.append(offset_prob.detach().cpu())
+                if onset_prob_neutral is not None:
+                    onset_prob = torch.sigmoid(onset_logits)
+                    _update_platt_stats(onset_platt_stats, onset_prob.detach() - onset_prob_neutral)
+                if offset_prob_neutral is not None:
+                    offset_prob = torch.sigmoid(offset_logits)
+                    _update_platt_stats(offset_platt_stats, offset_prob.detach() - offset_prob_neutral)
 
                 if pitch_logits is not None:
                     if pitch_logits.dim() == 2:
@@ -2346,8 +2341,8 @@ def _collect_logits(
         onset_logits_list=onset_logits_list,
         offset_logits_list=offset_logits_list,
         pitch_logits_list=pitch_logits_list,
-        onset_probs=onset_probs,
-        offset_probs=offset_probs,
+        onset_probs=None,
+        offset_probs=None,
         onset_tgts=onset_tgts,
         offset_tgts=offset_tgts,
         clips_done=clips_done,
@@ -2855,8 +2850,6 @@ def main():
     onset_logits_list = eval_results.onset_logits_list
     offset_logits_list = eval_results.offset_logits_list
     pitch_logits_list = eval_results.pitch_logits_list
-    onset_probs = eval_results.onset_probs
-    offset_probs = eval_results.offset_probs
     onset_tgts = eval_results.onset_tgts
     offset_tgts = eval_results.offset_tgts
     skip_paths = eval_results.skip_paths
@@ -3085,8 +3078,8 @@ def main():
     onset_logits = torch.cat(onset_logits_list, dim=0)
     offset_logits = torch.cat(offset_logits_list, dim=0)
     pitch_logits = torch.cat(pitch_logits_list, dim=0) if pitch_logits_list else None
-    onset_probs = torch.cat(onset_probs, dim=0)
-    offset_probs = torch.cat(offset_probs, dim=0)
+    onset_probs = torch.sigmoid(onset_logits)
+    offset_probs = torch.sigmoid(offset_logits)
     onset_tgts = torch.cat(onset_tgts, dim=0)
     offset_tgts = torch.cat(offset_tgts, dim=0)
 
@@ -3506,8 +3499,8 @@ def main():
         offset_temperature=offset_temperature,
         onset_bias=onset_bias,
         offset_bias=offset_bias,
-        onset_probs=torch.as_tensor(onset_probs),
-        offset_probs=torch.as_tensor(offset_probs),
+        onset_probs=onset_probs,
+        offset_probs=offset_probs,
         onset_true_bin=onset_true_bin,
         offset_true_bin=offset_true_bin,
         decoder_kind=decoder_kind,
