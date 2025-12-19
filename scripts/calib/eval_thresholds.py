@@ -506,10 +506,12 @@ def _process_per_tile_outputs(
     if fusion_enabled or paths:
         clip_ids = _resolve_clip_ids(paths, onset_tile.shape[0])
         key_dim = int(onset_tile.shape[-1])
+        include_records = fusion_debug_state is not None or runtime.return_per_tile_requested
         tile_mask_batch = build_batch_tile_mask(
             clip_ids,
             cache=tile_key_mask_cache,
             cache_scope="eval",
+            include_records=include_records,
             reg_meta_cache=reg_meta_cache,
             reg_refiner=reg_refiner,
             num_tiles=model_tiles,

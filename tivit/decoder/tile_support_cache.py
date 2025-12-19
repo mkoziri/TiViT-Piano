@@ -117,6 +117,21 @@ class TileSupportCache:
         self._eval.clear()
         return count
 
+    def clear_shared(self) -> int:
+        """Drop shared-layer entries (training cache)."""
+
+        count = len(self._shared)
+        self._shared.clear()
+        return count
+
+    def clear_all(self) -> _CacheCounts:
+        """Drop both cache layers and return how many entries were cleared."""
+
+        cleared = _CacheCounts(shared=len(self._shared), eval=len(self._eval))
+        self._shared.clear()
+        self._eval.clear()
+        return cleared
+
     def counts(self) -> _CacheCounts:
         """Return entry counts for logging/debug."""
 

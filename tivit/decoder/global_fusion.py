@@ -393,6 +393,7 @@ def build_batch_tile_mask(
     *,
     cache: TileSupportCache,
     cache_scope: CacheScope = "train",
+    include_records: bool = False,
     reg_meta_cache: Optional[MutableMapping[str, Dict[str, Any]]] = None,
     reg_refiner: Optional[RegistrationRefiner] = None,
     num_tiles: int,
@@ -404,7 +405,7 @@ def build_batch_tile_mask(
         empty = torch.zeros((0, num_tiles, n_keys), dtype=torch.float32)
         return TileMaskBatch(tensor=empty, records=[])
     masks: List[np.ndarray] = []
-    records: List[TileMaskResult] = []
+    records: List[TileMaskResult] = [] if include_records else []
     for video_uid in video_uids:
         record = resolve_tile_key_mask(
             video_uid,
@@ -417,7 +418,8 @@ def build_batch_tile_mask(
             n_keys=n_keys,
             canonical_hw=canonical_hw,
         )
-        records.append(record)
+        if include_records:
+            records.append(record)
         masks.append(record.mask.astype(np.float32))
     stacked = np.stack(masks, axis=0)
     return TileMaskBatch(tensor=torch.from_numpy(stacked), records=records)

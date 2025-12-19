@@ -483,7 +483,7 @@ class PerTileSupport:
         self.tiles = int(model_cfg.get("tiles", 3) or 3)
         self.cache_scope: CacheScope = "eval" if str(phase).lower() == "eval" else "train"
         self.tile_cache = tile_cache if tile_cache is not None else TileSupportCache()
-        self.reg_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
+        self.reg_meta_cache: Dict[str, Dict[str, Any]] = reg_meta_cache if reg_meta_cache is not None else {}
         dataset_ref = dataset if dataset is not None else object()
         self.reg_refiner = getattr(dataset_ref, "registration_refiner", None)
         debug_cfg = per_tile_cfg.get("debug", {}) or {}

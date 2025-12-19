@@ -199,6 +199,27 @@ def check_cache_key_normalises_video_uid() -> None:
     assert lower == upper, "cache key should ignore case differences in video uid"
 
 
+def check_clear_shared_and_all() -> None:
+    cache = TileSupportCache()
+    shared_key = make_tile_cache_key("video_shared", num_tiles=2, cushion_keys=0, n_keys=88)
+    eval_key = make_tile_cache_key("video_eval", num_tiles=2, cushion_keys=0, n_keys=88)
+    cache.put("train", shared_key, {"value": "shared"})
+    cache.put("eval", eval_key, {"value": "eval"})
+
+    cleared_shared = cache.clear_shared()
+    counts_after_shared = cache.counts()
+    assert cleared_shared == 1
+    assert counts_after_shared.shared == 0
+    assert counts_after_shared.eval == 1
+    assert cache.get("eval", eval_key)["value"] == "eval"
+
+    cleared_all = cache.clear_all()
+    assert cleared_all.shared == 0
+    assert cleared_all.eval == 1
+    counts_after_all = cache.counts()
+    assert counts_after_all.shared == 0 and counts_after_all.eval == 0
+
+
 def check_batch_id_resolution_prefers_video_uid() -> None:
     batch = {
         "video_uid": ["video_101", "video_202"],
@@ -213,6 +234,7 @@ def main() -> None:
         ("train scope reuse", check_train_scope_reuses_video_entry),
         ("eval clear preserves shared", check_eval_clear_preserves_shared_entries),
         ("cache key normalisation", check_cache_key_normalises_video_uid),
+        ("clear shared/all", check_clear_shared_and_all),
         ("batch id resolution", check_batch_id_resolution_prefers_video_uid),
     ]
     for label, fn in checks:

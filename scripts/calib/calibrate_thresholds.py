@@ -622,7 +622,7 @@ def _collect(
     comparison_batches_used = 0
     stageb_shape_logged = False
     tile_mask_cache = TileSupportCache()
-    effective_meta_cache: Dict[str, Dict[str, Any]] = dict(reg_meta_cache or {})
+    effective_meta_cache: Dict[str, Dict[str, Any]] = reg_meta_cache if reg_meta_cache is not None else {}
     if fusion_enabled and not effective_meta_cache:
         reg_cache_path = resolve_registration_cache_path(os.environ.get("TIVIT_REG_REFINED"))
         effective_meta_cache = _load_registration_metadata(reg_cache_path)
@@ -709,6 +709,7 @@ def _collect(
                     reg_refiner=registration_refiner,
                     cache=tile_mask_cache,
                     cache_scope="eval",
+                    include_records=fusion_debug_state is not None,
                     num_tiles=model_tiles,
                     cushion_keys=fusion_cfg.cushion_keys,
                     n_keys=int(onset_tile.shape[-1]),
