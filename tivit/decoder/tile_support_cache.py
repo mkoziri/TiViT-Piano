@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Hashable, Literal, Optional, Tuple
 
-from utils.identifiers import canonical_video_id
+from tivit.data.targets.identifiers import canonical_video_id
 
 CacheScope = Literal["train", "eval"]
 _FALLBACK_VIDEO_UID = "__fallback__"

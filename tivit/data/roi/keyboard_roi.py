@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils.identifiers import canonical_video_id
+from tivit.data.targets.identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

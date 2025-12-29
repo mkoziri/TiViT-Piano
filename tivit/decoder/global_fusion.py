@@ -12,8 +12,8 @@ import torch
 from .tile_keymap import TileMaskResult, build_tile_key_mask
 from .registration_geometry import build_canonical_registration_metadata
 from .tile_support_cache import CacheScope, TileSupportCache, make_tile_cache_key
-from utils.identifiers import canonical_video_id
-from utils.registration_refinement import RegistrationRefiner
+from tivit.data.targets.identifiers import canonical_video_id
+from tivit.data.roi.keyboard_roi import RegistrationRefiner
 
 _DEFAULT_APPLY_TO = ("onset", "offset", "pitch")
 _REG_LOOKUP_LOGGED: Set[str] = set()

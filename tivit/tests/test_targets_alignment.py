@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 
 from tivit.data.targets.frame_targets import build_frame_target_spec, build_soft_target_cfg, build_frame_targets
-from utils.frame_target_cache import FrameTargetCache
+from tivit.data.targets.frame_target_cache import FrameTargetCache
 
 
 def main() -> None:

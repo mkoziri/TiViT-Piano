@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Hashable, Tuple
 
-from utils.identifiers import canonical_video_id
+from tivit.data.targets.identifiers import canonical_video_id
 from .cache_api import Cache, CacheScope
 
 
@@ -46,4 +46,3 @@ class VideoCache:
 
 
 __all__ = ["VideoCache"]
-

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional
 
 try:
-    from utils.av_sync import AVLagCache  # type: ignore
+    from tivit.data.targets.av_sync import AVLagCache  # type: ignore
 except Exception:  # pragma: no cover - optional
     AVLagCache = None  # type: ignore[misc,assignment]
 
