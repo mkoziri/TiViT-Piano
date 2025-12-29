@@ -1,0 +1,152 @@
+training:
+  epochs: 4
+  learning_rate: 3e-5
+  weight_decay: 0.01
+  eval_freq: 1
+  debug_dummy_labels: false
+  log_interval: 25
+  save_every: 1
+  amp: false
+  resume: false
+  reset_head_bias: true
+  bias_seed:
+    onoff_prior_mean: 0.012
+  soft_targets:
+    enabled: false
+    apply_to:
+      onset: true
+      pitch: true
+      offset: false
+    onset_kernel:
+      - 0.5
+      - 1.0
+      - 0.5
+    frame_kernel:
+      - 0.5
+      - 1.0
+      - 0.5
+  loss_weights:
+    onoff_loss: bce_pos
+    onoff_pos_weight_mode: adaptive
+    onoff_pos_weight: 16.0
+    onoff_pos_weight_ema_alpha: 0.05
+    onoff_neg_smooth: 0.0
+    focal_gamma: 4.0
+    focal_alpha: 0.25
+    onoff_prior_mean: 0.012
+    onoff_prior_weight: 0.15
+    onoff_pos_weight_bands:
+      onset:
+        - 3.0
+        - 5.0
+      pitch:
+        - 2.0
+        - 4.0
+      offset:
+        - 3.0
+        - 5.0
+    onoff_heads:
+      onset:
+        loss: focal
+        pos_weight_mode: adaptive
+        focal_gamma: 4.0
+        focal_alpha: 0.25
+        prior_mean: 0.012
+        prior_weight: 0.15
+      offset:
+        loss: focal
+        focal_gamma: 2.5
+        focal_alpha: 0.2
+        prior_mean: 0.01
+        prior_weight: 0.15
+    onset: 1.8
+    offset: 0.6
+    pitch: 1.2
+    hand: 0.3
+    clef: 0.3
+  hand_gating:
+    mode: loss_reweight
+    strength: 0.75
+  metrics:
+    prob_threshold: 0.2
+    prob_threshold_onset: 0.2
+    prob_threshold_offset: 0.2
+    prob_temperature: 1.0
+    prob_temperature_onset: 1.0
+    prob_temperature_offset: 1.0
+    prob_logit_bias: 0.0
+    prob_logit_bias_onset: 0.0
+    prob_logit_bias_offset: 0.0
+    decoder:
+      onset:
+        open: 0.01
+        hold: 0.0075
+        min_on: 2
+        merge_gap: 1
+      offset:
+        open: 0.015
+        hold: 0.01
+        min_off: 2
+        merge_gap: 1
+    temporal_decoder:
+      shared:
+        low_ratio: 0.6
+        min_on: 2
+        min_off: 2
+        gap_merge: 1
+        median: 3
+    aggregation:
+      mode: k_of_p
+      k:
+        onset: 1
+        offset: 1
+      top_k: 3
+      tau_sum: 0.0
+    sweep:
+      floor_band:
+        - 0.20
+        - 0.30
+        - 0.40
+      threshold_mode: quantile
+      quantile_values:
+        - 0
+        - 50
+        - 70
+        - 80
+        - 90
+        - 95
+        - 98
+        - 99
+      include_max_quantile: true
+  best_selection:
+    mode: calibrated_event
+    trigger: on_proxy_improvement
+    n: 1
+    write_back: false
+    frames: 96
+    max_clips: 80
+    split: val
+    sweep:
+      delta: 0.05
+      low_guard: 0.1
+    min_prob: 0.02
+    max_prob: 0.98
+  per_tile:
+    enabled: true
+    heads:
+      - pitch
+      - onset
+      - offset
+    mask_cushion_keys: null
+    debug:
+      enabled: true
+      interval: 200
+
+optim:
+  grad_clip: 1.0
+  head_lr_multiplier: 10.0
+  offset_weight_decay_multiplier: 4.0
+
+train:
+  accumulate_steps: 12
+  freeze_backbone_epochs: 0

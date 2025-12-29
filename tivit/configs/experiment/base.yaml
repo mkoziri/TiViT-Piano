@@ -1,0 +1,15 @@
+experiment:
+  name: TiViT-Piano_PianoVAM_cache
+  seed: 1332
+  deterministic: true
+  output_dir: outputs
+
+logging:
+  log_dir: logs
+  checkpoint_dir: checkpoints
+  tensorboard: true
+  postproc_debug: true
+
+inference:
+  output_dir: inference_results
+  predict_on_train: false

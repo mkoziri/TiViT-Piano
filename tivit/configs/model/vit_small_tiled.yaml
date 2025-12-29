@@ -1,0 +1,24 @@
+model:
+  name: TiViT-Piano
+  backend: vits_tile
+  head_mode: frame
+  tiles: 3
+  input_channels: 3
+  transformer:
+    input_patch_size: 16
+    dropout: 0.1
+  vits_tile:
+    backbone_name: vit_small_patch16_224
+    pretrained: true
+    freeze_backbone: true
+    input_hw: [224, 224]
+    temporal_layers: 2
+    temporal_heads: 4
+    global_mixing_layers: 1
+    embed_dim: 384
+    dropout: 0.1
+
+tiling:
+  patch_w: 16
+  tokens_split: auto
+  overlap_tokens: 0

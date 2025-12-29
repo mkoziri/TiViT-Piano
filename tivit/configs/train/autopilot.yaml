@@ -1,0 +1,35 @@
+autopilot:
+  best_selection:
+    owner: autopilot
+  fast_strategy: two_stage
+  onset_optimizer:
+    open_grid: [0.01, 0.015, 0.02, 0.03]
+    min_on_grid: [2, 3]
+    hold_mode: fixed_ratio
+    hold_delta: 0.06
+    hold_min: 0.003
+    hold_ratio: 0.75
+    merge_gap: 1
+    thr_anchor: 0.2
+    thr_add_delta: 0.01
+    thr_add_steps: 5
+    thr_mul_ratio: 1.1
+    thr_mul_orders: 1
+    thr_min_prob: 0.005
+    thr_max_prob: 0.98
+    thr_low_guard: 0.01
+    thr_high_guard: 0.6
+    thr_min_points: 5
+    thr_max_points: 11
+  offset_optimizer:
+    thr_anchor: 0.3
+    thr_add_delta: 0.01
+    thr_add_steps: 5
+    thr_mul_ratio: 1.1
+    thr_mul_orders: 1
+    thr_min_prob: 0.02
+    thr_max_prob: 0.98
+    thr_low_guard: 0.02
+    thr_high_guard: 0.95
+    thr_min_points: 5
+    thr_max_points: 11

@@ -1,0 +1,13 @@
+eval:
+  mode: strict
+  tolerance: 0.0
+
+metrics:
+  prob_threshold: 0.2
+  prob_threshold_onset: 0.2
+  prob_threshold_offset: 0.2
+  aggregation:
+    mode: k_of_p
+    k:
+      onset: 1
+      offset: 1

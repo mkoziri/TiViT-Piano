@@ -1,0 +1,57 @@
+dataset:
+  name: PianoYT
+  root_dir: data/PianoYT
+  annotations_root: data/PianoYT
+  label_format: txt
+  label_targets: [pitch, onset, offset, hand, clef]
+  max_clips: 80
+  manifest:
+    train: null
+    val: null
+    test: null
+  split: train
+  split_train: train
+  split_val: val
+  split_test: test
+  frames: 96
+  decode_fps: 30.0
+  hop_seconds: 0.03333333333333333
+  resize: [145, 1024]
+  tiles: 3
+  channels: 3
+  normalize: true
+  apply_crop: true
+  canonical_hw: [145, 1024]
+  registration:
+    source: metadata
+    interp: bilinear
+    global_aug:
+      enabled: false
+      color_jitter:
+        brightness: 0.1
+        contrast: 0.1
+  crop_rescale: auto
+  include_low_res: false
+  batch_size: 2
+  num_workers: 2
+  prefetch_factor: 1
+  shuffle: true
+  sampler:
+    mode: onset_balanced
+    onset_frac: 0.5
+    nearmiss_frac: 0.25
+    bg_frac: 0.25
+    nearmiss_radius: 6
+  require_labels: true
+  frame_targets:
+    enable: true
+    tolerance: 0.03
+    dilate_active_frames: 1
+    fill_mode: overlap
+    hand_from_pitch: true
+    clef_thresholds: [60, 64]
+    note_min: 21
+    note_max: 108
+    cache_labels: true
+    cache_dir: .cache/labels
+    targets_sparse: true

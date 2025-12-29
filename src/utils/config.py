@@ -11,13 +11,13 @@ CLI:
 
 from pathlib import Path
 from typing import Any, Mapping, Union
-import yaml
+
+from tivit.core.config import load_experiment_config
 
 ConfigPath = Union[str, Path]
 
 
 def load_config(path: ConfigPath = "configs/config.yaml") -> Mapping[str, Any]:
-    p = Path(path).expanduser()
-    with p.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """Load a single config file or merge composed fragments."""
 
+    return load_experiment_config([Path(path).expanduser()])

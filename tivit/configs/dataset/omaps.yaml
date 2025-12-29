@@ -1,0 +1,43 @@
+dataset:
+  name: OMAPS
+  root_dir: null
+  annotations_root: null
+  label_format: txt
+  label_targets: [pitch, onset, offset, hand, clef]
+  max_clips: null
+  manifest:
+    train: null
+    val: null
+    test: null
+  split: train
+  split_train: train
+  split_val: val
+  split_test: test
+  frames: 96
+  decode_fps: 30.0
+  hop_seconds: 0.03333333333333333
+  resize: [145, 1024]
+  tiles: 3
+  channels: 3
+  normalize: true
+  apply_crop: true
+  canonical_hw: [145, 1024]
+  registration:
+    source: metadata
+    interp: bilinear
+    global_aug:
+      enabled: false
+      color_jitter:
+        brightness: 0.1
+        contrast: 0.1
+  batch_size: 2
+  num_workers: 2
+  prefetch_factor: 1
+  shuffle: true
+  sampler:
+    mode: onset_balanced
+    onset_frac: 0.5
+    nearmiss_frac: 0.25
+    bg_frac: 0.25
+    nearmiss_radius: 6
+  require_labels: true
