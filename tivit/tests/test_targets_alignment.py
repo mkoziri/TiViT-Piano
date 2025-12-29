@@ -19,7 +19,11 @@ from pathlib import Path
 
 import torch
 
-from tivit.data.targets.frame_targets import build_frame_target_spec, build_soft_target_cfg, build_frame_targets
+from tivit.data.targets.frame_targets import (
+    resolve_frame_target_spec,
+    resolve_soft_target_config,
+    prepare_frame_targets,
+)
 from tivit.data.targets.frame_target_cache import FrameTargetCache
 
 
@@ -27,7 +31,7 @@ def main() -> None:
     """Build frame targets and print keys/shapes."""
     events = [(0.1, 0.5, 60), (0.6, 1.0, 64)]
     labels = torch.tensor(events, dtype=torch.float32)
-    spec = build_frame_target_spec(
+    spec = resolve_frame_target_spec(
         {"enable": True, "tolerance": 0.03, "note_min": 21, "note_max": 108},
         frames=16,
         stride=1,
@@ -35,7 +39,7 @@ def main() -> None:
         canonical_hw=(145, 1024),
     )
     cache = FrameTargetCache(Path(".cache/test_targets"))
-    result = build_frame_targets(
+    result = prepare_frame_targets(
         labels=labels,
         lag_result=None,
         spec=spec,  # type: ignore[arg-type]
@@ -43,7 +47,7 @@ def main() -> None:
         split="test",
         video_id="video_000",
         clip_start=0.0,
-        soft_targets=build_soft_target_cfg({"enable": False}),
+        soft_targets=resolve_soft_target_config({"enable": False}),
     )
     payload = result.payload or {}
     print("keys", list(payload.keys()))
