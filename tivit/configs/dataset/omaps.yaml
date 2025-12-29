@@ -1,7 +1,7 @@
 dataset:
   name: OMAPS
-  root_dir: null
-  annotations_root: null
+  root_dir: data/omaps
+  annotations_root: data/omaps
   label_format: txt
   label_targets: [pitch, onset, offset, hand, clef]
   max_clips: null
