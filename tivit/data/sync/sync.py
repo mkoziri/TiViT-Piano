@@ -50,6 +50,7 @@ def resolve_sync(video_id: str, sample_meta: Mapping[str, Any] | None = None, la
 
     lag_seconds = 0.0
     source = "default"
+    # Prefer explicit metadata when available.
     if isinstance(sample_meta, Mapping):
         if "lag_seconds" in sample_meta:
             try:
@@ -69,6 +70,13 @@ def resolve_sync(video_id: str, sample_meta: Mapping[str, Any] | None = None, la
                 source = "meta_ms"
             except Exception:
                 pass
+        # If metadata carries lag_ms, persist to cache for future lookups.
+        if lag_cache is not None and hasattr(lag_cache, "set") and "lag_ms" in sample_meta:
+            try:
+                lag_cache.set(video_id, float(sample_meta["lag_ms"]))
+            except Exception:
+                pass
+    # Fall back to cache when no metadata override was found.
     if source == "default" and lag_cache is not None and hasattr(lag_cache, "get"):
         try:
             lag_ms = lag_cache.get(video_id)

@@ -40,6 +40,7 @@ def _get_float(cfg: Mapping[str, object], key: str, default: float = 0.0) -> flo
 
 
 def _color_jitter(frames: torch.Tensor, cj_cfg: Mapping[str, object], rng: random.Random) -> torch.Tensor:
+    """Apply simple brightness/contrast jitter using seeded RNG."""
     out = frames
     brightness = _get_float(cj_cfg, "brightness", 0.0)
     contrast = _get_float(cj_cfg, "contrast", 0.0)
@@ -79,7 +80,7 @@ def apply_global_augment(frames: torch.Tensor, aug_cfg: Mapping[str, object] | N
             out = out[..., y0 : y0 + crop_h, x0 : x0 + crop_w]
     if color_cfg:
         out = _color_jitter(out, color_cfg, local_rng)
-    return out
+    return out.clamp(0.0, 1.0)
 
 
 __all__ = ["apply_global_augment"]
