@@ -24,7 +24,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple, TypedDict
 
 import torch
 
-from .identifiers import canonical_video_id
+from tivit.data.targets.identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def _round_lag_frames(lag_ms: float, fps: float) -> Tuple[int, float]:
 def _round_lag_ms_legacy(lag_ms: float, fps: float) -> Tuple[int, float]:
     """Replicate the historic ms-based rounding used for compatibility."""
 
-    from .av_sync import round_lag_ms_for_cache  # local import to avoid cycle
+    from tivit.data.targets.av_sync import round_lag_ms_for_cache  # local import to avoid cycle
 
     rounded_ms = float(round_lag_ms_for_cache(lag_ms, fps))
     try:
@@ -91,19 +91,7 @@ def make_target_cache_key(
     canonicalize: bool = True,
     scheme: str = "frame",
 ) -> Tuple[str, FrameTargetMeta]:
-    """Serialise cache key inputs and return a SHA1 hash plus metadata.
-
-    Parameters
-    ----------
-    canonicalize:
-        When ``True`` (default), ``video_id`` is converted to ``video_###`` canonical
-        form for the cache key.  Pass ``False`` to construct compatibility keys that
-        preserve legacy identifiers such as ``video_106.0``.
-    scheme:
-        ``"frame"`` (default) rounds lag to frame units and is the canonical key
-        generator.  ``"legacy_ms"`` matches the historic millisecond-based rounding
-        to locate old cache entries.
-    """
+    """Serialise cache key inputs and return a SHA1 hash plus metadata."""
 
     hw_values = list(canonical_hw)
     if len(hw_values) < 2:
@@ -210,12 +198,7 @@ class FrameTargetCache:
                 tensors[key] = value.clone()
         return tensors, True
 
-    def save(
-        self,
-        key_hash: str,
-        metadata: Mapping[str, object],
-        data: Mapping[str, torch.Tensor],
-    ) -> bool:
+    def save(self, key_hash: str, metadata: Mapping[str, object], data: Mapping[str, torch.Tensor]) -> bool:
         """Persist tensors for ``key_hash``; return ``True`` on success."""
 
         path = self._path_for(key_hash)
@@ -227,10 +210,7 @@ class FrameTargetCache:
             return False
         payload = {
             "meta": dict(metadata),
-            "data": {
-                key: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
-                for key, tensor in data.items()
-            },
+            "data": {key: tensor.detach().cpu() if torch.is_tensor(tensor) else tensor for key, tensor in data.items()},
         }
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:

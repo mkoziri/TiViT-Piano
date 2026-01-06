@@ -1,0 +1,8 @@
+{
+  "canaries": [
+    "data/PianoYT/val/video_106.0.mp4",
+    "data/PianoYT/val/video_132.0.mp4"
+  ],
+  "count": 2,
+  "split": "val"
+}

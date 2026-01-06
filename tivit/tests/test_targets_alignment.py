@@ -24,7 +24,7 @@ from tivit.data.targets.frame_targets import (
     resolve_soft_target_config,
     prepare_frame_targets,
 )
-from tivit.data.targets.frame_target_cache import FrameTargetCache
+from tivit.data.cache.frame_target_cache import FrameTargetCache
 
 
 def main() -> None:

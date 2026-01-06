@@ -14,7 +14,7 @@ CLI:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, TypedDict
 
 import logging
 import time
@@ -22,9 +22,9 @@ import time
 import torch
 
 from .av_sync import AVLagResult
-from .frame_target_cache import FrameTargetCache, FrameTargetMeta, make_target_cache_key
 from .identifiers import canonical_video_id, id_aliases, log_legacy_id_hit
 from .time_grid import sec_to_frame
+from tivit.data.cache.frame_target_cache import FrameTargetCache, FrameTargetMeta, make_target_cache_key
 
 LOGGER = logging.getLogger(__name__)
 
@@ -199,6 +199,16 @@ class FrameTargetResult:
     lag_ms: Optional[int]
     lag_source: str
     lag_frames: Optional[int] = None
+
+
+class _CacheKeyKwargs(TypedDict):
+    split: str
+    lag_ms: float
+    fps: float
+    frames: int
+    tolerance: float
+    dilation: int
+    canonical_hw: Sequence[int]
 
 
 def resolve_frame_target_spec(
@@ -521,15 +531,15 @@ def prepare_frame_targets(
     lag_ms, lag_source = resolve_lag_ms(lag_result)
     canon_video = canonical_video_id(video_id)
     aliases = id_aliases(canon_video)
-    key_kwargs = dict(
-        split=split,
-        lag_ms=lag_ms,
-        fps=spec.fps,
-        frames=spec.frames,
-        tolerance=spec.tolerance,
-        dilation=spec.dilation,
-        canonical_hw=spec.canonical_hw,
-    )
+    key_kwargs: _CacheKeyKwargs = {
+        "split": split,
+        "lag_ms": lag_ms,
+        "fps": spec.fps,
+        "frames": spec.frames,
+        "tolerance": spec.tolerance,
+        "dilation": spec.dilation,
+        "canonical_hw": spec.canonical_hw,
+    }
 
     primary_key_hash, primary_key_meta = make_target_cache_key(
         video_id=canon_video,

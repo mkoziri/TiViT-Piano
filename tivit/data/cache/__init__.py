@@ -1,5 +1,5 @@
 from .cache_api import Cache, CacheScope, TileSupportCache
 from .video_cache import VideoCache
+from .frame_target_cache import FrameTargetCache, FrameTargetMeta, make_target_cache_key
 
-__all__ = ["Cache", "CacheScope", "TileSupportCache", "VideoCache"]
-
+__all__ = ["Cache", "CacheScope", "TileSupportCache", "VideoCache", "FrameTargetCache", "FrameTargetMeta", "make_target_cache_key"]

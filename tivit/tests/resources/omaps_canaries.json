@@ -1,0 +1,8 @@
+{
+  "canaries": [
+    "/home/almar/datasets/OMAPS/train/001.mp4",
+    "/home/almar/datasets/OMAPS/train/002.mp4"
+  ],
+  "count": 2,
+  "split": "train"
+}
