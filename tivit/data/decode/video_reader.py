@@ -36,6 +36,7 @@ class VideoReaderConfig:
     stride: int
     resize_hw: Tuple[int, int]
     channels: int = 3
+    start_frame: int = 0
 
 
 def _try_decord(path: Path, cfg: VideoReaderConfig) -> torch.Tensor:
@@ -45,7 +46,8 @@ def _try_decord(path: Path, cfg: VideoReaderConfig) -> torch.Tensor:
     decord.bridge.set_bridge("torch")
     vr = decord.VideoReader(str(path))
     total = len(vr)
-    idxs = list(range(0, total, cfg.stride))[: cfg.frames]
+    start = min(max(int(cfg.start_frame), 0), max(total - 1, 0))
+    idxs = list(range(start, total, cfg.stride))[: cfg.frames]
     if not idxs:
         idxs = [0]
     if len(idxs) < cfg.frames:
@@ -66,7 +68,11 @@ def _try_cv2(path: Path, cfg: VideoReaderConfig) -> torch.Tensor:
         ok, frame = cap.read()
         if not ok:
             break
-        if i % cfg.stride == 0:
+        if i < cfg.start_frame:
+            i += 1
+            continue
+        rel_idx = i - cfg.start_frame
+        if rel_idx % cfg.stride == 0:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = cv2.resize(frame, (cfg.resize_hw[1], cfg.resize_hw[0]), interpolation=cv2.INTER_AREA)
             images.append(frame)

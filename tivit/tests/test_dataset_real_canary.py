@@ -244,11 +244,14 @@ def _gather_candidates(split: str, dataset_cfg: Mapping[str, Any]) -> List[Path]
 
 def _select_decodable(candidates: List[Path], count: int, dataset_cfg: Mapping[str, Any]) -> List[Path]:
     selected: List[Path] = []
+    skip_seconds = float(dataset_cfg.get("skip_seconds", 0.0))
+    start_frame = max(0, int(round(skip_seconds * float(dataset_cfg.get("decode_fps", 30.0)))))
     vr_cfg = VideoReaderConfig(
         frames=int(dataset_cfg.get("frames", 32)),
         stride=1,
         resize_hw=tuple(dataset_cfg.get("resize", [224, 224])),
         channels=int(dataset_cfg.get("channels", 3)),
+        start_frame=start_frame,
     )
     for path in candidates:
         if len(selected) >= count:
