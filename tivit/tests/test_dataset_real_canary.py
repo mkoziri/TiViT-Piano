@@ -192,11 +192,11 @@ def _prepare_dataset_cfg(cfg: Mapping[str, Any], testing_cfg: Mapping[str, Any],
     cfg = dict(cfg)
     dataset_cfg: Dict[str, Any] = dict(cfg.get("dataset", {}))
     name = str(dataset_cfg.get("name", "dataset")).lower()
-    root_dir = dataset_cfg.get("root_dir") or testing_cfg.get("root_dir_default")
+    root_dir = dataset_cfg.get("root_dir")
     if not root_dir:
-        raise RuntimeError("dataset.root_dir is missing and no dataset.testing.root_dir_default was provided.")
+        raise RuntimeError("dataset.root_dir is required for the canary gate.")
     dataset_cfg["root_dir"] = str(_to_repo_path(root_dir))
-    annotations_root = dataset_cfg.get("annotations_root") or testing_cfg.get("annotations_root_default") or dataset_cfg["root_dir"]
+    annotations_root = dataset_cfg.get("annotations_root") or dataset_cfg["root_dir"]
     dataset_cfg["annotations_root"] = str(_to_repo_path(annotations_root))
 
     frame_targets_cfg: Dict[str, Any] = dict(dataset_cfg.get("frame_targets", {}) or {})
@@ -541,6 +541,13 @@ def main() -> None:
         idx = entry_map[canary.abs_path]
         try:
             sample = ds[idx]
+        except FileNotFoundError as exc:
+            if require_labels:
+                raise SystemExit(
+                    f"Missing label for canary {canary.video_rel} (split={split}). "
+                    "Ensure annotations/manifest are wired up or disable require_labels for this dataset."
+                ) from exc
+            raise
         except Exception as exc:  # pragma: no cover - fail loudly
             raise RuntimeError(f"Failed to load canary {canary.video_rel}: {exc}. Regenerate canaries or fix the source clip.") from exc
 

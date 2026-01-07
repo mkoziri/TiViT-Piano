@@ -47,10 +47,8 @@ dataset:
     regen_canaries: false
     enable_cache_equiv: false
     enable_audit_export: false
-    audit_dir: out/audit/omaps
+    audit_dir: tivit/tests/resources/audit/omaps
     cache_off: false
     strict_sampling: false
     strict_labels: false
     strict_fallback: false
-    root_dir_default: data/omaps
-    annotations_root_default: data/omaps

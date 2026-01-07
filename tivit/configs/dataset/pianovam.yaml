@@ -84,5 +84,3 @@ dataset:
     strict_sampling: false
     strict_labels: false
     strict_fallback: false
-    root_dir_default: data/PianoVAM_v1.0
-    annotations_root_default: data/PianoVAM_v1.0
