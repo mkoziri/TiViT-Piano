@@ -35,6 +35,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 
+try:
+    from PIL import Image, ImageDraw  # type: ignore
+except Exception:  # pragma: no cover - optional
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+
 try:  # optional visuals
     import matplotlib.pyplot as plt
 except Exception:  # pragma: no cover - optional
@@ -433,11 +439,21 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
         tiles_np = tile_tensor.permute(1, 0, 2, 3).reshape(3, tiles * tile_tensor.shape[-2], tile_tensor.shape[-1])
         tiles_np = tiles_np.permute(1, 2, 0).cpu().numpy()
         out_path = audit_dir / f"{canary.video_id}_frame{idx:03d}_tiles.png"
+        saved = False
         try:
             import imageio.v2 as imageio  # type: ignore
         except Exception:
-            continue
-        imageio.imwrite(out_path, (tiles_np * 255).astype("uint8"))
+            imageio = None  # type: ignore
+        if imageio is not None:
+            imageio.imwrite(out_path, (tiles_np * 255).astype("uint8"))
+            saved = True
+        elif Image is not None:
+            img = Image.fromarray((tiles_np * 255).astype("uint8"))
+            img.save(out_path)
+            saved = True
+
+        # Overlay showing tile grid (ROI proxy is full extent).
+        overlay_name = audit_dir / f"{canary.video_id}_frame{idx:03d}_overlay.png"
         try:
             import cv2  # type: ignore
         except Exception:
@@ -450,7 +466,17 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
                 x = k * step
                 cv2.line(overlay, (x, 0), (x, h - 1), (0, 255, 0), 2)
             cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), (255, 0, 0), 2)
-            cv2.imwrite(str(audit_dir / f"{canary.video_id}_frame{idx:03d}_overlay.png"), overlay)
+            cv2.imwrite(str(overlay_name), overlay)
+        elif Image is not None and ImageDraw is not None and saved:
+            overlay_img = Image.open(out_path).copy()
+            draw = ImageDraw.Draw(overlay_img)
+            w, h = overlay_img.size
+            step = w // tiles if tiles > 0 else w
+            for k in range(1, tiles):
+                x = k * step
+                draw.line([(x, 0), (x, h - 1)], fill=(0, 255, 0), width=2)
+            draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(255, 0, 0), width=2)
+            overlay_img.save(overlay_name)
 
     if plt is not None:
         onset = sample.get("onset")

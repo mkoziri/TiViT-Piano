@@ -1,0 +1,17 @@
+{
+  "target_means": {
+    "clef": 2.0,
+    "hand": 1.0,
+    "offset": 0.01278409082442522,
+    "onset": 0.01278409082442522,
+    "pitch": 0.01278409082442522
+  },
+  "video_range": {
+    "max": 1.0,
+    "min": -1.0
+  },
+  "videos": [
+    "data/PianoYT/val/video_106.0.mp4",
+    "data/PianoYT/val/video_132.0.mp4"
+  ]
+}

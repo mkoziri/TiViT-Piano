@@ -1,0 +1,36 @@
+{
+  "dtype": "torch.float32",
+  "metadata": {},
+  "shape": [
+    96,
+    3,
+    3,
+    145,
+    352
+  ],
+  "targets": {
+    "clef": [
+      96
+    ],
+    "hand": [
+      96
+    ],
+    "offset": [
+      96,
+      88
+    ],
+    "onset": [
+      96,
+      88
+    ],
+    "pitch": [
+      96,
+      88
+    ]
+  },
+  "video": "data/PianoYT/val/video_132.0.mp4",
+  "video_range": [
+    -1.0,
+    1.0
+  ]
+}
