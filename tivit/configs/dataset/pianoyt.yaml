@@ -55,3 +55,16 @@ dataset:
     cache_labels: true
     cache_dir: .cache/labels
     targets_sparse: true
+  testing:
+    canary_json: tivit/tests/resources/pianoyt_canaries.json
+    default_canary_count: 2
+    regen_canaries: false
+    enable_cache_equiv: false
+    enable_audit_export: false
+    audit_dir: out/audit/pianoyt
+    cache_off: false
+    strict_sampling: false
+    strict_labels: false
+    strict_fallback: false
+    root_dir_default: data/PianoYT
+    annotations_root_default: data/PianoYT

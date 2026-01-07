@@ -73,3 +73,16 @@ dataset:
       radius: 0.12
       dilate_margin: 0.02
       min_points: 4
+  testing:
+    canary_json: tivit/tests/resources/pianovam_canaries.json
+    default_canary_count: 2
+    regen_canaries: false
+    enable_cache_equiv: false
+    enable_audit_export: false
+    audit_dir: tivit/tests/resources/audit/pianovam
+    cache_off: false
+    strict_sampling: false
+    strict_labels: false
+    strict_fallback: false
+    root_dir_default: data/PianoVAM_v1.0
+    annotations_root_default: data/PianoVAM_v1.0

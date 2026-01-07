@@ -41,3 +41,16 @@ dataset:
     bg_frac: 0.25
     nearmiss_radius: 6
   require_labels: true
+  testing:
+    canary_json: tivit/tests/resources/omaps_canaries.json
+    default_canary_count: 2
+    regen_canaries: false
+    enable_cache_equiv: false
+    enable_audit_export: false
+    audit_dir: out/audit/omaps
+    cache_off: false
+    strict_sampling: false
+    strict_labels: false
+    strict_fallback: false
+    root_dir_default: data/omaps
+    annotations_root_default: data/omaps
