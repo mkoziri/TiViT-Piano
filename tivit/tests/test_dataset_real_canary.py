@@ -208,6 +208,7 @@ def _prepare_dataset_cfg(cfg: Mapping[str, Any], testing_cfg: Mapping[str, Any],
         frame_targets_cfg["cache_labels"] = False
     dataset_cfg["frame_targets"] = frame_targets_cfg
     dataset_cfg["num_workers"] = 0
+    dataset_cfg["prefetch_factor"] = None
 
     cfg["dataset"] = dataset_cfg
     return cfg
