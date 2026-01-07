@@ -60,9 +60,9 @@ dataset:
     default_canary_count: 2
     regen_canaries: false
     enable_cache_equiv: false
-    enable_audit_export: false
+    enable_audit_export: true
     audit_dir: tivit/tests/resources/audit/pianoyt
-    cache_off: false
+    cache_off: true
     strict_sampling: false
     strict_labels: false
     strict_fallback: false
