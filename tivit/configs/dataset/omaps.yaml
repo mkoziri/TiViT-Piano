@@ -16,7 +16,7 @@ dataset:
   frames: 96
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
-  skip_seconds: 0.0
+  skip_seconds: 15.0
   resize: [145, 1024]
   tiles: 3
   channels: 3
@@ -47,9 +47,9 @@ dataset:
     default_canary_count: 2
     regen_canaries: false
     enable_cache_equiv: false
-    enable_audit_export: false
+    enable_audit_export: true
     audit_dir: tivit/tests/resources/audit/omaps
-    cache_off: false
+    cache_off: true
     strict_sampling: false
     strict_labels: false
     strict_fallback: false
