@@ -25,6 +25,7 @@ dataset:
   resize: [180, 1536]
   tiles: 3
   channels: 3
+  grayscale: false
   normalize: true
   apply_crop: true
   canonical_hw: [180, 1536]
