@@ -505,12 +505,7 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
     crop_meta = sample.get("metadata", {}).get("crop") if isinstance(sample.get("metadata"), Mapping) else None
     if crop_meta is not None:
         try:
-            cfg_resize: Optional[Tuple[int, int]] = None
-            if resize_hw:
-                resize_list = list(resize_hw)
-                if len(resize_list) >= 2:
-                    cfg_resize = (int(resize_list[0]), int(resize_list[1]))
-            vr_cfg = VideoReaderConfig(frames=1, stride=1, resize_hw=cfg_resize or video.shape[-2:], channels=3)
+            vr_cfg = VideoReaderConfig(frames=1, stride=1, resize_hw=None, channels=3)
             decoded = load_clip(canary.abs_path, vr_cfg)
             frame0 = decoded[0].permute(1, 2, 0).cpu().numpy()
             h, w, _ = frame0.shape

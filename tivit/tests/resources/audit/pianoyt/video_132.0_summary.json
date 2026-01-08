@@ -1,6 +1,13 @@
 {
   "dtype": "torch.float32",
-  "metadata": {},
+  "metadata": {
+    "crop": [
+      45,
+      677,
+      1871,
+      993
+    ]
+  },
   "shape": [
     96,
     3,
@@ -30,7 +37,7 @@
   },
   "video": "data/PianoYT/val/video_132.0.mp4",
   "video_range": [
-    -1.0,
+    -0.9607843160629272,
     1.0
   ]
 }

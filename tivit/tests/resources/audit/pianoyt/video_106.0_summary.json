@@ -1,6 +1,13 @@
 {
   "dtype": "torch.float32",
-  "metadata": {},
+  "metadata": {
+    "crop": [
+      47,
+      675,
+      1869,
+      990
+    ]
+  },
   "shape": [
     96,
     3,
