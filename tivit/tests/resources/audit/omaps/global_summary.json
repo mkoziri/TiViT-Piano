@@ -1,0 +1,17 @@
+{
+  "target_means": {
+    "clef": 1.0885416865348816,
+    "hand": 0.8072916567325592,
+    "offset": 0.022845644503831863,
+    "onset": 0.021247632801532745,
+    "pitch": 0.04071969725191593
+  },
+  "video_range": {
+    "max": 1.0,
+    "min": -1.0
+  },
+  "videos": [
+    "/home/almar/datasets/OMAPS/train/001.mp4",
+    "/home/almar/datasets/OMAPS/train/002.mp4"
+  ]
+}

@@ -6,7 +6,7 @@
     3,
     3,
     145,
-    352
+    1024
   ],
   "targets": {
     "clef": [
@@ -28,9 +28,9 @@
       88
     ]
   },
-  "video": "data/PianoYT/val/video_132.0.mp4",
+  "video": "/home/almar/datasets/OMAPS/train/002.mp4",
   "video_range": [
-    -0.9971634149551392,
+    -1.0,
     1.0
   ]
 }

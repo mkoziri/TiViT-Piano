@@ -34,7 +34,7 @@ class VideoReaderConfig:
 
     frames: int
     stride: int
-    resize_hw: Tuple[int, int]
+    resize_hw: Tuple[int, int] | None
     channels: int = 3
     start_frame: int = 0
 
@@ -74,7 +74,8 @@ def _try_cv2(path: Path, cfg: VideoReaderConfig) -> torch.Tensor:
         rel_idx = i - cfg.start_frame
         if rel_idx % cfg.stride == 0:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (cfg.resize_hw[1], cfg.resize_hw[0]), interpolation=cv2.INTER_AREA)
+            if cfg.resize_hw and cfg.resize_hw[0] > 0 and cfg.resize_hw[1] > 0:
+                frame = cv2.resize(frame, (cfg.resize_hw[1], cfg.resize_hw[0]), interpolation=cv2.INTER_AREA)
             images.append(frame)
             if len(images) == cfg.frames:
                 break
@@ -104,9 +105,10 @@ def load_clip(path: str | Path, cfg: VideoReaderConfig) -> torch.Tensor:
     if cfg.channels == 1 and x.shape[-1] == 3:
         x = (0.299 * x[..., 0] + 0.587 * x[..., 1] + 0.114 * x[..., 2]).unsqueeze(-1)
     x = x.permute(0, 3, 1, 2)  # T,C,H,W
-    h, w = x.shape[-2:]
-    if (h, w) != cfg.resize_hw:
-        x = torch.nn.functional.interpolate(x, size=cfg.resize_hw, mode="area")
+    if cfg.resize_hw and cfg.resize_hw[0] > 0 and cfg.resize_hw[1] > 0:
+        h, w = x.shape[-2:]
+        if (h, w) != cfg.resize_hw:
+            x = torch.nn.functional.interpolate(x, size=cfg.resize_hw, mode="area")
     return x
 
 

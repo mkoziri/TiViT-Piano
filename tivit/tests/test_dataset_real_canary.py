@@ -325,8 +325,9 @@ def _check_frames(sample: Mapping[str, Any], expected_T: int, canary: Canary, ti
     if W < max(32, expected_w * 0.2):
         raise AssertionError(f"tile width {W} unexpectedly small vs resize width {expected_w} for {canary.video_rel}")
     total_width = W * tiles
-    if expected_w > 0 and not (0.8 * expected_w <= total_width <= 1.3 * expected_w):
-        raise AssertionError(f"tiling coverage {total_width} px out of bounds for expected ~{expected_w} on {canary.video_rel}")
+    expected_total_w = expected_w * tiles
+    if expected_w > 0 and not (0.8 * expected_total_w <= total_width <= 1.3 * expected_total_w):
+        raise AssertionError(f"tiling coverage {total_width} px out of bounds for expected ~{expected_total_w} on {canary.video_rel}")
     _assert_finite(video, "video", canary)
     vmin, vmax = float(video.min()), float(video.max())
     if not (-5.0 <= vmin <= 5.0 and -5.0 <= vmax <= 5.0):
