@@ -521,20 +521,7 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
                 x1 = int(max(0, min(w - 1, x1)))
                 y0 = int(max(0, min(h - 1, y0)))
                 y1 = int(max(0, min(h - 1, y1)))
-                if x1 > x0 and y1 > y0:
-                    try:
-                        import cv2  # type: ignore
-                    except Exception:
-                        cv2 = None  # type: ignore
-                    if cv2 is not None:
-                        frame_draw = frame0.copy()
-                        cv2.rectangle(frame_draw, (x0, y0), (x1, y1), (255, 0, 0), 2)
-                        cv2.imwrite(str(audit_dir / f"{canary.video_id}_frame000_crop.png"), frame_draw)
-                    elif Image is not None and ImageDraw is not None:
-                        img = Image.fromarray(frame0.astype("uint8"))
-                        draw = ImageDraw.Draw(img)
-                        draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
-                        img.save(audit_dir / f"{canary.video_id}_frame000_crop.png")
+                # Previously drew crop box on original frame; removed per request.
         except Exception:
             pass
 
