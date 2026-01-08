@@ -31,8 +31,9 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+import numpy as np
 import torch
 
 try:
@@ -424,7 +425,7 @@ def _check_sampling_rules(ds: Any, sample: Mapping[str, Any], canary: Canary, *,
         raise AssertionError(f"stride {ds.stride} invalid for {canary.video_rel}")
 
 
-def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *, tiles: int, norm_mean: Iterable[float], norm_std: Iterable[float]) -> None:
+def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *, tiles: int, norm_mean: Iterable[float], norm_std: Iterable[float], resize_hw: Optional[Iterable[int]] = None) -> None:
     audit_dir.mkdir(parents=True, exist_ok=True)
     video = sample["video"]
     T = video.shape[0]
@@ -438,9 +439,28 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
     vid_denorm = _denorm(video).clamp(0.0, 1.0)
     for idx in frames_idx:
         idx = int(max(0, min(T - 1, idx)))
-        tile_tensor = vid_denorm[idx]
-        tiles_np = tile_tensor.permute(1, 0, 2, 3).reshape(3, tiles * tile_tensor.shape[-2], tile_tensor.shape[-1])
-        tiles_np = tiles_np.permute(1, 2, 0).cpu().numpy()
+        tile_tensor = vid_denorm[idx]  # C, K, H, W
+        tiles_np_list = [
+            tile_tensor[:, k].permute(1, 2, 0).cpu().numpy() for k in range(tile_tensor.shape[1])
+        ]  # H, W, C per tile
+        tiles_np = tiles_np_list[0] if len(tiles_np_list) == 1 else np.concatenate(tiles_np_list, axis=1)
+        target_h, target_w = (None, None)
+        if resize_hw:
+            resize_list = list(resize_hw)
+            if len(resize_list) >= 2:
+                target_h, target_w = int(resize_list[0]), int(resize_list[1])
+        if target_h and target_w and (tiles_np.shape[0] != target_h or tiles_np.shape[1] != target_w):
+            try:
+                import cv2  # type: ignore
+            except Exception:
+                cv2 = None  # type: ignore
+            if cv2 is not None:
+                tiles_np = cv2.resize(tiles_np, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            elif Image is not None:
+                img_tmp = Image.fromarray((tiles_np * 255).astype("uint8"))
+                resampling = getattr(getattr(Image, "Resampling", Image), "BILINEAR", getattr(Image, "BILINEAR", 2))
+                img_tmp = img_tmp.resize((target_w, target_h), resample=resampling)
+                tiles_np = np.array(img_tmp).astype("float32") / 255.0
         out_path = audit_dir / f"{canary.video_id}_frame{idx:03d}_tiles.png"
         saved = False
         try:
@@ -480,6 +500,43 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
                 draw.line([(x, 0), (x, h - 1)], fill=(0, 255, 0), width=2)
             draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(255, 0, 0), width=2)
             overlay_img.save(overlay_name)
+
+    # Original frame with crop rectangle (first frame).
+    crop_meta = sample.get("metadata", {}).get("crop") if isinstance(sample.get("metadata"), Mapping) else None
+    if crop_meta is not None:
+        try:
+            cfg_resize: Optional[Tuple[int, int]] = None
+            if resize_hw:
+                resize_list = list(resize_hw)
+                if len(resize_list) >= 2:
+                    cfg_resize = (int(resize_list[0]), int(resize_list[1]))
+            vr_cfg = VideoReaderConfig(frames=1, stride=1, resize_hw=cfg_resize or video.shape[-2:], channels=3)
+            decoded = load_clip(canary.abs_path, vr_cfg)
+            frame0 = decoded[0].permute(1, 2, 0).cpu().numpy()
+            h, w, _ = frame0.shape
+            vals = list(crop_meta)
+            if len(vals) >= 4:
+                x0, y0, x1, y1 = map(float, vals[:4])
+                x0 = int(max(0, min(w - 1, x0)))
+                x1 = int(max(0, min(w - 1, x1)))
+                y0 = int(max(0, min(h - 1, y0)))
+                y1 = int(max(0, min(h - 1, y1)))
+                if x1 > x0 and y1 > y0:
+                    try:
+                        import cv2  # type: ignore
+                    except Exception:
+                        cv2 = None  # type: ignore
+                    if cv2 is not None:
+                        frame_draw = frame0.copy()
+                        cv2.rectangle(frame_draw, (x0, y0), (x1, y1), (255, 0, 0), 2)
+                        cv2.imwrite(str(audit_dir / f"{canary.video_id}_frame000_crop.png"), frame_draw)
+                    elif Image is not None and ImageDraw is not None:
+                        img = Image.fromarray(frame0.astype("uint8"))
+                        draw = ImageDraw.Draw(img)
+                        draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
+                        img.save(audit_dir / f"{canary.video_id}_frame000_crop.png")
+        except Exception:
+            pass
 
     if plt is not None:
         onset = sample.get("onset")
@@ -607,7 +664,7 @@ def main() -> None:
                         raise AssertionError(f"cache on/off mismatch for {key} in {canary.video_rel}")
 
         if options.enable_audit and options.audit_dir:
-            _export_audit(sample, canary, options.audit_dir, tiles=ds.tiles, norm_mean=ds.norm_mean, norm_std=ds.norm_std)
+            _export_audit(sample, canary, options.audit_dir, tiles=ds.tiles, norm_mean=ds.norm_mean, norm_std=ds.norm_std, resize_hw=ds.resize_hw)
         print(f"[ok] {canary.video_rel} split={split} idx={idx}")
 
     if options.enable_audit and options.audit_dir:
