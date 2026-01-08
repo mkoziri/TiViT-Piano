@@ -505,11 +505,15 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
     crop_meta = sample.get("metadata", {}).get("crop") if isinstance(sample.get("metadata"), Mapping) else None
     if crop_meta is not None:
         try:
-            vr_cfg = VideoReaderConfig(frames=1, stride=1, resize_hw=None, channels=3)
+            cfg_resize: Optional[Tuple[int, int]] = None
+            if resize_hw:
+                resize_list = list(resize_hw)
+                if len(resize_list) >= 2:
+                    cfg_resize = (int(resize_list[0]), int(resize_list[1]))
+            vr_cfg = VideoReaderConfig(frames=1, stride=1, resize_hw=cfg_resize or video.shape[-2:], channels=3)
             decoded = load_clip(canary.abs_path, vr_cfg)
             frame0 = decoded[0].permute(1, 2, 0).cpu().numpy()
-            frame0_u8 = (np.clip(frame0, 0.0, 1.0) * 255.0).astype("uint8")
-            h, w, _ = frame0_u8.shape
+            h, w, _ = frame0.shape
             vals = list(crop_meta)
             if len(vals) >= 4:
                 x0, y0, x1, y1 = map(float, vals[:4])
@@ -523,11 +527,11 @@ def _export_audit(sample: Mapping[str, Any], canary: Canary, audit_dir: Path, *,
                     except Exception:
                         cv2 = None  # type: ignore
                     if cv2 is not None:
-                        frame_draw = frame0_u8.copy()
+                        frame_draw = frame0.copy()
                         cv2.rectangle(frame_draw, (x0, y0), (x1, y1), (255, 0, 0), 2)
                         cv2.imwrite(str(audit_dir / f"{canary.video_id}_frame000_crop.png"), frame_draw)
                     elif Image is not None and ImageDraw is not None:
-                        img = Image.fromarray(frame0_u8)
+                        img = Image.fromarray(frame0.astype("uint8"))
                         draw = ImageDraw.Draw(img)
                         draw.rectangle([x0, y0, x1, y1], outline="red", width=2)
                         img.save(audit_dir / f"{canary.video_id}_frame000_crop.png")
