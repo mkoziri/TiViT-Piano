@@ -426,6 +426,51 @@ def build_dense_frame_targets(
         trace["painted_pairs_unique"] = int(torch.count_nonzero(onset_roll).item())
         trace["onset_frames_touched_count"] = len(frames_touched)
         trace["events_painted_total"] = events_painted_total
+
+    # Offset trace
+    if trace is not None:
+        offset_frames_touched: Set[int] = set()
+        offset_events_painted = 0
+        offset_center_frames = set()
+        for e, p in zip(off_frames, pit):
+            off_idx = int(torch.clamp(e, 0, T - 1).item())
+            offset_center_frames.add(off_idx)
+            offset_frames_touched.add(off_idx)
+            offset_events_painted += 1
+        trace["offset_timebase"] = "shifted_to_clip"
+        trace["offset_window_start"] = window_start
+        trace["offset_window_end"] = window_end
+        trace["offset_events_seen_total"] = events_seen_total
+        trace["offset_events_in_window_total"] = events_in_window_total
+        trace["offset_events_painted_total"] = offset_events_painted
+        trace["offset_min_used"] = float(on.min().item()) if on.numel() > 0 else None
+        trace["offset_max_used"] = float(on.max().item()) if on.numel() > 0 else None
+        trace["offset_painted_pairs_unique"] = int(torch.count_nonzero(offset_roll).item())
+        trace["offset_target_cells_actual"] = int(torch.count_nonzero(offset_roll).item())
+        trace["offset_target_frames_any_actual"] = int(torch.count_nonzero(offset_roll.sum(dim=1)).item())
+        trace["offset_frames_touched_by_painting"] = sorted(offset_frames_touched)
+        trace["offset_frames_touched_count"] = len(offset_frames_touched)
+        trace["offset_unique_center_frames_in_window"] = sorted(offset_center_frames)
+
+    # Pitch trace
+    if trace is not None:
+        pitch_painted_pairs = int(torch.count_nonzero(pitch_roll).item())
+        pitch_frames_any_actual = int(torch.count_nonzero(pitch_roll.sum(dim=1)).item())
+        trace["pitch_events_seen_total"] = events_seen_total
+        trace["pitch_events_in_window_total"] = events_in_window_total
+        trace["pitch_events_painted_total"] = events_painted_total
+        trace["pitch_painted_pairs_unique"] = pitch_painted_pairs
+        trace["pitch_target_cells_actual"] = pitch_painted_pairs
+        trace["pitch_frames_any_actual"] = pitch_frames_any_actual
+        trace["pitch_frames_any_painted_count"] = pitch_frames_any_actual
+        trace["pitch_frames_any_painted"] = (
+            sorted([int(i) for i in (pitch_roll.sum(dim=1) > 0).nonzero(as_tuple=False).view(-1).tolist()])
+            if pitch_roll.numel() > 0
+            else []
+        )
+        trace["pitch_min_used"] = int((pit + note_min).min().item()) if pit.numel() > 0 else None
+        trace["pitch_max_used"] = int((pit + note_min).max().item()) if pit.numel() > 0 else None
+        trace["pitch_invalid_pitch_events_dropped"] = int(events_seen_total - len(pit))
     return out
 
 

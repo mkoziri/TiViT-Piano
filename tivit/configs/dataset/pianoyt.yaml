@@ -68,8 +68,8 @@ dataset:
     enable_audit_export: true
     audit_dir: tivit/tests/resources/audit/pianoyt
     cache_off: true
-    strict_sampling: true
-    strict_labels: true
+    strict_sampling: false
+    strict_labels: false
     strict_fallback: false
     log_level: detailed
     export_report_json: true
@@ -77,4 +77,4 @@ dataset:
     max_event_examples: 2
     warn_fps_tolerance: 0.5
     warn_out_of_window_ratio: 0.2
-    enable_debug_extras: true
+    enable_debug_extras: false

@@ -981,6 +981,25 @@ class ModelReadinessReporter:
             name: self._summarize_target(name, sample.get(name), getattr(ds, "frame_target_spec", None))
             for name in ("pitch", "onset", "offset", "hand", "clef")
         }
+        pitch_trace = {
+            "painted_pairs_unique": target_build.get("pitch_painted_pairs_unique"),
+            "frames_any_actual": target_build.get("pitch_frames_any_actual"),
+            "events_in_window_total": target_build.get("pitch_events_in_window_total"),
+            "events_seen_total": target_build.get("pitch_events_seen_total"),
+            "min_used": target_build.get("pitch_min_used"),
+            "max_used": target_build.get("pitch_max_used"),
+        }
+        offset_trace = {
+            "painted_pairs_unique": target_build.get("offset_painted_pairs_unique"),
+            "frames_any_actual": target_build.get("offset_target_frames_any_actual"),
+            "events_in_window_total": target_build.get("offset_events_in_window_total"),
+            "events_seen_total": target_build.get("offset_events_seen_total"),
+            "min_used": target_build.get("offset_min_used"),
+            "max_used": target_build.get("offset_max_used"),
+        }
+        hand_trace = {
+            "enabled": sample.get("hand") is not None,
+        }
 
         def _safe_int(val: Any) -> Optional[int]:
             try:
@@ -1139,7 +1158,6 @@ class ModelReadinessReporter:
                 target_any_frames = int(torch.count_nonzero(onset_target.sum(dim=1)).item()) if onset_target.ndim >= 2 else None
         margin = 1.0 + self.warn_onset_cells_margin
         target_build_mismatch = False
-        tb_expected_cells = _safe_int(target_build.get("expected_onset_cells_from_events"))
         if targets_sparse and target_cells is not None:
             compare_to = tb_expected_cells if tb_expected_cells is not None else tb_note_in
             if compare_to is not None:
@@ -1298,6 +1316,9 @@ class ModelReadinessReporter:
                 "clip_start_mismatch": clip_start_mismatch,
             },
             "targets": targets,
+            "pitch_trace": pitch_trace,
+            "offset_trace": offset_trace,
+            "hand_trace": hand_trace,
             "spotcheck": spotcheck_summary,
             "frame_targets": {
                 "tolerance_s": tolerance_s,
