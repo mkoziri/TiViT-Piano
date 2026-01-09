@@ -30,6 +30,7 @@ dataset:
   apply_crop: true
   canonical_hw: [180, 1536]
   registration:
+    enable: true
     source: metadata
     interp: bilinear
     global_aug:
