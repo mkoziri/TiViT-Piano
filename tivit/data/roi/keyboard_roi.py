@@ -2454,7 +2454,8 @@ class RegistrationRefiner:
         crop_meta: Optional[Sequence[float] | Dict[str, Any]],
         interp: str = "bilinear",
         debug_context: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
+        return_result: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, "RegistrationResult"]:
         result = self.refine(
             video_id=video_id,
             video_path=video_path,
@@ -2485,7 +2486,7 @@ class RegistrationRefiner:
                 warped = F.interpolate(warped, size=self.canonical_hw, mode=interp, align_corners=False)
             else:
                 warped = F.interpolate(warped, size=self.canonical_hw, mode=interp)
-        return warped
+        return (warped, result) if return_result else warped
 
 
 __all__ = ["RegistrationRefiner", "RegistrationResult", "resolve_registration_cache_path"]

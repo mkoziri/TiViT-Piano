@@ -33,6 +33,8 @@ dataset:
       color_jitter:
         brightness: 0.1
         contrast: 0.1
+  avlag:
+    enable: true
   batch_size: 2
   num_workers: 2
   prefetch_factor: 1
@@ -55,3 +57,10 @@ dataset:
     strict_sampling: false
     strict_labels: false
     strict_fallback: false
+    log_level: detailed
+    export_report_json: true
+    report_json_path: tivit/tests/resources/audit/omaps/model_readiness_report.jsonl
+    max_event_examples: 2
+    warn_fps_tolerance: 0.5
+    warn_out_of_window_ratio: 0.2
+    enable_debug_extras: false
