@@ -989,11 +989,13 @@ class ModelReadinessReporter:
                 return None
 
         # Prefer per-note counts from target_build (same source as targets), fall back to sync_meta.
-        tb_note_total = _safe_int(target_build.get("note_events_used_total"))
+        tb_note_total = _safe_int(target_build.get("events_seen_total"))
         tb_note_after_lag = tb_note_total
-        tb_note_in = tb_note_total
+        tb_chord_in_total = _safe_int(target_build.get("events_in_window_total"))
+        tb_painted_pairs = _safe_int(target_build.get("painted_pairs_unique"))
+        tb_note_in = tb_painted_pairs
         tb_chord_total = None
-        tb_chord_in = None
+        tb_chord_in = tb_chord_in_total
         unique_center_frames = target_build.get("unique_onset_center_frames_in_window") or []
         tb_unique_frames = len(unique_center_frames)
         tb_events_in_window_sample: List[Any] = []
@@ -1069,6 +1071,18 @@ class ModelReadinessReporter:
             "note_events_after_lag_total": tb_note_after_lag,
             "chord_events_total": tb_chord_total,
             "chord_events_in_window": tb_chord_in,
+            "timebase": target_build.get("timebase"),
+            "window_start": target_build.get("window_start"),
+            "window_end": target_build.get("window_end"),
+            "min_onset_used": target_build.get("min_onset_used"),
+            "max_onset_used": target_build.get("max_onset_used"),
+            "onset_frames_touched_by_painting": target_build.get("onset_frames_touched_by_painting"),
+            "painted_pairs_unique": target_build.get("painted_pairs_unique"),
+            "unique_onset_center_frames_in_window": target_build.get("unique_onset_center_frames_in_window"),
+            "events_in_window_total": target_build.get("events_in_window_total"),
+            "events_seen_total": target_build.get("events_seen_total"),
+            "events_painted_total": target_build.get("events_painted_total"),
+            "frames_touched_count": target_build.get("onset_frames_touched_count"),
         }
         avg_notes_per_frame_tb = (
             float(tb_note_in) / max(float(tb_unique_frames), 1.0) if tb_note_in is not None and tb_unique_frames else None
@@ -1102,12 +1116,15 @@ class ModelReadinessReporter:
             frames_per_note_high = 1
         else:
             frames_per_note_high = int(math.ceil((2.0 * tolerance_s) / max(hop_s, 1e-6)) + 1 + dilation_frames)
-        expected_onset_cells_low = note_onsets_in_window * frames_per_note_low
-        expected_onset_cells_high = note_onsets_in_window * frames_per_note_high
-        tb_expected_cells = _safe_int(target_build.get("expected_onset_cells_from_events"))
+        tb_expected_cells = _safe_int(target_build.get("painted_pairs_unique")) or _safe_int(
+            target_build.get("expected_onset_cells_from_events")
+        )
         if tb_expected_cells is not None:
             expected_onset_cells_low = tb_expected_cells
             expected_onset_cells_high = tb_expected_cells
+        else:
+            expected_onset_cells_low = note_onsets_in_window * frames_per_note_low
+            expected_onset_cells_high = note_onsets_in_window * frames_per_note_high
         onset_cells_actual = targets.get("onset", {}).get("count_pos")
 
         spotcheck_summary = self._spotcheck_onsets(
@@ -1338,8 +1355,6 @@ class ModelReadinessReporter:
             warnings.append("targets_have_onsets_but_labels_none")
         if note_in > 0 and (onset_count is None or onset_count == 0):
             warnings.append("labels_have_onsets_but_targets_empty")
-        if lag_meta.get("dedup_suspect"):
-            warnings.append("target_build_events_dedup_suspected")
         try:
             if onset_cells_actual is not None and expected_high is not None:
                 upper = float(expected_high) * (1.0 + self.warn_onset_cells_margin)
@@ -1350,13 +1365,18 @@ class ModelReadinessReporter:
                 upper_t = float(expected_high) * (1.0 + self.warn_onset_cells_margin)
                 if float(target_cells) > upper_t:
                     warnings.append("target_cells_out_of_expected_range")
-            if target_any_frames is not None and unique_onsets is not None:
+            frames_touched = lag_meta.get("tb_counts", {}).get("frames_touched_count") if lag_meta.get("tb_counts") else None
+            if frames_touched is None and target_any_frames is not None and unique_onsets is not None:
                 if float(target_any_frames) > float(unique_onsets) * (1.0 + self.warn_onset_cells_margin):
                     warnings.append("target_any_frames_excess")
         except Exception:
             pass
-        if lag_meta.get("target_build_mismatch"):
-            warnings.append("target_build_count_mismatch")
+        painted_pairs = lag_meta.get("tb_counts", {}).get("painted_pairs_unique") if lag_meta.get("tb_counts") else None
+        frames_touched = lag_meta.get("tb_counts", {}).get("frames_touched_count") if lag_meta.get("tb_counts") else None
+        if painted_pairs is not None and target_cells is not None and painted_pairs != target_cells:
+            warnings.append("target_cells_mismatch_trace")
+        if frames_touched is not None and target_any_frames is not None and frames_touched != target_any_frames:
+            warnings.append("target_frames_mismatch_trace")
         if lag_meta.get("clip_start_mismatch"):
             warnings.append("clip_start_mismatch")
         spotcheck = record.get("spotcheck", {}) or {}
@@ -1458,7 +1478,7 @@ class ModelReadinessReporter:
             "tb_after_lag={tb_after_lag} tb_in_window_total={tb_in_win} tb_chord_total={tb_chord_total} tb_chord_in={tb_chord_in} "
             "sync_total={sync_total} sync_in={sync_in} sync_unique={sync_uniq} "
             "sparse={sparse} mismatch={mismatch} dedup_suspect={dedup} target_cells={target_cells} target_any_frames={target_any} "
-            "expected_from_events={exp_cells}".format(
+            "expected_from_events={exp_cells} painted_pairs={painted_pairs}".format(
                 tb_total=lag_meta.get("tb_counts", {}).get("total") if lag_meta.get("tb_counts") else None,
                 tb_in=lag_meta.get("tb_counts", {}).get("in_window") if lag_meta.get("tb_counts") else None,
                 tb_uniq=lag_meta.get("tb_counts", {}).get("unique_frames") if lag_meta.get("tb_counts") else None,
@@ -1476,16 +1496,32 @@ class ModelReadinessReporter:
                 target_cells=lag_meta.get("target_onset_cells"),
                 target_any=lag_meta.get("target_onset_frames_any"),
                 exp_cells=lag_meta.get("tb_counts", {}).get("expected_onset_cells_from_events") if lag_meta.get("tb_counts") else None,
+                painted_pairs=lag_meta.get("tb_counts", {}).get("painted_pairs_unique") if lag_meta.get("tb_counts") else None,
             )
         )
         lines.append(
-            "[lag] seconds={lag} source={source} frames={frames} note_in={in_w}/{total} uniq_frames={uniq} avg_notes_per_frame={avg:.2f} onset_cells={cells} expected=[{low},{high}] target_any_frames={any_frames} q={quant} examples={examples}".format(
+            "[lag.trace] timebase={timebase} window=[{ws},{we}] min_onset_used={min_on} max_onset_used={max_on} "
+            "frames_touched_count={ftc} frames_touched={ft} centers={centers}".format(
+                timebase=lag_meta.get("tb_counts", {}).get("timebase") if lag_meta.get("tb_counts") else None,
+                ws=lag_meta.get("tb_counts", {}).get("window_start") if lag_meta.get("tb_counts") else None,
+                we=lag_meta.get("tb_counts", {}).get("window_end") if lag_meta.get("tb_counts") else None,
+                min_on=lag_meta.get("tb_counts", {}).get("min_onset_used") if lag_meta.get("tb_counts") else None,
+                max_on=lag_meta.get("tb_counts", {}).get("max_onset_used") if lag_meta.get("tb_counts") else None,
+                ftc=len(lag_meta.get("tb_counts", {}).get("onset_frames_touched_by_painting") or []),
+                ft=lag_meta.get("tb_counts", {}).get("onset_frames_touched_by_painting"),
+                centers=lag_meta.get("tb_counts", {}).get("unique_onset_center_frames_in_window") if lag_meta.get("tb_counts") else None,
+            )
+        )
+        lines.append(
+            "[lag] seconds={lag} source={source} frames={frames} chords_in={chords} note_onsets_cells={cells_used} centers={uniq} frames_touched={ft} "
+            "avg_notes_per_frame={avg:.2f} onset_cells={cells} expected=[{low},{high}] target_any_frames={any_frames} q={quant} examples={examples}".format(
                 lag=lag_meta.get("lag_seconds"),
                 source=lag_meta.get("lag_source"),
                 frames=lag_meta.get("lag_frames"),
-                in_w=lag_meta.get("note_onsets_in_window"),
-                total=lag_meta.get("note_onsets_total"),
+                chords=lag_meta.get("tb_counts", {}).get("events_in_window_total") if lag_meta.get("tb_counts") else lag_meta.get("events_in_window"),
+                cells_used=lag_meta.get("tb_counts", {}).get("painted_pairs_unique") if lag_meta.get("tb_counts") else lag_meta.get("note_onsets_in_window"),
                 uniq=lag_meta.get("unique_onset_times_in_window"),
+                ft=lag_meta.get("tb_counts", {}).get("frames_touched_count") if lag_meta.get("tb_counts") else None,
                 avg=float(lag_meta.get("avg_notes_per_onset_time", 0.0)),
                 cells=lag_meta.get("onset_cells_actual"),
                 low=lag_meta.get("expected_onset_cells_low"),

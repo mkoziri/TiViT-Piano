@@ -316,6 +316,19 @@ def build_dense_frame_targets(
     mask_pitch = (pit >= int(note_min)) & (pit <= int(note_max))
     on, off, pit = on[mask_pitch], off[mask_pitch], pit[mask_pitch] - int(note_min)
 
+    window_start = 0.0
+    window_end = duration_sec
+    events_seen_total = int(len(on))
+    in_window_mask = (on >= window_start) & (on < window_end)
+    min_onset_used = float(on[in_window_mask].min().item()) if in_window_mask.any() else None
+    max_onset_used = float(on[in_window_mask].max().item()) if in_window_mask.any() else None
+    min_onset_seen = float(on.min().item()) if on.numel() > 0 else None
+    max_onset_seen = float(on.max().item()) if on.numel() > 0 else None
+    on = on[in_window_mask]
+    off = off[in_window_mask]
+    pit = pit[in_window_mask]
+    events_in_window_total = int(len(on))
+
     on_frames = torch.as_tensor(sec_to_frame(on, hop_seconds), dtype=torch.int64)
     off_frames = torch.as_tensor(sec_to_frame(off, hop_seconds), dtype=torch.int64)
     on_frames = torch.clamp(on_frames, 0, T - 1)
@@ -328,15 +341,22 @@ def build_dense_frame_targets(
                 "clip_start_sec_used_for_counts": 0.0,
                 "duration_sec_used_for_counts": duration_sec,
                 "clip_end_sec_used_for_counts": duration_sec,
+                "window_start": 0.0,
+                "window_end": duration_sec,
                 "hop_seconds": hop_seconds,
-                "note_events_used_total": int(len(on_frames)),
-                "min_onset_counted": float(on.min().item()) if on.numel() > 0 else None,
-                "max_onset_counted": float(on.max().item()) if on.numel() > 0 else None,
+                "events_seen_total": events_seen_total,
+                "events_in_window_total": events_in_window_total,
+                "events_painted_total": 0,
+                "min_onset_seen": min_onset_seen,
+                "max_onset_seen": max_onset_seen,
+                "min_onset_used": min_onset_used,
+                "max_onset_used": max_onset_used,
                 "unique_onset_center_frames_in_window": sorted({int(f.item()) for f in on_frames}),
             }
         )
 
     frames_touched: Set[int] = set()
+    events_painted_total = 0
     for s, e, p in zip(on_frames, off_frames, pit):
         s = int(s)
         e = int(e)
@@ -347,6 +367,7 @@ def build_dense_frame_targets(
         off_idx = min(e, T - 1)
         offset_roll[off_idx, p] = 1.0
         frames_touched.add(s)
+        events_painted_total += 1
 
     if dilate_active_frames and dilate_active_frames > 0:
         import torch.nn.functional as F
@@ -402,6 +423,9 @@ def build_dense_frame_targets(
         trace["onset_frames_touched_by_painting"] = sorted(frames_touched)
         trace["target_onset_cells_actual"] = int(torch.count_nonzero(onset_roll).item())
         trace["target_onset_frames_any_actual"] = int(torch.count_nonzero(onset_roll.sum(dim=1)).item())
+        trace["painted_pairs_unique"] = int(torch.count_nonzero(onset_roll).item())
+        trace["onset_frames_touched_count"] = len(frames_touched)
+        trace["events_painted_total"] = events_painted_total
     return out
 
 
