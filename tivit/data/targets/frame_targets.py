@@ -14,7 +14,7 @@ CLI:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, TypedDict
+from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple, TypedDict
 
 import logging
 import time
@@ -285,10 +285,12 @@ def build_dense_frame_targets(
     clef_thresholds: Tuple[int, int],
     dilate_active_frames: int,
     targets_sparse: bool,
+    trace: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build per-frame dense targets aligned to sampled frames."""
 
     hop_seconds = stride / max(1.0, float(fps))
+    duration_sec = hop_seconds * max(T - 1, 0)
 
     T = int(T)
     P = int(note_max - note_min + 1)
@@ -319,6 +321,22 @@ def build_dense_frame_targets(
     on_frames = torch.clamp(on_frames, 0, T - 1)
     off_frames = torch.clamp(off_frames, 0, T)
 
+    if trace is not None:
+        trace.update(
+            {
+                "timebase": "shifted_to_clip",
+                "clip_start_sec_used_for_counts": 0.0,
+                "duration_sec_used_for_counts": duration_sec,
+                "clip_end_sec_used_for_counts": duration_sec,
+                "hop_seconds": hop_seconds,
+                "note_events_used_total": int(len(on_frames)),
+                "min_onset_counted": float(on.min().item()) if on.numel() > 0 else None,
+                "max_onset_counted": float(on.max().item()) if on.numel() > 0 else None,
+                "unique_onset_center_frames_in_window": sorted({int(f.item()) for f in on_frames}),
+            }
+        )
+
+    frames_touched: Set[int] = set()
     for s, e, p in zip(on_frames, off_frames, pit):
         s = int(s)
         e = int(e)
@@ -328,6 +346,7 @@ def build_dense_frame_targets(
         onset_roll[s, p] = 1.0
         off_idx = min(e, T - 1)
         offset_roll[off_idx, p] = 1.0
+        frames_touched.add(s)
 
     if dilate_active_frames and dilate_active_frames > 0:
         import torch.nn.functional as F
@@ -338,6 +357,9 @@ def build_dense_frame_targets(
             x = roll.transpose(0, 1).unsqueeze(1)
             x = F.conv1d(x, ker, padding=dilate_active_frames)
             roll.copy_((x.squeeze(1) > 0).transpose(0, 1).float())
+            if roll is onset_roll:
+                active_frames = (roll.sum(dim=1) > 0).nonzero(as_tuple=False).view(-1).tolist()
+                frames_touched.update(int(f) for f in active_frames)
 
     # Hand head consumes 2-way per-frame labels (0=left, 1=right) and the
     # current implementation feeds it pseudo-supervision inferred from MIDI.
@@ -369,13 +391,18 @@ def build_dense_frame_targets(
     if targets_sparse:
         pass
 
-    return {
+    out = {
         "pitch_roll": pitch_roll,
         "onset_roll": onset_roll,
         "offset_roll": offset_roll,
         "hand_frame": hand_frame,
         "clef_frame": clef_frame,
     }
+    if trace is not None:
+        trace["onset_frames_touched_by_painting"] = sorted(frames_touched)
+        trace["target_onset_cells_actual"] = int(torch.count_nonzero(onset_roll).item())
+        trace["target_onset_frames_any_actual"] = int(torch.count_nonzero(onset_roll.sum(dim=1)).item())
+    return out
 
 
 def _shift_bool_mask(mask: torch.Tensor, delta: int) -> torch.Tensor:
@@ -525,6 +552,7 @@ def prepare_frame_targets(
     video_id: str,
     clip_start: float,
     soft_targets: Optional[SoftTargetConfig] = None,
+    trace: Optional[Dict[str, Any]] = None,
 ) -> FrameTargetResult:
     """Load or construct frame targets for a clip using a shared pipeline."""
 
@@ -613,6 +641,7 @@ def prepare_frame_targets(
         clef_thresholds=spec.clef_thresholds,
         dilate_active_frames=spec.dilation,
         targets_sparse=spec.targets_sparse,
+        trace=trace,
     )
     build_duration = time.perf_counter() - build_start
     if build_duration > 3.0:
@@ -666,6 +695,7 @@ def build_frame_targets(
     video_id: str,
     clip_start: float,
     soft_targets: Optional[SoftTargetConfig] = None,
+    trace: Optional[Dict[str, Any]] = None,
 ) -> FrameTargetResult:
     """Alias for prepare_frame_targets."""
 
@@ -678,6 +708,7 @@ def build_frame_targets(
         video_id=video_id,
         clip_start=clip_start,
         soft_targets=soft_targets,
+        trace=trace,
     )
 
 

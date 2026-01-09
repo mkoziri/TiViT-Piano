@@ -33,7 +33,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -879,7 +879,7 @@ class ModelReadinessReporter:
 
     def _spotcheck_onsets(
         self,
-        events_in_window: List[Tuple[float, float, float]],
+        events_in_window: List[Tuple[float, Optional[float], Any]],
         clip_start: float,
         hop_s: float,
         onset_target: Any,
@@ -937,7 +937,8 @@ class ModelReadinessReporter:
         tensor_shape = self._tensor_shape(video)
         hop_s = ds.stride / max(ds.decode_fps, 1e-6)
         duration_s = hop_s * max(ds.frames - 1, 0)
-        clip_start = float(getattr(ds, "skip_seconds", 0.0))
+        clip_start_ds = float(getattr(ds, "skip_seconds", 0.0))
+        clip_start = clip_start_ds
 
         decode_meta = debug_meta.get("decode", {}) if isinstance(debug_meta, Mapping) else {}
         tile_meta = debug_meta.get("tiling", {}) if isinstance(debug_meta, Mapping) else {}
@@ -945,6 +946,13 @@ class ModelReadinessReporter:
         refine_meta = debug_meta.get("registration", {}) if isinstance(debug_meta, Mapping) else {}
         sync_meta = debug_meta.get("sync", {}) if isinstance(debug_meta, Mapping) else {}
         target_build = debug_meta.get("target_build", {}) if isinstance(debug_meta, Mapping) else {}
+        if isinstance(target_build, Mapping):
+            try:
+                tb_clip_start = target_build.get("clip_start_sec")
+                if tb_clip_start is not None:
+                    clip_start = float(tb_clip_start)
+            except Exception:
+                clip_start = clip_start_ds
         events_before = list(sync_meta.get("events_before_sync") or [])
         events_after = list(sync_meta.get("events_after_sync") or [])
         actual_fps = decode_meta.get("actual_fps", decode_meta.get("decode_fps", ds.decode_fps))
@@ -962,7 +970,6 @@ class ModelReadinessReporter:
         lag_source = str(sample.get("sync", {}).get("source", target_build.get("lag_source", "unknown")))
         lag_ms = target_build.get("lag_ms")
         lag_frames = target_build.get("lag_frames")
-        in_window, out_window, out_ratio = self._event_window_stats(events_after, clip_start, duration_s)
         examples = self._event_examples(events_before, events_after, clip_start, duration_s, hop_s)
         reg_cache_path = None
         try:
@@ -975,28 +982,116 @@ class ModelReadinessReporter:
             for name in ("pitch", "onset", "offset", "hand", "clef")
         }
 
-        # Build per-note onset list (post lag application).
-        note_events = []
+        def _safe_int(val: Any) -> Optional[int]:
+            try:
+                return int(val)
+            except Exception:
+                return None
+
+        # Prefer per-note counts from target_build (same source as targets), fall back to sync_meta.
+        tb_note_total = _safe_int(target_build.get("note_events_used_total"))
+        tb_note_after_lag = tb_note_total
+        tb_note_in = tb_note_total
+        tb_chord_total = None
+        tb_chord_in = None
+        unique_center_frames = target_build.get("unique_onset_center_frames_in_window") or []
+        tb_unique_frames = len(unique_center_frames)
+        tb_events_in_window_sample: List[Any] = []
+
+        note_events_sync: List[Tuple[float, Optional[float], Any]] = []
         for evt in events_after:
             if not isinstance(evt, (list, tuple)) or len(evt) < 2:
                 continue
             onset_t = float(evt[0])
             offset_t = float(evt[1]) if len(evt) >= 2 else None
             pitch_val = evt[2] if len(evt) >= 3 else None
-            note_events.append((onset_t, offset_t, pitch_val))
-        note_onsets_total = len(note_events)
-        note_events_in_window = [evt for evt in note_events if clip_start <= evt[0] < (clip_start + duration_s)]
-        note_onsets_in_window = len(note_events_in_window)
-        note_offsets_in_window = sum(1 for evt in note_events if evt[1] is not None and clip_start <= float(evt[1]) < (clip_start + duration_s))
-        unique_onset_frames = set()
-        for evt in note_events_in_window:
+            note_events_sync.append((onset_t, offset_t, pitch_val))
+
+        note_events_sync_in_window = [
+            evt for evt in note_events_sync if clip_start <= evt[0] < (clip_start + duration_s)
+        ]
+        note_onsets_total_fb = len(note_events_sync)
+        note_onsets_in_window_fb = len(note_events_sync_in_window)
+        note_offsets_in_window = sum(
+            1
+            for evt in note_events_sync
+            if evt[1] is not None and clip_start <= float(evt[1]) < (clip_start + duration_s)
+        )
+
+        unique_onset_frames_fb: Set[int] = set()
+        for evt in note_events_sync_in_window:
             if self.onset_unique_time_quantization.lower() == "frame":
                 frame_idx = int(round((evt[0] - clip_start) / max(hop_s, 1e-6)))
-                unique_onset_frames.add(frame_idx)
+                unique_onset_frames_fb.add(frame_idx)
             else:
-                unique_onset_frames.add(int(round(evt[0] * 1000.0)))
-        unique_onsets = len(unique_onset_frames)
+                unique_onset_frames_fb.add(int(round(evt[0] * 1000.0)))
+
+        note_onsets_total = tb_note_total if tb_note_total is not None else note_onsets_total_fb
+        note_onsets_in_window = tb_note_in if tb_note_in is not None else note_onsets_in_window_fb
+        unique_onsets = tb_unique_frames if tb_unique_frames is not None else len(unique_onset_frames_fb)
+        note_onsets_outside = max(note_onsets_total - note_onsets_in_window, 0)
+        note_events_in_window_for_spotcheck: List[Tuple[float, Optional[float], Any]] = []
+        if tb_events_in_window_sample:
+            for evt in tb_events_in_window_sample:
+                if not isinstance(evt, (list, tuple)) or len(evt) < 1:
+                    continue
+                onset_t = float(evt[0])
+                offset_t = float(evt[1]) if len(evt) >= 2 else None
+                pitch_val = evt[2] if len(evt) >= 3 else None
+                note_events_in_window_for_spotcheck.append((onset_t, offset_t, pitch_val))
+        if not note_events_in_window_for_spotcheck:
+            note_events_in_window_for_spotcheck = note_events_sync_in_window
+        note_events_in_window_count = note_onsets_in_window
         avg_notes_per_onset_time = float(note_onsets_in_window) / max(unique_onsets, 1)
+        in_window = note_onsets_in_window
+        out_window = note_onsets_outside
+        out_ratio = float(out_window) / float(max(note_onsets_total, 1))
+
+        counts_source = (
+            "target_build" if tb_note_total is not None and tb_note_in is not None and tb_unique_frames is not None else "sync_fallback"
+        )
+        sync_counts = {
+            "total": note_onsets_total_fb,
+            "in_window": note_onsets_in_window_fb,
+            "unique_frames": len(unique_onset_frames_fb),
+        }
+        tb_counts = {
+            "total": tb_note_total,
+            "after_lag_total": tb_note_after_lag,
+            "in_window": tb_note_in,
+            "unique_frames": tb_unique_frames,
+            "sample_len": len(tb_events_in_window_sample),
+            "expected_onset_cells_from_events": _safe_int(target_build.get("expected_onset_cells_from_events")),
+            "target_onset_cells_actual": _safe_int(target_build.get("target_onset_cells_actual")),
+            "target_onset_frames_any_actual": _safe_int(target_build.get("target_onset_frames_any_actual")),
+            "note_events_in_window_total": tb_note_in,
+            "note_events_raw_total": tb_note_total,
+            "note_events_after_lag_total": tb_note_after_lag,
+            "chord_events_total": tb_chord_total,
+            "chord_events_in_window": tb_chord_in,
+        }
+        avg_notes_per_frame_tb = (
+            float(tb_note_in) / max(float(tb_unique_frames), 1.0) if tb_note_in is not None and tb_unique_frames else None
+        )
+        multi_pitch_frame = False
+        if tb_events_in_window_sample:
+            frame_pitch: Dict[int, Set[Any]] = {}
+            for evt in tb_events_in_window_sample:
+                try:
+                    onset_t = float(evt[0])
+                    pitch_val = evt[2] if len(evt) >= 3 else None
+                except Exception:
+                    continue
+                frame_idx = int(round((onset_t - clip_start) / max(hop_s, 1e-6)))
+                if pitch_val is not None:
+                    frame_pitch.setdefault(frame_idx, set()).add(pitch_val)
+            multi_pitch_frame = any(len(p) > 1 for p in frame_pitch.values())
+        dedup_suspect = bool(
+            avg_notes_per_frame_tb is not None
+            and abs(avg_notes_per_frame_tb - 1.0) < 1e-6
+            and not multi_pitch_frame
+            and (tb_note_in or 0) > 0
+        )
 
         spec = getattr(ds, "frame_target_spec", None)
         tolerance_s = float(getattr(spec, "tolerance", 0.0) or 0.0)
@@ -1009,15 +1104,40 @@ class ModelReadinessReporter:
             frames_per_note_high = int(math.ceil((2.0 * tolerance_s) / max(hop_s, 1e-6)) + 1 + dilation_frames)
         expected_onset_cells_low = note_onsets_in_window * frames_per_note_low
         expected_onset_cells_high = note_onsets_in_window * frames_per_note_high
+        tb_expected_cells = _safe_int(target_build.get("expected_onset_cells_from_events"))
+        if tb_expected_cells is not None:
+            expected_onset_cells_low = tb_expected_cells
+            expected_onset_cells_high = tb_expected_cells
         onset_cells_actual = targets.get("onset", {}).get("count_pos")
 
-        spotcheck_summary = self._spotcheck_onsets(note_events_in_window, clip_start, hop_s, sample.get("onset"), spec)
+        spotcheck_summary = self._spotcheck_onsets(
+            note_events_in_window_for_spotcheck, clip_start, hop_s, sample.get("onset"), spec
+        )
         onset_target = sample.get("onset")
-        target_cells = None
-        target_any_frames = None
-        if torch.is_tensor(onset_target):
-            target_cells = int(torch.count_nonzero(onset_target).item())
-            target_any_frames = int(torch.count_nonzero(onset_target.sum(dim=1)).item()) if onset_target.ndim >= 2 else None
+        target_cells = _safe_int(target_build.get("target_onset_cells_actual"))
+        target_any_frames = _safe_int(target_build.get("target_onset_frames_any_actual"))
+        if target_cells is None or target_any_frames is None:
+            if torch.is_tensor(onset_target):
+                target_cells = int(torch.count_nonzero(onset_target).item())
+                target_any_frames = int(torch.count_nonzero(onset_target.sum(dim=1)).item()) if onset_target.ndim >= 2 else None
+        margin = 1.0 + self.warn_onset_cells_margin
+        target_build_mismatch = False
+        tb_expected_cells = _safe_int(target_build.get("expected_onset_cells_from_events"))
+        if targets_sparse and target_cells is not None:
+            compare_to = tb_expected_cells if tb_expected_cells is not None else tb_note_in
+            if compare_to is not None:
+                upper_tb = float(compare_to) * margin
+                lower_tb = float(compare_to) / margin
+                if float(target_cells) > upper_tb or float(target_cells) < lower_tb:
+                    target_build_mismatch = True
+        if target_any_frames is not None:
+            compare_frames = tb_unique_frames
+            if compare_frames is not None:
+                upper_frames = float(compare_frames) * margin
+                lower_frames = float(compare_frames) / margin if compare_frames > 0 else 0.0
+                if float(target_any_frames) > upper_frames or float(target_any_frames) < lower_frames:
+                    target_build_mismatch = True
+        clip_start_mismatch = abs(float(clip_start) - float(clip_start_ds)) > 1e-6
 
         tile_bounds = tile_meta.get("tile_bounds_px")
         tile_xyxy = tile_meta.get("tile_xyxy")
@@ -1127,13 +1247,18 @@ class ModelReadinessReporter:
                 "lag_ms": lag_ms,
                 "lag_frames": lag_frames,
                 "apply_to": "labels",
-                "events_total": len(events_after),
+                "clip_start_used": clip_start,
+                "clip_start_dataset": clip_start_ds,
+                "counts_source": counts_source,
+                "tb_keys": sorted(list(target_build.keys())) if isinstance(target_build, Mapping) else None,
+                "sync_keys": sorted(list(sync_meta.keys())) if isinstance(sync_meta, Mapping) else None,
+                "events_total": note_onsets_total,
                 "events_in_window": in_window,
                 "events_outside_window": out_window,
                 "outside_ratio": out_ratio,
                 "note_onsets_total": note_onsets_total,
                 "note_onsets_in_window": note_onsets_in_window,
-                "note_onsets_outside": max(note_onsets_total - note_onsets_in_window, 0),
+                "note_onsets_outside": note_onsets_outside,
                 "note_offsets_in_window": note_offsets_in_window,
                 "unique_onset_times_in_window": unique_onsets,
                 "avg_notes_per_onset_time": avg_notes_per_onset_time,
@@ -1145,8 +1270,15 @@ class ModelReadinessReporter:
                 "onset_cells_actual": onset_cells_actual,
                 "target_onset_cells": target_cells,
                 "target_onset_frames_any": target_any_frames,
-                "note_events_in_window_count": len(note_events_in_window),
+                "note_events_in_window_count": note_events_in_window_count,
                 "examples": examples,
+                "tb_counts": tb_counts,
+                "sync_counts": sync_counts,
+                "avg_notes_per_frame_tb": avg_notes_per_frame_tb,
+                "dedup_suspect": dedup_suspect,
+                "multi_pitch_frame": multi_pitch_frame,
+                "target_build_mismatch": target_build_mismatch,
+                "clip_start_mismatch": clip_start_mismatch,
             },
             "targets": targets,
             "spotcheck": spotcheck_summary,
@@ -1206,6 +1338,8 @@ class ModelReadinessReporter:
             warnings.append("targets_have_onsets_but_labels_none")
         if note_in > 0 and (onset_count is None or onset_count == 0):
             warnings.append("labels_have_onsets_but_targets_empty")
+        if lag_meta.get("dedup_suspect"):
+            warnings.append("target_build_events_dedup_suspected")
         try:
             if onset_cells_actual is not None and expected_high is not None:
                 upper = float(expected_high) * (1.0 + self.warn_onset_cells_margin)
@@ -1221,6 +1355,10 @@ class ModelReadinessReporter:
                     warnings.append("target_any_frames_excess")
         except Exception:
             pass
+        if lag_meta.get("target_build_mismatch"):
+            warnings.append("target_build_count_mismatch")
+        if lag_meta.get("clip_start_mismatch"):
+            warnings.append("clip_start_mismatch")
         spotcheck = record.get("spotcheck", {}) or {}
         if spotcheck.get("enabled") and spotcheck.get("fail", 0) > 0:
             warnings.append("spotcheck_failed")
@@ -1237,6 +1375,7 @@ class ModelReadinessReporter:
         refinement = record.get("refinement", {})
         lag_meta = record.get("lag", {})
         targets = record.get("targets", {})
+        frame_targets = record.get("frame_targets", {}) or {}
         canary = record.get("canary", {})
         gray_info = decode.get("grayscale", {}) or {}
         gray_str = f"{'on' if gray_info.get('enabled') else 'off'}({gray_info.get('mode')})"
@@ -1300,6 +1439,43 @@ class ModelReadinessReporter:
                 err_w=refinement.get("err_white_px"),
                 err_k=refinement.get("err_black_px"),
                 cache=refinement.get("cache_path"),
+            )
+        )
+        lines.append(
+            "[lag.provenance] counts_source={src} tb_keys={tbk} sync_keys={sk} tb_counts={tb_counts} sync_counts={sc} "
+            "clip_start_used={clip} clip_start_ds={clip_ds}".format(
+                src=lag_meta.get("counts_source"),
+                tbk=lag_meta.get("tb_keys"),
+                sk=lag_meta.get("sync_keys"),
+                tb_counts=lag_meta.get("tb_counts"),
+                sc=lag_meta.get("sync_counts"),
+                clip=lag_meta.get("clip_start_used"),
+                clip_ds=lag_meta.get("clip_start_dataset"),
+            )
+        )
+        lines.append(
+            "[lag.tb_counts] tb_note_total={tb_total} tb_note_in={tb_in} tb_unique_frames={tb_uniq} avg_notes_per_frame_tb={avg_tb} "
+            "tb_after_lag={tb_after_lag} tb_in_window_total={tb_in_win} tb_chord_total={tb_chord_total} tb_chord_in={tb_chord_in} "
+            "sync_total={sync_total} sync_in={sync_in} sync_unique={sync_uniq} "
+            "sparse={sparse} mismatch={mismatch} dedup_suspect={dedup} target_cells={target_cells} target_any_frames={target_any} "
+            "expected_from_events={exp_cells}".format(
+                tb_total=lag_meta.get("tb_counts", {}).get("total") if lag_meta.get("tb_counts") else None,
+                tb_in=lag_meta.get("tb_counts", {}).get("in_window") if lag_meta.get("tb_counts") else None,
+                tb_uniq=lag_meta.get("tb_counts", {}).get("unique_frames") if lag_meta.get("tb_counts") else None,
+                avg_tb=lag_meta.get("avg_notes_per_frame_tb"),
+                tb_after_lag=lag_meta.get("tb_counts", {}).get("after_lag_total") if lag_meta.get("tb_counts") else None,
+                tb_in_win=lag_meta.get("tb_counts", {}).get("note_events_in_window_total") if lag_meta.get("tb_counts") else None,
+                tb_chord_total=lag_meta.get("tb_counts", {}).get("chord_events_total") if lag_meta.get("tb_counts") else None,
+                tb_chord_in=lag_meta.get("tb_counts", {}).get("chord_events_in_window") if lag_meta.get("tb_counts") else None,
+                sync_total=lag_meta.get("sync_counts", {}).get("total") if lag_meta.get("sync_counts") else None,
+                sync_in=lag_meta.get("sync_counts", {}).get("in_window") if lag_meta.get("sync_counts") else None,
+                sync_uniq=lag_meta.get("sync_counts", {}).get("unique_frames") if lag_meta.get("sync_counts") else None,
+                sparse=frame_targets.get("targets_sparse"),
+                mismatch=lag_meta.get("target_build_mismatch"),
+                dedup=lag_meta.get("dedup_suspect"),
+                target_cells=lag_meta.get("target_onset_cells"),
+                target_any=lag_meta.get("target_onset_frames_any"),
+                exp_cells=lag_meta.get("tb_counts", {}).get("expected_onset_cells_from_events") if lag_meta.get("tb_counts") else None,
             )
         )
         lines.append(
