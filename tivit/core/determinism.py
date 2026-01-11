@@ -42,6 +42,11 @@ def resolve_seed(seed_arg: Optional[int], cfg: Optional[Mapping[str, Any]]) -> i
             exp_seed = exp_cfg.get("seed")
             if isinstance(exp_seed, (int, float)):
                 return int(exp_seed)
+        dataset_cfg = cfg.get("dataset")
+        if isinstance(dataset_cfg, Mapping):
+            dataset_seed = dataset_cfg.get("seed")
+            if isinstance(dataset_seed, (int, float)):
+                return int(dataset_seed)
         data_cfg = cfg.get("data")
         if isinstance(data_cfg, Mapping):
             data_seed = data_cfg.get("seed")
@@ -154,4 +159,3 @@ def build_snapshot_metadata(
     if extras:
         payload["extras"] = _normalise_metadata_value(extras)
     return payload
-

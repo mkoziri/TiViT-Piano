@@ -1,6 +1,6 @@
 """Core utilities for configuration, typing, and registries."""
 
-from .config import DEFAULT_CONFIG_PATH, load_experiment_config, resolve_config_chain, save_resolved_config, write_run_artifacts
+from .config import DEFAULT_CONFIG_PATH, load_experiment_config, load_yaml_file, resolve_config_chain, save_resolved_config, write_run_artifacts
 from .registry import (
     DATASETS,
     MODELS,
@@ -24,6 +24,7 @@ __all__ = [
     "resolve_deterministic_flag",
     "resolve_seed",
     "DEFAULT_CONFIG_PATH",
+    "load_yaml_file",
     "load_experiment_config",
     "resolve_config_chain",
     "save_resolved_config",

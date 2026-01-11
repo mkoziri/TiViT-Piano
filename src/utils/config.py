@@ -20,4 +20,4 @@ ConfigPath = Union[str, Path]
 def load_config(path: ConfigPath = "configs/config.yaml") -> Mapping[str, Any]:
     """Load a single config file or merge composed fragments."""
 
-    return load_experiment_config([Path(path).expanduser()])
+    return load_experiment_config([Path(path).expanduser()], default_base=None)

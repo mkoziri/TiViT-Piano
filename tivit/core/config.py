@@ -101,10 +101,23 @@ def resolve_config_chain(
     return merged
 
 
-def load_experiment_config(configs: Sequence[str | Path] | None = None) -> Mapping[str, Any]:
+def load_experiment_config(
+    configs: Sequence[str | Path] | None = None,
+    *,
+    default_base: str | Path | None = DEFAULT_CONFIG_PATH,
+) -> Mapping[str, Any]:
+    """
+    Load and merge experiment configs with an optional implicit base.
+
+    ``default_base`` allows callers to request that configs without an explicit
+    ``base``/``bases`` entry are applied on top of the shared default stack
+    (for example ``tivit/configs/default.yaml``). Pass ``None`` to disable the
+    implicit base when loading a fully self-contained legacy config.
+    """
+
     if not configs:
         configs = [DEFAULT_CONFIG_PATH]
-    return resolve_config_chain(list(configs), default_base=None, allowed_namespaces=ALLOWED_TOP_LEVEL_KEYS)
+    return resolve_config_chain(list(configs), default_base=default_base, allowed_namespaces=ALLOWED_TOP_LEVEL_KEYS)
 
 
 def save_resolved_config(cfg: ConfigLike, path: str | Path) -> Path:
@@ -181,6 +194,7 @@ def write_run_artifacts(
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",
+    "load_yaml_file",
     "load_experiment_config",
     "resolve_config_chain",
     "save_resolved_config",

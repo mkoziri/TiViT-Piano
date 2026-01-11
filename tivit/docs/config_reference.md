@@ -6,6 +6,7 @@ Summary of the composable YAML fragments under `tivit/configs/`. Each section li
 - `tivit/configs/default.yaml` (bases list)
   - Purpose: select experiment metadata, dataset, model, training, decoder, priors, and autopilot fragments.
   - Type: YAML list of relative config paths merged in order.
+  - Helper: `tivit.core.config.load_experiment_config` will stack standalone fragments on top of `default.yaml` unless `default_base` is set to `null` (useful for legacy configs).
 
 ## Experiment & logging (`experiment/base.yaml`)
 - `experiment.name` (str): run label; used in logs/checkpoints. Default: `TiViT-Piano GCR basic`.
