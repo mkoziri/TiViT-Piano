@@ -1,11 +1,9 @@
 """Clef prediction head builder.
 
 Purpose:
-    - Provide a clef classification head that mirrors the legacy
-      ``MultiLayerHead`` setup while fitting the new registry layout.
+    - Provide a clef classification head that mirrors the legacy ``MultiLayerHead`` setup while fitting the new registry layout.
 Key Functions/Classes:
-    - ``build_head``: Construct a clef head with configurable class count,
-      hidden layers, and dropout.
+    - ``build_head``: Construct a clef head with configurable class count, hidden layers, and dropout.
 CLI Arguments:
     (none)
 Usage:

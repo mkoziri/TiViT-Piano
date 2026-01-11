@@ -1,4 +1,21 @@
-"""Composable config loading, validation, and materialization helpers."""
+"""Config composition and provenance helpers.
+
+Purpose:
+- Load and deep-merge YAML fragments with optional implicit bases.
+- Validate allowed namespaces and materialize resolved configs to disk.
+- Record git/command provenance for reproducibility.
+
+Key Functions/Classes:
+- resolve_config_chain: Merge YAML fragments with base handling.
+- load_experiment_config: Entry point for composed experiment configs.
+- write_run_artifacts: Persist resolved config, git commit, and command.
+
+CLI Arguments:
+- (none; import-only utilities).
+
+Usage:
+- Import in pipelines: ``from tivit.core.config import load_experiment_config``.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +51,7 @@ ALLOWED_TOP_LEVEL_KEYS: Collection[str] = {
 
 
 def _deep_merge(base: MutableMapping[str, Any], overlay: Mapping[str, Any]) -> MutableMapping[str, Any]:
+    """Recursively merge mapping ``overlay`` into ``base`` (in-place)."""
     for key, value in overlay.items():
         if isinstance(value, Mapping) and isinstance(base.get(key), MutableMapping):
             _deep_merge(base[key], value)  # type: ignore[index]
@@ -43,6 +61,7 @@ def _deep_merge(base: MutableMapping[str, Any], overlay: Mapping[str, Any]) -> M
 
 
 def load_yaml_file(path: str | Path) -> Mapping[str, Any]:
+    """Load YAML mapping from disk, enforcing a top-level mapping."""
     resolved = Path(path).expanduser()
     with resolved.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
@@ -52,6 +71,7 @@ def load_yaml_file(path: str | Path) -> Mapping[str, Any]:
 
 
 def _validate_namespaces(data: Mapping[str, Any], allowed: Collection[str] | None, source: Path) -> None:
+    """Validate that ``data`` only contains allowed top-level keys."""
     if allowed is None:
         return
     unknown = [key for key in data.keys() if key not in allowed]
@@ -121,6 +141,7 @@ def load_experiment_config(
 
 
 def save_resolved_config(cfg: ConfigLike, path: str | Path) -> Path:
+    """Persist a merged config to ``path`` and return the resolved path."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:
@@ -129,6 +150,7 @@ def save_resolved_config(cfg: ConfigLike, path: str | Path) -> Path:
 
 
 def _detect_git_commit(repo_root: Path | None = None) -> str:
+    """Return the git SHA for provenance; fallback to ``unknown`` on failure."""
     root = repo_root or Path(__file__).resolve().parents[2]
     try:
         proc = subprocess.run(
@@ -144,6 +166,7 @@ def _detect_git_commit(repo_root: Path | None = None) -> str:
 
 
 def _format_command_line(command: Sequence[str] | str | None) -> str:
+    """Render the command line used for the run as a string."""
     if command is None:
         try:
             import sys

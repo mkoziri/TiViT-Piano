@@ -1,4 +1,19 @@
-"""Per-head loss composition helper."""
+"""Multitask loss composition for TiViT-Piano heads.
+
+Purpose:
+    - Combine pitch/onset/offset/hand/clef losses with adaptive weighting.
+    - Support frame/clip modes, per-tile supervision, and hand gating.
+    - Preserve legacy behavior while fitting the new layout.
+Key Functions/Classes:
+    - MultitaskLoss: composite loss with time alignment and priors.
+    - OnOffPosWeightEMA: EMA tracker for adaptive pos_weight per head/scope.
+    - build_loss(): factory mirroring legacy signature compatibility.
+CLI Arguments:
+    (none)
+Usage:
+    loss_fn = build_loss(cfg)  # cfg with training.loss_weights
+    loss, parts = loss_fn(preds, targets)
+"""
 
 from __future__ import annotations
 
@@ -23,6 +38,7 @@ class PosRateEMA:
         self.value: Optional[torch.Tensor] = None
 
     def process(self, observation: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        """Update EMA with a new observation and return the smoothed value."""
         obs = observation.detach().float().cpu()
         if self.value is None:
             if update:
@@ -34,12 +50,15 @@ class PosRateEMA:
         return self.value.clone()
 
     def peek(self) -> Optional[torch.Tensor]:
+        """Return a copy of the current EMA without updating."""
         return None if self.value is None else self.value.clone()
 
     def state_dict(self) -> Dict[str, Any]:
+        """Serialize EMA state for checkpointing."""
         return {"value": None if self.value is None else self.value.tolist()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore EMA state from checkpoint data."""
         value = state.get("value") if isinstance(state, Mapping) else None
         if value is None:
             self.value = None
@@ -51,6 +70,7 @@ class OnOffPosWeightEMA:
     """Maintain EMA statistics for onset/offset heads (clip & frame modes)."""
 
     def __init__(self, alpha: float) -> None:
+        """Initialise clip/frame EMA trackers with smoothing factor ``alpha``."""
         alpha = float(alpha)
         self.alpha = alpha
         self.clip = {"onset": PosRateEMA(alpha), "offset": PosRateEMA(alpha)}
@@ -58,24 +78,29 @@ class OnOffPosWeightEMA:
 
     @staticmethod
     def _reduce_clip_targets(targets: torch.Tensor) -> torch.Tensor:
+        """Reduce clip targets to a scalar positive rate."""
         return torch.tensor([float(targets.float().mean().item())], dtype=torch.float32)
 
     @staticmethod
     def _reduce_frame_roll(roll: torch.Tensor) -> torch.Tensor:
+        """Reduce frame-level roll to per-pitch positive rates."""
         P = roll.shape[-1]
         return roll.reshape(-1, P).float().mean(dim=0).cpu()
 
     def clip_pos_weight(self, head: str, targets: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        """Compute clip-level pos_weight via EMA for a head."""
         tracker = self.clip[head]
         rate = tracker.process(self._reduce_clip_targets(targets), update=update)
         return _pos_weight_from_rate(rate)
 
     def frame_pos_weight(self, head: str, roll: torch.Tensor, *, update: bool = True) -> torch.Tensor:
+        """Compute frame-level pos_weight via EMA for a head."""
         tracker = self.frame[head]
         rate = tracker.process(self._reduce_frame_roll(roll), update=update)
         return _pos_weight_from_rate(rate)
 
     def state_dict(self) -> Dict[str, Any]:
+        """Serialize nested EMA state for checkpointing."""
         return {
             "alpha": self.alpha,
             "clip": {k: v.state_dict() for k, v in self.clip.items()},
@@ -83,6 +108,7 @@ class OnOffPosWeightEMA:
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore nested EMA state from checkpoint data."""
         if not isinstance(state, Mapping):
             return
         for scope_name, registry in (("clip", self.clip), ("frame", self.frame)):
@@ -94,6 +120,7 @@ class OnOffPosWeightEMA:
 
 
 def _coerce_pos_weight_band(value: Any) -> Optional[Tuple[float, float]]:
+    """Normalize a band config into (low, high) floats."""
     if isinstance(value, Mapping):
         value = value.get("band", value.get("values", value.get("range", value)))
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
@@ -117,15 +144,19 @@ def _pos_weight_from_rate(
     clamp_min: float = 1.0,
     clamp_max: float = 100.0,
 ) -> torch.Tensor:
-    rate_clamped = rate.clone().clamp(min=eps, max=1.0 - eps)
-    pos_weight = (1.0 - rate_clamped) / rate_clamped
-    return pos_weight.clamp_(min=clamp_min, max=clamp_max)
+    """Convert observed positive rate into BCE pos_weight with clamping."""
+    with torch.no_grad():
+        rate_clamped = rate.detach().clamp(min=eps, max=1.0 - eps)
+        pos_weight = (1.0 - rate_clamped) / rate_clamped
+        return pos_weight.clamp(min=clamp_min, max=clamp_max)
 
 
 def _adaptive_pos_weight_from_roll(target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    flat = target.detach().reshape(-1, target.shape[-1]).float()
-    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
-    return ((1.0 - pos) / (pos + eps)).clamp(1.0, 100.0)
+    """Compute per-class pos_weight from target roll frequencies."""
+    with torch.no_grad():
+        flat = target.detach().reshape(-1, target.shape[-1]).float()
+        pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+        return ((1.0 - pos) / (pos + eps)).clamp(1.0, 100.0)
 
 
 def _banded_pos_weight_from_roll(
@@ -133,24 +164,27 @@ def _banded_pos_weight_from_roll(
     band: Tuple[float, float],
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    flat = target.detach().reshape(-1, target.shape[-1]).float()
-    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
-    neg = (1.0 - pos).clamp_min(eps)
-    ratio = pos / neg
-    low, high = band
-    if high < low:
-        low, high = high, low
-    span = ratio.max() - ratio.min()
-    if span <= eps:
-        mapped = torch.full_like(ratio, 0.5 * (low + high))
-    else:
-        mapped = (ratio - ratio.min()) / span.clamp_min(eps)
-        mapped = low + mapped * (high - low)
-    mapped = mapped.clamp(min=min(low, high), max=max(low, high))
-    return mapped
+    """Map per-class positive ratios into a configured band."""
+    with torch.no_grad():
+        flat = target.detach().reshape(-1, target.shape[-1]).float()
+        pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+        neg = (1.0 - pos).clamp_min(eps)
+        ratio = pos / neg
+        low, high = band
+        if high < low:
+            low, high = high, low
+        span = ratio.max() - ratio.min()
+        if span <= eps:
+            mapped = torch.full_like(ratio, 0.5 * (low + high))
+        else:
+            mapped = (ratio - ratio.min()) / span.clamp_min(eps)
+            mapped = low + mapped * (high - low)
+        mapped = mapped.clamp(min=min(low, high), max=max(low, high))
+        return mapped
 
 
 def _log_banded_weight_stats(head: str, context: str, weights: torch.Tensor, band: Tuple[float, float]) -> None:
+    """Log one-time diagnostics for banded weights to avoid noisy logs."""
     key = (context, head)
     if key in _ADAPTIVE_BAND_LOGGED:
         return
@@ -178,22 +212,22 @@ def _dynamic_pos_weighted_bce(
     pos_weight_override: Optional[torch.Tensor] = None,
     weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute BCEWithLogits with adaptive or overridden positive class weights."""
+    """BCEWithLogits using adaptive or provided positive class weighting."""
 
     eps = 1e-6
     target_float = targets.float()
-    if pos_weight_override is not None:
-        pos_weight = pos_weight_override.detach().to(device=logits.device, dtype=logits.dtype)
-    else:
-        if pos_rate_override is not None:
-            positive_rate = pos_rate_override.detach().to(device=logits.device, dtype=logits.dtype)
+    with torch.no_grad():
+        if pos_weight_override is not None:
+            pos_weight = pos_weight_override.detach().to(device=logits.device, dtype=logits.dtype)
         else:
-            positive_rate = target_float.mean()
-        positive_rate = positive_rate.clamp(min=eps, max=1.0 - eps)
-        pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
-
-    pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
-    w = weight.to(device=logits.device, dtype=logits.dtype) if weight is not None else None
+            if pos_rate_override is not None:
+                positive_rate = pos_rate_override.detach().to(device=logits.device, dtype=logits.dtype)
+            else:
+                positive_rate = target_float.mean()
+            positive_rate = positive_rate.clamp(min=eps, max=1.0 - eps)
+            pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
+        pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+        w = weight.to(device=logits.device, dtype=logits.dtype) if weight is not None else None
 
     return F.binary_cross_entropy_with_logits(
         logits,
@@ -205,7 +239,7 @@ def _dynamic_pos_weighted_bce(
 
 
 def _time_pool_out_to_clip(out: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
-    """If logits are time-distributed but using clip losses, reduce over time."""
+    """Reduce time-distributed logits when computing clip-mode losses."""
 
     pooled = dict(out)
     if "pitch_logits" in out and out["pitch_logits"].dim() == 3:
@@ -238,6 +272,7 @@ def _interp_mask_BT(mask_bt: torch.Tensor, Tprime: int) -> torch.Tensor:
 
 
 def _match_pitch_dim(x: Optional[torch.Tensor], P: int) -> Optional[torch.Tensor]:
+    """Align pitch dimension to model head size, padding/cropping as needed."""
     if x is None:
         return None
     if x.shape[-1] == P:
@@ -254,13 +289,7 @@ def _match_pitch_dim(x: Optional[torch.Tensor], P: int) -> Optional[torch.Tensor
 
 
 def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    Build per-head onset/offset loss settings with backward-compatible defaults.
-
-    Legacy flat keys (onoff_loss, focal_gamma, ...) remain supported, while
-    per-head overrides can be provided via ``onoff_heads.<head>.<key>`` or
-    simple aliases such as ``offset_focal_gamma``.
-    """
+    """Build per-head onset/offset loss settings with backward-compatible defaults."""
     if not isinstance(weights, Mapping):
         weights = {}
 
@@ -344,6 +373,7 @@ def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str
 
 
 def _resolve_head_weights(cfg: Mapping[str, Any] | None, override: Mapping[str, float] | None) -> Dict[str, float]:
+    """Resolve per-head scalar weights from training config and overrides."""
     weights = {k: 1.0 for k in ("pitch", "onset", "offset", "hand", "clef")}
     if isinstance(cfg, Mapping):
         for head in weights:
@@ -370,10 +400,7 @@ def _per_tile_masked_loss(
     *,
     head: str,
 ) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, Any]]]:
-    """
-    Compute a masked per-tile loss and lightweight diagnostics.
-    Returns (loss_tensor, debug_dict) where debug_dict contains per-tile means.
-    """
+    """Masked per-tile loss plus minimal debug stats; returns (loss, debug)."""
     if not torch.is_tensor(logits_tile) or not torch.is_tensor(mask):
         return None, None
     if logits_tile.dim() != 4 or mask.dim() != 3:
@@ -435,6 +462,7 @@ class MultitaskLoss:
     """Composite loss for pitch/onset/offset/hand/clef heads."""
 
     def __init__(self, cfg: Mapping[str, Any] | None = None, head_weights: Mapping[str, float] | None = None) -> None:
+        """Initialise loss wiring while preserving legacy weight overrides."""
         loss_cfg = {}
         per_tile_cfg = {}
         gating_cfg = {}
@@ -456,9 +484,11 @@ class MultitaskLoss:
         self.hand_gating_cfg = gating_cfg
 
     def state_dict(self) -> Dict[str, Any]:
+        """Return serialisable adaptive state (EMA trackers)."""
         return {"pos_rate_state": None if self.pos_rate_state is None else self.pos_rate_state.state_dict()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Load adaptive state while tolerating partial checkpoints."""
         if not isinstance(state, Mapping):
             return
         pos_state = state.get("pos_rate_state")
@@ -475,6 +505,7 @@ class MultitaskLoss:
         hand_gating: Optional[Mapping[str, Any]] = None,
         pos_rate_state: Optional[OnOffPosWeightEMA] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Dispatch to clip- or frame-mode loss depending on logits rank."""
         pitch_logits = preds.get("pitch_logits")
         if pitch_logits is None:
             raise ValueError("Missing pitch_logits in predictions")
@@ -500,6 +531,7 @@ class MultitaskLoss:
         update_state: bool,
         pos_rate_state: Optional[OnOffPosWeightEMA],
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Clip-mode loss with optional adaptive pos_weight and priors."""
         state = pos_rate_state or self.pos_rate_state
         out = _time_pool_out_to_clip(preds)
         device = next(iter(out.values())).device if out else "cpu"
@@ -521,6 +553,7 @@ class MultitaskLoss:
             cfg: Mapping[str, Any],
             target: torch.Tensor,
         ) -> Optional[torch.Tensor]:
+            """Resolve clip-level pos_weight following configured mode."""
             mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
             loss_mode = str(cfg.get("loss", "bce_pos")).lower()
             if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
@@ -603,6 +636,7 @@ class MultitaskLoss:
         hand_gating: Optional[Mapping[str, Any]],
         pos_rate_state: Optional[OnOffPosWeightEMA],
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Frame-mode loss with time alignment, gating, priors, and per-tile paths."""
         state = pos_rate_state or self.pos_rate_state
         pitch_logit = preds["pitch_logits"]
         onset_logit = preds.get("onset_logits")
@@ -711,7 +745,8 @@ class MultitaskLoss:
 
         eps = 1e-6
         pitch_mode = self.pitch_pos_mode
-        pos_rate_pitch = pitch_roll.reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)
+        with torch.no_grad():
+            pos_rate_pitch = pitch_roll.detach().reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)
         if pitch_mode == "adaptive_band" and self.pitch_band is not None:
             pos_w_pitch = _banded_pos_weight_from_roll(pitch_roll, self.pitch_band, eps)
             _log_banded_weight_stats("pitch", "frame", pos_w_pitch, self.pitch_band)
@@ -720,6 +755,7 @@ class MultitaskLoss:
             pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
 
         def _bce_with_reach(logits: torch.Tensor, targets: torch.Tensor, pos_w: Optional[torch.Tensor]) -> torch.Tensor:
+            """BCE helper that applies optional reach-based weights."""
             if reach_weights is None or logits.shape != targets.shape:
                 pos_w_local = pos_w.to(device=logits.device, dtype=logits.dtype) if pos_w is not None else None
                 return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_w_local)
@@ -759,6 +795,7 @@ class MultitaskLoss:
         offset_cfg = head_cfgs["offset"]
 
         def _frame_pos_weight(head: str, cfg: Mapping[str, Any], roll: torch.Tensor) -> Optional[torch.Tensor]:
+            """Resolve frame-level pos_weight following configured mode."""
             mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
             loss_mode = str(cfg.get("loss", "bce_pos")).lower()
             if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
@@ -785,6 +822,7 @@ class MultitaskLoss:
             roll: torch.Tensor,
             pos_weight: Optional[torch.Tensor],
         ) -> torch.Tensor:
+            """Compute per-head frame loss with optional focal/pos_weight."""
             mode = str(cfg.get("loss", "bce_pos")).lower()
             if mode in {"focal", "focal_bce"}:
                 gamma = float(cfg.get("focal_gamma", 2.0))
@@ -920,12 +958,7 @@ class MultitaskLoss:
 
 
 def build_loss(cfg: Mapping[str, Any] | None = None, head_weights: Mapping[str, float] | None = None) -> MultitaskLoss:
-    """
-    Factory for the multitask loss.
-
-    Backwards-compat: passing a plain mapping without a ``training`` section is
-    treated as a head-weight override to match the old signature.
-    """
+    """Factory for the multitask loss (supports legacy head-weight-only input)."""
     if cfg is not None and head_weights is None and not (isinstance(cfg, Mapping) and "training" in cfg):
         head_weights = cfg  # type: ignore[assignment]
         cfg = None

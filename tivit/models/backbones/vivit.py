@@ -1,4 +1,16 @@
-"""ViViT-style backbone ported from the legacy implementation."""
+"""ViViT-style backbone (GCR, registry-backed).
+
+Purpose:
+    - Provide the factorized ViViT/TiViT-Piano encoder with token-aligned tiling while preserving legacy behaviour and shapes.
+    - Serve as the ``backend: vivit`` builder for the new registry/factory.
+Key Functions/Classes:
+    - ``TubeletEmbed`` / ``FactorizedSpaceTimeEncoder`` / ``TiViTPiano``: core modules for patchifying, encoding, and predicting multi-task logits.
+    - ``build_model``: Instantiate the backbone from a nested config mapping.
+CLI Arguments:
+    (none)
+Usage:
+    from tivit.models.backbones.vivit import build_model
+"""
 
 from __future__ import annotations
 
@@ -113,7 +125,7 @@ class FactorizedSpaceTimeEncoder(nn.Module):
             (B, tiles * Ntokens, D)
         """
 
-        x_tiles_list = list(x_tiles)
+        x_tiles_list = x_tiles if isinstance(x_tiles, (list, tuple)) else list(x_tiles)
         if not x_tiles_list:
             raise ValueError("x_tiles must be non-empty")
         b = x_tiles_list[0].shape[0]
@@ -179,7 +191,6 @@ class TiViTPiano(nn.Module):
         self._tile_aligned_width: Optional[int] = None
         self._tile_bounds: Optional[List[Tuple[int, int]]] = None
         self._tile_token_counts: Optional[List[int]] = None
-        self._tile_widths_px: Optional[List[int]] = None
         self._tiling_debug_enabled = False
         self._tiling_debug_logged = False
 
@@ -219,6 +230,7 @@ class TiViTPiano(nn.Module):
         self._patch_sw = self.embed.proj.stride[2]
 
     def _init_encoder_if_needed(self, t_tokens: int, s_tokens: int) -> None:
+        """Lazy-init the encoder once token factors are known to save memory."""
         if self.encoder is None:
             self.encoder = FactorizedSpaceTimeEncoder(
                 t_tokens=int(t_tokens),
@@ -248,7 +260,7 @@ class TiViTPiano(nn.Module):
         bounds = self._tile_bounds
         if cache_width is None or bounds is None or cache_width != w:
             sample = x[0]
-            _, tokens_per_tile, widths_px, bounds, aligned_w, _ = tile_vertical_token_aligned(
+            _, tokens_per_tile, _, bounds, aligned_w, _ = tile_vertical_token_aligned(
                 sample,
                 self.tiles,
                 patch_w=self.tiling_patch_w,
@@ -259,7 +271,6 @@ class TiViTPiano(nn.Module):
             self._tile_aligned_width = cache_width
             self._tile_bounds = bounds
             self._tile_token_counts = tokens_per_tile
-            self._tile_widths_px = widths_px
         if cache_width is None or bounds is None:
             raise RuntimeError("Token-aligned tiling failed to compute bounds")
         if w != cache_width:
@@ -282,6 +293,7 @@ class TiViTPiano(nn.Module):
         return tiles
 
     def _maybe_log_tiling_debug(self, tiles: Sequence[torch.Tensor]) -> None:
+        """Emit a one-time tiling debug log without holding onto tensors."""
         if not self._tiling_debug_enabled or self._tiling_debug_logged:
             return
         if not tiles:
@@ -421,6 +433,7 @@ class TiViTPiano(nn.Module):
 
 
 def _get(d: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Fetch ``key`` from mapping with ``default``, mirroring legacy semantics."""
     v = d.get(key, default)
     return v if v is not None else default
 

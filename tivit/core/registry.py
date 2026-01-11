@@ -1,4 +1,19 @@
-"""Lightweight registries for datasets, models, and pipeline components."""
+"""Lightweight registries for datasets, models, heads, losses, priors, and postproc.
+
+Purpose:
+- Provide a simple name→callable registry with lazy module loading.
+- Expose default registrations for built-in datasets/models/pipeline pieces.
+
+Key Functions/Classes:
+- Registry: Core registry type with register/get/build helpers.
+- register_default_components: Populate all registries with built-ins.
+
+CLI Arguments:
+- (none; import-only utilities).
+
+Usage:
+- Import and resolve components: ``from tivit.core.registry import MODELS, register_default_components``.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +31,7 @@ class Registry:
         self._items: Dict[str, Callable[..., Any]] = {}
 
     def register(self, name: str, fn: Callable[..., Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a callable under ``name``; usable as decorator or direct call."""
         key = name.lower().strip()
 
         def _decorator(target: Callable[..., Any]) -> Callable[..., Any]:
@@ -27,15 +43,18 @@ class Registry:
         return _decorator
 
     def get(self, name: str) -> Callable[..., Any]:
+        """Return the callable registered under ``name`` (case-insensitive)."""
         key = name.lower().strip()
         if key not in self._items:
             raise KeyError(f"{self.kind} '{name}' is not registered")
         return self._items[key]
 
     def build(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """Call a registered builder with ``*args``/``**kwargs``."""
         return self.get(name)(*args, **kwargs)
 
     def available(self) -> Tuple[str, ...]:
+        """List registered names sorted alphabetically."""
         return tuple(sorted(self._items.keys()))
 
 
@@ -50,6 +69,7 @@ _DEFAULTS_LOADED = False
 
 
 def _lazy(path: str, attr: str) -> Callable[..., Any]:
+    """Delay module import until the registered callable is invoked."""
     def _wrapped(*args: Any, **kwargs: Any) -> Any:
         module = import_module(path)
         return getattr(module, attr)(*args, **kwargs)
@@ -58,18 +78,21 @@ def _lazy(path: str, attr: str) -> Callable[..., Any]:
 
 
 def _register_dataset_defaults() -> None:
+    """Register built-in datasets."""
     DATASETS.register("omaps")(_lazy("tivit.data.datasets.omaps", "build_dataset"))
     DATASETS.register("pianoyt")(_lazy("tivit.data.datasets.pianoyt", "build_dataset"))
     DATASETS.register("pianovam")(_lazy("tivit.data.datasets.pianovam", "build_dataset"))
 
 
 def _register_model_defaults() -> None:
+    """Register built-in backbones."""
     MODELS.register("vivit")(_lazy("tivit.models.backbones.vivit", "build_model"))
     MODELS.register("vit_small")(_lazy("tivit.models.backbones.vit_small", "build_model"))
     MODELS.register("vits_tile")(_lazy("tivit.models.backbones.vit_small", "build_model"))
 
 
 def _register_head_defaults() -> None:
+    """Register built-in heads."""
     HEADS.register("onset")(_lazy("tivit.models.heads.onset", "build_head"))
     HEADS.register("offset")(_lazy("tivit.models.heads.offset", "build_head"))
     HEADS.register("pitch")(_lazy("tivit.models.heads.pitch", "build_head"))
@@ -78,12 +101,14 @@ def _register_head_defaults() -> None:
 
 
 def _register_loss_defaults() -> None:
+    """Register built-in loss factories."""
     LOSSES.register("multitask")(_lazy("tivit.losses.multitask_loss", "build_loss"))
     LOSSES.register("bce")(_lazy("tivit.losses.bce", "build_loss"))
     LOSSES.register("focal")(_lazy("tivit.losses.focal", "build_loss"))
 
 
 def _register_prior_defaults() -> None:
+    """Register built-in priors."""
     PRIORS.register("hand_gating")(_lazy("tivit.priors.hand_gating", "build_prior"))
     PRIORS.register("key_signature")(_lazy("tivit.priors.key_signature", "build_prior"))
     PRIORS.register("chord_smoothness")(_lazy("tivit.priors.chord_smoothness", "build_prior"))
@@ -91,6 +116,7 @@ def _register_prior_defaults() -> None:
 
 
 def _register_postproc_defaults() -> None:
+    """Register built-in post-processing steps."""
     POSTPROC.register("thresholding")(_lazy("tivit.postproc.thresholding", "build_postproc"))
     POSTPROC.register("event_decode")(_lazy("tivit.postproc.event_decode", "build_decoder"))
     POSTPROC.register("hand_gate")(_lazy("tivit.postproc.constraints.hand_gate", "build_constraint"))

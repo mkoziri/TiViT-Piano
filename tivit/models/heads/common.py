@@ -1,4 +1,14 @@
-"""Shared head layers for TiViT models (legacy-compatible, local copy)."""
+"""Shared head layers for TiViT models (GCR).
+
+Purpose:
+    - Provide a local copy of the lightweight MLP head used by all tasks while avoiding legacy imports.
+Key Functions/Classes:
+    - ``MultiLayerHead``: LayerNorm + MLP stack with optional dropout.
+CLI Arguments:
+    (none)
+Usage:
+    from tivit.models.heads.common import MultiLayerHead
+"""
 
 from __future__ import annotations
 

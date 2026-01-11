@@ -1,8 +1,20 @@
-"""Deterministic runtime helpers shared by training, evaluation, and calibration.
+"""Deterministic runtime helpers for training, evaluation, and calibration.
 
-This module standardises how seeds and backend flags are configured across
-entrypoints, and provides utility functions for DataLoader worker seeding so
-batch order stays reproducible for a fixed seed.
+Purpose:
+- Resolve seeds/deterministic flags from CLI or config and apply backend settings.
+- Produce reproducible DataLoader seeds/generators scoped by namespace.
+- Build metadata fingerprints for caching eval windows.
+
+Key Functions/Classes:
+- configure_determinism: Seed Python/NumPy/PyTorch and toggle deterministic backends.
+- make_loader_components: Create DataLoader generator/worker_init_fn pairs.
+- build_snapshot_metadata: Normalise metadata used for cache fingerprints.
+
+CLI Arguments:
+- (none; import-only utilities).
+
+Usage:
+- Import in entrypoints: ``from tivit.core.determinism import configure_determinism``.
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ _UINT32_MAX = 2 ** 32
 
 
 def _normalise_metadata_value(value: Any) -> Any:
+    """Convert nested metadata into JSON-serialisable primitives."""
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, (tuple, list)):
@@ -94,6 +107,7 @@ def configure_determinism(seed: int, deterministic: bool = True) -> None:
 
 
 def _derive_namespaced_seed(base_seed: int, namespace: Optional[str]) -> int:
+    """Derive a deterministic seed offset using CRC32 of the namespace."""
     if not namespace:
         return base_seed % _UINT32_MAX
     crc = zlib.crc32(namespace.encode("utf-8"), base_seed % _UINT32_MAX)
@@ -109,6 +123,7 @@ def make_torch_generator(base_seed: int, *, namespace: Optional[str] = None) -> 
 
 
 def _seed_worker(worker_id: int, *, base_seed: int) -> None:
+    """Seed a DataLoader worker for deterministic shuffling."""
     worker_seed = (base_seed + worker_id) % _UINT32_MAX
     random.seed(worker_seed)
     np.random.seed(worker_seed)

@@ -3,8 +3,7 @@
 Purpose:
     - Re-export task-specific head constructors for registry and factory use.
 Key Functions/Classes:
-    - ``build_onset_head`` / ``build_offset_head`` / ``build_pitch_head`` /
-      ``build_hand_head`` / ``build_clef_head``: Builders for task heads.
+    - ``build_onset_head`` / ``build_offset_head`` / ``build_pitch_head`` / ``build_hand_head`` / ``build_clef_head``: Builders for task heads.
 CLI Arguments:
     (none)
 Usage:

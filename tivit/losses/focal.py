@@ -1,4 +1,17 @@
-"""Focal loss helper."""
+"""Binary focal loss helpers.
+
+Purpose:
+    - Provide a focal BCE variant for class imbalance.
+    - Expose a registry-friendly builder for configs.
+Key Functions/Classes:
+    - focal_loss: focal BCE on logits with alpha/gamma.
+    - build_loss: closure that binds default kwargs.
+CLI Arguments:
+    (none)
+Usage:
+    loss_fn = build_loss(alpha=0.25, gamma=2.0)
+    loss = loss_fn(logits, targets)
+"""
 
 from __future__ import annotations
 
@@ -16,6 +29,7 @@ def focal_loss(
     gamma: float = 2.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
+    """Sigmoid focal loss used for sparse positive classes."""
     prob = torch.sigmoid(logits)
     ce = F.binary_cross_entropy(prob, target, reduction="none")
     p_t = prob * target + (1 - prob) * (1 - target)
@@ -28,6 +42,7 @@ def focal_loss(
 
 
 def build_loss(**kwargs):
+    """Return a closure that applies focal loss with the provided defaults."""
     def _loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return focal_loss(logits, target, **kwargs)
 
@@ -35,4 +50,3 @@ def build_loss(**kwargs):
 
 
 __all__ = ["focal_loss", "build_loss"]
-

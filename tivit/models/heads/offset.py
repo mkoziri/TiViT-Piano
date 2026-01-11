@@ -1,11 +1,9 @@
 """Offset head builder.
 
 Purpose:
-    - Expose the offset prediction head via the new layout while reusing the
-      legacy ``MultiLayerHead`` implementation.
+    - Expose the offset prediction head via the new layout while reusing the legacy ``MultiLayerHead`` implementation.
 Key Functions/Classes:
-    - ``build_head``: Construct a feedforward head for offset logits with
-      configurable hidden layers and dropout.
+    - ``build_head``: Construct a feedforward head for offset logits with configurable hidden layers and dropout.
 CLI Arguments:
     (none)
 Usage:

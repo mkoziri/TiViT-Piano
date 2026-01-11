@@ -1,8 +1,7 @@
 """Pitch head builder.
 
 Purpose:
-    - Supply a pitch-activity head that mirrors the legacy multi-layer setup
-      while living in the new registry-driven layout.
+    - Supply a pitch-activity head that mirrors the legacy multi-layer setup while living in the new registry-driven layout.
 Key Functions/Classes:
     - ``build_head``: Construct a feedforward head for per-pitch activity.
 CLI Arguments:

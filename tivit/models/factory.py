@@ -1,18 +1,14 @@
 """TiViT model factory shim and registry bridge.
 
 Purpose:
-    - Provide a registry-backed entrypoint that mirrors the prior behaviour
-      while using the new implementations.
-    - Keep a single source of truth for model construction while the new
-      layout stabilizes.
+    - Provide a registry-backed entrypoint that mirrors the prior behaviour while using the new implementations.
+    - Keep a single source of truth for model construction while the new layout stabilizes.
 Key Functions/Classes:
-    - ``build_model``: Resolve the configured backbone name and delegate to the
-      registered builder (defaults to ViViT) with a legacy-compatible config.
+    - ``build_model``: Resolve the configured backbone name and delegate to the registered builder (defaults to ViViT) with a legacy-compatible config.
 CLI Arguments:
     (none)
 Usage:
-    Import ``build_model`` from this module or ``tivit.models`` to construct a
-    model for training/evaluation scripts.
+    Import ``build_model`` from this module or ``tivit.models`` to construct a model for training/evaluation scripts.
 """
 
 from __future__ import annotations

@@ -1,11 +1,9 @@
 """Backbone+head composition wrapper.
 
 Purpose:
-    - Keep a stable entrypoint for constructing the multitask model from the
-      new implementation.
+    - Keep a stable entrypoint for constructing the multitask model from the new implementation.
 Key Functions/Classes:
-    - ``build_model``: Forward the provided config to the new factory so
-      backbone+head composition stays consistent.
+    - ``build_model``: Forward the provided config to the new factory so backbone+head composition stays consistent.
 CLI Arguments:
     (none)
 Usage:

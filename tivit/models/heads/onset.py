@@ -1,11 +1,9 @@
 """Onset head builder.
 
 Purpose:
-    - Provide the default onset classification head matching the legacy
-      ``MultiLayerHead`` configuration.
+    - Provide the default onset classification head matching the legacy ``MultiLayerHead`` configuration.
 Key Functions/Classes:
-    - ``build_head``: Construct a feedforward head for onset logits with
-      optional hidden sizes and dropout.
+    - ``build_head``: Construct a feedforward head for onset logits with optional hidden sizes and dropout.
 CLI Arguments:
     (none)
 Usage:

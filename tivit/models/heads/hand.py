@@ -1,11 +1,9 @@
 """Hand presence head builder.
 
 Purpose:
-    - Provide left/right hand detection logits consistent with the legacy
-      multitask head while fitting the new registry structure.
+    - Provide left/right hand detection logits consistent with the legacy multitask head while fitting the new registry structure.
 Key Functions/Classes:
-    - ``build_head``: Construct a two-class (or configurable) hand presence
-      head with optional hidden layers.
+    - ``build_head``: Construct a two-class (or configurable) hand presence head with optional hidden layers.
 CLI Arguments:
     (none)
 Usage:

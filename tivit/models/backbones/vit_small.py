@@ -1,4 +1,16 @@
-"""ViT-S/DeiT-S tile backend ported from the legacy implementation."""
+"""ViT-S/DeiT-S tile backend (GCR, registry-backed).
+
+Purpose:
+    - Expose the tiled ViT-S/DeiT-S backbone with temporal and cross-tile mixing while matching legacy behaviour and shapes.
+    - Serve as the ``backend: vits_tile``/``backend: vit_small`` builder in the new registry/factory.
+Key Functions/Classes:
+    - ``SharedTileViTEncoder`` / ``TileTemporalEncoder`` / ``CrossTileMixer`` / ``ViTSTilePiano``: shared ViT feature extractor, temporal transformer, tile mixer, and multi-task heads.
+    - ``build_model``: Instantiate the backend from a nested config mapping.
+CLI Arguments:
+    (none)
+Usage:
+    from tivit.models.backbones.vit_small import build_model
+"""
 
 from __future__ import annotations
 
@@ -62,6 +74,7 @@ class SharedTileViTEncoder(nn.Module):
                 param.requires_grad_(False)
 
     def train(self, mode: bool = True) -> SharedTileViTEncoder:  # type: ignore[override]
+        """Keep the frozen backbone in eval mode when training the head stack."""
         super().train(mode)
         if self.freeze_backbone:
             self.backbone.eval()
@@ -221,10 +234,12 @@ class ViTSTilePiano(nn.Module):
         self.head_clef = MultiLayerHead(embed_dim, clef_classes, hidden_dims=(base_hidden // 2,), dropout=dropout)
 
     def enable_tiling_debug(self) -> None:
+        """Enable a single round of tiling debug logs to aid troubleshooting."""
         self._tiling_debug_enabled = True
         self._tiling_debug_logged = False
 
     def _tile_split_token_aligned(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Split and optionally pad tiles on the token grid to keep widths aligned."""
         b, t, c, h, w = x.shape
         cache_width = self._tile_aligned_width
         bounds = self._tile_bounds
@@ -261,6 +276,7 @@ class ViTSTilePiano(nn.Module):
         return tiles
 
     def _maybe_log_tiling_debug(self, tiles: Sequence[torch.Tensor]) -> None:
+        """Log tiling details once without holding references to the tensors."""
         if not self._tiling_debug_enabled or self._tiling_debug_logged:
             return
         if not tiles:
@@ -340,6 +356,7 @@ class ViTSTilePiano(nn.Module):
 
 
 def _get(d: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Fetch ``key`` from mapping with ``default``, mirroring legacy semantics."""
     v = d.get(key, default)
     return v if v is not None else default
 
