@@ -2,23 +2,24 @@
 
 Purpose:
     - Combine pitch/onset/offset/hand/clef losses with adaptive weighting.
-    - Support frame/clip modes, per-tile supervision, and hand gating.
-    - Preserve legacy behavior while fitting the new layout.
+    - Support frame/clip modes, per-tile supervision, and optional hand gating.
+    - Enforce a single explicit config source at ``training.loss``.
 Key Functions/Classes:
     - MultitaskLoss: composite loss with time alignment and priors.
     - OnOffPosWeightEMA: EMA tracker for adaptive pos_weight per head/scope.
-    - build_loss(): factory mirroring legacy signature compatibility.
+    - build_loss(): factory that validates and returns a MultitaskLoss.
 CLI Arguments:
     (none)
 Usage:
-    loss_fn = build_loss(cfg)  # cfg with training.loss_weights
+    loss_fn = build_loss(cfg)  # cfg with training.loss
     loss, parts = loss_fn(preds, targets)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
+import math
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,166 @@ from tivit.decoder.decode import pool_roll_BT
 
 LOGGER = logging.getLogger(__name__)
 _ADAPTIVE_BAND_LOGGED: set[Tuple[str, str]] = set()
+HEAD_ORDER = ("pitch", "onset", "offset", "hand", "clef")
+PITCH_POS_WEIGHT_MODES = {"adaptive", "adaptive_band", "fixed", "sqrt", "off", "none"}
+ONOFF_POS_WEIGHT_MODES = {"adaptive", "adaptive_band", "fixed", "ema", "off", "none"}
+ONOFF_LOSSES = {"bce", "bce_pos", "bce_with_logits", "focal", "focal_bce"}
+PITCH_LOSSES = {"bce", "bce_pos", "bce_with_logits"}
+HAND_CLEF_LOSSES = {"ce"}
+
+
+def _coerce_pos_weight_band(value: Any) -> Optional[Tuple[float, float]]:
+    """Normalize a band config into (low, high) floats."""
+    if isinstance(value, Mapping):
+        value = value.get("band", value.get("values", value.get("range", value)))
+    if value is None:
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError("pos_weight_band must be a 2-element sequence or null")
+    if len(value) != 2:
+        raise ValueError("pos_weight_band must contain exactly two numeric entries")
+    try:
+        low = float(value[0])
+        high = float(value[1])
+    except (TypeError, ValueError):
+        raise ValueError("pos_weight_band values must be numeric") from None
+    if not math.isfinite(low) or not math.isfinite(high):
+        raise ValueError("pos_weight_band values must be finite")
+    if high < low:
+        low, high = high, low
+    return (low, high)
+
+
+def _pos_weight_from_rate(
+    rate: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    clamp_min: float = 1.0,
+    clamp_max: float = 100.0,
+) -> torch.Tensor:
+    """Convert observed positive rate into BCE pos_weight with clamping."""
+    rate_clamped = rate.clone().clamp(min=eps, max=1.0 - eps)
+    pos_weight = (1.0 - rate_clamped) / rate_clamped
+    return pos_weight.clamp_(min=clamp_min, max=clamp_max)
+
+
+def _adaptive_pos_weight_from_roll(target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Compute per-class pos_weight from target roll frequencies."""
+    flat = target.detach().reshape(-1, target.shape[-1]).float()
+    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+    return ((1.0 - pos) / (pos + eps)).clamp(1.0, 100.0)
+
+
+def _banded_pos_weight_from_roll(
+    target: torch.Tensor,
+    band: Tuple[float, float],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Map per-class positive ratios into a configured band."""
+    flat = target.detach().reshape(-1, target.shape[-1]).float()
+    pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
+    neg = (1.0 - pos).clamp_min(eps)
+    ratio = pos / neg
+    low, high = band
+    if high < low:
+        low, high = high, low
+    span = ratio.max() - ratio.min()
+    if span <= eps:
+        mapped = torch.full_like(ratio, 0.5 * (low + high))
+    else:
+        mapped = (ratio - ratio.min()) / span.clamp_min(eps)
+        mapped = low + mapped * (high - low)
+    mapped = mapped.clamp(min=min(low, high), max=max(low, high))
+    return mapped
+
+
+def _log_banded_weight_stats(head: str, context: str, weights: torch.Tensor, band: Tuple[float, float]) -> None:
+    """Log one-time diagnostics for banded weights to avoid noisy logs."""
+    key = (context, head)
+    if key in _ADAPTIVE_BAND_LOGGED:
+        return
+    w_min = float(weights.min().item())
+    w_mean = float(weights.mean().item())
+    w_max = float(weights.max().item())
+    LOGGER.info(
+        "[onoff_loss] head=%s mode=adaptive_band context=%s band=[%.2f, %.2f] pos_weight min=%.3f mean=%.3f max=%.3f",
+        head,
+        context,
+        band[0],
+        band[1],
+        w_min,
+        w_mean,
+        w_max,
+    )
+    _ADAPTIVE_BAND_LOGGED.add(key)
+
+
+def _dynamic_pos_weighted_bce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    pos_weight_override: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """BCEWithLogits using adaptive or provided positive class weighting."""
+    eps = 1e-6
+    target_float = targets.float()
+    if pos_weight_override is not None:
+        pos_weight = pos_weight_override.detach().to(device=logits.device, dtype=logits.dtype)
+    else:
+        positive_rate = target_float.mean().clamp(min=eps, max=1.0 - eps)
+        pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
+
+    pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+    w = weight.to(device=logits.device, dtype=logits.dtype) if weight is not None else None
+
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        target_float,
+        weight=w,
+        pos_weight=pos_weight,
+        reduction="mean",
+    )
+
+
+def _time_pool_out_to_clip(out: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+    """Reduce time-distributed logits when computing clip-mode losses."""
+    pooled = dict(out)
+    for key in ("pitch_logits", "onset_logits", "offset_logits", "hand_logits", "clef_logits"):
+        if key in out and out[key].dim() == 3:
+            pooled[key] = out[key].mean(dim=1)
+    return pooled
+
+
+def _interp_labels_BT(x_bt: torch.Tensor, Tprime: int) -> torch.Tensor:
+    """Interpolate integer labels along time with nearest sampling."""
+    x = x_bt.float().unsqueeze(1)
+    x = F.interpolate(x, size=Tprime, mode="nearest")
+    return x.squeeze(1).long()
+
+
+def _interp_mask_BT(mask_bt: torch.Tensor, Tprime: int) -> torch.Tensor:
+    """Interpolate a (B,T) mask to T' using nearest sampling."""
+    m = mask_bt.float().unsqueeze(1)
+    m = F.interpolate(m, size=Tprime, mode="nearest")
+    return (m.squeeze(1) > 0.5)
+
+
+def _match_pitch_dim(x: Optional[torch.Tensor], P: int) -> Optional[torch.Tensor]:
+    """Align pitch dimension to model head size, padding/cropping as needed."""
+    if x is None:
+        return None
+    if x.shape[-1] == P:
+        return x
+    if x.shape[-1] > P:
+        start = 0
+        if x.shape[-1] == 128 and P == 88:
+            start = 21
+        return x[..., start : start + P]
+    pad = P - x.shape[-1]
+    if pad <= 0:
+        return x
+    return F.pad(x, (0, pad))
 
 
 class PosRateEMA:
@@ -119,276 +280,187 @@ class OnOffPosWeightEMA:
                     tracker.load_state_dict(tracker_state)
 
 
-def _coerce_pos_weight_band(value: Any) -> Optional[Tuple[float, float]]:
-    """Normalize a band config into (low, high) floats."""
-    if isinstance(value, Mapping):
-        value = value.get("band", value.get("values", value.get("range", value)))
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        return None
-    if len(value) < 2:
-        return None
+def _validate_required(mapping: Mapping[str, Any], required: set[str], allowed: set[str], ctx: str) -> None:
+    missing = required - set(mapping.keys())
+    if missing:
+        raise ValueError(f"{ctx} missing required keys: {sorted(missing)}")
+    unknown = set(mapping.keys()) - allowed
+    if unknown:
+        raise ValueError(f"{ctx} has unknown keys: {sorted(unknown)}")
+
+
+def _as_float(value: Any, ctx: str) -> float:
     try:
-        low = float(value[0])
-        high = float(value[1])
+        out = float(value)
     except (TypeError, ValueError):
-        return None
-    if high < low:
-        low, high = high, low
-    return (low, high)
+        raise ValueError(f"{ctx} must be a float") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{ctx} must be finite")
+    return out
 
 
-def _pos_weight_from_rate(
-    rate: torch.Tensor,
-    *,
-    eps: float = 1e-6,
-    clamp_min: float = 1.0,
-    clamp_max: float = 100.0,
-) -> torch.Tensor:
-    """Convert observed positive rate into BCE pos_weight with clamping."""
-    with torch.no_grad():
-        rate_clamped = rate.detach().clamp(min=eps, max=1.0 - eps)
-        pos_weight = (1.0 - rate_clamped) / rate_clamped
-        return pos_weight.clamp(min=clamp_min, max=clamp_max)
+def _validate_per_tile(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    allowed = {"enabled", "heads", "mask_cushion_keys", "debug"}
+    _validate_required(cfg, {"enabled", "heads"}, allowed, "training.loss.per_tile")
 
+    debug_cfg = cfg.get("debug", {}) or {}
+    if not isinstance(debug_cfg, Mapping):
+        raise ValueError("training.loss.per_tile.debug must be a mapping")
+    _validate_required(debug_cfg, set(), {"enabled", "interval"}, "training.loss.per_tile.debug")
 
-def _adaptive_pos_weight_from_roll(target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Compute per-class pos_weight from target roll frequencies."""
-    with torch.no_grad():
-        flat = target.detach().reshape(-1, target.shape[-1]).float()
-        pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
-        return ((1.0 - pos) / (pos + eps)).clamp(1.0, 100.0)
+    heads_val = cfg.get("heads")
+    if not isinstance(heads_val, Sequence) or isinstance(heads_val, (str, bytes)):
+        raise ValueError("training.loss.per_tile.heads must be a sequence")
+    heads = tuple(str(h).lower() for h in heads_val)
 
-
-def _banded_pos_weight_from_roll(
-    target: torch.Tensor,
-    band: Tuple[float, float],
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Map per-class positive ratios into a configured band."""
-    with torch.no_grad():
-        flat = target.detach().reshape(-1, target.shape[-1]).float()
-        pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
-        neg = (1.0 - pos).clamp_min(eps)
-        ratio = pos / neg
-        low, high = band
-        if high < low:
-            low, high = high, low
-        span = ratio.max() - ratio.min()
-        if span <= eps:
-            mapped = torch.full_like(ratio, 0.5 * (low + high))
-        else:
-            mapped = (ratio - ratio.min()) / span.clamp_min(eps)
-            mapped = low + mapped * (high - low)
-        mapped = mapped.clamp(min=min(low, high), max=max(low, high))
-        return mapped
-
-
-def _log_banded_weight_stats(head: str, context: str, weights: torch.Tensor, band: Tuple[float, float]) -> None:
-    """Log one-time diagnostics for banded weights to avoid noisy logs."""
-    key = (context, head)
-    if key in _ADAPTIVE_BAND_LOGGED:
-        return
-    w_min = float(weights.min().item())
-    w_mean = float(weights.mean().item())
-    w_max = float(weights.max().item())
-    LOGGER.info(
-        "[onoff_loss] head=%s mode=adaptive_band context=%s band=[%.2f, %.2f] pos_weight min=%.3f mean=%.3f max=%.3f",
-        head,
-        context,
-        band[0],
-        band[1],
-        w_min,
-        w_mean,
-        w_max,
-    )
-    _ADAPTIVE_BAND_LOGGED.add(key)
-
-
-def _dynamic_pos_weighted_bce(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    pos_rate_override: Optional[torch.Tensor] = None,
-    pos_weight_override: Optional[torch.Tensor] = None,
-    weight: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """BCEWithLogits using adaptive or provided positive class weighting."""
-
-    eps = 1e-6
-    target_float = targets.float()
-    with torch.no_grad():
-        if pos_weight_override is not None:
-            pos_weight = pos_weight_override.detach().to(device=logits.device, dtype=logits.dtype)
-        else:
-            if pos_rate_override is not None:
-                positive_rate = pos_rate_override.detach().to(device=logits.device, dtype=logits.dtype)
-            else:
-                positive_rate = target_float.mean()
-            positive_rate = positive_rate.clamp(min=eps, max=1.0 - eps)
-            pos_weight = ((1.0 - positive_rate) / positive_rate).clamp(1.0, 100.0)
-        pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
-        w = weight.to(device=logits.device, dtype=logits.dtype) if weight is not None else None
-
-    return F.binary_cross_entropy_with_logits(
-        logits,
-        target_float,
-        weight=w,
-        pos_weight=pos_weight,
-        reduction="mean",
-    )
-
-
-def _time_pool_out_to_clip(out: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
-    """Reduce time-distributed logits when computing clip-mode losses."""
-
-    pooled = dict(out)
-    if "pitch_logits" in out and out["pitch_logits"].dim() == 3:
-        pooled["pitch_logits"] = out["pitch_logits"].mean(dim=1)
-    if "onset_logits" in out and out["onset_logits"].dim() == 3:
-        pooled["onset_logits"] = out["onset_logits"].mean(dim=1)
-    if "offset_logits" in out and out["offset_logits"].dim() == 3:
-        pooled["offset_logits"] = out["offset_logits"].mean(dim=1)
-    if "hand_logits" in out and out["hand_logits"].dim() == 3:
-        pooled["hand_logits"] = out["hand_logits"].mean(dim=1)
-    if "clef_logits" in out and out["clef_logits"].dim() == 3:
-        pooled["clef_logits"] = out["clef_logits"].mean(dim=1)
-    return pooled
-
-
-def _interp_labels_BT(x_bt: torch.Tensor, Tprime: int) -> torch.Tensor:
-    """Interpolate integer labels along time with nearest sampling."""
-
-    x = x_bt.float().unsqueeze(1)
-    x = F.interpolate(x, size=Tprime, mode="nearest")
-    return x.squeeze(1).long()
-
-
-def _interp_mask_BT(mask_bt: torch.Tensor, Tprime: int) -> torch.Tensor:
-    """Interpolate a (B,T) mask to T' using nearest sampling."""
-
-    m = mask_bt.float().unsqueeze(1)
-    m = F.interpolate(m, size=Tprime, mode="nearest")
-    return (m.squeeze(1) > 0.5)
-
-
-def _match_pitch_dim(x: Optional[torch.Tensor], P: int) -> Optional[torch.Tensor]:
-    """Align pitch dimension to model head size, padding/cropping as needed."""
-    if x is None:
-        return None
-    if x.shape[-1] == P:
-        return x
-    if x.shape[-1] > P:
-        start = 0
-        if x.shape[-1] == 128 and P == 88:
-            start = 21
-        return x[..., start : start + P]
-    pad = P - x.shape[-1]
-    if pad <= 0:
-        return x
-    return F.pad(x, (0, pad))
-
-
-def _resolve_onoff_loss_config(weights: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Build per-head onset/offset loss settings with backward-compatible defaults."""
-    if not isinstance(weights, Mapping):
-        weights = {}
-
-    default_cfg = {
-        "loss": str(weights.get("onoff_loss", "bce_pos")).lower(),
-        "pos_weight_mode": str(weights.get("onoff_pos_weight_mode", "adaptive")).lower(),
-        "pos_weight": weights.get("onoff_pos_weight"),
-        "focal_gamma": float(weights.get("focal_gamma", 2.0)),
-        "focal_alpha": float(weights.get("focal_alpha", 0.25)),
-        "prior_mean": float(weights.get("onoff_prior_mean", 0.12)),
-        "prior_weight": float(weights.get("onoff_prior_weight", 0.0)),
-        "pos_weight_band": None,
+    per_tile = {
+        "enabled": bool(cfg.get("enabled", False)),
+        "heads": heads,
     }
+    if "mask_cushion_keys" in cfg:
+        cushion = cfg.get("mask_cushion_keys")
+        per_tile["mask_cushion_keys"] = None if cushion is None else int(cushion)
+    if debug_cfg:
+        per_tile["debug"] = {
+            "enabled": bool(debug_cfg.get("enabled", False)),
+            "interval": int(debug_cfg.get("interval", 0) or 0),
+        }
+    return per_tile
 
-    per_head_overrides = weights.get("onoff_heads", {})
-    if not isinstance(per_head_overrides, Mapping):
-        per_head_overrides = {}
 
-    band_defaults = weights.get("onoff_pos_weight_bands", {})
-    if not isinstance(band_defaults, Mapping):
-        band_defaults = {}
+def _validate_head_block(name: str, cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    if name == "pitch":
+        required = {"loss", "pos_weight_mode", "pos_weight", "pos_weight_band"}
+        allowed = required
+        _validate_required(cfg, required, allowed, f"training.loss.heads.{name}")
+        loss = str(cfg["loss"]).lower()
+        if loss not in PITCH_LOSSES:
+            raise ValueError(f"training.loss.heads.{name}.loss must be one of {sorted(PITCH_LOSSES)}")
+        mode = str(cfg["pos_weight_mode"]).lower()
+        if mode not in PITCH_POS_WEIGHT_MODES:
+            raise ValueError(f"training.loss.heads.{name}.pos_weight_mode must be one of {sorted(PITCH_POS_WEIGHT_MODES)}")
+        pos_weight = cfg.get("pos_weight")
+        if mode == "fixed":
+            if pos_weight is None:
+                raise ValueError(f"training.loss.heads.{name}.pos_weight is required when pos_weight_mode='fixed'")
+            pos_weight = _as_float(pos_weight, f"training.loss.heads.{name}.pos_weight")
+        elif pos_weight is not None:
+            pos_weight = _as_float(pos_weight, f"training.loss.heads.{name}.pos_weight")
+        band = cfg.get("pos_weight_band")
+        band_val = _coerce_pos_weight_band(band) if band is not None else None
+        if mode == "adaptive_band" and band_val is None:
+            raise ValueError(f"training.loss.heads.{name}.pos_weight_band is required for pos_weight_mode='adaptive_band'")
+        return {
+            "loss": loss,
+            "pos_weight_mode": mode,
+            "pos_weight": pos_weight,
+            "pos_weight_band": band_val,
+        }
 
-    alias_patterns = {
-        "loss": ("{head}_loss", "{head}_onoff_loss"),
-        "pos_weight_mode": ("{head}_pos_weight_mode", "{head}_onoff_pos_weight_mode"),
-        "pos_weight": ("{head}_pos_weight", "{head}_onoff_pos_weight"),
-        "focal_gamma": ("{head}_focal_gamma",),
-        "focal_alpha": ("{head}_focal_alpha",),
-        "prior_mean": ("{head}_prior_mean", "{head}_onoff_prior_mean"),
-        "prior_weight": ("{head}_prior_weight", "{head}_onoff_prior_weight"),
-        "pos_weight_band": ("{head}_pos_weight_band",),
+    if name in {"onset", "offset"}:
+        required = {
+            "loss",
+            "pos_weight_mode",
+            "pos_weight",
+            "pos_weight_band",
+            "focal_gamma",
+            "focal_alpha",
+            "prior_mean",
+            "prior_weight",
+        }
+        allowed = required
+        _validate_required(cfg, required, allowed, f"training.loss.heads.{name}")
+        loss = str(cfg["loss"]).lower()
+        if loss not in ONOFF_LOSSES:
+            raise ValueError(f"training.loss.heads.{name}.loss must be one of {sorted(ONOFF_LOSSES)}")
+        mode = str(cfg["pos_weight_mode"]).lower()
+        if mode not in ONOFF_POS_WEIGHT_MODES:
+            raise ValueError(f"training.loss.heads.{name}.pos_weight_mode must be one of {sorted(ONOFF_POS_WEIGHT_MODES)}")
+        pos_weight = cfg.get("pos_weight")
+        if mode == "fixed":
+            if pos_weight is None:
+                raise ValueError(f"training.loss.heads.{name}.pos_weight is required when pos_weight_mode='fixed'")
+            pos_weight = _as_float(pos_weight, f"training.loss.heads.{name}.pos_weight")
+        elif pos_weight is not None:
+            pos_weight = _as_float(pos_weight, f"training.loss.heads.{name}.pos_weight")
+        band = cfg.get("pos_weight_band")
+        band_val = _coerce_pos_weight_band(band) if band is not None else None
+        if mode == "adaptive_band" and band_val is None:
+            raise ValueError(f"training.loss.heads.{name}.pos_weight_band is required for pos_weight_mode='adaptive_band'")
+        focal_gamma = _as_float(cfg["focal_gamma"], f"training.loss.heads.{name}.focal_gamma")
+        focal_alpha = _as_float(cfg["focal_alpha"], f"training.loss.heads.{name}.focal_alpha")
+        prior_mean = _as_float(cfg["prior_mean"], f"training.loss.heads.{name}.prior_mean")
+        prior_weight = _as_float(cfg["prior_weight"], f"training.loss.heads.{name}.prior_weight")
+        return {
+            "loss": loss,
+            "pos_weight_mode": mode,
+            "pos_weight": pos_weight,
+            "pos_weight_band": band_val,
+            "focal_gamma": focal_gamma,
+            "focal_alpha": focal_alpha,
+            "prior_mean": prior_mean,
+            "prior_weight": prior_weight,
+        }
+
+    if name in {"hand", "clef"}:
+        required = {"loss"}
+        allowed = required
+        _validate_required(cfg, required, allowed, f"training.loss.heads.{name}")
+        loss = str(cfg["loss"]).lower()
+        if loss not in HAND_CLEF_LOSSES:
+            raise ValueError(f"training.loss.heads.{name}.loss must be one of {sorted(HAND_CLEF_LOSSES)}")
+        return {"loss": loss}
+
+    raise ValueError(f"Unknown head '{name}' in training.loss.heads")
+
+
+def _validate_loss_schema(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(cfg, Mapping):
+        raise ValueError("MultitaskLoss expects a mapping config containing training.loss")
+    training_cfg = cfg.get("training")
+    if not isinstance(training_cfg, Mapping):
+        raise ValueError("Config is missing 'training' mapping required for loss construction")
+    loss_cfg = training_cfg.get("loss")
+    if not isinstance(loss_cfg, Mapping):
+        raise ValueError("Config is missing 'training.loss' mapping required for loss construction")
+
+    allowed_top = {"head_weights", "ema_alpha", "neg_smooth_onoff", "per_tile", "heads"}
+    _validate_required(loss_cfg, allowed_top, allowed_top, "training.loss")
+
+    head_weights_raw = loss_cfg.get("head_weights")
+    if not isinstance(head_weights_raw, Mapping):
+        raise ValueError("training.loss.head_weights must be a mapping")
+    _validate_required(head_weights_raw, set(HEAD_ORDER), set(HEAD_ORDER), "training.loss.head_weights")
+    head_weights = {k: _as_float(head_weights_raw[k], f"training.loss.head_weights.{k}") for k in HEAD_ORDER}
+
+    ema_alpha = _as_float(loss_cfg.get("ema_alpha"), "training.loss.ema_alpha")
+    if ema_alpha < 0.0:
+        raise ValueError("training.loss.ema_alpha must be non-negative")
+    neg_smooth = _as_float(loss_cfg.get("neg_smooth_onoff"), "training.loss.neg_smooth_onoff")
+    if neg_smooth < 0.0:
+        raise ValueError("training.loss.neg_smooth_onoff must be non-negative")
+
+    per_tile_cfg = loss_cfg.get("per_tile")
+    if not isinstance(per_tile_cfg, Mapping):
+        raise ValueError("training.loss.per_tile must be a mapping")
+    per_tile = _validate_per_tile(per_tile_cfg)
+
+    heads_cfg = loss_cfg.get("heads")
+    if not isinstance(heads_cfg, Mapping):
+        raise ValueError("training.loss.heads must be a mapping")
+    _validate_required(heads_cfg, set(HEAD_ORDER), set(HEAD_ORDER), "training.loss.heads")
+
+    heads: Dict[str, Dict[str, Any]] = {}
+    for head in HEAD_ORDER:
+        heads[head] = _validate_head_block(head, heads_cfg.get(head, {}))
+
+    return {
+        "head_weights": head_weights,
+        "ema_alpha": ema_alpha,
+        "neg_smooth_onoff": neg_smooth,
+        "per_tile": per_tile,
+        "heads": heads,
     }
-
-    resolved: Dict[str, Dict[str, Any]] = {}
-    for head in ("onset", "offset"):
-        cfg = dict(default_cfg)
-        cfg["pos_weight_band"] = _coerce_pos_weight_band(band_defaults.get(head))
-
-        nested = per_head_overrides.get(head)
-        if isinstance(nested, Mapping):
-            for key, value in nested.items():
-                if key == "pos_weight_band":
-                    cfg[key] = _coerce_pos_weight_band(value)
-                    continue
-                if key in cfg:
-                    cfg[key] = value
-
-        for key, patterns in alias_patterns.items():
-            for pattern in patterns:
-                alias = pattern.format(head=head)
-                if alias in weights:
-                    if key == "pos_weight_band":
-                        cfg[key] = _coerce_pos_weight_band(weights[alias])
-                    else:
-                        cfg[key] = weights[alias]
-                    break
-
-        cfg["loss"] = str(cfg["loss"]).lower()
-        cfg["pos_weight_mode"] = str(cfg["pos_weight_mode"]).lower()
-        cfg["focal_gamma"] = float(cfg["focal_gamma"])
-        cfg["focal_alpha"] = float(cfg["focal_alpha"])
-        cfg["prior_mean"] = float(cfg["prior_mean"])
-        cfg["prior_weight"] = float(cfg["prior_weight"])
-
-        pos_weight_raw = cfg.get("pos_weight")
-        if pos_weight_raw is None:
-            pos_weight_val: Optional[float] = None
-        else:
-            try:
-                pos_weight_val = float(pos_weight_raw)
-            except (TypeError, ValueError):
-                pos_weight_val = None
-        if pos_weight_val is None or pos_weight_val <= 0.0:
-            cfg["pos_weight"] = None
-        else:
-            cfg["pos_weight"] = pos_weight_val
-
-        resolved[head] = cfg
-
-    return resolved
-
-
-def _resolve_head_weights(cfg: Mapping[str, Any] | None, override: Mapping[str, float] | None) -> Dict[str, float]:
-    """Resolve per-head scalar weights from training config and overrides."""
-    weights = {k: 1.0 for k in ("pitch", "onset", "offset", "hand", "clef")}
-    if isinstance(cfg, Mapping):
-        for head in weights:
-            if head in cfg:
-                try:
-                    weights[head] = float(cfg[head])
-                except (TypeError, ValueError):
-                    pass
-    if isinstance(override, Mapping):
-        for k, v in override.items():
-            try:
-                weights[str(k)] = float(v)
-            except (TypeError, ValueError):
-                continue
-    return weights
 
 
 def _per_tile_masked_loss(
@@ -462,26 +534,25 @@ class MultitaskLoss:
     """Composite loss for pitch/onset/offset/hand/clef heads."""
 
     def __init__(self, cfg: Mapping[str, Any] | None = None, head_weights: Mapping[str, float] | None = None) -> None:
-        """Initialise loss wiring while preserving legacy weight overrides."""
-        loss_cfg = {}
-        per_tile_cfg = {}
-        gating_cfg = {}
-        if isinstance(cfg, Mapping):
-            loss_cfg = cfg.get("training", {}).get("loss_weights", {}) if isinstance(cfg.get("training"), Mapping) else {}
-            per_tile_cfg = cfg.get("training", {}).get("per_tile", {}) if isinstance(cfg.get("training"), Mapping) else {}
-            gating_cfg = cfg.get("priors", {}).get("hand_gating", {}) if isinstance(cfg.get("priors"), Mapping) else {}
-        self.loss_cfg = loss_cfg
-        self.head_cfgs = _resolve_onoff_loss_config(loss_cfg)
-        self.head_weights = _resolve_head_weights(loss_cfg, head_weights)
-        self.neg_smooth = float(loss_cfg.get("onoff_neg_smooth", 0.0))
-        self.pitch_band = _coerce_pos_weight_band((loss_cfg.get("onoff_pos_weight_bands", {}) or {}).get("pitch"))
-        self.pitch_pos_mode = str(loss_cfg.get("onoff_pos_weight_mode", "adaptive")).lower()
-        ema_alpha = float(loss_cfg.get("onoff_pos_weight_ema_alpha", 0.0))
-        if any(cfg.get("pos_weight_mode", "") == "ema" for cfg in self.head_cfgs.values()) and ema_alpha <= 0.0:
-            ema_alpha = 0.05
-        self.pos_rate_state = OnOffPosWeightEMA(ema_alpha) if ema_alpha > 0.0 else None
-        self.per_tile_defaults = per_tile_cfg
-        self.hand_gating_cfg = gating_cfg
+        """Initialise loss wiring with strict config validation."""
+        if head_weights is not None:
+            raise ValueError("head_weights override is not supported; configure training.loss.head_weights instead")
+        validated = _validate_loss_schema(cfg or {})
+        self.head_weights = validated["head_weights"]
+        self.neg_smooth = validated["neg_smooth_onoff"]
+        self.per_tile_defaults = validated["per_tile"]
+        self.head_cfgs = validated["heads"]
+        self.pitch_cfg = self.head_cfgs["pitch"]
+        self.onset_cfg = self.head_cfgs["onset"]
+        self.offset_cfg = self.head_cfgs["offset"]
+        self.hand_cfg = self.head_cfgs["hand"]
+        self.clef_cfg = self.head_cfgs["clef"]
+        uses_ema = any(self.head_cfgs[h]["pos_weight_mode"] == "ema" for h in ("onset", "offset"))
+        ema_alpha = validated["ema_alpha"]
+        if uses_ema and ema_alpha <= 0.0:
+            raise ValueError("training.loss.ema_alpha must be > 0 when any head uses pos_weight_mode='ema'")
+        self.pos_rate_state = OnOffPosWeightEMA(ema_alpha) if uses_ema and ema_alpha > 0.0 else None
+        self.hand_gating_cfg = cfg.get("priors", {}).get("hand_gating", {}) if isinstance(cfg, Mapping) else {}
 
     def state_dict(self) -> Dict[str, Any]:
         """Return serialisable adaptive state (EMA trackers)."""
@@ -522,6 +593,60 @@ class MultitaskLoss:
             )
         raise ValueError(f"Unsupported pitch_logits rank {pitch_logits.dim()}")
 
+    def _pitch_pos_weight(self, target: torch.Tensor, device: torch.device, *, context: str) -> Optional[torch.Tensor]:
+        mode = self.pitch_cfg["pos_weight_mode"]
+        band = self.pitch_cfg["pos_weight_band"]
+        pos_weight = self.pitch_cfg.get("pos_weight")
+        eps = 1e-6
+        if mode in {"off", "none"}:
+            return None
+        if mode == "fixed":
+            return torch.full((target.shape[-1],), float(pos_weight), dtype=torch.float32, device=device)
+        if mode == "adaptive_band":
+            if band is None:
+                raise ValueError("pitch pos_weight_mode='adaptive_band' requires pos_weight_band")
+            weights_local = _banded_pos_weight_from_roll(target, band, eps)
+            _log_banded_weight_stats("pitch", context, weights_local, band)
+            return weights_local.to(device=device)
+        if mode == "sqrt":
+            pos_rate = target.reshape(-1, target.shape[-1]).float().mean(dim=0).clamp_min(eps)
+            return ((1.0 - pos_rate) / (pos_rate + eps)).sqrt().clamp(1.0, 50.0).to(device=device)
+        return _adaptive_pos_weight_from_roll(target, eps).to(device=device)
+
+    def _onoff_pos_weight(
+        self,
+        head: str,
+        cfg: Mapping[str, Any],
+        roll: torch.Tensor,
+        device: torch.device,
+        state: Optional[OnOffPosWeightEMA],
+        *,
+        update_state: bool,
+        context: str,
+    ) -> Optional[torch.Tensor]:
+        mode = cfg.get("pos_weight_mode", "adaptive")
+        band = cfg.get("pos_weight_band")
+        pos_weight = cfg.get("pos_weight")
+        if mode in {"off", "none"}:
+            return None
+        if mode == "fixed":
+            if pos_weight is None:
+                raise ValueError(f"{head} pos_weight_mode='fixed' requires pos_weight")
+            pos_val = float(pos_weight)
+            return torch.full((roll.shape[-1],), pos_val, dtype=torch.float32, device=device)
+        if mode == "ema":
+            if state is None:
+                raise ValueError("pos_weight_mode='ema' requires training.loss.ema_alpha > 0")
+            fn = state.clip_pos_weight if context == "clip" else state.frame_pos_weight
+            return fn(head, roll, update=update_state).to(device=device)
+        if mode == "adaptive_band":
+            if band is None:
+                raise ValueError(f"{head} pos_weight_mode='adaptive_band' requires pos_weight_band")
+            weights_local = _banded_pos_weight_from_roll(roll, band)
+            _log_banded_weight_stats(head, context, weights_local, band)
+            return weights_local.to(device=device)
+        return _adaptive_pos_weight_from_roll(roll).to(device=device)
+
     # ---- clip-mode loss -------------------------------------------------
     def _clip_loss(
         self,
@@ -534,7 +659,7 @@ class MultitaskLoss:
         """Clip-mode loss with optional adaptive pos_weight and priors."""
         state = pos_rate_state or self.pos_rate_state
         out = _time_pool_out_to_clip(preds)
-        device = next(iter(out.values())).device if out else "cpu"
+        device = next(iter(out.values())).device if out else torch.device("cpu")
         total = torch.tensor(0.0, device=device)
         parts: Dict[str, Any] = {}
 
@@ -544,34 +669,7 @@ class MultitaskLoss:
         elif pitch_target.dim() == 3:
             pitch_target = pitch_target.max(dim=1).values
 
-        head_cfgs = self.head_cfgs
-        onset_cfg = head_cfgs["onset"]
-        offset_cfg = head_cfgs["offset"]
-
-        def _clip_pos_weight(
-            head: str,
-            cfg: Mapping[str, Any],
-            target: torch.Tensor,
-        ) -> Optional[torch.Tensor]:
-            """Resolve clip-level pos_weight following configured mode."""
-            mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
-            loss_mode = str(cfg.get("loss", "bce_pos")).lower()
-            if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
-                return None
-            if mode == "fixed" and cfg.get("pos_weight") is not None:
-                return torch.full((target.shape[-1],), float(cfg["pos_weight"]), dtype=torch.float32)
-            if mode == "ema" and state is not None:
-                return state.clip_pos_weight(head, target, update=update_state)
-            if mode == "adaptive_band":
-                band = cfg.get("pos_weight_band")
-                if band is None:
-                    return _adaptive_pos_weight_from_roll(target)
-                weights_local = _banded_pos_weight_from_roll(target, band)
-                _log_banded_weight_stats(head, "clip", weights_local, band)
-                return weights_local
-            if mode in {"none", "off"}:
-                return None
-            return None
+        pitch_pos_weight = self._pitch_pos_weight(pitch_target, device, context="clip")
 
         def _clip_head_loss(
             head: str,
@@ -579,18 +677,22 @@ class MultitaskLoss:
             logits: torch.Tensor,
             target: torch.Tensor,
         ) -> torch.Tensor:
-            mode = str(cfg.get("loss", "bce_pos")).lower()
+            mode = cfg.get("loss", "bce")
             if mode in {"focal", "focal_bce"}:
-                gamma = float(cfg.get("focal_gamma", 2.0))
-                alpha = float(cfg.get("focal_alpha", 0.25))
+                gamma = float(cfg["focal_gamma"])
+                alpha = float(cfg["focal_alpha"])
                 bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
                 probs = torch.sigmoid(logits)
                 weight = (alpha * (1.0 - probs).pow(gamma)).detach()
                 return (weight * bce).mean()
-            pos_weight_override = _clip_pos_weight(head, cfg, target)
+            pos_weight_override = self._onoff_pos_weight(
+                head, cfg, target, device, state, update_state=update_state, context="clip"
+            )
             return _dynamic_pos_weighted_bce(logits, target, pos_weight_override=pos_weight_override)
 
-        loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], pitch_target) * float(self.head_weights.get("pitch", 1.0))
+        loss_pitch = _dynamic_pos_weighted_bce(out["pitch_logits"], pitch_target, pos_weight_override=pitch_pos_weight) * float(
+            self.head_weights.get("pitch", 1.0)
+        )
         total = total + loss_pitch
         parts["pitch"] = float(loss_pitch.detach().cpu())
 
@@ -605,8 +707,12 @@ class MultitaskLoss:
         elif offset_target.dim() == 3:
             offset_target = offset_target.max(dim=1).values
 
-        loss_onset = _clip_head_loss("onset", onset_cfg, out["onset_logits"], onset_target) * float(self.head_weights.get("onset", 1.0))
-        loss_offset = _clip_head_loss("offset", offset_cfg, out["offset_logits"], offset_target) * float(self.head_weights.get("offset", 1.0))
+        loss_onset = _clip_head_loss("onset", self.onset_cfg, out["onset_logits"], onset_target) * float(
+            self.head_weights.get("onset", 1.0)
+        )
+        loss_offset = _clip_head_loss("offset", self.offset_cfg, out["offset_logits"], offset_target) * float(
+            self.head_weights.get("offset", 1.0)
+        )
         total = total + loss_onset + loss_offset
         parts["onset"] = float(loss_onset.detach().cpu())
         parts["offset"] = float(loss_offset.detach().cpu())
@@ -709,7 +815,7 @@ class MultitaskLoss:
         if isinstance(per_tile, Mapping):
             per_tile_ctx.update(per_tile)
         per_tile_enabled = bool(per_tile_ctx.get("enabled", False))
-        per_tile_heads_raw = per_tile_ctx.get("heads")
+        per_tile_heads_raw = per_tile_ctx.get("heads", ())
         if isinstance(per_tile_heads_raw, Sequence) and not isinstance(per_tile_heads_raw, (str, bytes)):
             per_tile_heads = {str(h).lower() for h in per_tile_heads_raw}
         else:
@@ -727,7 +833,7 @@ class MultitaskLoss:
         onset_tile = per_tile_ctx.get("onset") if per_tile_enabled else None
         offset_tile = per_tile_ctx.get("offset") if per_tile_enabled else None
 
-        gating_cfg = dict(self.hand_gating_cfg)
+        gating_cfg = dict(self.hand_gating_cfg) if isinstance(self.hand_gating_cfg, Mapping) else {}
         if isinstance(hand_gating, Mapping):
             gating_cfg.update(hand_gating)
         gating_mode = str(gating_cfg.get("mode", "off")).lower()
@@ -743,16 +849,7 @@ class MultitaskLoss:
                     neg_weight = 1.0 + gating_alpha * (1.0 - hr)
                     reach_weights = torch.where(hr_valid > 0.5, neg_weight, torch.ones_like(hr))
 
-        eps = 1e-6
-        pitch_mode = self.pitch_pos_mode
-        with torch.no_grad():
-            pos_rate_pitch = pitch_roll.detach().reshape(-1, pitch_roll.shape[-1]).mean(dim=0).clamp_min(eps)
-        if pitch_mode == "adaptive_band" and self.pitch_band is not None:
-            pos_w_pitch = _banded_pos_weight_from_roll(pitch_roll, self.pitch_band, eps)
-            _log_banded_weight_stats("pitch", "frame", pos_w_pitch, self.pitch_band)
-            pos_w_pitch = pos_w_pitch.to(device)
-        else:
-            pos_w_pitch = ((1.0 - pos_rate_pitch) / (pos_rate_pitch + eps)).sqrt().clamp(1.0, 50.0).to(device)
+        pos_w_pitch = self._pitch_pos_weight(pitch_roll, device, context="frame")
 
         def _bce_with_reach(logits: torch.Tensor, targets: torch.Tensor, pos_w: Optional[torch.Tensor]) -> torch.Tensor:
             """BCE helper that applies optional reach-based weights."""
@@ -790,31 +887,6 @@ class MultitaskLoss:
         else:
             loss_pitch = _bce_with_reach(pitch_logit, pitch_roll, pos_w_pitch) * float(self.head_weights.get("pitch", 1.0))
 
-        head_cfgs = self.head_cfgs
-        onset_cfg = head_cfgs["onset"]
-        offset_cfg = head_cfgs["offset"]
-
-        def _frame_pos_weight(head: str, cfg: Mapping[str, Any], roll: torch.Tensor) -> Optional[torch.Tensor]:
-            """Resolve frame-level pos_weight following configured mode."""
-            mode = str(cfg.get("pos_weight_mode", "adaptive")).lower()
-            loss_mode = str(cfg.get("loss", "bce_pos")).lower()
-            if loss_mode not in {"bce_pos", "bce", "bce_with_logits"}:
-                return None
-            if mode == "fixed" and cfg.get("pos_weight") is not None:
-                return torch.full((P,), float(cfg["pos_weight"]), dtype=torch.float32)
-            if mode == "ema" and state is not None:
-                return state.frame_pos_weight(head, roll, update=update_state)
-            if mode == "adaptive_band":
-                band = cfg.get("pos_weight_band")
-                if band is None:
-                    return _adaptive_pos_weight_from_roll(roll, eps)
-                weights_local = _banded_pos_weight_from_roll(roll, band, eps).detach()
-                _log_banded_weight_stats(head, "frame", weights_local, band)
-                return weights_local
-            if mode in {"none", "off"}:
-                return None
-            return _adaptive_pos_weight_from_roll(roll, eps)
-
         def _compute_frame_head_loss(
             head: str,
             cfg: Mapping[str, Any],
@@ -823,10 +895,10 @@ class MultitaskLoss:
             pos_weight: Optional[torch.Tensor],
         ) -> torch.Tensor:
             """Compute per-head frame loss with optional focal/pos_weight."""
-            mode = str(cfg.get("loss", "bce_pos")).lower()
+            mode = cfg.get("loss", "bce")
             if mode in {"focal", "focal_bce"}:
-                gamma = float(cfg.get("focal_gamma", 2.0))
-                alpha = float(cfg.get("focal_alpha", 0.25))
+                gamma = float(cfg["focal_gamma"])
+                alpha = float(cfg["focal_alpha"])
                 bce = F.binary_cross_entropy_with_logits(logits, roll, reduction="none")
                 probs = torch.sigmoid(logits)
                 weight = (alpha * (1.0 - probs).pow(gamma)).detach()
@@ -834,21 +906,24 @@ class MultitaskLoss:
                     weight = weight * reach_weights.to(device=logits.device, dtype=logits.dtype)
                 return (weight * bce).mean()
 
-            if pos_weight is not None:
-                pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+            pos_weight_local = pos_weight.to(device=logits.device, dtype=logits.dtype) if pos_weight is not None else None
             if reach_weights is not None and reach_weights.shape == roll.shape:
                 weight = reach_weights.to(device=logits.device, dtype=logits.dtype)
                 return F.binary_cross_entropy_with_logits(
                     logits,
                     roll,
                     weight=weight,
-                    pos_weight=pos_weight,
+                    pos_weight=pos_weight_local,
                     reduction="mean",
                 )
-            return F.binary_cross_entropy_with_logits(logits, roll, pos_weight=pos_weight)
+            return F.binary_cross_entropy_with_logits(logits, roll, pos_weight=pos_weight_local)
 
-        pos_w_on = _frame_pos_weight("onset", onset_cfg, onset_roll)
-        pos_w_off = _frame_pos_weight("offset", offset_cfg, offset_roll)
+        pos_w_on = self._onoff_pos_weight(
+            "onset", self.onset_cfg, onset_roll, device, state, update_state=update_state, context="frame"
+        )
+        pos_w_off = self._onoff_pos_weight(
+            "offset", self.offset_cfg, offset_roll, device, state, update_state=update_state, context="frame"
+        )
 
         use_tile_onset = per_tile_enabled and "onset" in per_tile_heads and torch.is_tensor(onset_tile)
         if use_tile_onset and onset_logit is not None:
@@ -858,7 +933,7 @@ class MultitaskLoss:
                 onset_tile_tensor,
                 onset_roll,
                 mask_tensor,
-                onset_cfg,
+                self.onset_cfg,
                 pos_w_on,
                 head="onset",
             )
@@ -867,9 +942,9 @@ class MultitaskLoss:
                 if debug_onset:
                     per_tile_debug["onset"] = debug_onset
             else:
-                loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on)
+                loss_onset = _compute_frame_head_loss("onset", self.onset_cfg, onset_logit, onset_roll, pos_w_on)
         else:
-            loss_onset = _compute_frame_head_loss("onset", onset_cfg, onset_logit, onset_roll, pos_w_on) if onset_logit is not None else torch.tensor(0.0, device=device)
+            loss_onset = _compute_frame_head_loss("onset", self.onset_cfg, onset_logit, onset_roll, pos_w_on) if onset_logit is not None else torch.tensor(0.0, device=device)
 
         use_tile_offset = per_tile_enabled and "offset" in per_tile_heads and torch.is_tensor(offset_tile)
         if use_tile_offset and offset_logit is not None:
@@ -879,7 +954,7 @@ class MultitaskLoss:
                 offset_tile_tensor,
                 offset_roll,
                 mask_tensor,
-                offset_cfg,
+                self.offset_cfg,
                 pos_w_off,
                 head="offset",
             )
@@ -888,9 +963,9 @@ class MultitaskLoss:
                 if debug_offset:
                     per_tile_debug["offset"] = debug_offset
             else:
-                loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off)
+                loss_offset = _compute_frame_head_loss("offset", self.offset_cfg, offset_logit, offset_roll, pos_w_off)
         else:
-            loss_offset = _compute_frame_head_loss("offset", offset_cfg, offset_logit, offset_roll, pos_w_off) if offset_logit is not None else torch.tensor(0.0, device=device)
+            loss_offset = _compute_frame_head_loss("offset", self.offset_cfg, offset_logit, offset_roll, pos_w_off) if offset_logit is not None else torch.tensor(0.0, device=device)
 
         loss_onset = loss_onset * float(self.head_weights.get("onset", 1.0))
         loss_offset = loss_offset * float(self.head_weights.get("offset", 1.0))
@@ -932,8 +1007,8 @@ class MultitaskLoss:
 
         reg_terms: Dict[str, torch.Tensor] = {}
         for head, cfg, logits in (
-            ("onset", onset_cfg, onset_logit),
-            ("offset", offset_cfg, offset_logit),
+            ("onset", self.onset_cfg, onset_logit),
+            ("offset", self.offset_cfg, offset_logit),
         ):
             if logits is None:
                 continue
@@ -958,10 +1033,7 @@ class MultitaskLoss:
 
 
 def build_loss(cfg: Mapping[str, Any] | None = None, head_weights: Mapping[str, float] | None = None) -> MultitaskLoss:
-    """Factory for the multitask loss (supports legacy head-weight-only input)."""
-    if cfg is not None and head_weights is None and not (isinstance(cfg, Mapping) and "training" in cfg):
-        head_weights = cfg  # type: ignore[assignment]
-        cfg = None
+    """Factory for the multitask loss (expects cfg.training.loss schema)."""
     return MultitaskLoss(cfg, head_weights=head_weights)
 
 

@@ -76,10 +76,12 @@ Dataset-specific additions:
 - `training.reset_head_bias` (bool): reinit onset/offset heads.
 - `training.bias_seed.onoff_prior_mean` (float): bias init prior.
 - `training.soft_targets.*` (mapping): enable/which heads/kernel shapes.
-- `training.loss_weights.*` (mapping): per-loss weights, focal/bce priors.
+- `training.loss.head_weights` (mapping): per-head weights for pitch/onset/offset/hand/clef.
+- `training.loss.ema_alpha` / `neg_smooth_onoff` (float): EMA alpha for pos_weight_mode=ema; negative smoothing strength.
+- `training.loss.per_tile.*` (mapping): enable/heads/mask cushion/debug interval for per-tile supervision.
+- `training.loss.heads.*` (mapping): explicit per-head configs. Pitch requires loss/pos_weight_mode/pos_weight/pos_weight_band; onset/offset also require focal_gamma/focal_alpha/prior_mean/prior_weight; hand/clef expose `loss: ce`.
 - `training.metrics.*` (mapping): thresholds, temps, biases, decoder params for metrics.
 - `training.best_selection.*` (mapping): selection mode/trigger/n; uses dataset frames/max_clips/splits.
-- `training.per_tile.*` (mapping): per-tile supervision toggles.
 - `optim.*`: grad clip, head/offset lr multipliers.
 - `train.*`: accumulation and freeze schedule.
 

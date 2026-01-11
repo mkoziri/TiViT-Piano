@@ -106,7 +106,8 @@ class PerTileSupport:
         tile_cache: TileSupportCache | None = None,
     ) -> None:
         training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
-        per_tile_cfg = training_cfg.get("per_tile", {}) or {}
+        loss_cfg = training_cfg.get("loss", {}) if isinstance(training_cfg, Mapping) else {}
+        per_tile_cfg = loss_cfg.get("per_tile", {}) or {}
         self.enabled = bool(per_tile_cfg.get("enabled", False))
         self.heads = tuple(str(h).lower() for h in per_tile_cfg.get("heads", ("pitch", "onset", "offset")))
         decoder_cfg = cfg.get("decoder", {}).get("global_fusion", {}) if isinstance(cfg, Mapping) else {}
