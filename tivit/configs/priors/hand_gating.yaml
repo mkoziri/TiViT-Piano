@@ -1,4 +1,0 @@
-priors:
-  hand_gating:
-    mode: loss_reweight
-    strength: 0.75

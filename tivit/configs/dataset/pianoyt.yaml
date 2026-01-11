@@ -1,3 +1,4 @@
+# PianoYT dataset defaults: paths, sampling, and target generation.
 dataset:
   name: PianoYT
   root_dir: data/PianoYT

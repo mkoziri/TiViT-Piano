@@ -1,9 +1,8 @@
+# ViT-S tiled model defaults; relies on dataset.tiles/channels for shapes.
 model:
   name: TiViT-Piano
   backend: vits_tile
   head_mode: frame
-  tiles: 3
-  input_channels: 3
   transformer:
     input_patch_size: 16
     dropout: 0.1

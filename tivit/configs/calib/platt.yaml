@@ -1,3 +1,4 @@
+# Platt scaling calibration settings.
 calibration:
   method: platt
   output_path: calibration.json

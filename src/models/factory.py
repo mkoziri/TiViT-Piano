@@ -41,14 +41,16 @@ def build_model(cfg: Mapping[str, Any]):
 
     dataset_cfg = cfg.get("dataset", {}) if isinstance(cfg, Mapping) else {}
     tiling_cfg = cfg.get("tiling", {}) if isinstance(cfg, Mapping) else {}
+    tiles = int(_get(dataset_cfg, "tiles", 3))
+    input_channels = int(_get(dataset_cfg, "channels", 3))
 
     if backend == "vivit":
         if "transformer" not in mcfg:
             raise ValueError("model.transformer is required for the ViViT backend")
         tcfg = mcfg["transformer"]
         return TiViTPiano(
-            tiles=_get(mcfg, "tiles", 3),
-            input_channels=_get(mcfg, "input_channels", 3),
+            tiles=tiles,
+            input_channels=input_channels,
             patch_size=_get(tcfg, "input_patch_size", 16),
             tube_size=_get(tcfg, "tube_size", 2),
             d_model=_get(tcfg, "d_model", 768),
@@ -73,8 +75,8 @@ def build_model(cfg: Mapping[str, Any]):
             raise ValueError("model.vits_tile.input_hw must provide height and width")
         dropout_default = _get(tcfg, "dropout", 0.1)
         return ViTSTilePiano(
-            tiles=_get(mcfg, "tiles", 3),
-            input_channels=_get(mcfg, "input_channels", 3),
+            tiles=tiles,
+            input_channels=input_channels,
             head_mode=mcfg.get("head_mode", "frame"),
             tiling_cfg=tiling_cfg,
             backbone_name=str(vcfg.get("backbone_name", "vit_small_patch16_224")),

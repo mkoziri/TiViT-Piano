@@ -1,7 +1,18 @@
-"""Model factory that honors the registry-backed layout.
+"""TiViT model factory shim and registry bridge.
 
-This wrapper keeps compatibility with the legacy :mod:`src.models.factory`
-while allowing experiments to resolve backbones via the new registry.
+Purpose:
+    - Provide a registry-backed entrypoint that mirrors the prior behaviour
+      while using the new implementations.
+    - Keep a single source of truth for model construction while the new
+      layout stabilizes.
+Key Functions/Classes:
+    - ``build_model``: Resolve the configured backbone name and delegate to the
+      registered builder (defaults to ViViT) with a legacy-compatible config.
+CLI Arguments:
+    (none)
+Usage:
+    Import ``build_model`` from this module or ``tivit.models`` to construct a
+    model for training/evaluation scripts.
 """
 
 from __future__ import annotations
@@ -14,7 +25,7 @@ register_default_components()
 
 
 def build_model(cfg: Mapping[str, Any]):
-    """Build a model using the registered backbone indicated by ``cfg``."""
+    """Build the requested backbone via the registry (defaults to ViViT)."""
 
     model_cfg = cfg.get("model", {}) if isinstance(cfg, Mapping) else {}
     backend = str(model_cfg.get("backend", "vivit") or "vivit").lower()
@@ -23,4 +34,3 @@ def build_model(cfg: Mapping[str, Any]):
 
 
 __all__ = ["build_model"]
-

@@ -1,15 +1,16 @@
+# Experiment-wide metadata and logging defaults.
 experiment:
-  name: TiViT-Piano_PianoVAM_cache
+  name: TiViT-Piano GCR basic
   seed: 1332
   deterministic: true
-  output_dir: outputs
+  output_dir: /tivit/outputs
 
 logging:
-  log_dir: logs
+  log_dir: /tivit/logs
   checkpoint_dir: checkpoints
   tensorboard: true
   postproc_debug: true
 
 inference:
-  output_dir: inference_results
+  output_dir: /tivit/inference_results
   predict_on_train: false

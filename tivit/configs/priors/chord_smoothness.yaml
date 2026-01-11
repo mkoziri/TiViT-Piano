@@ -1,3 +1,0 @@
-priors:
-  chord_smoothness:
-    strength: 0.15

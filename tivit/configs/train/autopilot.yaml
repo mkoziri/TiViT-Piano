@@ -1,3 +1,4 @@
+# Autopilot sweep/tuning defaults layered on top of training.
 autopilot:
   best_selection:
     owner: autopilot

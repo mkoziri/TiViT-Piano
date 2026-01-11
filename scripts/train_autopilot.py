@@ -3323,18 +3323,10 @@ def main() -> int:
     if args.dataset_max_clips is not None:
         dataset_cfg["max_clips"] = int(args.dataset_max_clips)
         changed = True
-    desired_best_sel_clips: Optional[int] = None
-    if args.calib_max_clips is not None:
-        desired_best_sel_clips = int(args.calib_max_clips)
-    elif args.dataset_max_clips is not None:
-        desired_best_sel_clips = int(args.dataset_max_clips)
-    else:
-        desired_best_sel_clips = _coerce_positive_int(dataset_cfg.get("max_clips"))
-    if desired_best_sel_clips:
-        best_sel_max = _coerce_positive_int(best_sel_cfg.get("max_clips"))
-        if best_sel_max != desired_best_sel_clips:
-            best_sel_cfg["max_clips"] = desired_best_sel_clips
-            changed = True
+    if "max_clips" in best_sel_cfg:
+        # Prefer dataset.max_clips to avoid duplicate authorities.
+        best_sel_cfg.pop("max_clips", None)
+        changed = True
     if changed:
         print("[autopilot] updated config defaults/determinism for training/calibration")
     save_cfg(cfg)

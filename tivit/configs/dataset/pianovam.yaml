@@ -1,3 +1,4 @@
+# PianoVAM dataset defaults: paths, sampling, and target generation.
 dataset:
   name: PianoVAM
   root_dir: null

@@ -1,3 +1,4 @@
+# Decoder/postprocessing defaults for onset/offset streams.
 decoder:
   global_fusion:
     enabled: false

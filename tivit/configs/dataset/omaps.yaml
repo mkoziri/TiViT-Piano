@@ -1,3 +1,4 @@
+# OMAPS dataset defaults: paths, sampling, and target generation.
 dataset:
   name: OMAPS
   root_dir: data/omaps

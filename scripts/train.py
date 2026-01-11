@@ -4383,9 +4383,23 @@ def main():
         selection_trigger = "on_proxy_improvement"
     selection_interval = _coerce_positive_int(best_sel_cfg.get("n")) or 1
     selection_write_back = bool(best_sel_cfg.get("write_back", False))
-    selection_frames = _coerce_positive_int(best_sel_cfg.get("frames")) or 96
-    selection_max_clips = _coerce_positive_int(best_sel_cfg.get("max_clips")) or 80
-    selection_split = str(best_sel_cfg.get("split", "val"))
+    dataset_cfg = cfg.get("dataset", {}) if isinstance(cfg, Mapping) else {}
+    selection_frames = (
+        _coerce_positive_int(best_sel_cfg.get("frames"))
+        or _coerce_positive_int(dataset_cfg.get("frames"))
+        or 96
+    )
+    selection_max_clips = (
+        _coerce_positive_int(best_sel_cfg.get("max_clips"))
+        or _coerce_positive_int(dataset_cfg.get("max_clips"))
+        or 80
+    )
+    selection_split = str(
+        best_sel_cfg.get("split")
+        or dataset_cfg.get("split_val")
+        or dataset_cfg.get("split")
+        or "val"
+    )
     sweep_cfg = best_sel_cfg.get("sweep", {}) if isinstance(best_sel_cfg, Mapping) else {}
     sweep_delta = float(_coerce_float(sweep_cfg.get("delta"), 0.05) or 0.05)
     sweep_low_guard = float(_coerce_float(sweep_cfg.get("low_guard"), 0.10) or 0.10)

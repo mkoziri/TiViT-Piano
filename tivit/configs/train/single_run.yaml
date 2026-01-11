@@ -1,3 +1,4 @@
+# Training hyperparameters and metrics for a single run.
 training:
   epochs: 4
   learning_rate: 3e-5
@@ -64,9 +65,6 @@ training:
     pitch: 1.2
     hand: 0.3
     clef: 0.3
-  hand_gating:
-    mode: loss_reweight
-    strength: 0.75
   metrics:
     prob_threshold: 0.2
     prob_threshold_onset: 0.2
@@ -123,9 +121,6 @@ training:
     trigger: on_proxy_improvement
     n: 1
     write_back: false
-    frames: 96
-    max_clips: 80
-    split: val
     sweep:
       delta: 0.05
       low_guard: 0.1

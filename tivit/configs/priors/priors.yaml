@@ -1,4 +1,11 @@
+# Priors configuration applied to logits/targets.
 priors:
+  enabled: true
+  hand_gating:
+    mode: loss_reweight
+    strength: 0.75
+  chord_smoothness:
+    strength: 0.15
   key_signature:
     enabled: true
     ref_head: onset

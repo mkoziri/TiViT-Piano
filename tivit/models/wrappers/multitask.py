@@ -1,22 +1,28 @@
-"""Backbone+head composition wrapper."""
+"""Backbone+head composition wrapper.
+
+Purpose:
+    - Keep a stable entrypoint for constructing the multitask model from the
+      new implementation.
+Key Functions/Classes:
+    - ``build_model``: Forward the provided config to the new factory so
+      backbone+head composition stays consistent.
+CLI Arguments:
+    (none)
+Usage:
+    from tivit.models.wrappers.multitask import build_model
+"""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from src.models.factory import build_model as _legacy_build_model
+from tivit.models.factory import build_model as _build_model
 
 
 def build_model(cfg: Mapping[str, Any]):
-    """
-    Delegate to the legacy factory.
+    """Construct the multitask model via the new factory."""
 
-    Keeping a single implementation avoids behavioural drift while enabling the
-    new registry/namespace layout.
-    """
-
-    return _legacy_build_model(cfg)
+    return _build_model(cfg)
 
 
 __all__ = ["build_model"]
-
