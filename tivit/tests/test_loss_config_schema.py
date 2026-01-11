@@ -1,12 +1,27 @@
-"""Validate the explicit training.loss schema for MultitaskLoss."""
+#!/usr/bin/env python3
+"""Multitask loss config schema smoke test.
+
+Purpose:
+    - Ensure the explicit training.loss schema is accepted without hidden defaults.
+    - Catch missing-required-key failures early without relying on pytest.
+Key Functions/Classes:
+    - main(): run the schema checks.
+CLI Arguments:
+    (none)
+Usage:
+    python tivit/tests/test_loss_config_schema.py
+"""
 
 from __future__ import annotations
 
 import copy
+import sys
 
-import pytest
-
-torch = pytest.importorskip("torch")  # noqa: F401
+try:
+    import torch  # noqa: F401
+except ImportError:
+    print("torch not available; skipping loss config schema smoke test", file=sys.stderr)
+    sys.exit(0)
 
 from tivit.losses.multitask_loss import MultitaskLoss
 
@@ -59,23 +74,37 @@ def _base_cfg() -> dict:
     }
 
 
-def test_loss_schema_reads_explicit_config():
+def _assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def _expect_value_error(cfg: dict) -> None:
+    try:
+        MultitaskLoss(cfg)
+    except ValueError:
+        return
+    raise AssertionError("Expected ValueError for invalid loss config")
+
+
+def main() -> None:
     cfg = _base_cfg()
     loss = MultitaskLoss(cfg)
 
-    assert loss.head_weights == {"pitch": 1.0, "onset": 2.0, "offset": 3.0, "hand": 0.4, "clef": 0.5}
-    assert loss.neg_smooth == 0.1
-    assert loss.per_tile_defaults["enabled"] is False
-    assert loss.pitch_cfg["pos_weight_mode"] == "sqrt"
-    assert loss.onset_cfg["pos_weight"] == 3.0
-    assert loss.offset_cfg["pos_weight_mode"] == "adaptive"
-    assert loss.offset_cfg["pos_weight_band"] == (0.5, 2.0)
+    _assert(loss.head_weights == {"pitch": 1.0, "onset": 2.0, "offset": 3.0, "hand": 0.4, "clef": 0.5}, "head_weights mismatch")
+    _assert(loss.neg_smooth == 0.1, "neg_smooth mismatch")
+    _assert(loss.per_tile_defaults["enabled"] is False, "per_tile enabled flag mismatch")
+    _assert(loss.pitch_cfg["pos_weight_mode"] == "sqrt", "pitch pos_weight_mode mismatch")
+    _assert(loss.onset_cfg["pos_weight"] == 3.0, "onset pos_weight mismatch")
+    _assert(loss.offset_cfg["pos_weight_mode"] == "adaptive", "offset pos_weight_mode mismatch")
+    _assert(loss.offset_cfg["pos_weight_band"] == (0.5, 2.0), "offset pos_weight_band mismatch")
 
-
-def test_loss_schema_missing_required_key_raises():
-    cfg = _base_cfg()
     cfg_bad = copy.deepcopy(cfg)
     cfg_bad["training"]["loss"].pop("head_weights")
-    with pytest.raises(ValueError):
-        MultitaskLoss(cfg_bad)
+    _expect_value_error(cfg_bad)
 
+    print("loss config schema checks passed")
+
+
+if __name__ == "__main__":
+    main()
