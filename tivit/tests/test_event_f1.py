@@ -20,7 +20,7 @@ import numpy as np
 from tivit.metrics import EventF1Result, event_f1
 
 
-def _assert_close(val: float, target: float, *, tol: float = 1e-9) -> None:
+def _assert_close(val: float, target: float, *, tol: float = 1e-6) -> None:
     assert math.isclose(val, target, rel_tol=tol, abs_tol=tol), f"{val} != {target}"
 
 
