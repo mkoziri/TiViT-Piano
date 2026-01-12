@@ -15,7 +15,7 @@ CLI:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import torch
 
@@ -46,7 +46,7 @@ class DecoderEventSet:
     pitches: int
     device: torch.device
     dtype: torch.dtype
-    stats: Dict[str, float] = field(default_factory=dict)
+    stats: Dict[str, Any] = field(default_factory=dict)
 
     def clone_events(self) -> List[NoteEvent]:
         return [NoteEvent(**vars(ev)) for ev in self.events]

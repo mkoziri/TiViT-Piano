@@ -5,7 +5,7 @@ dataset:
   annotations_root: data/PianoYT
   label_format: txt
   label_targets: [pitch, onset, offset, hand, clef]
-  max_clips: 80
+  max_clips: 5
   manifest:
     train: null
     val: null

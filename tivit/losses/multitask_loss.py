@@ -84,11 +84,11 @@ def _banded_pos_weight_from_roll(
     band: Tuple[float, float],
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Map per-class positive ratios into a configured band."""
+    """Map per-class positive rarity (neg/pos) into a configured band."""
     flat = target.detach().reshape(-1, target.shape[-1]).float()
     pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
     neg = (1.0 - pos).clamp_min(eps)
-    ratio = pos / neg
+    ratio = neg / pos  # larger when positives are rarer
     low, high = band
     if high < low:
         low, high = high, low
@@ -376,6 +376,8 @@ def _validate_head_block(name: str, cfg: Mapping[str, Any]) -> Dict[str, Any]:
         mode = str(cfg["pos_weight_mode"]).lower()
         if mode not in ONOFF_POS_WEIGHT_MODES:
             raise ValueError(f"training.loss.heads.{name}.pos_weight_mode must be one of {sorted(ONOFF_POS_WEIGHT_MODES)}")
+        if loss in {"focal", "focal_bce"} and mode not in {"off", "none"}:
+            raise ValueError(f"training.loss.heads.{name}: focal loss requires pos_weight_mode='off'")
         pos_weight = cfg.get("pos_weight")
         if mode == "fixed":
             if pos_weight is None:

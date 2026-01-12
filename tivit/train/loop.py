@@ -50,7 +50,7 @@ def _apply_overrides(
     smoke: bool,
 ) -> tuple[dict[str, Any], str, str | None]:
     """Return a copied config with CLI overrides applied."""
-    cfg_copy = copy.deepcopy(cfg)
+    cfg_copy: dict[str, Any] = dict(copy.deepcopy(cfg))
     dataset_cfg = cfg_copy.setdefault("dataset", {})
     training_cfg = cfg_copy.setdefault("training", {})
 

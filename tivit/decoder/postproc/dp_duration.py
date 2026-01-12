@@ -243,7 +243,7 @@ def _run_viterbi(
 
     for t in range(1, T):
         current: Dict[int, float] = {}
-        current_back: Dict[int, int] = {}
+        current_back: Dict[int, Optional[int]] = {}
         for state, score in prev_scores.items():
             for nxt, penalty in transitions(state):
                 new_score = score - penalty + emission(nxt, t)
@@ -262,7 +262,7 @@ def _run_viterbi(
 
     if not prev_scores:
         return torch.zeros(T, dtype=torch.bool)
-    best_state = max(prev_scores, key=prev_scores.get)
+    best_state = max(prev_scores, key=lambda state: prev_scores[state])
     path = [best_state]
     for t in range(T - 1, 0, -1):
         prev = backrefs[t].get(best_state)

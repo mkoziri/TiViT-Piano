@@ -17,7 +17,17 @@ from tivit.decoder.decode import (
 
 def build_decoder(metrics_cfg: Mapping[str, Any] | None = None):
     normalized = resolve_decoder_from_config(metrics_cfg or {})
-    gates = resolve_decoder_gates(normalized)
+    gates = {}
+    for head, cfg in normalized.items():
+        defaults = DECODER_DEFAULTS.get(head, {})
+        fallback_open = float(cfg.get("open", defaults.get("open", 0.5)))
+        default_hold = float(cfg.get("hold", defaults.get("hold", 0.0)))
+        open_thr, hold_thr = resolve_decoder_gates(
+            cfg,
+            fallback_open=fallback_open,
+            default_hold=default_hold,
+        )
+        gates[head] = {**cfg, "open": open_thr, "hold": hold_thr}
 
     def _decode(probs: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
         decoded = {}
@@ -47,4 +57,3 @@ __all__ = [
     "resolve_decoder_gates",
     "build_decoder",
 ]
-

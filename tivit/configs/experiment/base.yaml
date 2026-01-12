@@ -7,7 +7,7 @@ experiment:
 
 logging:
   log_dir: /tivit/logs
-  checkpoint_dir: checkpoints
+  checkpoint_dir: /tivit/checkpoints
   tensorboard: true
   postproc_debug: true
 

@@ -151,6 +151,7 @@ def apply(event_set: DecoderEventSet, cfg: Mapping[str, Any]) -> DecoderEventSet
         summary["applied"] = False
         event_set.stats["snap"] = summary
         return event_set
+    assert tempo.bpm is not None
     beat_ms = 60_000.0 / tempo.bpm
     grid_ms = beat_ms / _GRID_DIVISIONS
     total = len(event_set.events)
