@@ -1,0 +1,6 @@
+dataset:
+  batch_size: 1
+  frames: 16
+  resize: [112, 112]
+  max_clips: 1
+  num_workers: 0

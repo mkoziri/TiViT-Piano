@@ -18,11 +18,11 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 
 from tivit.core.config import DEFAULT_CONFIG_PATH, load_experiment_config
@@ -36,6 +36,7 @@ from tivit.models import build_model
 from tivit.train.callbacks import Callback, CallbackList
 from tivit.train.eval_loop import run_evaluation
 from tivit.train.optim import build_optimizer
+from tivit.utils.amp import autocast, grad_scaler
 from tivit.utils.logging import get_logger, log_final_result, log_stage
 
 LOGGER = get_logger(__name__)
@@ -204,6 +205,53 @@ def _prepare_targets(
     return _fabricate_dummy_targets(outputs, device)
 
 
+def _seed_onoff_head_bias(
+    model: torch.nn.Module,
+    onset_prior: float,
+    offset_prior: float,
+) -> None:
+    """Initialize onset/offset head biases from Bernoulli priors."""
+
+    def _seed(head: Any, prior: float, name: str) -> None:
+        if head is None:
+            return
+        prior_clamped = min(max(prior, 1e-6), 1.0 - 1e-6)
+        logit = math.log(prior_clamped / (1.0 - prior_clamped))
+        target = None
+        if isinstance(head, torch.nn.Sequential) and len(head) > 0:
+            target = head[-1]
+        elif isinstance(getattr(head, "net", None), torch.nn.Sequential) and len(head.net) > 0:  # type: ignore[operator]
+            target = head.net[-1]  # type: ignore[index]
+        bias_tensor = getattr(target, "bias", None)
+        if target is None or bias_tensor is None or not torch.is_tensor(bias_tensor):
+            return
+        with torch.no_grad():
+            bias_tensor.fill_(logit)
+        LOGGER.info("Seeded %s head bias to prior=%.4f (logit=%.4f)", name, prior_clamped, logit)
+
+    _seed(getattr(model, "head_onset", None), onset_prior, "onset")
+    _seed(getattr(model, "head_offset", None), offset_prior, "offset")
+
+
+def _resolve_prior_mean(cfg: Mapping[str, Any], head: str, default: float = 0.02) -> float:
+    """Fetch prior_mean for a head with basic validation."""
+    try:
+        value = float(
+            (cfg.get("training", {}) if isinstance(cfg, Mapping) else {})
+            .get("loss", {})
+            .get("heads", {})
+            .get(head, {})
+            .get("prior_mean")
+        )
+    except (TypeError, ValueError):
+        LOGGER.warning("Missing or invalid prior_mean for head '%s'; using default %.3f", head, default)
+        return default
+    if not (0.0 < value < 1.0) or not math.isfinite(value):
+        LOGGER.warning("Out-of-range prior_mean %.4f for head '%s'; using default %.3f", value, head, default)
+        return default
+    return value
+
+
 def _compute_loss_for_batch(
     model: torch.nn.Module,
     loss_fn: MultitaskLoss,
@@ -220,7 +268,7 @@ def _compute_loss_for_batch(
         raise ValueError("Batch is missing tensor key 'video'")
     x = video.to(device=device, non_blocking=True)
     request_per_tile = per_tile_support.request_per_tile_outputs if per_tile_support is not None else False
-    with autocast(enabled=amp_enabled):
+    with autocast(device, enabled=amp_enabled):
         outputs = model(x, return_per_tile=request_per_tile)
         per_tile_ctx = per_tile_support.build_context(outputs, batch) if per_tile_support is not None else None
         targets = _prepare_targets(outputs, batch, device, debug_dummy_labels=debug_dummy_labels)
@@ -232,7 +280,7 @@ def _train_one_epoch(
     model: torch.nn.Module,
     loss_fn: MultitaskLoss,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: Any,
     loader: Iterable[Mapping[str, Any]],
     device: torch.device,
     *,
@@ -316,7 +364,7 @@ def _load_checkpoint(
     checkpoint: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: Any,
     device: torch.device,
 ) -> int:
     payload = torch.load(checkpoint, map_location=device)
@@ -336,7 +384,7 @@ def _save_checkpoint(
     epoch: int,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: Any,
 ) -> Path:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"epoch_{epoch}.pt"
@@ -378,12 +426,16 @@ def run_training(
     configure_determinism(seed_val, deterministic=deterministic_flag)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
+    if not isinstance(training_cfg, Mapping):
+        training_cfg = {}
+    reset_head_bias = bool(training_cfg.get("reset_head_bias", True))
+
     model = build_model(cfg).to(device)
     loss_fn = MultitaskLoss(cfg)
     optimizer = build_optimizer(model, cfg)
-    training_cfg = cfg.get("training", {}) if isinstance(cfg, Mapping) else {}
     amp_enabled = bool(training_cfg.get("amp", False))
-    scaler = GradScaler(enabled=amp_enabled)
+    scaler = grad_scaler(device, enabled=amp_enabled)
     grad_clip = float(cfg.get("optim", {}).get("grad_clip", 0.0))
     accum_steps = int(cfg.get("train", {}).get("accumulate_steps", 1))
     log_interval = int(training_cfg.get("log_interval", 10))
@@ -416,6 +468,10 @@ def run_training(
                 LOGGER.info("Resumed from %s (epoch %d)", latest, loaded_epoch)
             except Exception as exc:  # pragma: no cover - defensive
                 LOGGER.warning("Failed to resume from %s: %s", latest, exc)
+    if reset_head_bias and start_epoch == 1:
+        onset_prior = _resolve_prior_mean(cfg, "onset", default=0.02)
+        offset_prior = _resolve_prior_mean(cfg, "offset", default=0.02)
+        _seed_onoff_head_bias(model, onset_prior, offset_prior)
 
     try:
         for epoch in range(start_epoch, epochs + 1):

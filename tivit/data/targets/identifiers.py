@@ -13,6 +13,7 @@ CLI:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import re
 from pathlib import Path
@@ -20,6 +21,9 @@ from typing import List, Optional, Union
 
 LOGGER = logging.getLogger(__name__)
 _LEGACY_HITS: set[str] = set()
+_LEGACY_TOTAL = 0
+_LEGACY_UNIQUE = 0
+_LEGACY_REPORTED = False
 
 
 def canonical_video_id(path_or_id: Union[str, Path]) -> str:
@@ -95,19 +99,35 @@ def id_aliases(canon_id: str) -> List[str]:
     return aliases
 
 
+def _report_legacy_hits() -> None:
+    """Report a summary of legacy ID normalization hits once per run."""
+    global _LEGACY_REPORTED
+    if _LEGACY_REPORTED or _LEGACY_TOTAL <= 0:
+        return
+    _LEGACY_REPORTED = True
+    LOGGER.info(
+        "[compat] legacy_id_hit summary normalized=%d unique=%d",
+        _LEGACY_TOTAL,
+        _LEGACY_UNIQUE,
+    )
+
+
 def log_legacy_id_hit(legacy_id: str, canon_id: str, *, logger: Optional[logging.Logger] = None) -> None:
-    """Emit a single compat log the first time a legacy ID mapping is used."""
+    """Record a compat hit; summary is logged once at shutdown."""
 
     legacy = str(legacy_id or "").strip()
     canon = canonical_video_id(canon_id)
     if not legacy or legacy == canon:
         return
     key = f"{legacy}->{canon}"
-    if key in _LEGACY_HITS:
-        return
-    _LEGACY_HITS.add(key)
-    target_logger = logger if logger is not None else LOGGER
-    target_logger.debug("[compat] legacy_id_hit id=%s → canon=%s", legacy, canon)
+    global _LEGACY_TOTAL, _LEGACY_UNIQUE
+    _LEGACY_TOTAL += 1
+    if key not in _LEGACY_HITS:
+        _LEGACY_HITS.add(key)
+        _LEGACY_UNIQUE += 1
+
+
+atexit.register(_report_legacy_hits)
 
 
 __all__ = ["canonical_video_id", "id_aliases", "log_legacy_id_hit"]

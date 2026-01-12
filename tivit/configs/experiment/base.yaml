@@ -3,14 +3,14 @@ experiment:
   name: TiViT-Piano GCR basic
   seed: 1332
   deterministic: true
-  output_dir: /tivit/outputs
+  output_dir: outputs
 
 logging:
-  log_dir: /tivit/logs
-  checkpoint_dir: /tivit/checkpoints
+  log_dir: logs
+  checkpoint_dir: checkpoints
   tensorboard: true
   postproc_debug: true
 
 inference:
-  output_dir: /tivit/inference_results
+  output_dir: inference_results
   predict_on_train: false

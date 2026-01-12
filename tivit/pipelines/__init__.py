@@ -1,7 +1,28 @@
-from .train_single import train_single
-from .evaluate import evaluate
-from .autopilot import autopilot
-from .export import export_model
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Callable
 
 __all__ = ["train_single", "evaluate", "autopilot", "export_model"]
 
+if TYPE_CHECKING:
+    from .autopilot import autopilot as autopilot
+    from .evaluate import evaluate as evaluate
+    from .export import export_model as export_model
+    from .train_single import train_single as train_single
+
+
+def __getattr__(name: str) -> Callable:
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = {
+        "train_single": "tivit.pipelines.train_single",
+        "evaluate": "tivit.pipelines.evaluate",
+        "autopilot": "tivit.pipelines.autopilot",
+        "export_model": "tivit.pipelines.export",
+    }[name]
+    return getattr(import_module(module_name), name)
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

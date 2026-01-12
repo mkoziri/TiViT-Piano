@@ -15,12 +15,12 @@ CLI Arguments:
     - seed / deterministic: runtime overrides for determinism.
     - smoke: 1-epoch tiny run for fast sanity checks.
 Usage:
-    python scripts/tivit_train.py --config tivit/configs/default.yaml
+    python -m tivit.pipelines.train_single --config tivit/configs/default.yaml
 """
 
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
 from typing import Sequence
 
@@ -56,6 +56,40 @@ def train_single(
         smoke=smoke,
     )
     log_final_result("train", "training completed")
+
+
+def _parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Run TiViT-Piano training (new stack, no legacy)")
+    ap.add_argument("--config", action="append", default=None, help="One or more config fragments to merge")
+    ap.add_argument("--train-split", choices=["train", "val", "test"])
+    ap.add_argument("--val-split", choices=["train", "val", "test"])
+    ap.add_argument("--max-clips", type=int)
+    ap.add_argument("--frames", type=int)
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--verbose", choices=["quiet", "info", "debug"], default="quiet")
+    ap.add_argument("--smoke", action="store_true")
+    return ap.parse_args()
+
+
+def _main() -> None:
+    args = _parse_args()
+    configs = args.config or [Path("tivit/configs/default.yaml")]
+    train_single(
+        configs=configs,
+        verbose=args.verbose,
+        train_split=args.train_split,
+        val_split=args.val_split,
+        max_clips=args.max_clips,
+        frames=args.frames,
+        seed=args.seed,
+        deterministic=args.deterministic,
+        smoke=bool(args.smoke),
+    )
+
+
+if __name__ == "__main__":
+    _main()
 
 
 __all__ = ["train_single"]

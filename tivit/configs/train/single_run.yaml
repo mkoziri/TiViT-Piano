@@ -100,14 +100,14 @@ training:
       pitch:
         loss: bce_pos
         # pitch-only mode to preserve current behavior (code must support this explicitly)
-        pos_weight_mode: off          # sqrt | adaptive_band | fixed | off
+        pos_weight_mode: "off"        # sqrt | adaptive_band | fixed | off
         pos_weight: null              # used only for fixed
         pos_weight_band: [2.0, 4.0]   # used only for adaptive_band
 
       onset:
         loss: focal                   # focal | bce_pos | bce | bce_with_logits
         # Focal ignores pos_weight; keep it explicit to avoid ambiguity
-        pos_weight_mode: off
+        pos_weight_mode: "off"
         pos_weight: null
         pos_weight_band: null
         focal_gamma: 4.0
@@ -117,7 +117,7 @@ training:
 
       offset:
         loss: focal
-        pos_weight_mode: off
+        pos_weight_mode: "off"
         pos_weight: null
         pos_weight_band: null
         focal_gamma: 2.5
@@ -130,11 +130,6 @@ training:
 
       clef:
         loss: ce
-
-    # If you seed head biases from priors, keep that here (single place)
-    bias_seed:
-      onset_prior_mean: 0.012
-      offset_prior_mean: 0.01
 
 optim:
   grad_clip: 1.0

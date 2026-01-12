@@ -74,7 +74,6 @@ Dataset-specific additions:
 - `training.amp` (bool): mixed precision toggle.
 - `training.resume` (bool): resume flag.
 - `training.reset_head_bias` (bool): reinit onset/offset heads.
-- `training.bias_seed.onoff_prior_mean` (float): bias init prior.
 - `training.soft_targets.*` (mapping): enable/which heads/kernel shapes.
 - `training.loss.head_weights` (mapping): per-head weights for pitch/onset/offset/hand/clef.
 - `training.loss.ema_alpha` / `neg_smooth_onoff` (float): EMA alpha for pos_weight_mode=ema; negative smoothing strength.

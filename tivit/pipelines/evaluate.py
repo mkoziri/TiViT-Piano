@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
-from torch.cuda.amp import autocast
 
 from tivit.data.loaders import make_dataloader
 from tivit.models import build_model
@@ -32,6 +31,7 @@ from tivit.pipelines._common import find_checkpoint, prepare_run, resolve_eval_s
 from tivit.train.eval_loop import run_evaluation
 from tivit.train.loop import PerTileSupport, _prepare_targets
 from tivit.losses.multitask_loss import MultitaskLoss
+from tivit.utils.amp import autocast
 from tivit.utils.logging import log_final_result, log_stage
 
 
@@ -102,7 +102,7 @@ def evaluate(
             raise ValueError("Batch is missing tensor key 'video'")
         x = video.to(device=device, non_blocking=True)
         request_per_tile = per_tile_support.request_per_tile_outputs
-        with autocast(enabled=amp_enabled):
+        with autocast(device, enabled=amp_enabled):
             outputs = model(x, return_per_tile=request_per_tile)
             per_tile_ctx = per_tile_support.build_context(outputs, batch)
             targets = _prepare_targets(outputs, batch, device, debug_dummy_labels=debug_dummy_labels)

@@ -798,9 +798,15 @@ class MultitaskLoss:
             if torch.is_tensor(hand_reach_valid):
                 hand_reach_valid = _interp_mask_BT(hand_reach_valid, T_logits)
 
-        pitch_roll = _match_pitch_dim(pitch_roll, P) or _zero_roll()
-        onset_roll = _match_pitch_dim(onset_roll, P) or _zero_roll()
-        offset_roll = _match_pitch_dim(offset_roll, P) or _zero_roll()
+        pitch_roll = _match_pitch_dim(pitch_roll, P)
+        onset_roll = _match_pitch_dim(onset_roll, P)
+        offset_roll = _match_pitch_dim(offset_roll, P)
+        if pitch_roll is None:
+            pitch_roll = _zero_roll()
+        if onset_roll is None:
+            onset_roll = _zero_roll()
+        if offset_roll is None:
+            offset_roll = _zero_roll()
         if torch.is_tensor(hand_reach):
             hand_reach = _match_pitch_dim(hand_reach, P)
         if torch.is_tensor(hand_reach_valid) and hand_reach_valid.dim() == 3:
