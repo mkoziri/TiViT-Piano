@@ -1,14 +1,32 @@
-"""High-level training entrypoint used by CLI."""
+"""TiViT-Piano single-run training pipeline.
+
+Purpose:
+    - Compose configs, configure logging, and delegate to the new training loop.
+    - Expose CLI-friendly overrides for splits, frames, seeds, and smoke tests.
+    - Persist resolved configs/commands for reproducibility.
+Key Functions/Classes:
+    - train_single: wrapper around ``tivit.train.loop.run_training`` for one experiment.
+CLI Arguments:
+    - configs: YAML fragments to merge before training.
+    - verbose: logging verbosity (quiet|info|debug).
+    - train_split / val_split: dataset split overrides for train/validation loaders.
+    - max_clips: cap clips per split for quick iterations.
+    - frames: override clip length in frames.
+    - seed / deterministic: runtime overrides for determinism.
+    - smoke: 1-epoch tiny run for fast sanity checks.
+Usage:
+    python scripts/tivit_train.py --config tivit/configs/default.yaml
+"""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 
-from tivit.core.config import load_experiment_config, write_run_artifacts
+from tivit.pipelines._common import prepare_run
 from tivit.train.loop import run_training
-from tivit.utils.logging import configure_logging, log_final_result, log_stage
+from tivit.utils.logging import log_final_result, log_stage
 
 
 def train_single(
@@ -23,12 +41,7 @@ def train_single(
     deterministic: bool | None = None,
     smoke: bool = False,
 ) -> None:
-    cfg = load_experiment_config(configs)
-    log_cfg = cfg.get("logging", {}) if isinstance(cfg, Mapping) else {}
-    log_dir = log_cfg.get("log_dir", "logs")
-    log_file = log_cfg.get("train_log", "train.log")
-    configure_logging(verbose, log_dir=log_dir, log_file=log_file, stage_only_console=True)
-    write_run_artifacts(cfg, log_dir=log_dir, command=sys.argv, configs=configs)
+    prepare_run(configs, stage_name="train", default_log_file="train.log", verbose=verbose)
 
     log_stage("train", "building dataloaders and model")
     run_training(

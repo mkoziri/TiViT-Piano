@@ -1,5 +1,4 @@
 bases:
-bases:
   # Composition entrypoint: choose experiment metadata, dataset, model, training,
   # decoder, priors, and autopilot defaults to build a full run config.
   - experiment/base.yaml
