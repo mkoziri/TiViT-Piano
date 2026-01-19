@@ -26,7 +26,7 @@ dataset:
   resize: [180, 1536]
   tiles: 3
   channels: 3
-  grayscale: false
+  grayscale: true
   normalize: true
   apply_crop: true
   canonical_hw: [180, 1536]
@@ -84,7 +84,7 @@ dataset:
     default_canary_count: 2
     regen_canaries: false
     enable_cache_equiv: false
-    enable_audit_export: false
+    enable_audit_export: true
     audit_dir: tivit/tests/resources/audit/pianovam
     cache_off: false
     strict_sampling: false
