@@ -2,7 +2,7 @@ bases:
   # Composition entrypoint: choose experiment metadata, dataset, model, training,
   # decoder, priors, and autopilot defaults to build a full run config.
   - experiment/base.yaml
-  - dataset/pianoyt.yaml
+  - dataset/pianovam.yaml
   - model/vivit_tiled.yaml
   - train/single_run.yaml
   - decoder/decoder.yaml
