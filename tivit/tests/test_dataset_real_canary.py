@@ -33,7 +33,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -508,9 +508,25 @@ def _check_roi_and_fallbacks(sample: Mapping[str, Any], canary: Canary, *, stric
         try:
             vals = list(crop)
             if len(vals) >= 4:
-                x0, y0, x1, y1 = map(float, vals[:4])
-                if x1 <= x0 or y1 <= y0:
+                def _as_xyxy(values: Sequence[Any]) -> Optional[Tuple[float, float, float, float]]:
+                    try:
+                        y0, y1, x0, x1 = map(float, values[:4])
+                    except (TypeError, ValueError):
+                        return None
+                    if x1 > x0 and y1 > y0:
+                        return x0, y0, x1, y1
+                    try:
+                        x0, y0, x1, y1 = map(float, values[:4])
+                    except (TypeError, ValueError):
+                        return None
+                    if x1 > x0 and y1 > y0:
+                        return x0, y0, x1, y1
+                    return None
+
+                resolved = _as_xyxy(vals)
+                if resolved is None:
                     raise AssertionError(f"degenerate crop {crop} for {canary.video_rel}")
+                x0, y0, x1, y1 = resolved
                 if (x1 - x0) < 8 or (y1 - y0) < 8:
                     raise AssertionError(f"crop too small for {canary.video_rel}: {crop}")
         except Exception:
