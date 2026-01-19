@@ -22,7 +22,7 @@ dataset:
   frames: 96
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
-  skip_seconds: 0.0
+  skip_seconds: 8.0
   resize: [180, 1536]
   tiles: 3
   channels: 3
