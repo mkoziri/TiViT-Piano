@@ -1,8 +1,8 @@
 # PianoVAM dataset defaults: paths, sampling, and target generation.
 dataset:
   name: PianoVAM
-  root_dir: null
-  annotations_root: null
+  root_dir: data/PianoVAM_v1.0
+  annotations_root: data/PianoVAM_v1.0
   label_format: midi
   label_targets:
     - pitch
