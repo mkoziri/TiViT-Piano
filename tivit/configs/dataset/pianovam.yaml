@@ -12,9 +12,9 @@ dataset:
     - clef
   max_clips: 80
   manifest:
-    train: null
-    val: null
-    test: null
+    train: data/PianoVAM_v1.0/manifest.json
+    val: data/PianoVAM_v1.0/manifest.json
+    test: data/PianoVAM_v1.0/manifest.json
   split: train
   split_train: train
   split_val: val
