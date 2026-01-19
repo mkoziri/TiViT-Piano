@@ -277,6 +277,19 @@ def _prepare_dataset_cfg(cfg: Mapping[str, Any], testing_cfg: Mapping[str, Any],
     return cfg
 
 
+def _resolve_manifest_path(dataset_cfg: Mapping[str, Any], split: str) -> Optional[Path]:
+    manifest_cfg = dataset_cfg.get("manifest")
+    if isinstance(manifest_cfg, Mapping):
+        candidate = manifest_cfg.get(split)
+    elif isinstance(manifest_cfg, (str, Path)):
+        candidate = manifest_cfg
+    else:
+        candidate = None
+    if not candidate:
+        return None
+    return _to_repo_path(candidate)
+
+
 def _resolve_split(dataset_cfg: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
     candidates = [
         dataset_cfg.get("split_val"),
@@ -292,9 +305,18 @@ def _resolve_split(dataset_cfg: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]
     for split in candidates:
         if not split:
             continue
-        exists = (root / str(split)).exists()
-        trace["candidates"].append({"name": str(split), "exists": exists})
-        if exists:
+        manifest_path = _resolve_manifest_path(dataset_cfg, str(split))
+        manifest_exists = bool(manifest_path is not None and manifest_path.exists())
+        dir_exists = (root / str(split)).exists()
+        trace["candidates"].append(
+            {"name": str(split), "dir_exists": dir_exists, "manifest": str(manifest_path) if manifest_path else None}
+        )
+        if manifest_exists and manifest_path is not None:
+            resolved_manifest = manifest_path.resolve()
+            trace["selected"] = str(split)
+            trace["found_path"] = str(resolved_manifest)
+            return str(split), trace
+        if dir_exists:
             trace["selected"] = str(split)
             trace["found_path"] = str((root / str(split)).resolve())
             return str(split), trace
@@ -305,7 +327,32 @@ def _resolve_split(dataset_cfg: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]
 
 
 def _gather_candidates(split: str, dataset_cfg: Mapping[str, Any]) -> List[Path]:
-    split_dir = Path(dataset_cfg["root_dir"]) / split
+    root = Path(dataset_cfg["root_dir"])
+    manifest_path = _resolve_manifest_path(dataset_cfg, split)
+    if manifest_path and manifest_path.exists():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        entries = payload.get(split, [])
+        candidates: List[Path] = []
+        if isinstance(entries, list):
+            for item in entries:
+                if isinstance(item, Mapping):
+                    rel = item.get("video") or item.get("video_path")
+                elif isinstance(item, str):
+                    rel = item
+                else:
+                    continue
+                if not rel:
+                    continue
+                path = Path(rel)
+                if not path.is_absolute():
+                    path = root / rel
+                if path.exists():
+                    candidates.append(path)
+        return candidates
+    split_dir = root / split
     return sorted(split_dir.rglob("*.mp4"))
 
 
