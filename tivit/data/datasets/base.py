@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
 
 from tivit.data.decode.video_reader import VideoReaderConfig, load_clip
 from tivit.data.roi.keyboard_roi import (
@@ -578,3 +579,47 @@ class DatasetAdapter:
 
     def dataloader(self, drop_last: bool = False):
         raise NotImplementedError
+
+
+# Keep metadata-like fields as per-sample lists to avoid default_collate failures.
+_NON_COLLATE_KEYS = {"metadata", "sampler_meta", "_debug_extras", "hand_skeleton_path"}
+_CRITICAL_KEYS = {
+    "video",
+    "pitch",
+    "onset",
+    "offset",
+    "hand",
+    "clef",
+    "hand_frame_mask",
+    "hand_mask",
+    "hand_reach",
+    "hand_reach_valid",
+}
+
+
+def safe_collate_fn(batch: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Collate batch dicts while leaving variable-length metadata unstacked.
+
+    This prevents DataLoader from crashing on lists with inconsistent lengths,
+    while still enforcing strict collation for tensors used in training.
+    """
+    if not batch:
+        return {}
+    keys: set[str] = set()
+    for sample in batch:
+        keys.update(sample.keys())
+    collated: Dict[str, Any] = {}
+    for key in keys:
+        values = [sample.get(key) for sample in batch]
+        if key in _NON_COLLATE_KEYS:
+            # Preserve per-sample metadata/debug objects without stacking.
+            collated[key] = values
+            continue
+        try:
+            collated[key] = default_collate(values)
+        except Exception:
+            if key in _CRITICAL_KEYS:
+                raise
+            # Fall back to a list for auxiliary fields that may vary per sample.
+            collated[key] = values
+    return collated

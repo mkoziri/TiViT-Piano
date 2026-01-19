@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from tivit.data.datasets.base import BasePianoDataset, DatasetEntry
+from tivit.data.datasets.base import BasePianoDataset, DatasetEntry, safe_collate_fn
 from tivit.data.targets.identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
@@ -256,4 +256,5 @@ def make_dataloader(cfg: Mapping[str, Any], split: str, drop_last: bool = False,
         drop_last=drop_last,
         pin_memory=True,
         prefetch_factor=prefetch_factor,
+        collate_fn=safe_collate_fn,
     )

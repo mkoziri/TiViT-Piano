@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from .base import DatasetAdapter
+from .base import DatasetAdapter, safe_collate_fn
 from .omaps_impl import OMAPSDataset
 
 
@@ -46,6 +46,7 @@ class OMAPSAdapter(DatasetAdapter):
             pin_memory=pin_memory,
             prefetch_factor=prefetch,
             sampler=sampler,
+            collate_fn=safe_collate_fn,
         )
 
 
