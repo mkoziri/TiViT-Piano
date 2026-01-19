@@ -82,7 +82,7 @@ dataset:
   testing:
     canary_json: tivit/tests/resources/pianovam_canaries.json
     default_canary_count: 2
-    regen_canaries: true
+    regen_canaries: false
     enable_cache_equiv: false
     enable_audit_export: false
     audit_dir: tivit/tests/resources/audit/pianovam
