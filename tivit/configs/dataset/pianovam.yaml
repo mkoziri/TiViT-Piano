@@ -69,7 +69,7 @@ dataset:
     cache_dir: .cache/labels
     targets_sparse: true
   hand_supervision:
-    enable: true
+    enable: false
     min_confidence: 0.05
     time_tolerance: 0.05
     max_dx: 0.12
@@ -82,7 +82,7 @@ dataset:
   testing:
     canary_json: tivit/tests/resources/pianovam_canaries.json
     default_canary_count: 2
-    regen_canaries: false
+    regen_canaries: true
     enable_cache_equiv: false
     enable_audit_export: false
     audit_dir: tivit/tests/resources/audit/pianovam
@@ -96,4 +96,4 @@ dataset:
     max_event_examples: 2
     warn_fps_tolerance: 0.5
     warn_out_of_window_ratio: 0.2
-    enable_debug_extras: false
+    enable_debug_extras: true
