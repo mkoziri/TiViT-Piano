@@ -4,7 +4,7 @@ __pycache__/
 .venv/
 
 # Datasets
-datasets/
+/datasets/
 data/cache/
 data/processed/
 data/omaps
