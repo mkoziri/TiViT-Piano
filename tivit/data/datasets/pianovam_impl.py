@@ -193,8 +193,17 @@ class PianoVAMDataset(BasePianoDataset):
                             continue
                         parts = line.strip().split("\t")
                         if len(parts) < 3:
+                            parts = line.strip().split()
+                        if len(parts) < 3:
                             continue
-                        onset, offset, pitch = float(parts[0]), float(parts[1]), int(parts[2])
+                        try:
+                            onset = float(parts[0])
+                            offset = float(parts[1])
+                            # PianoVAM TSVs may be 5-column (pitch at index 3).
+                            pitch_raw = parts[3] if len(parts) >= 5 else parts[2]
+                            pitch = int(round(float(pitch_raw)))
+                        except (TypeError, ValueError):
+                            continue
                         events.append((onset, offset, pitch))
             else:
                 with entry.label_path.open("r", encoding="utf-8") as handle:
