@@ -74,6 +74,10 @@ def configure_logging(
 
     logging.captureWarnings(True)
     os.environ[env_var] = resolved
+    # Silence heavy ROI debug blocks unless explicitly running in debug mode.
+    logging.getLogger("tivit.data.roi.keyboard_roi").setLevel(
+        logging.DEBUG if resolved == "debug" else logging.INFO
+    )
     return resolved
 
 
@@ -92,4 +96,3 @@ def log_final_result(stage: str, message: str) -> None:
 
 
 __all__ = ["configure_logging", "get_logger", "log_stage", "log_final_result", "QUIET_INFO_FLAG", "StageFilter"]
-
