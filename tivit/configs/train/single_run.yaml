@@ -5,7 +5,7 @@ training:
   weight_decay: 0.01
   eval_freq: 1
   debug_dummy_labels: false
-  log_interval: 25
+  log_interval: 1 # was 25
   save_every: 1
   amp: false
   resume: false
