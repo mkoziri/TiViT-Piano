@@ -1,0 +1,30 @@
+# CPU/memory-light overrides for a tiny PianoVAM run with priors enabled.
+experiment:
+  name: PianoVAM CPU small
+
+logging:
+  tensorboard: false
+  postproc_debug: false
+
+dataset:
+  max_clips: 30
+  frames: 48
+  batch_size: 1
+  num_workers: 2
+  prefetch_factor: 1
+  frame_targets:
+    cache_labels: false
+
+training:
+  epochs: 4
+  eval_freq: 1
+  log_interval: 1
+  save_every: 1
+  amp: false
+  loss:
+    per_tile:
+      debug:
+        enabled: false
+
+train:
+  accumulate_steps: 1
