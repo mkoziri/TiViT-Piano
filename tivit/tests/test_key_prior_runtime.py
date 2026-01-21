@@ -1,18 +1,15 @@
-"""Key-prior runtime tests.
+"""Key-prior runtime smoke checks (standalone script).
 
 Purpose:
     - Verify runtime settings resolve from config with the decoder toggle.
     - Ensure the key prior returns correctly shaped logits when enabled.
-
 Key Functions/Classes:
-    - test_key_prior_runtime_disabled(): Confirms disabled toggle returns None.
-    - test_key_prior_runtime_apply(): Confirms enabled toggle applies prior.
-
+    - run_key_prior_runtime_disabled: Confirms disabled toggle returns None.
+    - run_key_prior_runtime_apply: Confirms enabled toggle applies prior.
 CLI Arguments:
     (none)
-
 Usage:
-    pytest tivit/tests/test_key_prior_runtime.py
+    python tivit/tests/test_key_prior_runtime.py
 """
 
 from __future__ import annotations
@@ -36,12 +33,12 @@ def _base_cfg(enabled: bool) -> dict:
     }
 
 
-def test_key_prior_runtime_disabled():
+def run_key_prior_runtime_disabled():
     runtime = resolve_key_prior_runtime(_base_cfg(False))
     assert runtime is None
 
 
-def test_key_prior_runtime_apply():
+def run_key_prior_runtime_apply():
     cfg = _base_cfg(True)
     runtime = resolve_key_prior_runtime(cfg)
     assert runtime is not None
@@ -55,3 +52,13 @@ def test_key_prior_runtime_apply():
     out = apply_key_prior_from_config({"onset": logits}, cfg)
     assert "onset" in out
     assert out["onset"].shape == logits.shape
+
+
+def run_all() -> None:
+    run_key_prior_runtime_disabled()
+    run_key_prior_runtime_apply()
+    print("key prior runtime checks passed")
+
+
+if __name__ == "__main__":
+    run_all()
