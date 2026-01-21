@@ -8,7 +8,7 @@ Scope: new stack only (`tivit/`), excluding legacy `src/` and root `scripts/` un
 - Models + heads: `tivit/models/backbones/*.py`, `tivit/models/heads/*.py`.
 - Training/eval/export: `tivit/train/*.py`, `tivit/pipelines/*.py`.
 - Decoder + postproc: `tivit/decoder/*.py`, `tivit/postproc/*.py`.
-- Optional priors: `tivit/priors/*.py`.
+- Optional priors: training-time in `tivit/priors/*.py`, decode-time key prior in `tivit/postproc/`.
 
 ## Flowchart
 ```mermaid
@@ -42,11 +42,11 @@ Status legend: Full = implemented parity, Partial = reduced scope, Mixed = combi
 | Data pipeline | `tivit/data/**` | Full | No stubs found. |
 | Models + heads | `tivit/models/**` | Full | Full head set implemented. |
 | Losses + metrics | `tivit/losses/**`, `tivit/metrics/**` | Full | Full stack present. |
-| Train + eval + export | `tivit/train/**`, `tivit/pipelines/*.py` | Full | New stack entrypoints. |
+| Train + eval + export | `tivit/train/**`, `tivit/pipelines/*.py` | Full | New stack entrypoints; eval decodes logits and reports event F1 via `tivit/metrics/event_f1.py`. |
 | Decoder + thresholding | `tivit/decoder/**`, `tivit/postproc/*.py` | Full | Hysteresis + thresholding implemented. |
 | Autopilot | `tivit/pipelines/autopilot.py` | Partial | Train -> eval -> export only; no selection/calibration orchestration. |
 | Calibration utilities | `tivit/calibration/*.py` | Partial | Scaling + IO only; no sweep/selection CLI. |
-| Priors | `tivit/priors/*.py` | Mixed | Key signature prior implemented; hand gating is no-op; chord smoothness is placeholder. |
+| Priors | `tivit/priors/*.py`, `tivit/postproc/key_signature.py`, `tivit/postproc/key_prior_runtime.py` | Mixed | Training-time priors apply in the loss; decode-time key signature prior applied in postproc; hand gating loss reweight supported; chord smoothness is placeholder. |
 | Postproc constraints | `tivit/postproc/constraints/*.py` | Stub | No-op placeholders. |
 
 ## Legacy CLI Parity Matrix
@@ -85,7 +85,7 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 | `scripts/check/test_synthetic_forward.py` | `tivit/tests/test_vivit_forward.py`, `tivit/tests/test_vits_tile_forward.py` | Partial |
 | `scripts/check/test_tile_support_cache.py` | None (legacy-only) | None |
 | `scripts/eval_pianovam.py` | `scripts/tivit_eval.py` + `tivit/metrics/event_f1.py` | Partial |
-| `scripts/theory_decode.py` | `tivit/priors/key_signature.py` (no CLI) | None |
+| `scripts/theory_decode.py` | `tivit/postproc/key_signature.py` (no CLI) | None |
 | `scripts/probe_timegrid.py` | None (legacy-only) | None |
 | `scripts/rebuild_av_lags.py` | None (legacy-only) | None |
 | `scripts/clean_tivit.py` | None (legacy-only) | None |

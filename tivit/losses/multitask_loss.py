@@ -3,7 +3,7 @@
 Purpose:
     - Combine pitch/onset/offset/hand/clef losses with adaptive weighting.
     - Support frame/clip modes, per-tile supervision, and optional hand gating.
-    - Enforce a single explicit config source at ``training.loss``.
+    - Enforce a single explicit config source at ``training.loss`` and honor ``priors.enabled`` for training-time priors.
 Key Functions/Classes:
     - MultitaskLoss: composite loss with time alignment and priors.
     - OnOffPosWeightEMA: EMA tracker for adaptive pos_weight per head/scope.
@@ -554,7 +554,11 @@ class MultitaskLoss:
         if uses_ema and ema_alpha <= 0.0:
             raise ValueError("training.loss.ema_alpha must be > 0 when any head uses pos_weight_mode='ema'")
         self.pos_rate_state = OnOffPosWeightEMA(ema_alpha) if uses_ema and ema_alpha > 0.0 else None
-        self.hand_gating_cfg = cfg.get("priors", {}).get("hand_gating", {}) if isinstance(cfg, Mapping) else {}
+        priors_cfg = cfg.get("priors", {}) if isinstance(cfg, Mapping) else {}
+        if not isinstance(priors_cfg, Mapping):
+            priors_cfg = {}
+        self.priors_enabled = bool(priors_cfg.get("enabled", False))
+        self.hand_gating_cfg = priors_cfg.get("hand_gating", {}) if self.priors_enabled else {}
 
     def state_dict(self) -> Dict[str, Any]:
         """Return serialisable adaptive state (EMA trackers)."""
@@ -1014,19 +1018,20 @@ class MultitaskLoss:
         }
 
         reg_terms: Dict[str, torch.Tensor] = {}
-        for head, cfg, logits in (
-            ("onset", self.onset_cfg, onset_logit),
-            ("offset", self.offset_cfg, offset_logit),
-        ):
-            if logits is None:
-                continue
-            prior_w = float(cfg.get("prior_weight", 0.0))
-            if prior_w <= 0.0:
-                continue
-            prior_mean = float(cfg.get("prior_mean", 0.12))
-            reg = prior_w * (torch.sigmoid(logits).mean() - prior_mean).abs()
-            total = total + reg
-            reg_terms[head] = reg
+        if self.priors_enabled:
+            for head, cfg, logits in (
+                ("onset", self.onset_cfg, onset_logit),
+                ("offset", self.offset_cfg, offset_logit),
+            ):
+                if logits is None:
+                    continue
+                prior_w = float(cfg.get("prior_weight", 0.0))
+                if prior_w <= 0.0:
+                    continue
+                prior_mean = float(cfg.get("prior_mean", 0.12))
+                reg = prior_w * (torch.sigmoid(logits).mean() - prior_mean).abs()
+                total = total + reg
+                reg_terms[head] = reg
 
         if reg_terms:
             reg_sum = sum(float(reg.detach().cpu()) for reg in reg_terms.values())

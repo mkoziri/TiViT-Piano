@@ -6,6 +6,7 @@ Purpose:
 Key Functions/Classes:
     - ``EventF1Result``: Container for the aggregated F1 triple and supporting counts.
     - ``event_f1``: Compute tolerance-aware event F1 for 2D/3D pianoroll masks.
+    - ``f1_from_counts``: Convert TP/FP/FN totals into precision/recall/F1.
 CLI Arguments:
     (none)
 Usage:
@@ -145,4 +146,26 @@ def event_f1(pred: MaskLike, target: MaskLike, *, hop_seconds: float, tolerance:
     )
 
 
-__all__ = ["EventF1Result", "event_f1"]
+def f1_from_counts(tp: int, fp: int, fn: int, *, eps: float = 1e-8) -> EventF1Result:
+    """Compute precision/recall/F1 from aggregated counts."""
+    total_tp = int(tp)
+    total_fp = int(fp)
+    total_fn = int(fn)
+    precision = total_tp / (total_tp + total_fp + eps) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn + eps) if (total_tp + total_fn) > 0 else 0.0
+    if precision == 0.0 and recall == 0.0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall + eps)
+    return EventF1Result(
+        f1=float(f1),
+        precision=float(precision),
+        recall=float(recall),
+        true_positives=total_tp,
+        false_positives=total_fp,
+        false_negatives=total_fn,
+        clips_evaluated=0,
+    )
+
+
+__all__ = ["EventF1Result", "event_f1", "f1_from_counts"]

@@ -3,7 +3,7 @@ Shared piano dataset backbone.
 
 Purpose:
     - Provide common decode, crop/registration, tiling, normalization, and target prep.
-    - Centralize sampler metadata, AV lag handling, and cache hookups.
+    - Centralize sampler metadata, AV lag handling, cache hookups, and optional hand supervision.
 Key Functions/Classes:
     - DatasetEntry
     - BasePianoDataset
@@ -454,6 +454,138 @@ class BasePianoDataset(Dataset):
             "clef": payload.get("clef_frame"),
         }
 
+    def _prepare_hand_supervision(
+        self,
+        *,
+        entry: DatasetEntry,
+        clip_meta: Mapping[str, Any],
+        raw: Mapping[str, Any],
+        source_hw: Optional[Sequence[int]],
+    ) -> Mapping[str, Any]:
+        cfg = dict(self.dataset_cfg.get("hand_supervision", {}) or {})
+        if not cfg or not bool(cfg.get("enable", False)):
+            return {}
+        if self.registration_refiner is None:
+            return {}
+
+        hand_path = raw.get("hand_skeleton_path")
+        if not isinstance(hand_path, (str, Path)):
+            return {}
+        if source_hw is None or len(source_hw) < 2:
+            return {}
+
+        try:
+            from tivit.data.hand_labels import (
+                EventHandLabelConfig,
+                build_event_hand_labels,
+                compute_hand_reach,
+                key_centers_from_geometry,
+                load_pianovam_hand_landmarks,
+                map_landmarks_to_canonical,
+            )
+        except Exception:
+            return {}
+
+        clip_start = float(clip_meta.get("clip_start", 0.0))
+        time_tol = cfg.get("time_tolerance")
+        min_conf = float(cfg.get("min_confidence", 0.0))
+        aligned = load_pianovam_hand_landmarks(
+            hand_path,
+            clip_start_sec=clip_start,
+            frames=self.frames,
+            stride=self.stride,
+            decode_fps=self.decode_fps,
+            min_confidence=min_conf,
+            time_tolerance=float(time_tol) if time_tol is not None else None,
+        )
+
+        reg_payload = self.registration_refiner.get_cache_entry_payload(entry.video_id)
+        canonical = map_landmarks_to_canonical(
+            aligned,
+            registration=reg_payload,
+            source_hw=source_hw,
+            crop_meta=entry.metadata,
+        )
+        geometry_meta = self.registration_refiner.get_geometry_metadata(entry.video_id)
+        key_centers = key_centers_from_geometry(geometry_meta)
+        if key_centers is None:
+            return {}
+
+        outputs: Dict[str, Any] = {}
+
+        events = raw.get("events", [])
+        if events:
+            onsets: List[float] = []
+            pitches: List[int] = []
+            for evt in events:
+                if len(evt) < 3:
+                    continue
+                try:
+                    onsets.append(float(evt[0]))
+                    pitches.append(int(round(float(evt[2]))))
+                except (TypeError, ValueError):
+                    continue
+            if onsets and pitches:
+                onsets_t = torch.tensor(onsets, dtype=torch.float32)
+                pitch_t = torch.tensor(pitches, dtype=torch.int64)
+                note_min = int(self.target_cfg.get("note_min", 21))
+                key_indices = pitch_t - int(note_min)
+                valid = (key_indices >= 0) & (key_indices < key_centers.numel())
+                if valid.any():
+                    onsets_t = onsets_t[valid]
+                    key_indices = key_indices[valid]
+                    cfg_obj = EventHandLabelConfig(
+                        time_tolerance=float(cfg.get("time_tolerance", 0.05)),
+                        max_dx=float(cfg.get("max_dx", 0.12)),
+                        min_points=int(cfg.get("min_points", 4)),
+                        unknown_class=int(cfg.get("unknown_class", 2)),
+                    )
+                    evt_labels = build_event_hand_labels(
+                        onsets_sec=onsets_t,
+                        key_indices=key_indices,
+                        key_centers_norm=key_centers,
+                        frame_times=aligned.frame_times,
+                        canonical=canonical,
+                        config=cfg_obj,
+                    )
+
+                    T = aligned.frame_times.numel()
+                    frame_lab = torch.zeros((T,), dtype=torch.long)
+                    frame_mask = torch.zeros((T,), dtype=torch.bool)
+                    for onset, lbl, valid_evt in zip(onsets_t.tolist(), evt_labels.labels.tolist(), evt_labels.mask.tolist()):
+                        if not valid_evt:
+                            continue
+                        idx = int(torch.abs(aligned.frame_times - float(onset)).argmin().item())
+                        if idx < 0 or idx >= T:
+                            continue
+                        if not frame_mask[idx]:
+                            frame_lab[idx] = int(lbl)
+                            frame_mask[idx] = True
+                        elif frame_lab[idx] != int(lbl):
+                            frame_lab[idx] = 0
+                            frame_mask[idx] = False
+
+                    outputs["hand"] = frame_lab
+                    outputs["hand_frame_mask"] = frame_mask
+                    outputs["hand_coverage"] = evt_labels.coverage
+                    outputs["hand_events"] = evt_labels.labels
+                    outputs["hand_event_mask"] = evt_labels.mask
+
+        reach_cfg = cfg.get("reach", {}) or {}
+        if bool(reach_cfg.get("enable", False)):
+            reach = compute_hand_reach(
+                canonical,
+                key_centers_norm=key_centers,
+                radius=float(reach_cfg.get("radius", 0.12)),
+                dilate=float(reach_cfg.get("dilate_margin", 0.02)),
+                min_points=int(reach_cfg.get("min_points", 4)),
+            )
+            outputs["hand_reach"] = reach.reach
+            outputs["hand_reach_valid"] = reach.valid
+            outputs["hand_reach_coverage"] = reach.coverage
+
+        return outputs
+
     def _sampler_meta(self, events: Sequence[Sequence[float]]) -> Mapping[str, Any]:
         """Return minimal sampler metadata for onset-balanced samplers."""
 
@@ -486,6 +618,7 @@ class BasePianoDataset(Dataset):
         entry = self.entries[idx]
         debug_extras: Optional[Dict[str, Any]] = {} if self.return_debug_extras else None
         frames = self._decode_clip(entry.video_path)
+        source_hw = (int(frames.shape[-2]), int(frames.shape[-1])) if frames.ndim >= 4 else None
         if debug_extras is not None:
             debug_extras["decode"] = {
                 "frames": self.frames,
@@ -548,6 +681,12 @@ class BasePianoDataset(Dataset):
             clef_seq=raw.get("clef_seq"),
             debug_meta=debug_extras,
         ) if raw.get("events") else {}
+        hand_supervision = self._prepare_hand_supervision(
+            entry=entry,
+            clip_meta=clip_meta,
+            raw=raw,
+            source_hw=source_hw,
+        )
         sample: MutableMapping[str, Any] = {
             "video": tiles,
             "path": clip_meta["path"],
@@ -559,6 +698,8 @@ class BasePianoDataset(Dataset):
         if "hand_skeleton_path" in raw:
             sample["hand_skeleton_path"] = raw["hand_skeleton_path"]
         sample.update(targets)
+        if hand_supervision:
+            sample.update(hand_supervision)
         if debug_extras is not None:
             debug_extras["post_tile_shape"] = list(tiles.shape) if torch.is_tensor(tiles) else None
             debug_extras["canonical_hw"] = list(self.canonical_hw)

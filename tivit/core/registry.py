@@ -3,6 +3,7 @@
 Purpose:
 - Provide a simple name→callable registry with lazy module loading.
 - Expose default registrations for built-in datasets/models/pipeline pieces.
+- Keep decoding-only priors in postproc; this registry targets training-time components.
 
 Key Functions/Classes:
 - Registry: Core registry type with register/get/build helpers.
@@ -110,7 +111,6 @@ def _register_loss_defaults() -> None:
 def _register_prior_defaults() -> None:
     """Register built-in priors."""
     PRIORS.register("hand_gating")(_lazy("tivit.priors.hand_gating", "build_prior"))
-    PRIORS.register("key_signature")(_lazy("tivit.priors.key_signature", "build_prior"))
     PRIORS.register("chord_smoothness")(_lazy("tivit.priors.chord_smoothness", "build_prior"))
     PRIORS.register("none")(_lazy("tivit.priors.base", "null_prior"))
 

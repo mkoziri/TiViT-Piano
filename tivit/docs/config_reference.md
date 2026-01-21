@@ -88,13 +88,13 @@ Dataset-specific additions:
 - `decoder.global_fusion.*`: fusion mode, cushion keys, apply_to, consistency check.
 - `decoder.post.snap.*`: snapping parameters.
 - `decoder.post.dp.*`: dynamic programming parameters.
-- `decoder.post.key_prior.*`: pitch-class key prior strength and ranges.
+- `decoder.post.key_prior.enabled` (bool): decoding-time key prior master switch; pulls parameters from `priors.key_signature`.
 
 ## Priors (`priors/priors.yaml`)
-- `priors.enabled` (bool): master switch.
+- `priors.enabled` (bool): master switch for training-time priors (hand gating, chord smoothness).
 - `priors.hand_gating.*`: mode/strength.
 - `priors.chord_smoothness.strength` (float): smoothing weight.
-- `priors.key_signature.*`: enable/ref_head/apply_to/window/beta/rho/prior_strength/epsilon/fps/midi range.
+- `priors.key_signature.*`: ref_head/apply_to/window/beta/rho/prior_strength/epsilon/fps/midi range for decoding key prior (controlled by `decoder.post.key_prior.enabled`).
 
 ## Autopilot (`train/autopilot.yaml`)
 - `autopilot.best_selection.owner` (str): owner of selection metadata.

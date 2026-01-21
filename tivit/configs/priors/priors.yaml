@@ -7,7 +7,7 @@ priors:
   chord_smoothness:
     strength: 0.15
   key_signature:
-    enabled: true
+    # Used for decoding when decoder.post.key_prior.enabled is true.
     ref_head: onset
     apply_to: [onset, offset]
     window_sec: 3.0
