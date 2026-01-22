@@ -72,8 +72,13 @@ def find_checkpoint(cfg: Mapping[str, Any], checkpoint: str | Path | None = None
     ckpt_dir = Path(log_cfg.get("checkpoint_dir", "./checkpoints")).expanduser()
     if not ckpt_dir.exists():
         return None
-    candidates = sorted(ckpt_dir.glob("epoch_*.pt"))
-    return candidates[-1] if candidates else None
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return best
+    candidates = list(ckpt_dir.glob("epoch_*.pt"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _maybe_init_lazy_encoder(

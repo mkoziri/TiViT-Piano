@@ -51,17 +51,24 @@ def autopilot(
     cfg, log_dir, _ = prepare_run(configs, stage_name="autopilot", default_log_file="autopilot.log", verbose=verbose)
     log_stage("autopilot", "starting autopilot pipeline (train → eval → export)")
 
-    train_single(
-        configs=configs,
-        verbose=verbose,
-        train_split=train_split,
-        val_split=val_split,
-        max_clips=max_clips,
-        frames=frames,
-        seed=seed,
-        deterministic=deterministic,
-        smoke=smoke,
-    )
+    autopilot_cfg = cfg.get("autopilot", {}) if isinstance(cfg, Mapping) else {}
+    if not isinstance(autopilot_cfg, Mapping):
+        autopilot_cfg = {}
+    enable_training = bool(autopilot_cfg.get("enable_training", True))
+    if enable_training:
+        train_single(
+            configs=configs,
+            verbose=verbose,
+            train_split=train_split,
+            val_split=val_split,
+            max_clips=max_clips,
+            frames=frames,
+            seed=seed,
+            deterministic=deterministic,
+            smoke=smoke,
+        )
+    else:
+        log_stage("autopilot", "skipping training stage (autopilot.enable_training=false)")
 
     resolved_ckpt = find_checkpoint(cfg, checkpoint)
     metrics: Mapping[str, float] | None = None
