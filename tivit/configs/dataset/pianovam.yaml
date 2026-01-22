@@ -32,6 +32,7 @@ dataset:
   canonical_hw: [180, 1536]
   registration:
     enable: true
+    cache_path: reg_refined_pianovam.json
     source: metadata
     interp: bilinear
     global_aug:
@@ -46,8 +47,8 @@ dataset:
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
-  num_workers: 0 # Should be 4 or more for real training
-  prefetch_factor: null #It was 1
+  num_workers: 2 # Should be 4 or more for real training
+  prefetch_factor: 1 
   shuffle: true
   sampler:
     mode: onset_balanced
