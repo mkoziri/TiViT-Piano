@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import logging
 from typing import Any, Mapping, MutableMapping, Sequence
 
 import torch
@@ -27,6 +28,8 @@ import torch
 from tivit.core.config import load_experiment_config, write_run_artifacts
 from tivit.core.determinism import configure_determinism, resolve_deterministic_flag, resolve_seed
 from tivit.utils.logging import configure_logging
+
+LOGGER = logging.getLogger(__name__)
 
 
 def prepare_run(
@@ -73,6 +76,25 @@ def find_checkpoint(cfg: Mapping[str, Any], checkpoint: str | Path | None = None
     return candidates[-1] if candidates else None
 
 
+def _maybe_init_lazy_encoder(
+    model: torch.nn.Module,
+    state: Mapping[str, Any],
+    device: torch.device,
+) -> None:
+    if getattr(model, "encoder", None) is not None:
+        return
+    if not callable(getattr(model, "_init_encoder_if_needed", None)):
+        return
+    if not any(str(key).startswith("encoder.") for key in state.keys()):
+        return
+    try:
+        model._init_encoder_if_needed(t_tokens=1, s_tokens=1)
+    except Exception:
+        return
+    LOGGER.info("Initialized lazy encoder before checkpoint load.")
+    model.to(device)
+
+
 def load_model_weights(
     model: torch.nn.Module,
     checkpoint: Path,
@@ -83,6 +105,8 @@ def load_model_weights(
     """Load model weights from a checkpoint payload; return epoch if present."""
     payload = torch.load(checkpoint, map_location=device)
     state = payload.get("model", payload)
+    if isinstance(state, Mapping):
+        _maybe_init_lazy_encoder(model, state, device)
     model.load_state_dict(state, strict=strict)
     epoch_val = payload.get("epoch")
     try:
