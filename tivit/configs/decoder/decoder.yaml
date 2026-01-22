@@ -36,4 +36,4 @@ decoder:
       emission_gain: 4.0
       emission_bias: 0.0
     key_prior:
-      enabled: true
+      enabled: false
