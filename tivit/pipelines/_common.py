@@ -88,12 +88,13 @@ def _maybe_init_lazy_encoder(
 ) -> None:
     if getattr(model, "encoder", None) is not None:
         return
-    if not callable(getattr(model, "_init_encoder_if_needed", None)):
+    init_fn = getattr(model, "_init_encoder_if_needed", None)
+    if not callable(init_fn):
         return
     if not any(str(key).startswith("encoder.") for key in state.keys()):
         return
     try:
-        model._init_encoder_if_needed(t_tokens=1, s_tokens=1)
+        init_fn(t_tokens=1, s_tokens=1)
     except Exception:
         return
     LOGGER.info("Initialized lazy encoder before checkpoint load.")
