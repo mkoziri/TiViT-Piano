@@ -1,6 +1,6 @@
 # Autopilot sweep/tuning defaults layered on top of training.
 autopilot:
-  enable_training: false
+  enable_training: true
   best_selection:
     owner: autopilot
   fast_strategy: two_stage
