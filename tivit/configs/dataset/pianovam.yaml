@@ -19,7 +19,7 @@ dataset:
   split_train: train
   split_val: val
   split_test: test
-  frames: 96
+  frames: 48
   decode_fps: 30.0
   hop_seconds: 0.03333333333333333
   skip_seconds: 8.0
