@@ -98,7 +98,7 @@ training:
     # Explicit per-head settings: no defaults, no inheritance, no alias keys
     heads:
       pitch:
-        loss: focal
+        loss: bce
         # pitch-only mode to preserve current behavior (code must support this explicitly)
         pos_weight_mode: "off"        # sqrt | adaptive_band | fixed | off
         pos_weight: 33.3              # used only for fixed
