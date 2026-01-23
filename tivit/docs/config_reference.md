@@ -89,10 +89,11 @@ Dataset-specific additions:
 - `decoder.post.snap.*`: snapping parameters.
 - `decoder.post.dp.*`: dynamic programming parameters.
 - `decoder.post.key_prior.enabled` (bool): decoding-time key prior master switch; pulls parameters from `priors.key_signature`.
+- `decoder.post.hand_gate.enabled` (bool): decoding-time hand gate master switch; pulls parameters from `priors.hand_gating.*`.
 
 ## Priors (`priors/priors.yaml`)
 - `priors.enabled` (bool): master switch for training-time priors (hand gating, chord smoothness).
-- `priors.hand_gating.*`: mode/strength.
+- `priors.hand_gating.*`: training-time mode/strength plus decode-time apply_to/decode_mode/decode_strength/clef_thresholds/note_min.
 - `priors.chord_smoothness.strength` (float): smoothing weight.
 - `priors.key_signature.*`: ref_head/apply_to/window/beta/rho/prior_strength/epsilon/fps/midi range for decoding key prior (controlled by `decoder.post.key_prior.enabled`).
 

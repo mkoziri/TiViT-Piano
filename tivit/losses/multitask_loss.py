@@ -26,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tivit.decoder.decode import pool_roll_BT
+from tivit.priors.base import compute_prior_mean_regularizer
+from tivit.priors.hand_gating import build_reach_weights
 
 LOGGER = logging.getLogger(__name__)
 _ADAPTIVE_BAND_LOGGED: set[Tuple[str, str]] = set()
@@ -848,18 +850,13 @@ class MultitaskLoss:
         gating_cfg = dict(self.hand_gating_cfg) if isinstance(self.hand_gating_cfg, Mapping) else {}
         if isinstance(hand_gating, Mapping):
             gating_cfg.update(hand_gating)
-        gating_mode = str(gating_cfg.get("mode", "off")).lower()
-        gating_alpha = float(gating_cfg.get("strength", 1.0))
-        reach_weights = None
-        if gating_mode == "loss_reweight":
-            if torch.is_tensor(hand_reach) and torch.is_tensor(hand_reach_valid):
-                hr = hand_reach.to(device=device, dtype=pitch_roll.dtype).clamp(0.0, 1.0)
-                hr_valid = hand_reach_valid.to(device=device, dtype=pitch_roll.dtype)
-                if hr_valid.dim() == 2:
-                    hr_valid = hr_valid.unsqueeze(-1).expand_as(hr)
-                if hr_valid.shape == hr.shape:
-                    neg_weight = 1.0 + gating_alpha * (1.0 - hr)
-                    reach_weights = torch.where(hr_valid > 0.5, neg_weight, torch.ones_like(hr))
+        reach_weights = build_reach_weights(
+            hand_reach if torch.is_tensor(hand_reach) else None,
+            hand_reach_valid if torch.is_tensor(hand_reach_valid) else None,
+            gating_cfg,
+            device=device,
+            dtype=pitch_roll.dtype,
+        )
 
         pos_w_pitch = self._pitch_pos_weight(pitch_roll, device, context="frame")
 
@@ -1025,11 +1022,9 @@ class MultitaskLoss:
             ):
                 if logits is None:
                     continue
-                prior_w = float(cfg.get("prior_weight", 0.0))
-                if prior_w <= 0.0:
+                reg = compute_prior_mean_regularizer(logits, cfg, default_mean=0.12)
+                if reg is None:
                     continue
-                prior_mean = float(cfg.get("prior_mean", 0.12))
-                reg = prior_w * (torch.sigmoid(logits).mean() - prior_mean).abs()
                 total = total + reg
                 reg_terms[head] = reg
 

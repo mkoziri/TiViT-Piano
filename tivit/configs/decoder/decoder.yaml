@@ -37,3 +37,5 @@ decoder:
       emission_bias: 0.0
     key_prior:
       enabled: false
+    hand_gate:
+      enabled: false

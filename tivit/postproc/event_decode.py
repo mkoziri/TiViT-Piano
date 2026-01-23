@@ -31,6 +31,7 @@ from tivit.decoder.decode import (
     resolve_decoder_from_config,
     resolve_decoder_gates,
 )
+from tivit.postproc.hand_gate_runtime import apply_hand_gate_from_config
 from tivit.postproc.key_prior_runtime import apply_key_prior_from_config
 
 
@@ -57,6 +58,7 @@ def _normalize_logits_inputs(inputs: Mapping[str, torch.Tensor]) -> dict[str, to
         "onset_logits": "onset",
         "offset_logits": "offset",
         "pitch_logits": "pitch",
+        "hand_logits": "hand",
     }
     for src, dst in aliases.items():
         if dst not in normalized and src in normalized:
@@ -98,6 +100,10 @@ def build_decoder(
             probs = {head: torch.sigmoid(tensor) for head, tensor in logits_map.items() if torch.is_tensor(tensor)}
         else:
             probs = inputs
+        if full_cfg is not None:
+            gated = apply_hand_gate_from_config(probs, inputs, full_cfg, input_is_logits=bool(input_is_logits))
+            if gated:
+                probs = {**probs, **gated}
         decoded = {}
         for head, cfg in gates.items():
             roll = probs.get(head)

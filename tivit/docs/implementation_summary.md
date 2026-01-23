@@ -46,8 +46,8 @@ Status legend: Full = implemented parity, Partial = reduced scope, Mixed = combi
 | Decoder + thresholding | `tivit/decoder/**`, `tivit/postproc/*.py` | Full | Hysteresis + thresholding implemented. |
 | Autopilot | `tivit/pipelines/autopilot.py` | Partial | Train -> eval -> export only; no selection/calibration orchestration. |
 | Calibration utilities | `tivit/calibration/*.py` | Partial | Scaling + IO only; no sweep/selection CLI. |
-| Priors | `tivit/priors/*.py`, `tivit/postproc/key_signature.py`, `tivit/postproc/key_prior_runtime.py` | Mixed | Training-time priors apply in the loss; decode-time key signature prior applied in postproc; hand gating loss reweight supported; chord smoothness is placeholder. |
-| Postproc constraints | `tivit/postproc/constraints/*.py` | Stub | No-op placeholders. |
+| Priors | `tivit/priors/*.py`, `tivit/postproc/key_signature.py`, `tivit/postproc/key_prior_runtime.py`, `tivit/postproc/hand_gate_runtime.py` | Mixed | Training-time priors apply in the loss; decode-time key signature prior and hand gate apply in postproc; chord smoothness is placeholder. |
+| Postproc constraints | `tivit/postproc/min_note_length.py`, `tivit/postproc/harmony_filter.py` | Stub | No-op placeholders. |
 
 ## Legacy CLI Parity Matrix
 Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None = no new-stack equivalent.

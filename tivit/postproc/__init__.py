@@ -28,7 +28,8 @@ from .event_decode import (
     build_decoder_from_logits,
 )
 from .key_signature import KeySignaturePrior, build_prior as build_key_signature
-from .constraints import build_hand_gate, build_min_note_length, build_harmony_filter
+from .min_note_length import build_constraint as build_min_note_length
+from .harmony_filter import build_constraint as build_harmony_filter
 
 __all__ = [
     "build_threshold_mask",
@@ -44,7 +45,6 @@ __all__ = [
     "build_decoder_from_logits",
     "KeySignaturePrior",
     "build_key_signature",
-    "build_hand_gate",
     "build_min_note_length",
     "build_harmony_filter",
 ]

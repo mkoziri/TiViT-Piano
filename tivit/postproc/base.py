@@ -11,4 +11,3 @@ class Constraint:
 
 
 __all__ = ["Constraint"]
-

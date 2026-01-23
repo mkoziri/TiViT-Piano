@@ -119,9 +119,8 @@ def _register_postproc_defaults() -> None:
     """Register built-in post-processing steps."""
     POSTPROC.register("thresholding")(_lazy("tivit.postproc.thresholding", "build_postproc"))
     POSTPROC.register("event_decode")(_lazy("tivit.postproc.event_decode", "build_decoder"))
-    POSTPROC.register("hand_gate")(_lazy("tivit.postproc.constraints.hand_gate", "build_constraint"))
-    POSTPROC.register("min_note_length")(_lazy("tivit.postproc.constraints.min_note_length", "build_constraint"))
-    POSTPROC.register("harmony_filter")(_lazy("tivit.postproc.constraints.harmony_filter", "build_constraint"))
+    POSTPROC.register("min_note_length")(_lazy("tivit.postproc.min_note_length", "build_constraint"))
+    POSTPROC.register("harmony_filter")(_lazy("tivit.postproc.harmony_filter", "build_constraint"))
 
 
 def register_default_components() -> None:
