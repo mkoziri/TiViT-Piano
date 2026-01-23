@@ -4,6 +4,7 @@ Scope: new stack only (`tivit/`), excluding legacy `src/` and root `scripts/` un
 
 ## Overview
 - Config + registry: `tivit/core/config.py`, `tivit/core/registry.py`, YAML fragments under `tivit/configs/`.
+- Infrastructure utils: `tivit/utils/*.py` (AMP, logging, fs, timing).
 - Data pipeline: `tivit/data/` (decode -> registration -> augment -> normalize -> tiling -> sync -> targets).
 - Models + heads: `tivit/models/backbones/*.py`, `tivit/models/heads/*.py`.
 - Training/eval/export: `tivit/train/*.py`, `tivit/pipelines/*.py`.
@@ -39,6 +40,7 @@ Status legend: Full = implemented parity, Partial = reduced scope, Mixed = combi
 | Area | Key files | Status vs legacy | Notes |
 |---|---|---|---|
 | Config + registry | `tivit/core/config.py`, `tivit/core/registry.py` | Full | Matches legacy composition/registration behavior. |
+| Infrastructure utils | `tivit/utils/*.py` | Full | Scoped to AMP/logging/fs/timing; domain helpers live in `tivit/core` and `tivit/data`. |
 | Data pipeline | `tivit/data/**` | Full | No stubs found. |
 | Models + heads | `tivit/models/**` | Full | Full head set implemented. |
 | Losses + metrics | `tivit/losses/**`, `tivit/metrics/**` | Full | Full stack present. |

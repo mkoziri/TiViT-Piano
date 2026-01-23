@@ -1,4 +1,16 @@
-"""AMP helpers with version-compatible fallbacks."""
+"""AMP helpers with version-compatible fallbacks.
+
+Purpose:
+    - Provide autocast and GradScaler wrappers that work across torch versions.
+    - Offer a safe no-op scaler when AMP is disabled or unsupported.
+
+Key Functions/Classes:
+    - autocast(): Return a compatible autocast context manager.
+    - grad_scaler(): Return a GradScaler or no-op fallback.
+
+CLI:
+    None. Import from training or evaluation loops.
+"""
 
 from __future__ import annotations
 
@@ -25,8 +37,42 @@ if _SCALER_FN is None:
 _SCALER_DEVICE_TYPE = _supports_device_type(_SCALER_FN) if _SCALER_FN else False
 
 
-def autocast(device: torch.device, *, enabled: bool) -> contextlib.AbstractContextManager[Any]:
+class _NoOpGradScaler:
+    """Minimal scaler interface used when AMP is disabled or unavailable."""
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer) -> None:
+        return None
+
+    def step(self, optimizer, *args, **kwargs):
+        return optimizer.step(*args, **kwargs)
+
+    def update(self, *args, **kwargs) -> None:
+        return None
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, state) -> None:
+        return None
+
+    def is_enabled(self) -> bool:
+        return False
+
+
+def _coerce_device(device: torch.device | str | None) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(str(device))
+
+
+def autocast(device: torch.device | str | None, *, enabled: bool) -> contextlib.AbstractContextManager[Any]:
     """Return a compatible autocast context manager for the device."""
+    device = _coerce_device(device)
     if _AUTOCAST_DEVICE_TYPE:
         return cast(contextlib.AbstractContextManager[Any], torch.autocast(device_type=device.type, enabled=enabled))
     if device.type == "cuda":
@@ -34,13 +80,18 @@ def autocast(device: torch.device, *, enabled: bool) -> contextlib.AbstractConte
     return contextlib.nullcontext()
 
 
-def grad_scaler(device: torch.device, *, enabled: bool):
+def grad_scaler(device: torch.device | str | None, *, enabled: bool):
     """Return a GradScaler instance that matches the installed torch API."""
+    if not enabled:
+        return _NoOpGradScaler()
     if _SCALER_FN is None:
         raise RuntimeError("GradScaler is unavailable in the installed torch package.")
+    device = _coerce_device(device)
     if _SCALER_DEVICE_TYPE:
         return _SCALER_FN(device_type=device.type, enabled=enabled)
-    return _SCALER_FN(enabled=enabled)
+    if device.type == "cuda":
+        return _SCALER_FN(enabled=enabled)
+    return _NoOpGradScaler()
 
 
 __all__ = ["autocast", "grad_scaler"]

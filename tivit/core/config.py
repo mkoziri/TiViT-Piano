@@ -27,6 +27,8 @@ from typing import Any, Collection, Iterable, Mapping, MutableMapping, Sequence
 
 import yaml
 
+from tivit.utils.fs import atomic_write, atomic_write_text
+
 ConfigLike = Mapping[str, Any]
 CONFIG_ROOT = Path(__file__).resolve().parent.parent / "configs"
 DEFAULT_CONFIG_PATH = CONFIG_ROOT / "default.yaml"
@@ -142,11 +144,11 @@ def load_experiment_config(
 
 def save_resolved_config(cfg: ConfigLike, path: str | Path) -> Path:
     """Persist a merged config to ``path`` and return the resolved path."""
-    target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(cfg, handle, sort_keys=False)
-    return target
+    def _write(tmp: Path) -> None:
+        with tmp.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(cfg, handle, sort_keys=False)
+
+    return atomic_write(path, _write)
 
 
 def _detect_git_commit(repo_root: Path | None = None) -> str:
@@ -201,7 +203,7 @@ def write_run_artifacts(
 
     commit = _detect_git_commit()
     commit_path = output_dir / "git_commit.txt"
-    commit_path.write_text(f"{commit}\n", encoding="utf-8")
+    atomic_write_text(commit_path, f"{commit}\n", encoding="utf-8")
     paths["git_commit"] = commit_path
 
     cmd_text = _format_command_line(command)
@@ -209,7 +211,7 @@ def write_run_artifacts(
         cfg_list = ", ".join(str(Path(p).expanduser()) for p in configs)
         cmd_text = f"{cmd_text}\nconfigs: {cfg_list}".strip()
     cmd_path = output_dir / "command.txt"
-    cmd_path.write_text(f"{cmd_text}\n", encoding="utf-8")
+    atomic_write_text(cmd_path, f"{cmd_text}\n", encoding="utf-8")
     paths["command"] = cmd_path
 
     return paths

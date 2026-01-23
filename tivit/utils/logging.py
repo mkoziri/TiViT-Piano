@@ -1,4 +1,18 @@
-"""File-first logging with quiet console output."""
+"""File-first logging with quiet console output.
+
+Purpose:
+    - Configure a consistent logging policy for TiViT pipelines.
+    - Keep file logs verbose while keeping console logs quiet and structured.
+
+Key Functions/Classes:
+    - configure_logging(): Configure root handlers and per-module levels.
+    - get_logger(): Return a namespaced logger.
+    - log_stage()/log_final_result(): Emit stage and final markers.
+    - StageFilter: Permit only stage/progress logs on the console.
+
+CLI:
+    None. Import from pipeline entrypoints or training loops.
+"""
 
 from __future__ import annotations
 
