@@ -9,7 +9,7 @@ training:
   save_every: 1
   amp: false
   resume: false
-  reset_head_bias: true
+  reset_head_bias: false
 
   soft_targets:
     enabled: false
@@ -32,22 +32,22 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.20
-        hold: 0.12
-        min_on: 1
-        merge_gap: 6
+        open: 0.01
+        hold: 0.0075
+        min_on: 2
+        merge_gap: 1
       offset:
-        open: 0.20
-        hold: 0.12
-        min_off: 1
-        merge_gap: 6
+        open: 0.015
+        hold: 0.01
+        min_off: 2
+        merge_gap: 1
     temporal_decoder:
       shared:
         low_ratio: 0.6
-        min_on: 1
-        min_off: 1
-        gap_merge: 6
-        median: 7
+        min_on: 2
+        min_off: 2
+        gap_merge: 1
+        median: 3
     aggregation:
       mode: k_of_p
       k:
@@ -75,54 +75,53 @@ training:
   # Single-source-of-truth loss config (no overrides anywhere else)
   loss:
     head_weights:
-      pitch: 1.2
-      onset: 1.8
-      offset: 0.6
-      hand: 0.3
-      clef: 0.3
+      pitch: 1.0
+      onset: 1.0
+      offset: 1.0
+      hand: 0.0
+      clef: 0.0
 
     # Used only if some head chooses pos_weight_mode: ema
-    ema_alpha: 0.05
+    ema_alpha: 0.0
 
     # Applied only to onset/offset rolls
     neg_smooth_onoff: 0.0
 
     per_tile:
-      enabled: true
+      enabled: false
       heads: [pitch, onset, offset]
       mask_cushion_keys: null
       debug:
-        enabled: true
+        enabled: false
         interval: 200
 
     # Explicit per-head settings: no defaults, no inheritance, no alias keys
     heads:
       pitch:
         loss: bce
-        # pitch-only mode to preserve current behavior (code must support this explicitly)
         pos_weight_mode: "off"        # sqrt | adaptive_band | fixed | off
-        pos_weight: 33.3              # used only for fixed
-        pos_weight_band: [2.0, 4.0]   # used only for adaptive_band
+        pos_weight: null              # used only for fixed
+        pos_weight_band: null         # used only for adaptive_band
 
       onset:
-        loss: focal                 # focal | bce_pos | bce | bce_with_logits
+        loss: bce                   # focal | bce_pos | bce | bce_with_logits
         pos_weight_mode: "off"
-        pos_weight: 150.0
+        pos_weight: null
         pos_weight_band: null
-        focal_gamma: 4.0
+        focal_gamma: 2.0
         focal_alpha: 0.25
-        prior_mean: 0.012
-        prior_weight: 0.15
+        prior_mean: 0.01
+        prior_weight: 0.0
 
       offset:
-        loss: focal
+        loss: bce
         pos_weight_mode: "off"
-        pos_weight: 163.5
+        pos_weight: null
         pos_weight_band: null
         focal_gamma: 2.5
         focal_alpha: 0.2
         prior_mean: 0.01
-        prior_weight: 0.15
+        prior_weight: 0.0
 
       hand:
         loss: ce
@@ -132,9 +131,9 @@ training:
 
 optim:
   grad_clip: 1.0
-  head_lr_multiplier: 10.0
-  offset_weight_decay_multiplier: 4.0
+  head_lr_multiplier: 1.0
+  offset_weight_decay_multiplier: 1.0
 
 train:
-  accumulate_steps: 12
+  accumulate_steps: 1
   freeze_backbone_epochs: 0

@@ -10,7 +10,7 @@ dataset:
     - offset
     - hand
     - clef
-  max_clips: 50
+  max_clips: 10
   manifest:
     train: data/PianoVAM_v1.0/manifest.json
     val: data/PianoVAM_v1.0/manifest.json
