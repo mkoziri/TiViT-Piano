@@ -1,6 +1,6 @@
 # Priors configuration applied to logits/targets.
 priors:
-  enabled: true
+  enabled: false
   hand_gating:
     mode: loss_reweight
     strength: 0.75

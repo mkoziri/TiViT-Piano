@@ -32,28 +32,28 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.01
-        hold: 0.0075
-        min_on: 2
-        merge_gap: 1
+        open: 0.20
+        hold: 0.12
+        min_on: 1
+        merge_gap: 6
       offset:
-        open: 0.015
-        hold: 0.01
-        min_off: 2
-        merge_gap: 1
+        open: 0.20
+        hold: 0.12
+        min_off: 1
+        merge_gap: 6
     temporal_decoder:
       shared:
         low_ratio: 0.6
-        min_on: 2
-        min_off: 2
-        gap_merge: 1
-        median: 3
+        min_on: 1
+        min_off: 1
+        gap_merge: 6
+        median: 7
     aggregation:
       mode: k_of_p
       k:
         onset: 1
         offset: 1
-      top_k: 3
+      top_k: 7
       tau_sum: 0.0
     sweep:
       floor_band: [0.2, 0.3, 0.4]
@@ -100,15 +100,15 @@ training:
       pitch:
         loss: bce_pos
         # pitch-only mode to preserve current behavior (code must support this explicitly)
-        pos_weight_mode: "off"        # sqrt | adaptive_band | fixed | off
-        pos_weight: null              # used only for fixed
+        pos_weight_mode: "fixed"        # sqrt | adaptive_band | fixed | off
+        pos_weight: 33.3              # used only for fixed
         pos_weight_band: [2.0, 4.0]   # used only for adaptive_band
 
       onset:
         loss: focal                   # focal | bce_pos | bce | bce_with_logits
         # Focal ignores pos_weight; keep it explicit to avoid ambiguity
-        pos_weight_mode: "off"
-        pos_weight: null
+        pos_weight_mode: "fixed"
+        pos_weight: 150.0
         pos_weight_band: null
         focal_gamma: 4.0
         focal_alpha: 0.25
@@ -117,8 +117,8 @@ training:
 
       offset:
         loss: focal
-        pos_weight_mode: "off"
-        pos_weight: null
+        pos_weight_mode: "fixed"
+        pos_weight: 163.5
         pos_weight_band: null
         focal_gamma: 2.5
         focal_alpha: 0.2
