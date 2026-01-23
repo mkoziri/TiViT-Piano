@@ -105,8 +105,7 @@ training:
         pos_weight_band: [2.0, 4.0]   # used only for adaptive_band
 
       onset:
-        loss: focal                   # focal | bce_pos | bce | bce_with_logits
-        # Focal ignores pos_weight; keep it explicit to avoid ambiguity
+        loss: bce_pos                 # focal | bce_pos | bce | bce_with_logits
         pos_weight_mode: "fixed"
         pos_weight: 150.0
         pos_weight_band: null
@@ -116,7 +115,7 @@ training:
         prior_weight: 0.15
 
       offset:
-        loss: focal
+        loss: bce_pos
         pos_weight_mode: "fixed"
         pos_weight: 163.5
         pos_weight_band: null
