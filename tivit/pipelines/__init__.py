@@ -3,12 +3,13 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING, Callable
 
-__all__ = ["train_single", "evaluate", "autopilot", "export_model"]
+__all__ = ["train_single", "evaluate", "autopilot", "export_model", "calibrate"]
 
 if TYPE_CHECKING:
     from .autopilot import autopilot as autopilot
     from .evaluate import evaluate as evaluate
     from .export import export_model as export_model
+    from .calibrate import calibrate as calibrate
     from .train_single import train_single as train_single
 
 
@@ -20,6 +21,7 @@ def __getattr__(name: str) -> Callable:
         "evaluate": "tivit.pipelines.evaluate",
         "autopilot": "tivit.pipelines.autopilot",
         "export_model": "tivit.pipelines.export",
+        "calibrate": "tivit.pipelines.calibrate",
     }[name]
     return getattr(import_module(module_name), name)
 

@@ -47,7 +47,7 @@ Status legend: Full = implemented parity, Partial = reduced scope, Mixed = combi
 | Train + eval + export | `tivit/train/**`, `tivit/pipelines/*.py` | Full | New stack entrypoints; eval decodes logits and reports event F1 via `tivit/metrics/event_f1.py`. |
 | Decoder + thresholding | `tivit/decoder/**`, `tivit/postproc/*.py` | Full | Hysteresis + thresholding implemented. |
 | Autopilot | `tivit/pipelines/autopilot.py` | Partial | Train -> eval -> export only; no selection/calibration orchestration. |
-| Calibration utilities | `tivit/calibration/*.py` | Partial | Scaling + IO only; no sweep/selection CLI. |
+| Calibration utilities | `tivit/calibration/*.py`, `tivit/pipelines/calibrate.py` | Partial | Basic threshold sweep added; temperature/platt fitting not yet ported. |
 | Priors | `tivit/priors/*.py`, `tivit/postproc/key_signature.py`, `tivit/postproc/key_prior_runtime.py`, `tivit/postproc/hand_gate_runtime.py` | Mixed | Training-time priors apply in the loss; decode-time key signature prior and hand gate apply in postproc; chord smoothness is placeholder. |
 | Postproc constraints | `tivit/postproc/min_note_length.py`, `tivit/postproc/harmony_filter.py` | Stub | No-op placeholders. |
 
@@ -59,7 +59,7 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 | `scripts/train.py` | `scripts/tivit_train.py` (wraps `tivit/pipelines/train_single.py`) | Full |
 | `scripts/train_autopilot.py` | `scripts/tivit_autopilot.py` (wraps `tivit/pipelines/autopilot.py`) | Partial |
 | `scripts/calib/calibrate.py` | None (legacy-only) | None |
-| `scripts/calib/calibrate_thresholds.py` | `tivit/calibration/temperature.py`, `tivit/calibration/platt.py`, `tivit/calibration/io.py` | Partial |
+| `scripts/calib/calibrate_thresholds.py` | `tivit/pipelines/calibrate.py` | Partial |
 | `scripts/calib/calibrate_thresholds_legacy.py` | None (legacy-only) | None |
 | `scripts/calib/eval_thresholds.py` | None (legacy-only) | None |
 | `scripts/calib/eval_thresholds_legacy.py` | None (legacy-only) | None |

@@ -103,8 +103,12 @@ Dataset-specific additions:
 - `autopilot.onset_optimizer.*` / `offset_optimizer.*`: threshold grid and search parameters.
 
 ## Calibration (`calib/*.yaml`)
-- `calibration.method` (str): `temperature` or `platt`.
+- `calibration.method` (str): `threshold_sweep` (basic). `temperature`/`platt` are reserved for future fits.
 - `calibration.output_path` (str): where to write calibration JSON.
+- `calibration.threshold_priors_path` (str): dataset threshold priors YAML path for sweep centers.
+- `calibration.sweep.delta` (float): step size around the center threshold.
+- `calibration.sweep.steps` (int): number of sweep points (rounded up to an odd count).
+- `calibration.sweep.min_prob` / `max_prob` (float): clamp sweep values.
 
 ## Tips
 - Composition order in `default.yaml` defines override precedence.

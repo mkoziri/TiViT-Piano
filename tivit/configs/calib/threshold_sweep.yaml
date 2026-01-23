@@ -1,0 +1,11 @@
+# Threshold sweep calibration settings.
+calibration:
+  # Supported methods: threshold_sweep (basic), basic (alias).
+  method: threshold_sweep
+  output_path: calibration.json
+  threshold_priors_path: tivit/configs/priors/threshold_priors.yaml
+  sweep:
+    delta: 0.05
+    steps: 5
+    min_prob: 0.02
+    max_prob: 0.98
