@@ -5,7 +5,7 @@ calibration:
   output_path: calibration.json
   threshold_priors_path: tivit/logs/threshold_priors.yaml
   sweep:
-    delta: 0.03
-    steps: 5
-    min_prob: 0.02
-    max_prob: 0.98
+    delta: 0.1
+    steps: 9
+    min_prob: 0.05
+    max_prob: 0.95
