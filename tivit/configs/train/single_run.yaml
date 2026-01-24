@@ -22,7 +22,7 @@ training:
 
   metrics:
     prob_threshold: 0.2
-    prob_threshold_onset: 0.2
+    prob_threshold_onset: 0.5
     prob_threshold_offset: 0.2
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
@@ -32,15 +32,18 @@ training:
     prob_logit_bias_offset: 0.0
     decoder:
       onset:
-        open: 0.01
-        hold: 0.0075
+        open: 0.5
+        hold: 0.3
         min_on: 2
-        merge_gap: 1
-      offset:
-        open: 0.015
-        hold: 0.01
         min_off: 2
         merge_gap: 1
+        median: 3
+      offset:
+        open: 0.2
+        hold: 0.12
+        min_off: 2
+        merge_gap: 1
+        median: 3
     temporal_decoder:
       shared:
         low_ratio: 0.6
