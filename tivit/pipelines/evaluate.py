@@ -160,6 +160,17 @@ def evaluate(
                 except (TypeError, ValueError):
                     continue
 
+            # TEMP_DEBUG: log sigmoid stats to confirm output scale during eval.
+            if idx == 0:
+                for head in ("onset", "offset"):
+                    logit = outputs.get(f"{head}_logits")
+                    if torch.is_tensor(logit):
+                        probs = torch.sigmoid(logit.detach())
+                        log_stage(
+                            "eval",
+                            f"debug_{head}_sigmoid: mean={float(probs.mean().item()):.6f} max={float(probs.max().item()):.6f}",
+                        )
+
             logits_map: dict[str, torch.Tensor] = {}
             for head in ("onset", "offset"):
                 tensor = outputs.get(f"{head}_logits")

@@ -86,7 +86,7 @@ training:
       clef: 0.0
 
     # Used only if some head chooses pos_weight_mode: ema
-    ema_alpha: 0.0
+    ema_alpha: 0.05
 
     # Applied only to onset/offset rolls
     neg_smooth_onoff: 0.0
@@ -109,8 +109,8 @@ training:
 
       onset:
         loss: bce                   # focal | bce_pos | bce | bce_with_logits
-        pos_weight_mode: "fixed"
-        pos_weight: 150.0
+        pos_weight_mode: "ema"
+        pos_weight: null
         pos_weight_band: null
         focal_gamma: 2.0
         focal_alpha: 0.25
@@ -119,8 +119,8 @@ training:
 
       offset:
         loss: bce
-        pos_weight_mode: "fixed"
-        pos_weight: 165.0
+        pos_weight_mode: "ema"
+        pos_weight: null
         pos_weight_band: null
         focal_gamma: 2.5
         focal_alpha: 0.2
