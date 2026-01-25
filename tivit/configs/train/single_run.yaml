@@ -1,6 +1,6 @@
 # Training hyperparameters and metrics for a single run.
 training:
-  epochs: 5
+  epochs: 20
   learning_rate: 3e-5
   weight_decay: 0.01
   eval_freq: 1

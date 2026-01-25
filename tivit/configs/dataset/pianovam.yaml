@@ -10,7 +10,7 @@ dataset:
     - offset
     - hand
     - clef
-  max_clips: 10
+  max_clips: 50
   manifest:
     train: data/PianoVAM_v1.0/manifest.json
     val: data/PianoVAM_v1.0/manifest.json
@@ -19,7 +19,7 @@ dataset:
   split_train: train
   split_val: val
   split_test: test
-  frames: 48
+  frames: 60
   decode_fps: 60.0
   hop_seconds: 0.03333333333333333
   skip_seconds: 8.0
@@ -43,7 +43,7 @@ dataset:
         brightness: 0.1
         contrast: 0.1
   avlag:
-    enable: false # TEMP_DEBUG: disable AV lag correction for alignment check
+    enable: true
   crop_rescale: auto
   include_low_res: false
   batch_size: 2
@@ -66,7 +66,7 @@ dataset:
     clef_thresholds: [60, 64]
     note_min: 21
     note_max: 108
-    cache_labels: false # TEMP_DEBUG: rebuild targets every run
+    cache_labels: true
     cache_dir: .cache/labels
     targets_sparse: true
   hand_supervision:
