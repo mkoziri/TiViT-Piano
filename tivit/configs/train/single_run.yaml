@@ -30,6 +30,18 @@ training:
     prob_logit_bias: 0.0
     prob_logit_bias_onset: 0.0
     prob_logit_bias_offset: 0.0
+    eval_mode: both
+    patk:
+      fps: 30.0
+      onset_tolerance_ms: 100.0
+      onset_sigma: 0.2
+      onset_radius: 8
+      frame_sigma: 0.8
+      frame_radius: 4
+      threshold: 0.5
+      ignore_tail: 4
+      offset_ratio: 0.2
+      offset_min_tolerance: 0.05
     decoder:
       onset:
         open: 0.006
