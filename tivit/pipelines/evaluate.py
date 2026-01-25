@@ -147,6 +147,25 @@ def evaluate(
         dataset_cfg = {}
     hop_seconds = _resolve_hop_seconds(dataset_cfg)
     event_tolerance = _resolve_event_tolerance(dataset_cfg)
+    try:
+        hop_cfg_val = float(dataset_cfg.get("hop_seconds", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        hop_cfg_val = 0.0
+    try:
+        decode_fps_val = float(dataset_cfg.get("decode_fps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        decode_fps_val = 0.0
+    stride_est = int(round(hop_seconds * decode_fps_val)) if decode_fps_val > 0 else None
+    avlag_cfg = dataset_cfg.get("avlag", {}) if isinstance(dataset_cfg.get("avlag"), Mapping) else {}
+    frame_cfg = dataset_cfg.get("frame_targets", {}) if isinstance(dataset_cfg.get("frame_targets"), Mapping) else {}
+    log_stage(
+        "eval",
+        "TEMP_DEBUG alignment: "
+        f"decode_fps={decode_fps_val:.2f} hop_cfg={hop_cfg_val:.6f} hop_resolved={hop_seconds:.6f} "
+        f"stride_est={stride_est} event_tolerance={event_tolerance:.3f} "
+        f"avlag_enable={bool(avlag_cfg.get('enable', True))} "
+        f"cache_labels={bool(frame_cfg.get('cache_labels', True))} patk_fps={patk_cfg.fps:.2f}",
+    )
 
     ckpt_path = find_checkpoint(cfg_eval, checkpoint)
     if ckpt_path:

@@ -50,7 +50,7 @@ from tivit.data.transforms.augment import apply_global_augment
 from tivit.data.transforms.normalize import normalize
 from tivit.data.sampler import build_onset_balanced_sampler
 from tivit.data.targets.av_sync import AVLagCache
-from tivit.data.cache.frame_target_cache import FrameTargetCache
+from tivit.data.cache.frame_target_cache import FrameTargetCache, NullFrameTargetCache
 from tivit.data.targets.identifiers import canonical_video_id
 
 LOGGER = logging.getLogger(__name__)
@@ -125,7 +125,11 @@ class BasePianoDataset(Dataset):
         self._av_sync_cache = AVLagCache() if self.avlag_enabled else None
         if self._av_sync_cache is not None:
             self._av_sync_cache.preload()
-        self._frame_target_cache = FrameTargetCache(self.target_cfg.get("cache_dir"))
+        cache_labels = bool(self.target_cfg.get("cache_labels", True))
+        if cache_labels:
+            self._frame_target_cache = FrameTargetCache(self.target_cfg.get("cache_dir"))
+        else:
+            self._frame_target_cache = NullFrameTargetCache()
         self.frame_target_spec: Optional[FrameTargetSpec] = resolve_frame_target_spec(
             self.target_cfg,
             frames=self.frames,

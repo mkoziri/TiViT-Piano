@@ -227,3 +227,17 @@ class FrameTargetCache:
             return False
         finally:
             self._release_lock(lock_path)
+
+
+class NullFrameTargetCache(FrameTargetCache):
+    """Cache stub that never persists frame-target tensors."""
+
+    def __init__(self) -> None:
+        self.cache_dir = Path(".")
+        self._lock_timeout_logged = False
+
+    def load(self, _: str) -> Tuple[Optional[Dict[str, torch.Tensor]], bool]:
+        return None, False
+
+    def save(self, *_: object, **__: object) -> bool:
+        return False
