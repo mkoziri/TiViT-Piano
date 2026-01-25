@@ -255,19 +255,6 @@ def evaluate(
                 onset_probs = smooth_time_probs(onset_probs, sigma=patk_cfg.onset_sigma, radius=patk_cfg.onset_radius)
                 frame_probs = smooth_time_probs(frame_probs, sigma=patk_cfg.frame_sigma, radius=patk_cfg.frame_radius)
 
-                if idx == 0:
-                    # TEMP_DEBUG: remove once PATK threshold is calibrated.
-                    onset_mean = float(onset_probs.mean().detach().cpu().item())
-                    onset_max = float(onset_probs.max().detach().cpu().item())
-                    frame_mean = float(frame_probs.mean().detach().cpu().item())
-                    frame_max = float(frame_probs.max().detach().cpu().item())
-                    log_stage(
-                        "eval",
-                        "TEMP_DEBUG patk_probs: onset_mean="
-                        f"{onset_mean:.6f} onset_max={onset_max:.6f} "
-                        f"frame_mean={frame_mean:.6f} frame_max={frame_max:.6f}",
-                    )
-
                 onset_mask = clamp_probs(onset_probs, patk_cfg.threshold)
                 frame_mask = clamp_probs(frame_probs, patk_cfg.threshold)
 
