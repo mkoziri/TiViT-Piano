@@ -33,15 +33,15 @@ training:
     decoder:
       # TEMP_DEBUG: lower gates to confirm events appear before recalibrating.
       onset:
-        open: 0.1
-        hold: 0.06
+        open: 0.008
+        hold: 0.005
         min_on: 2
         min_off: 2
         merge_gap: 1
         median: 3
       offset:
-        open: 0.1
-        hold: 0.06
+        open: 0.007
+        hold: 0.004
         min_off: 2
         merge_gap: 1
         median: 3
