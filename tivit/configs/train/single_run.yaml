@@ -34,16 +34,16 @@ training:
       onset:
         open: 0.006
         hold: 0.0036
-        min_on: 2
-        min_off: 2
-        merge_gap: 1
-        median: 3
+        min_on: 1
+        min_off: 1
+        merge_gap: 0
+        median: 1
       offset:
         open: 0.007
         hold: 0.0042
-        min_off: 2
-        merge_gap: 1
-        median: 3
+        min_off: 1
+        merge_gap: 0
+        median: 1
     temporal_decoder:
       shared:
         low_ratio: 0.6
