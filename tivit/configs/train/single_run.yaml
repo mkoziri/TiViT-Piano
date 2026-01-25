@@ -21,9 +21,9 @@ training:
     frame_kernel: [0.5, 1.0, 0.5]
 
   metrics:
-    prob_threshold: 0.005
-    prob_threshold_onset: 0.005
-    prob_threshold_offset: 0.005
+    prob_threshold: 0.006
+    prob_threshold_onset: 0.006
+    prob_threshold_offset: 0.007
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
     prob_temperature_offset: 1.0
@@ -31,17 +31,16 @@ training:
     prob_logit_bias_onset: 0.0
     prob_logit_bias_offset: 0.0
     decoder:
-      # TEMP_DEBUG: lower gates to confirm events appear before recalibrating.
       onset:
-        open: 0.008
-        hold: 0.005
+        open: 0.006
+        hold: 0.0036
         min_on: 2
         min_off: 2
         merge_gap: 1
         median: 3
       offset:
         open: 0.007
-        hold: 0.004
+        hold: 0.0042
         min_off: 2
         merge_gap: 1
         median: 3
