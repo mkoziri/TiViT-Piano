@@ -59,7 +59,7 @@ dataset:
   require_labels: true
   frame_targets:
     enable: true
-    tolerance: 0.03
+    tolerance: 0.10
     dilate_active_frames: 1
     fill_mode: overlap
     hand_from_pitch: true
