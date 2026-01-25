@@ -21,9 +21,9 @@ training:
     frame_kernel: [0.5, 1.0, 0.5]
 
   metrics:
-    prob_threshold: 0.2
-    prob_threshold_onset: 0.5
-    prob_threshold_offset: 0.2
+    prob_threshold: 0.005
+    prob_threshold_onset: 0.005
+    prob_threshold_offset: 0.005
     prob_temperature: 1.0
     prob_temperature_onset: 1.0
     prob_temperature_offset: 1.0
