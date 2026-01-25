@@ -38,7 +38,7 @@ training:
       onset_radius: 8
       frame_sigma: 0.8
       frame_radius: 4
-      threshold: 0.008
+      threshold: 0.007
       ignore_tail: 4
       offset_ratio: 0.2
       offset_min_tolerance: 0.05
