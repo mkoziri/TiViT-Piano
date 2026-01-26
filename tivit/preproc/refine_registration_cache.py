@@ -10,6 +10,7 @@ from typing import Any, Mapping, MutableSequence, Sequence, Type
 
 from tivit.core.config import resolve_config_chain
 from tivit.data.roi.keyboard_roi import RegistrationRefiner, resolve_registration_cache_path
+from tivit.data.targets.identifiers import canonical_video_id
 
 
 def _load_config(path: Path) -> Mapping[str, Any]:
@@ -82,9 +83,20 @@ def main() -> int:
         description="Populate reg_refined.json for all dataset splits.",
     )
     parser.add_argument("config", help="Path to dataset config YAML.")
+    parser.add_argument(
+        "--only-ids",
+        help="Comma-separated list of video IDs to process (optional).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging and ROI artifact dumps.",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
+    logging.getLogger("tivit.data.roi.keyboard_roi").setLevel(log_level)
 
     cfg = _load_config(Path(args.config))
     dataset_cfg = cfg.get("dataset")
@@ -104,6 +116,13 @@ def main() -> int:
 
     refiner = RegistrationRefiner(canonical_hw, cache_path=cache_path, sample_frames=sample_frames)
 
+    only_ids = set()
+    if args.only_ids:
+        for part in str(args.only_ids).split(","):
+            token = part.strip()
+            if token:
+                only_ids.add(canonical_video_id(token))
+
     total_processed = 0
     total_fallback = 0
     warmup_target = 2
@@ -120,6 +139,9 @@ def main() -> int:
         warmup_count = min(warmup_target, len(entries))
 
         for idx, entry in enumerate(entries):
+            canon_id = canonical_video_id(entry.video_id)
+            if only_ids and canon_id not in only_ids:
+                continue
             crop_meta = None
             metadata = entry.metadata if isinstance(entry.metadata, Mapping) else {}
             if isinstance(metadata, Mapping):
@@ -132,6 +154,8 @@ def main() -> int:
                     crop_meta=crop_meta,
                     debug_context={"split": split, "dataset_index": idx},
                 )
+                if only_ids:
+                    only_ids.discard(canon_id)
                 if str(result.status).startswith("fallback"):
                     fallback += 1
                     entry_fallback = True
@@ -151,6 +175,10 @@ def main() -> int:
                     fallback=fallback,
                     cache_path=cache_path,
                 )
+
+        if only_ids:
+            logging.warning("Missing requested IDs after split=%s: %s", split, sorted(only_ids))
+            break
 
         _print_summary(
             split=split,
