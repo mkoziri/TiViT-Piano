@@ -491,6 +491,8 @@ def run_training(
                 per_tile_support=per_tile_train,
                 debug_dummy_labels=debug_dummy_labels,
             )
+            if train_metrics:
+                LOGGER.info("[train] epoch=%d metrics=%s", epoch, train_metrics)
             eval_metrics = None
             if val_loader is not None and (epoch % eval_freq == 0):
                 eval_step = lambda batch: _compute_loss_for_batch(  # noqa: E731

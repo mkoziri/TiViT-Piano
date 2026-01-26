@@ -147,7 +147,10 @@ class BasePianoDataset(Dataset):
             entries = entries[: int(max_clips)]
         self.entries: List[DatasetEntry] = entries
 
-        self._sampler = build_onset_balanced_sampler(self, self.sampler_cfg, base_seed=int(seed_val or 0))
+        if str(self.split).lower() == "train":
+            self._sampler = build_onset_balanced_sampler(self, self.sampler_cfg, base_seed=int(seed_val or 0))
+        else:
+            self._sampler = None
 
     def build_onset_sampler_metadata(self, nearmiss_radius: int = 0) -> Mapping[str, Any]:
         """Collect onset/background indices plus start frames for the sampler."""
