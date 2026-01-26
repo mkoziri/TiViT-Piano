@@ -31,7 +31,7 @@ dataset:
   apply_crop: true
   canonical_hw: [180, 1536]
   registration:
-    enable: true
+    enable: false
     cache_path: reg_refined_pianovam.json
     source: metadata
     interp: bilinear
@@ -43,7 +43,7 @@ dataset:
         brightness: 0.1
         contrast: 0.1
   avlag:
-    enable: true
+    enable: false
   crop_rescale: auto
   include_low_res: false
   batch_size: 2

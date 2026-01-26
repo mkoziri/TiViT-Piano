@@ -12,7 +12,7 @@ training:
   reset_head_bias: false
 
   soft_targets:
-    enabled: false
+    enabled: true
     apply_to:
       onset: true
       pitch: true
