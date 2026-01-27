@@ -60,13 +60,13 @@ dataset:
   frame_targets:
     enable: true
     tolerance: 0.10
-    dilate_active_frames: 1
+    dilate_active_frames: 3 #it was one
     fill_mode: overlap
     hand_from_pitch: true
     clef_thresholds: [60, 64]
     note_min: 21
     note_max: 108
-    cache_labels: true
+    cache_labels: false
     cache_dir: .cache/labels
     targets_sparse: true
   hand_supervision:
