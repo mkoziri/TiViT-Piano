@@ -8,8 +8,8 @@ training:
   log_interval: 1 # was 25
   save_every: 1
   amp: false
-  resume: true
-  reset_head_bias: false
+  resume: false
+  reset_head_bias: true
 
   soft_targets:
     enabled: true
@@ -120,8 +120,8 @@ training:
 
       onset:
         loss: bce                   # focal | bce_pos | bce | bce_with_logits
-        pos_weight_mode: "ema"
-        pos_weight: null
+        pos_weight_mode: "fixed"
+        pos_weight: 10.0
         pos_weight_band: null
         focal_gamma: 2.0
         focal_alpha: 0.25
@@ -130,8 +130,8 @@ training:
 
       offset:
         loss: bce
-        pos_weight_mode: "ema"
-        pos_weight: null
+        pos_weight_mode: "fixed"
+        pos_weight: 8.0
         pos_weight_band: null
         focal_gamma: 2.5
         focal_alpha: 0.2
