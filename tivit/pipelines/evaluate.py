@@ -118,11 +118,20 @@ def _resolve_calibration_path(cfg: Mapping[str, Any]) -> Path | None:
     path = Path(str(raw_path)).expanduser()
     if path.is_absolute():
         return path if path.exists() else None
+    candidates = []
     if path.exists():
-        return path
+        candidates.append(path)
     log_dir = Path(cfg.get("logging", {}).get("log_dir", "logs")).expanduser()
-    candidate = log_dir / path
-    return candidate if candidate.exists() else None
+    candidates.append(log_dir / path)
+    repo_root = Path(__file__).resolve().parents[2]
+    if path.parent == Path("."):
+        candidates.append(repo_root / "tivit" / "logs" / path.name)
+    else:
+        candidates.append(repo_root / "tivit" / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _apply_calibration_decoder_overrides(
