@@ -224,6 +224,7 @@ def evaluate(
     total_loss = 0.0
     total_batches = 0
     parts_sum: dict[str, float] = {}
+    debug_logged = False
     event_counts = None
     if eval_mode in {"native", "both"}:
         event_counts = {
@@ -262,6 +263,27 @@ def evaluate(
                     parts_sum[key] = parts_sum.get(key, 0.0) + float(value)
                 except (TypeError, ValueError):
                     continue
+
+            if not debug_logged:
+                # TEMP_DEBUG: log sigmoid stats for onset/offset to verify logit scale.
+                onset_logits = outputs.get("onset_logits")
+                offset_logits = outputs.get("offset_logits")
+                if torch.is_tensor(onset_logits) and torch.is_tensor(offset_logits):
+                    onset_probs = torch.sigmoid(onset_logits.detach())
+                    offset_probs = torch.sigmoid(offset_logits.detach())
+                    log_stage(
+                        "eval",
+                        (
+                            "TEMP_DEBUG logits: onset(mean={:.6f} max={:.6f}) "
+                            "offset(mean={:.6f} max={:.6f})"
+                        ).format(
+                            float(onset_probs.mean().item()),
+                            float(onset_probs.max().item()),
+                            float(offset_probs.mean().item()),
+                            float(offset_probs.max().item()),
+                        ),
+                    )
+                    debug_logged = True
 
 
             if eval_mode in {"native", "both"} and event_counts is not None:
