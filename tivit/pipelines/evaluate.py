@@ -25,6 +25,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from tivit.calibration import read_calibration
 from tivit.data.loaders import make_dataloader
 from tivit.decoder.decode import pool_roll_BT
 from tivit.models import build_model
@@ -107,6 +108,50 @@ def _resolve_eval_mode(metrics_cfg: Mapping[str, Any]) -> str:
     return mode
 
 
+def _resolve_calibration_path(cfg: Mapping[str, Any]) -> Path | None:
+    calibration_cfg = cfg.get("calibration", {}) if isinstance(cfg, Mapping) else {}
+    if not isinstance(calibration_cfg, Mapping):
+        return None
+    raw_path = calibration_cfg.get("output_path")
+    if not raw_path:
+        return None
+    path = Path(str(raw_path)).expanduser()
+    if path.is_absolute():
+        return path if path.exists() else None
+    if path.exists():
+        return path
+    log_dir = Path(cfg.get("logging", {}).get("log_dir", "logs")).expanduser()
+    candidate = log_dir / path
+    return candidate if candidate.exists() else None
+
+
+def _apply_calibration_decoder_overrides(
+    metrics_cfg: dict[str, Any],
+    calibration: Mapping[str, Any],
+) -> bool:
+    decoder_payload = calibration.get("decoder")
+    if not isinstance(decoder_payload, Mapping):
+        return False
+    decoder_cfg = metrics_cfg.get("decoder")
+    if not isinstance(decoder_cfg, dict):
+        decoder_cfg = {}
+        metrics_cfg["decoder"] = decoder_cfg
+    updated = False
+    for head in ("onset", "offset"):
+        entry = decoder_payload.get(head)
+        if not isinstance(entry, Mapping):
+            continue
+        head_cfg = decoder_cfg.get(head)
+        if not isinstance(head_cfg, dict):
+            head_cfg = {}
+            decoder_cfg[head] = head_cfg
+        for key in ("open", "hold", "min_on", "min_off", "merge_gap", "median"):
+            if key in entry and entry[key] is not None:
+                head_cfg[key] = entry[key]
+                updated = True
+    return updated
+
+
 def evaluate(
     configs: Sequence[str | Path] | None = None,
     *,
@@ -136,10 +181,21 @@ def evaluate(
     amp_enabled = bool(training_cfg.get("amp", False)) and torch.cuda.is_available()
     debug_dummy_labels = bool(training_cfg.get("debug_dummy_labels", False))
     per_tile_support = PerTileSupport(cfg_eval, getattr(loader, "dataset", None), phase="eval")
-    decoder = build_decoder(cfg_eval)
     metrics_cfg = training_cfg.get("metrics", {}) if isinstance(training_cfg, Mapping) else {}
-    if not isinstance(metrics_cfg, Mapping):
-        metrics_cfg = {}
+    if not isinstance(metrics_cfg, dict):
+        metrics_cfg = dict(metrics_cfg) if isinstance(metrics_cfg, Mapping) else {}
+        if isinstance(training_cfg, dict):
+            training_cfg["metrics"] = metrics_cfg
+    calib_path = _resolve_calibration_path(cfg_eval)
+    if calib_path is not None:
+        try:
+            calibration_payload = read_calibration(calib_path)
+        except Exception as exc:
+            log_stage("eval", f"failed to load calibration {calib_path}: {exc}")
+        else:
+            if _apply_calibration_decoder_overrides(metrics_cfg, calibration_payload):
+                log_stage("eval", f"using calibration overrides from {calib_path}")
+    decoder = build_decoder(cfg_eval)
     eval_mode = _resolve_eval_mode(metrics_cfg)
     patk_cfg = PatkDecodeConfig.from_config(metrics_cfg, cfg_eval.get("dataset", {}) if isinstance(cfg_eval, Mapping) else {})
     dataset_cfg = cfg_eval.get("dataset", {}) if isinstance(cfg_eval, Mapping) else {}
