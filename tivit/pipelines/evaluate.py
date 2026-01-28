@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from tivit.calibration import read_calibration
+from tivit.calibration.io import read_calibration
 from tivit.data.loaders import make_dataloader
 from tivit.decoder.decode import pool_roll_BT
 from tivit.models import build_model
