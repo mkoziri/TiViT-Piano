@@ -26,7 +26,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import numpy as np
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -40,6 +42,7 @@ from tivit.data.targets.frame_targets import FrameTargetSpec, prepare_frame_targ
 from tivit.decoder.registration_geometry import build_canonical_registration_metadata
 from tivit.decoder.tile_keymap import build_tile_key_mask
 from tivit.preproc.threshold_stats import SplitStats, build_log_bins
+from tivit.utils.imbalance import map_ratio_to_band, sanitize_ratio
 
 
 class NullFrameTargetCache(FrameTargetCache):
@@ -89,6 +92,43 @@ def _collect_splits(dataset_cfg: Mapping[str, Any]) -> List[str]:
     _add(dataset_cfg.get("split"))
     return list(splits) if splits else ["train"]
 
+
+
+
+def _resolve_pos_weight_bands(cfg: Mapping[str, Any]) -> Dict[str, Tuple[float, float]]:
+    heads = cfg.get("training", {}).get("loss", {}).get("heads", {}) if isinstance(cfg, Mapping) else {}
+    if not isinstance(heads, Mapping):
+        heads = {}
+
+    def _band(head: str, default: Tuple[float, float]) -> Tuple[float, float]:
+        head_cfg = heads.get(head, {}) if isinstance(heads.get(head), Mapping) else {}
+        band = head_cfg.get("pos_weight_band")
+        if isinstance(band, Sequence) and not isinstance(band, (str, bytes)) and len(band) == 2:
+            return float(band[0]), float(band[1])
+        return default
+
+    return {
+        "pitch": _band("pitch", (2.0, 4.0)),
+        "onset": _band("onset", (3.0, 5.0)),
+        "offset": _band("offset", (3.0, 5.0)),
+    }
+
+
+def _pos_weights_from_stats(stats: SplitStats, bands: Mapping[str, Tuple[float, float]]) -> Dict[str, List[float]]:
+    weights: Dict[str, List[float]] = {}
+    for head in ("pitch", "onset", "offset"):
+        pos_counts = np.asarray(stats.pos_counts_by_key.get(head, []), dtype=np.float64)
+        if pos_counts.size == 0 or stats.n_keys <= 0:
+            continue
+        total_cells = float(stats.total_cells.get(head, 0))
+        if total_cells <= 0:
+            continue
+        total_per_key = total_cells / float(stats.n_keys)
+        neg = np.clip(total_per_key - pos_counts, 0.0, None)
+        ratio = np.where(pos_counts > 0.0, neg / np.maximum(pos_counts, 1e-12), np.inf)
+        ratio = sanitize_ratio(ratio)
+        weights[head] = map_ratio_to_band(torch.as_tensor(ratio), bands[head]).tolist()
+    return weights
 
 def _resolve_threshold_baselines(cfg: Mapping[str, Any]) -> Dict[str, float]:
     metrics_cfg = cfg.get("training", {}).get("metrics", {}) if isinstance(cfg, Mapping) else {}
@@ -592,6 +632,7 @@ def main() -> int:
         splits = [s.strip() for s in args.splits.split(",") if s.strip()]
 
     summaries: Dict[str, Mapping[str, Any]] = {}
+    stats_by_split: Dict[str, SplitStats] = {}
     specs: Dict[str, Mapping[str, Any]] = {}
     for split in splits:
         stats, spec = compute_split_stats(
@@ -603,6 +644,7 @@ def main() -> int:
             disable_targets=bool(args.disable_targets),
         )
         summary = stats.summary()
+        stats_by_split[split] = stats
         summaries[split] = summary
         if spec is not None:
             specs[split] = {
@@ -635,6 +677,25 @@ def main() -> int:
         yaml.safe_dump(output, handle, sort_keys=False)
 
     print(f"[threshold_priors] wrote {out_path}", flush=True)
+    ref_split = _pick_reference_split(summaries)
+    ref_stats = stats_by_split.get(ref_split)
+    if ref_stats is not None:
+        bands = _resolve_pos_weight_bands(cfg)
+        weights = _pos_weights_from_stats(ref_stats, bands)
+        log_dir = Path(__file__).resolve().parents[1] / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        weights_path = log_dir / "pos_weights.json"
+        payload = {
+            "meta": {
+                "config": str(args.config),
+                "split": ref_split,
+            },
+            "bands": {k: list(v) for k, v in bands.items()},
+            "weights": weights,
+        }
+        weights_path.write_text(json.dumps(payload, indent=2))
+        print(f"[threshold_priors] wrote pos_weight file {weights_path}", flush=True)
+
     return 0
 
 

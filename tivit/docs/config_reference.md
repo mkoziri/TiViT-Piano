@@ -76,6 +76,7 @@ Dataset-specific additions:
 - `training.reset_head_bias` (bool): reinit onset/offset heads.
 - `training.soft_targets.*` (mapping): enable/which heads/kernel shapes.
 - `training.loss.head_weights` (mapping): per-head weights for pitch/onset/offset/hand/clef.
+- `training.loss.pos_weight_path` (str): optional dataset-level pos_weight JSON (from `tivit.preproc.threshold_priors`).
 - `training.loss.ema_alpha` / `neg_smooth_onoff` (float): EMA alpha for pos_weight_mode=ema; negative smoothing strength.
 - `training.loss.per_tile.*` (mapping): enable/heads/mask cushion/debug interval for per-tile supervision.
 - `training.loss.heads.*` (mapping): explicit per-head configs. Pitch requires loss/pos_weight_mode/pos_weight/pos_weight_band; onset/offset also require focal_gamma/focal_alpha/prior_mean/prior_weight; hand/clef expose `loss: ce`.

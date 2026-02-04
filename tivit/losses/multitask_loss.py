@@ -17,8 +17,10 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -28,6 +30,7 @@ import torch.nn.functional as F
 from tivit.decoder.decode import pool_roll_BT
 from tivit.priors.base import compute_prior_mean_regularizer
 from tivit.priors.hand_gating import build_reach_weights
+from tivit.utils.imbalance import map_ratio_to_band
 
 LOGGER = logging.getLogger(__name__)
 _ADAPTIVE_BAND_LOGGED: set[Tuple[str, str]] = set()
@@ -91,17 +94,20 @@ def _banded_pos_weight_from_roll(
     pos = flat.mean(dim=0).clamp(min=eps, max=1.0 - eps)
     neg = (1.0 - pos).clamp_min(eps)
     ratio = neg / pos  # larger when positives are rarer
-    low, high = band
-    if high < low:
-        low, high = high, low
-    span = ratio.max() - ratio.min()
-    if span <= eps:
-        mapped = torch.full_like(ratio, 0.5 * (low + high))
-    else:
-        mapped = (ratio - ratio.min()) / span.clamp_min(eps)
-        mapped = low + mapped * (high - low)
-    mapped = mapped.clamp(min=min(low, high), max=max(low, high))
-    return mapped
+    return map_ratio_to_band(ratio, band, eps=eps)
+
+
+def _load_pos_weight_file(path: str | Path) -> Mapping[str, Any]:
+    """Load precomputed pos_weight values from JSON."""
+    path_obj = Path(path).expanduser()
+    if not path_obj.exists():
+        raise ValueError(f"pos_weight_path not found: {path_obj}")
+    data = json.loads(path_obj.read_text())
+    if isinstance(data, Mapping) and isinstance(data.get("weights"), Mapping):
+        data = data["weights"]
+    if not isinstance(data, Mapping):
+        raise ValueError("pos_weight file must contain a mapping of head -> weights")
+    return data
 
 
 def _log_banded_weight_stats(head: str, context: str, weights: torch.Tensor, band: Tuple[float, float]) -> None:
@@ -151,6 +157,24 @@ def _dynamic_pos_weighted_bce(
         pos_weight=pos_weight,
         reduction="mean",
     )
+
+
+
+
+def _pos_weight_tensor(value: Any, size: int, device: torch.device, ctx: str) -> torch.Tensor:
+    """Build a per-class pos_weight tensor for BCE losses."""
+    if value is None:
+        raise ValueError(f"{ctx} pos_weight is required but missing")
+    if torch.is_tensor(value):
+        tensor = value.detach().to(device=device, dtype=torch.float32).flatten()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        tensor = torch.tensor([_as_float(v, f"{ctx}[{i}]") for i, v in enumerate(value)],
+                              device=device, dtype=torch.float32)
+    else:
+        return torch.full((size,), _as_float(value, ctx), dtype=torch.float32, device=device)
+    if tensor.numel() != size:
+        raise ValueError(f"{ctx} pos_weight expected {size} values, got {tensor.numel()}")
+    return tensor
 
 
 def _time_pool_out_to_clip(out: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
@@ -428,7 +452,7 @@ def _validate_loss_schema(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(loss_cfg, Mapping):
         raise ValueError("Config is missing 'training.loss' mapping required for loss construction")
 
-    allowed_top = {"head_weights", "ema_alpha", "neg_smooth_onoff", "per_tile", "heads"}
+    allowed_top = {"head_weights", "ema_alpha", "neg_smooth_onoff", "per_tile", "heads", "pos_weight_path"}
     _validate_required(loss_cfg, allowed_top, allowed_top, "training.loss")
 
     head_weights_raw = loss_cfg.get("head_weights")
@@ -450,6 +474,10 @@ def _validate_loss_schema(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     per_tile = _validate_per_tile(per_tile_cfg)
 
     heads_cfg = loss_cfg.get("heads")
+    pos_weight_path = loss_cfg.get("pos_weight_path")
+    if pos_weight_path is not None:
+        pos_weight_path = str(pos_weight_path)
+
     if not isinstance(heads_cfg, Mapping):
         raise ValueError("training.loss.heads must be a mapping")
     _validate_required(heads_cfg, set(HEAD_ORDER), set(HEAD_ORDER), "training.loss.heads")
@@ -463,6 +491,7 @@ def _validate_loss_schema(cfg: Mapping[str, Any]) -> Dict[str, Any]:
         "ema_alpha": ema_alpha,
         "neg_smooth_onoff": neg_smooth,
         "per_tile": per_tile,
+        "pos_weight_path": pos_weight_path,
         "heads": heads,
     }
 
@@ -562,6 +591,11 @@ class MultitaskLoss:
         self.priors_enabled = bool(priors_cfg.get("enabled", False))
         self.hand_gating_cfg = priors_cfg.get("hand_gating", {}) if self.priors_enabled else {}
 
+        self.precomputed_pos_weights = None
+        pos_weight_path = validated.get("pos_weight_path")
+        if pos_weight_path:
+            self.precomputed_pos_weights = _load_pos_weight_file(pos_weight_path)
+
     def state_dict(self) -> Dict[str, Any]:
         """Return serialisable adaptive state (EMA trackers)."""
         return {"pos_rate_state": None if self.pos_rate_state is None else self.pos_rate_state.state_dict()}
@@ -609,8 +643,10 @@ class MultitaskLoss:
         if mode in {"off", "none"}:
             return None
         if mode == "fixed":
-            return torch.full((target.shape[-1],), float(pos_weight), dtype=torch.float32, device=device)
+            return _pos_weight_tensor(pos_weight, target.shape[-1], device, "pitch pos_weight")
         if mode == "adaptive_band":
+            if self.precomputed_pos_weights and "pitch" in self.precomputed_pos_weights:
+                return _pos_weight_tensor(self.precomputed_pos_weights["pitch"], target.shape[-1], device, "pitch pos_weight")
             if band is None:
                 raise ValueError("pitch pos_weight_mode='adaptive_band' requires pos_weight_band")
             weights_local = _banded_pos_weight_from_roll(target, band, eps)
@@ -638,16 +674,15 @@ class MultitaskLoss:
         if mode in {"off", "none"}:
             return None
         if mode == "fixed":
-            if pos_weight is None:
-                raise ValueError(f"{head} pos_weight_mode='fixed' requires pos_weight")
-            pos_val = float(pos_weight)
-            return torch.full((roll.shape[-1],), pos_val, dtype=torch.float32, device=device)
+            return _pos_weight_tensor(pos_weight, roll.shape[-1], device, f"{head} pos_weight")
         if mode == "ema":
             if state is None:
                 raise ValueError("pos_weight_mode='ema' requires training.loss.ema_alpha > 0")
             fn = state.clip_pos_weight if context == "clip" else state.frame_pos_weight
             return fn(head, roll, update=update_state).to(device=device)
         if mode == "adaptive_band":
+            if self.precomputed_pos_weights and head in self.precomputed_pos_weights:
+                return _pos_weight_tensor(self.precomputed_pos_weights[head], roll.shape[-1], device, f"{head} pos_weight")
             if band is None:
                 raise ValueError(f"{head} pos_weight_mode='adaptive_band' requires pos_weight_band")
             weights_local = _banded_pos_weight_from_roll(roll, band)
