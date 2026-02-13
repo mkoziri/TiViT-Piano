@@ -9,7 +9,7 @@ CLI Arguments:
     - configs: YAML fragments to merge before evaluation.
     - verbose: logging verbosity (quiet|info|debug).
     - split: dataset split override for evaluation.
-    - checkpoint: optional checkpoint hint (default: latest).
+    - checkpoint: optional checkpoint hint (default: best, else latest).
     - max_batches / max_clips / frames: evaluation caps.
     - seed / deterministic: runtime overrides.
     - smoke: tiny run for quick sanity checks.

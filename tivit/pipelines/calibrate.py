@@ -11,7 +11,7 @@ Key Functions/Classes:
 
 CLI Arguments:
     --config PATH (repeatable): config fragments to merge.
-    --checkpoint PATH: explicit checkpoint (default: latest in checkpoint_dir).
+    --checkpoint PATH: explicit checkpoint (default: best in checkpoint_dir, else latest).
     --max-batches INT / --max-clips INT / --frames INT: evaluation caps.
     --seed INT / --deterministic[/-no-deterministic]: runtime overrides.
     --verbose {quiet,info,debug}: logging verbosity.

@@ -9,7 +9,7 @@ Key Functions/Classes:
 CLI Arguments:
     - configs: YAML fragments to merge before export.
     - verbose: logging verbosity (quiet|info|debug).
-    - checkpoint: checkpoint path to export (default: latest under logging.checkpoint_dir).
+    - checkpoint: checkpoint path to export (default: best under logging.checkpoint_dir, else latest).
     - output_path: explicit TorchScript destination (default: inference.output_dir/<name>_ts.pt).
     - seed / deterministic: optional runtime overrides applied before export.
 Usage:

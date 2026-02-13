@@ -33,6 +33,7 @@ PRESETS: dict[str, set[str]] = {
     "pycache": {"pycache"},
     "custom": set(),
 }
+CHECKPOINT_EXTS = {".pt", ".pth", ".ckpt"}
 
 
 def _safe_resolve(path: Path) -> Path:
@@ -118,16 +119,43 @@ def _find_pycache_dirs(project_root: Path) -> list[Path]:
     return pycache_dirs
 
 
+def _is_best_checkpoint(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    name = path.name.lower()
+    return "best" in name and path.suffix.lower() in CHECKPOINT_EXTS
+
+
+def _find_best_checkpoints(checkpoint_dir: Path) -> set[Path]:
+    best: set[Path] = set()
+    for entry in checkpoint_dir.rglob("*"):
+        if _is_best_checkpoint(entry):
+            best.add(entry)
+    return best
+
+
 def _selective_checkpoint_targets(checkpoint_dir: Path) -> list[Path]:
     if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
         return [checkpoint_dir]
+    best_files = _find_best_checkpoints(checkpoint_dir)
+    if not best_files:
+        return [checkpoint_dir]
     selective: list[Path] = []
     for entry in checkpoint_dir.iterdir():
-        name = entry.name.lower()
-        if entry.is_file() and "best" in name and entry.suffix.lower() in {".pt", ".pth", ".ckpt"}:
+        if entry.is_file():
+            if entry in best_files:
+                continue
+            selective.append(entry)
             continue
-        selective.append(entry)
-    return selective or [checkpoint_dir]
+        if entry.is_dir():
+            if any(_is_within(best_path, entry) for best_path in best_files):
+                for child in entry.rglob("*"):
+                    if child.is_dir() or child in best_files:
+                        continue
+                    selective.append(child)
+            else:
+                selective.append(entry)
+    return selective
 
 
 def _build_targets(

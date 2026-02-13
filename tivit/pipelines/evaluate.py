@@ -10,7 +10,7 @@ CLI Arguments:
     - configs: YAML fragments to merge before evaluation.
     - verbose: logging verbosity (quiet|info|debug).
     - split: dataset split to evaluate (default: dataset.split_val/test fallback).
-    - checkpoint: checkpoint path to load (default: latest under logging.checkpoint_dir).
+    - checkpoint: checkpoint path to load (default: best under logging.checkpoint_dir, else latest).
     - max_batches: cap evaluation batches for smoke tests.
     - max_clips / frames / seed / deterministic / smoke: optional overrides applied to eval only.
 Usage:

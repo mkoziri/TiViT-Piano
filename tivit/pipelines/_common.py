@@ -7,7 +7,7 @@ Purpose:
 Key Functions/Classes:
     - prepare_run: load configs, configure logging, and write run artifacts.
     - resolve_eval_split: choose an eval split from config with sensible fallbacks.
-    - find_checkpoint: locate an explicit or latest checkpoint path.
+    - find_checkpoint: locate an explicit or best/latest checkpoint path.
     - load_model_weights: load a model state dict from a checkpoint payload.
     - setup_runtime: apply determinism settings and return a device handle.
 CLI Arguments:
@@ -30,6 +30,25 @@ from tivit.core.determinism import configure_determinism, resolve_deterministic_
 from tivit.utils.logging import configure_logging
 
 LOGGER = logging.getLogger(__name__)
+CHECKPOINT_EXTS = {".pt", ".pth", ".ckpt"}
+
+
+def _is_best_checkpoint(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    name = path.name.lower()
+    return "best" in name and path.suffix.lower() in CHECKPOINT_EXTS
+
+
+def _find_best_checkpoint(ckpt_dir: Path) -> Path | None:
+    candidates = [path for path in ckpt_dir.iterdir() if _is_best_checkpoint(path)]
+    if not candidates:
+        return None
+    preferred = {f"best{ext}" for ext in CHECKPOINT_EXTS}
+    preferred_candidates = [path for path in candidates if path.name.lower() in preferred]
+    if preferred_candidates:
+        return max(preferred_candidates, key=lambda path: path.stat().st_mtime)
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def prepare_run(
@@ -64,18 +83,20 @@ def resolve_eval_split(cfg: Mapping[str, Any], split_override: str | None = None
 
 
 def find_checkpoint(cfg: Mapping[str, Any], checkpoint: str | Path | None = None) -> Path | None:
-    """Return an explicit checkpoint or the latest epoch_* file under checkpoint_dir."""
+    """Return an explicit checkpoint or the best/latest checkpoint under checkpoint_dir."""
     if checkpoint:
         resolved = Path(checkpoint).expanduser()
         return resolved if resolved.exists() else None
     log_cfg = cfg.get("logging", {}) if isinstance(cfg, Mapping) else {}
     ckpt_dir = Path(log_cfg.get("checkpoint_dir", "./checkpoints")).expanduser()
-    if not ckpt_dir.exists():
+    if not ckpt_dir.exists() or not ckpt_dir.is_dir():
         return None
-    best = ckpt_dir / "best.pt"
-    if best.exists():
+    best = _find_best_checkpoint(ckpt_dir)
+    if best is not None:
         return best
-    candidates = list(ckpt_dir.glob("epoch_*.pt"))
+    candidates: list[Path] = []
+    for ext in CHECKPOINT_EXTS:
+        candidates.extend(ckpt_dir.glob(f"epoch_*{ext}"))
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)

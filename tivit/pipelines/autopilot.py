@@ -11,7 +11,7 @@ CLI Arguments:
     - verbose: logging verbosity (quiet|info|debug).
     - train_split / val_split / eval_split: dataset split overrides.
     - max_clips / frames / seed / deterministic / smoke: shared runtime overrides.
-    - checkpoint: optional checkpoint hint (default: latest after training).
+    - checkpoint: optional checkpoint hint (default: best after training, else latest).
     - max_eval_batches: limit eval batches; skip_eval / skip_export toggles.
     - export_path: explicit TorchScript destination.
 Usage:
