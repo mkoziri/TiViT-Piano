@@ -58,7 +58,7 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 |---|---|---|
 | `scripts/train.py` | `scripts/tivit_train.py` (wraps `tivit/pipelines/train_single.py`) | Full |
 | `scripts/train_autopilot.py` | `scripts/tivit_autopilot.py` (wraps `tivit/pipelines/autopilot.py`) | Partial |
-| `scripts/calib/calibrate.py` | None (legacy-only) | None |
+| `scripts/calib/calibrate.py` | `tivit/pipelines/calibrate.py` | Partial |
 | `scripts/calib/calibrate_thresholds.py` | `tivit/pipelines/calibrate.py` | Partial |
 | `scripts/calib/calibrate_thresholds_legacy.py` | None (legacy-only) | None |
 | `scripts/calib/eval_thresholds.py` | None (legacy-only) | None |
@@ -69,7 +69,7 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 | `scripts/calib/make_calib_split.py` | None (legacy-only) | None |
 | `scripts/calib/parse_sweep.py` | None (legacy-only) | None |
 | `scripts/calib/sweep.py` | None (legacy-only) | None |
-| `scripts/calib/threshold_utils.py` | None (legacy-only) | None |
+| `scripts/calib/threshold_utils.py` | `tivit/calibration/thresholds.py` | Partial |
 | `scripts/check/analyze_class_balance.py` | None (legacy-only) | None |
 | `scripts/check/check_hand_label_utils.py` | None (legacy-only) | None |
 | `scripts/check/check_model.py` | `tivit/tests/test_vivit_forward.py`, `tivit/tests/test_vits_tile_forward.py` | Partial |
@@ -80,7 +80,7 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 | `scripts/check/diagnose_onset_offsets.py` | None (legacy-only) | None |
 | `scripts/check/test_conf.py` | None (legacy-only) | None |
 | `scripts/check/test_forward.py` | `tivit/tests/test_vivit_forward.py`, `tivit/tests/test_vits_tile_forward.py` | Partial |
-| `scripts/check/test_key_prior.py` | None (legacy-only) | None |
+| `scripts/check/test_key_prior.py` | `tivit/tests/test_key_prior_runtime.py` | Partial |
 | `scripts/check/test_labels.py` | `tivit/tests/test_targets_alignment.py` | Partial |
 | `scripts/check/test_loader.py` | `tivit/tests/test_dataset_*.py` | Partial |
 | `scripts/check/test_refinement.py` | `tivit/tests/test_registration.py` | Partial |
@@ -90,6 +90,6 @@ Status legend: Full = equivalent new-stack wrapper, Partial = some overlap, None
 | `scripts/theory_decode.py` | `tivit/postproc/key_signature.py` (no CLI) | None |
 | `scripts/probe_timegrid.py` | None (legacy-only) | None |
 | `scripts/rebuild_av_lags.py` | None (legacy-only) | None |
-| `scripts/clean_tivit.py` | None (legacy-only) | None |
+| `scripts/clean_tivit.py` | `tivit/pipelines/clean_tivit.py` | Partial |
 | `scripts/dev/gen_file_index.py` | None (legacy-only) | None |
 | `scripts/dev/gen_repo_tree.py` | None (legacy-only) | None |
